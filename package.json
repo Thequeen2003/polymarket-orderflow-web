@@ -1,0 +1,19 @@
+{
+  "name": "polymarket-orderflow-web",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "web",
+    "api"
+  ],
+  "scripts": {
+    "dev": "concurrently -n api,web -c cyan,magenta \"npm run dev -w api\" \"npm run dev -w web\"",
+    "build": "npm run build -w api && npm run build -w web",
+    "test": "npm test -w api && npm test -w web",
+    "lint": "npm run lint -w api && npm run lint -w web"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.0"
+  }
+}
+
