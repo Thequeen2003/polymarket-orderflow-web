@@ -1,13 +1,127 @@
-import { useCallback, useEffect, useMemo, useState, type ReactElement } from 'react';
-import { clobBooks, health, marketsGet, marketsList, marketsSearch, type ApiErr, type ApiOk } from './lib/api';
-import type { ClobBookEntry } from './lib/api';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
+import {
+  assistantChat,
+  clobBooks,
+  health,
+  marketsGet,
+  marketsList,
+  marketsSearch,
+  marketsUpdownShortcut,
+  type ApiErr,
+  type ApiOk,
+  type ClobBookEntry,
+  type UpdownInterval,
+  type UpdownShortcutAsset,
+} from './lib/api';
+import { BookSideGrouped } from './BookPanel';
+import { displayPrice, midPrice, pickBookLevels, topOfBook } from './bookLevels';
+import { MomentumChart, type SeriesPoint } from './MomentumChart';
+import { resolveUpDownIndices } from './upDown';
+import { OrderFlowChart } from './OrderFlowChart';
+import { snapshotFromBook, type BookSnapshot } from './orderflowMetrics';
+import { MomentumAlertsTab } from './MomentumAlertsTab';
+import { AboveBelowDashboard } from './AboveBelowDashboard';
+import { FlowZonesTab } from './FlowZonesTab';
+import { SignalsPtbOnly } from './SignalsPtbOnly';
+import { TradeSegmentedControl } from './tradeUi';
+import { PtbWatchTab } from './PtbWatchTab';
+import { priceToBeat, rtdsCrypto } from './lib/api';
+import type { SpotPoint } from './SpotLevelChart';
+import {
+  bookIntelForAssistant,
+  bookIntelLines,
+  computeBookIntel,
+  formatGammaVolumeLines,
+  pickGammaVolumeStats,
+} from './bookIntel';
+import { outcomeEntryExitHints } from './chartReadouts';
+import { buildRollingContext, rollingContextText } from './contextSummary';
 
 function pretty(value: unknown) {
   return JSON.stringify(value, null, 2);
 }
 
+const PTB_WATCH_SLUGS_KEY = 'ptbWatchSlugs.v1';
+const PTB_WATCH_RECENT_KEY = 'ptbWatchRecentSlugs.v1';
+
+function readStringArray(key: string, max: number): string[] {
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    const out = parsed.map((x) => String(x).trim()).filter(Boolean);
+    return out.slice(0, max);
+  } catch {
+    return [];
+  }
+}
+
+function writeStringArray(key: string, value: string[]) {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    /* ignore */
+  }
+}
+
 function isOk<T>(res: ApiOk<T> | ApiErr): res is ApiOk<T> {
   return (res as ApiOk<T>).ok === true && 'data' in (res as ApiOk<T>);
+}
+
+/** API should return an array; coerce wrapped shapes so the list never `.map`s a non-array. */
+function asMarketRows(data: unknown): unknown[] {
+  if (Array.isArray(data)) return data;
+  if (data && typeof data === 'object') {
+    const o = data as Record<string, unknown>;
+    for (const key of ['markets', 'data', 'items', 'results'] as const) {
+      const inner = o[key];
+      if (Array.isArray(inner)) return inner;
+    }
+  }
+  return [];
+}
+
+/** True when this object is a Gamma market row (not an event wrapper). */
+function isGammaMarketRow(m: unknown): boolean {
+  if (!m || typeof m !== 'object') return false;
+  const o = m as Record<string, unknown>;
+  if (typeof o.conditionId === 'string' && o.conditionId.startsWith('0x')) return true;
+  if (o.clobTokenIds != null || o.clob_token_ids != null) return true;
+  if (
+    typeof o.question === 'string' &&
+    (typeof o.slug === 'string' || typeof o.id === 'string' || typeof o.id === 'number')
+  )
+    return true;
+  const mk = o.markets;
+  const hasNestedMarkets = Array.isArray(mk) && mk.length > 0;
+  if (
+    !hasNestedMarkets &&
+    typeof o.slug === 'string' &&
+    o.slug.trim() &&
+    (typeof o.id === 'string' || typeof o.id === 'number')
+  )
+    return true;
+  return false;
+}
+
+function pickMarketSlug(m: unknown): string {
+  if (!m || typeof m !== 'object') return '';
+  const o = m as Record<string, unknown>;
+  if (!isGammaMarketRow(m)) {
+    const mk = o.markets;
+    if (Array.isArray(mk) && mk.length > 0) {
+      const first = mk[0];
+      if (first && isGammaMarketRow(first)) {
+        return pickMarketSlug(first);
+      }
+    }
+  }
+  if (typeof o.slug === 'string' && o.slug.trim()) return o.slug.trim();
+  if (typeof o.market_slug === 'string' && o.market_slug.trim()) return o.market_slug.trim();
+  if (typeof o.id === 'string' && o.id.trim()) return o.id.trim();
+  if (typeof o.id === 'number' && Number.isFinite(o.id)) return String(o.id);
+  return '';
 }
 
 function shortToken(id: string) {
@@ -18,9 +132,20 @@ function shortToken(id: string) {
 function pickTokenIds(market: unknown): string[] {
   if (!market || typeof market !== 'object') return [];
   const anyMarket = market as Record<string, unknown>;
-  const ids = anyMarket.clob_token_ids;
+  const ids = anyMarket.clob_token_ids ?? anyMarket.clobTokenIds;
   if (Array.isArray(ids)) return ids.map(String).filter(Boolean);
-  if (typeof ids === 'string') return ids.split(',').map((s) => s.trim()).filter(Boolean);
+  if (typeof ids === 'string') {
+    const t = ids.trim();
+    if (t.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(t) as unknown;
+        if (Array.isArray(parsed)) return parsed.map(String).filter(Boolean);
+      } catch {
+        /* fall through */
+      }
+    }
+    return t.split(',').map((s) => s.trim()).filter(Boolean);
+  }
   return [];
 }
 
@@ -46,55 +171,346 @@ function pickOutcomeLabels(market: unknown): string[] {
   return [];
 }
 
-type BookLevel = { price: number; size: number };
-
-function pickBookLevels(book: unknown): { bids: BookLevel[]; asks: BookLevel[] } {
-  if (!book || typeof book !== 'object') return { bids: [], asks: [] };
-  const anyBook = book as Record<string, unknown>;
-  const bidsRaw = Array.isArray(anyBook.bids) ? anyBook.bids : [];
-  const asksRaw = Array.isArray(anyBook.asks) ? anyBook.asks : [];
-  const toLevel = (v: unknown): BookLevel | null => {
-    if (!v || typeof v !== 'object') return null;
-    const o = v as Record<string, unknown>;
-    const price = Number(o.price ?? o.rate ?? o.value);
-    const size = Number(o.size ?? o.shares ?? o.amount ?? o.quantity);
-    if (!Number.isFinite(price) || !Number.isFinite(size)) return null;
-    return { price, size };
-  };
-  const bids = bidsRaw.map(toLevel).filter((x): x is BookLevel => x !== null).sort((a, b) => b.price - a.price);
-  const asks = asksRaw.map(toLevel).filter((x): x is BookLevel => x !== null).sort((a, b) => a.price - b.price);
-  return {
-    bids: bids.slice(0, 36),
-    asks: asks.slice(0, 36),
-  };
+/** Match server: accept slug/id or full `polymarket.com/event/...` URLs when pasting from the site. */
+function normalizeMarketLookupRef(raw: string): string {
+  const s = decodeURIComponent(raw).trim();
+  if (!s) return '';
+  if (!/polymarket\.com/i.test(s)) return s;
+  try {
+    const withProto = /^https?:\/\//i.test(s) ? s : `https://${s}`;
+    const u = new URL(withProto);
+    const parts = u.pathname.split('/').filter(Boolean);
+    const keyIdx = parts.findIndex((p) => /^(event|events|market|markets)$/i.test(p));
+    if (keyIdx !== -1 && parts[keyIdx + 1]) return decodeURIComponent(parts[keyIdx + 1]!);
+    const last = parts[parts.length - 1];
+    return last ? decodeURIComponent(last) : s;
+  } catch {
+    return s;
+  }
 }
 
-function BookSide({
-  title,
-  levels,
-  tone,
-}: {
-  title: string;
-  levels: BookLevel[];
-  tone: 'ask' | 'bid';
-}): ReactElement {
-  const empty = levels.length === 0;
+function pickMarketQuestion(m: unknown): string {
+  if (!m || typeof m !== 'object') return '';
+  const o = m as Record<string, unknown>;
+  return String(o.question ?? o.title ?? '').trim();
+}
+
+function isMarketClosed(m: unknown | null): boolean {
+  if (!m || typeof m !== 'object') return false;
+  const o = m as Record<string, unknown>;
+  return o.closed === true;
+}
+
+function parseUpdownSlug(slug: string): {
+  asset: 'btc' | 'eth' | 'sol';
+  ts: number;
+  interval: UpdownInterval;
+  stepSec: number;
+} | null {
+  const m = slug.trim().toLowerCase().match(/^(btc|eth|sol)-updown-(5m|15m)-(\d+)$/);
+  if (!m) return null;
+  const asset = m[1] as 'btc' | 'eth' | 'sol';
+  const interval = m[2] as UpdownInterval;
+  const ts = Number(m[3]);
+  if (!Number.isFinite(ts) || ts <= 0) return null;
+  const stepSec = interval === '15m' ? 900 : 300;
+  return { asset, ts, interval, stepSec };
+}
+
+function nextUpdownSlug(slug: string, dir: -1 | 1): string | null {
+  const p = parseUpdownSlug(slug);
+  if (!p) return null;
+  return `${p.asset}-updown-${p.interval}-${p.ts + dir * p.stepSec}`;
+}
+
+function buildAssistantContext(
+  slug: string,
+  market: unknown | null,
+  books: ClobBookEntry[] | null,
+  labels: string[],
+): string {
+  const lines: string[] = [];
+  lines.push(`Market slug: ${slug || '—'}`);
+  const q = pickMarketQuestion(market);
+  if (q) lines.push(`Question: ${q.slice(0, 800)}`);
+  const gv = pickGammaVolumeStats(market);
+  const gLines = formatGammaVolumeLines(gv);
+  lines.push('');
+  lines.push('--- Gamma (venue / slow stats — not live tape) ---');
+  for (const gl of gLines) lines.push(gl);
+  if (books) {
+    for (let i = 0; i < books.length; i++) {
+      const e = books[i]!;
+      const lab = labels[i] ?? `Outcome ${i + 1}`;
+      lines.push('');
+      lines.push(`[${lab}] token ${shortToken(e.token)}`);
+      if (e.error) lines.push(`  book error: ${e.error}`);
+      else {
+        const { asks, bids } = pickBookLevels(e.book);
+        const askStr = asks.slice(0, 10).map((l) => `${l.price}×${l.size}`).join(', ');
+        const bidStr = bids.slice(0, 10).map((l) => `${l.price}×${l.size}`).join(', ');
+        lines.push(`  asks (buyable, sample): ${askStr || '—'}`);
+        lines.push(`  bids (sellable, sample): ${bidStr || '—'}`);
+        lines.push(bookIntelForAssistant(lab, e.book));
+      }
+    }
+  }
+  return lines.join('\n');
+}
+
+type AutoLine = { ts: number; kind: 'sent' | 'reply' | 'error'; text: string };
+
+function AutoTerminal({ lines }: { lines: AutoLine[] }): ReactElement {
+  const tail = lines.slice(-12);
   return (
-    <div className="rounded-xl border border-zinc-900 bg-zinc-950/50 p-3">
-      <div className={`text-sm font-medium ${tone === 'ask' ? 'text-emerald-200' : 'text-sky-200'}`}>{title}</div>
-      <div className="mt-2 space-y-1 text-xs">
-        {empty ? (
-          <div className="text-zinc-500">No levels yet.</div>
+    <div className="mt-4 rounded-2xl border border-zinc-800/50 bg-black/20 p-3 ring-1 ring-white/[0.02]">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Auto context feed</div>
+        <div className="text-[10px] text-zinc-600">{lines.length === 0 ? 'idle' : `${lines.length} lines`}</div>
+      </div>
+      <div className="max-h-40 overflow-y-auto rounded-xl border border-zinc-800/40 bg-black/25 p-2 font-mono text-[11px] leading-relaxed text-zinc-300">
+        {tail.length === 0 ? (
+          <div className="text-zinc-600">No updates yet.</div>
         ) : (
-          levels.map((l, i) => (
-            <div key={`${tone}-${i}`} className="flex items-center justify-between rounded bg-zinc-900/40 px-2 py-1">
-              <span className="font-mono text-zinc-200">{l.price}</span>
-              <span className="font-mono text-zinc-400">{l.size}</span>
+          tail.map((l, i) => (
+            <div key={`${l.ts}-${i}`} className="flex gap-2">
+              <span className="shrink-0 text-zinc-600">{new Date(l.ts).toLocaleTimeString()}</span>
+              <span
+                className={
+                  l.kind === 'error' ? 'text-red-200/90' : l.kind === 'sent' ? 'text-zinc-400' : 'text-emerald-200/90'
+                }
+              >
+                {l.text}
+              </span>
             </div>
           ))
         )}
       </div>
     </div>
+  );
+}
+
+function OutcomePane({
+  entry,
+  label,
+  autoLines,
+  fetchedAt,
+  market,
+}: {
+  entry: ClobBookEntry;
+  label: string;
+  autoLines: AutoLine[];
+  fetchedAt: number | null;
+  market: unknown | null;
+}): ReactElement {
+  const parsed = pickBookLevels(entry.book);
+  const tob = topOfBook(entry.book);
+  const mid = midPrice(entry.book);
+  const intel = useMemo(() => computeBookIntel(entry.book), [entry.book]);
+  const gammaStats = useMemo(() => pickGammaVolumeStats(market), [market]);
+  const gammaLines = useMemo(() => formatGammaVolumeLines(gammaStats), [gammaStats]);
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 2_000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const ageMs = fetchedAt == null ? null : now - fetchedAt;
+  const live = ageMs != null && ageMs < 20_000;
+  return (
+    <div className="rounded-2xl border border-zinc-800/50 bg-gradient-to-b from-zinc-900/25 to-zinc-950/40 p-4 shadow-lg shadow-black/25 ring-1 ring-white/[0.03]">
+      <div className="flex flex-wrap items-baseline justify-between gap-2 border-b border-zinc-800/40 pb-3">
+        <div className="text-[15px] font-semibold tracking-tight text-zinc-100">{label}</div>
+        <div className="flex flex-wrap items-center gap-2">
+          <div
+            className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide ${
+              live ? 'border-emerald-700/40 bg-emerald-950/25 text-emerald-200' : 'border-zinc-700/40 bg-zinc-950/40 text-zinc-500'
+            }`}
+            title={fetchedAt ? `Last fetched ${new Date(fetchedAt).toLocaleTimeString()}` : 'Not fetched yet'}
+          >
+            {live ? 'LIVE' : 'STALE'}
+          </div>
+          <div className="rounded-md bg-zinc-900/60 px-2 py-1 font-mono text-[11px] text-zinc-400">
+            mid {mid != null ? displayPrice(mid) : '—'} · bid {tob.bestBid != null ? displayPrice(tob.bestBid) : '—'} · ask{' '}
+            {tob.bestAsk != null ? displayPrice(tob.bestAsk) : '—'}
+          </div>
+          <div className="rounded-md bg-zinc-900/60 px-2 py-0.5 font-mono text-[11px] text-zinc-500">{shortToken(entry.token)}</div>
+        </div>
+      </div>
+      {entry.error ? (
+        <div className="mt-3 rounded-xl border border-amber-800/30 bg-amber-950/20 px-3 py-2 text-xs leading-relaxed text-amber-100/90">
+          {entry.error}
+        </div>
+      ) : null}
+      {!entry.error ? (
+        <div className="mt-3 rounded-xl border border-zinc-800/50 bg-zinc-900/30 px-3 py-2.5 ring-1 ring-white/[0.02]">
+          <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Book vs chart (entry / exit)</div>
+          <ul className="mt-1.5 space-y-1 text-[11px] leading-relaxed text-zinc-400">
+            {outcomeEntryExitHints({
+              label,
+              mid,
+              bestBid: tob.bestBid,
+              bestAsk: tob.bestAsk,
+            }).map((line, i) => (
+              <li key={i}>{line}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      {!entry.error ? (
+        <div className="mt-3 rounded-xl border border-indigo-900/35 bg-indigo-950/20 px-3 py-2.5 ring-1 ring-white/[0.02]">
+          <div className="text-[10px] font-semibold uppercase tracking-wide text-indigo-300/90">Volume & liquidity (Gamma)</div>
+          <p className="mt-1 text-[10px] leading-snug text-zinc-500">
+            From the market listing — useful for how much has traded overall; the ladder is still the live quote.
+          </p>
+          <ul className="mt-1.5 space-y-1 text-[11px] leading-relaxed text-indigo-100/85">
+            {gammaLines.map((line, i) => (
+              <li key={i}>{line}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      {!entry.error && intel ? (
+        <div className="mt-3 rounded-xl border border-emerald-900/30 bg-emerald-950/15 px-3 py-2.5 ring-1 ring-white/[0.02]">
+          <div className="text-[10px] font-semibold uppercase tracking-wide text-emerald-300/90">Depth & microprice (this outcome)</div>
+          <p className="mt-1 text-[10px] leading-snug text-zinc-500">
+            Computed from the CLOB snapshot: where size sits vs mid, and a simple “air pocket” scan a few levels up the asks.
+          </p>
+          <ul className="mt-1.5 space-y-1 text-[11px] leading-relaxed text-emerald-100/90">
+            {bookIntelLines(intel).map((line, i) => (
+              <li key={i}>{line}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <BookSideGrouped title="Buyable (asks)" levels={parsed.asks} tone="ask" />
+        <BookSideGrouped title="Sellable (bids)" levels={parsed.bids} tone="bid" />
+      </div>
+      <AutoTerminal lines={autoLines} />
+    </div>
+  );
+}
+
+type ChatTurn = { role: 'user' | 'assistant'; content: string };
+
+function OrderFlowAssistant({ apiAvailable, context }: { apiAvailable: boolean; context: string }): ReactElement {
+  const [messages, setMessages] = useState<ChatTurn[]>([]);
+  const [input, setInput] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function send() {
+    const text = input.trim();
+    if (!text || busy) return;
+    setErr(null);
+    const next: ChatTurn[] = [...messages, { role: 'user', content: text }];
+    setMessages(next);
+    setInput('');
+    setBusy(true);
+    const res = await assistantChat({ messages: next, context: context || undefined, max_tokens: 560 });
+    setBusy(false);
+    if (isOk(res)) setMessages([...next, { role: 'assistant', content: res.data.message }]);
+    else setErr(pretty(res));
+  }
+
+  return (
+    <div className="flex h-full min-h-[22rem] flex-col rounded-2xl border border-zinc-800/50 bg-zinc-950/35 p-4 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] xl:min-h-[32rem]">
+      <div className="text-[15px] font-semibold tracking-tight text-zinc-100">Order-flow assistant</div>
+      <p className="mt-1.5 text-xs leading-relaxed text-zinc-500">
+        The API calls your provider (Moonshot / OpenAI-compatible). Put{' '}
+        <span className="rounded bg-zinc-900/80 px-1 font-mono text-zinc-400">MOONSHOT_API_KEY</span> or{' '}
+        <span className="rounded bg-zinc-900/80 px-1 font-mono text-zinc-400">OPENAI_API_KEY</span> in{' '}
+        <span className="font-mono text-zinc-400">.env</span> at the <span className="text-zinc-300">repo root</span> or in{' '}
+        <span className="font-mono text-zinc-400">api/.env</span>, then restart <span className="font-mono text-zinc-400">npm run dev</span>.
+        If replies fail, expand the red error — it often names a bad model or billing issue.
+      </p>
+      {!apiAvailable ? (
+        <div className="mt-3 rounded-xl border border-amber-800/25 bg-amber-950/15 px-3 py-2 text-xs leading-relaxed text-amber-100/85">
+          Assistant is off until the API reports a configured key (health check).
+        </div>
+      ) : null}
+      <div className="mt-3 flex-1 space-y-2.5 overflow-y-auto rounded-xl border border-zinc-800/40 bg-black/20 p-3 text-sm shadow-inner shadow-black/20">
+        {messages.length === 0 ? (
+          <div className="text-xs leading-relaxed text-zinc-500">
+            Ask how to read the ladder, what tighter asks imply, or how UP/DOWN books relate. Context updates when you change markets.
+          </div>
+        ) : (
+          messages.map((m, i) => (
+            <div
+              key={i}
+              className={`rounded-xl px-3 py-2 text-xs leading-relaxed ${
+                m.role === 'user'
+                  ? 'ml-2 border border-indigo-500/20 bg-indigo-950/35 text-indigo-50'
+                  : 'mr-2 border border-zinc-700/30 bg-zinc-900/55 text-zinc-200'
+              }`}
+            >
+              <div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-zinc-500">{m.role}</div>
+              <div className="whitespace-pre-wrap text-[13px] leading-relaxed">{m.content}</div>
+            </div>
+          ))
+        )}
+        {busy ? <div className="text-xs text-indigo-300/90">Thinking…</div> : null}
+        {err ? <pre className="overflow-auto rounded-lg bg-red-950/20 p-2 text-xs text-red-200/90">{err}</pre> : null}
+      </div>
+      <div className="mt-3 flex gap-2">
+        <input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              void send();
+            }
+          }}
+          disabled={!apiAvailable || busy}
+          placeholder={apiAvailable ? 'Ask about this book…' : 'Configure API key first'}
+          className="min-w-0 flex-1 rounded-xl border border-zinc-700/50 bg-zinc-900/40 px-3 py-2.5 text-[13px] text-zinc-100 outline-none ring-indigo-500/0 transition-shadow placeholder:text-zinc-600 focus:border-indigo-500/40 focus:ring-2 focus:ring-indigo-500/25 disabled:opacity-50"
+        />
+        <button
+          type="button"
+          disabled={!apiAvailable || busy}
+          onClick={() => void send()}
+          className="shrink-0 rounded-xl bg-indigo-500 px-4 py-2.5 text-xs font-semibold text-white shadow-md shadow-indigo-950/40 transition-colors hover:bg-indigo-400 disabled:opacity-40"
+        >
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+
+type LoadMarketResult = { ok: true; slug: string; data: unknown } | { ok: false };
+type MainTab = 'book' | 'flowzones' | 'signals' | 'momentum' | 'watch' | 'assistant' | 'raw';
+
+function MainTabButton({
+  id,
+  label,
+  title: titleAttr,
+  active,
+  onSelect,
+}: {
+  id: MainTab;
+  label: string;
+  /** Full label for hover (when `label` is shortened). */
+  title?: string;
+  active: boolean;
+  onSelect: (id: MainTab) => void;
+}): ReactElement {
+  return (
+    <button
+      type="button"
+      title={titleAttr ?? label}
+      onClick={() => onSelect(id)}
+      className={`border-b-2 px-2.5 py-2 text-[13px] font-medium transition-colors ${
+        active
+          ? 'border-amber-500/75 text-zinc-100'
+          : 'border-transparent text-zinc-500 hover:text-zinc-300'
+      }`}
+    >
+      {label}
+    </button>
   );
 }
 
@@ -107,9 +523,74 @@ function App() {
   const [books, setBooks] = useState<ClobBookEntry[] | null>(null);
   const [booksLoading, setBooksLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [marketsError, setMarketsError] = useState<string | null>(null);
+  const [slugInput, setSlugInput] = useState('');
+  const [outcomeTab, setOutcomeTab] = useState(0);
+  const [assistantAvailable, setAssistantAvailable] = useState(false);
+  const [shortcutBusy, setShortcutBusy] = useState<{ asset: UpdownShortcutAsset; interval: UpdownInterval } | null>(null);
+  const [lastShortcut, setLastShortcut] = useState<{ asset: UpdownShortcutAsset; interval: UpdownInterval } | null>(null);
+  const [mainTab, setMainTab] = useState<MainTab>('book');
+  const [ptbWatchSlugs, setPtbWatchSlugs] = useState<string[]>(() => readStringArray(PTB_WATCH_SLUGS_KEY, 12));
+  const [ptbWatchRecentSlugs, setPtbWatchRecentSlugs] = useState<string[]>(() => readStringArray(PTB_WATCH_RECENT_KEY, 24));
+  const [autoEnabled, setAutoEnabled] = useState(false);
+  const [autoBusy, setAutoBusy] = useState(false);
+  const [autoLinesBySlug, setAutoLinesBySlug] = useState<Record<string, AutoLine[]>>({});
+  const [, setAutoThreadBySlug] = useState<Record<string, { role: 'user' | 'assistant'; content: string }[]>>({});
+  const [, setAutoBiasBySlug] = useState<Record<string, { bias: string; confidence: number | null; why: string }>>({});
+  const autoThreadRef = useRef<Record<string, { role: 'user' | 'assistant'; content: string }[]>>({});
+  const [booksFetchedAt, setBooksFetchedAt] = useState<number | null>(null);
+  const [chartEnabled, setChartEnabled] = useState(true);
+  const [chartSeriesBySlug, setChartSeriesBySlug] = useState<Record<string, Record<string, SeriesPoint[]>>>({});
+  const [flowSeriesBySlug, setFlowSeriesBySlug] = useState<Record<string, Record<string, BookSnapshot[]>>>({});
+  const [flowMode, setFlowMode] = useState<'price' | 'flow'>('flow');
+  const [ssrPriceToBeat, setSsrPriceToBeat] = useState<number | null>(null);
+  const [rtdsSpot, setRtdsSpot] = useState<number | null>(null);
+  const [rtdsTickAt, setRtdsTickAt] = useState<number | null>(null);
+  const [spotSeriesBySlug, setSpotSeriesBySlug] = useState<Record<string, SpotPoint[]>>({});
+  const [now, setNow] = useState(() => Date.now());
+
+  const prevDepthMapsRef = useRef<Record<string, { bids: Map<string, number>; asks: Map<string, number> }>>({});
 
   const tokenIds = useMemo(() => pickTokenIds(marketJson), [marketJson]);
   const outcomeLabels = useMemo(() => pickOutcomeLabels(marketJson), [marketJson]);
+
+  const signalsProbMids = useMemo(() => {
+    if (!selectedSlug || !books || books.length < 2 || outcomeLabels.length < 2) {
+      return { up: [] as SpotPoint[], down: [] as SpotPoint[] };
+    }
+    const idx = resolveUpDownIndices(outcomeLabels, marketJson);
+    if (!idx) return { up: [] as SpotPoint[], down: [] as SpotPoint[] };
+    const tokU = books[idx.up]?.token;
+    const tokD = books[idx.down]?.token;
+    const m = chartSeriesBySlug[selectedSlug] ?? {};
+    const clean = (arr: SeriesPoint[]): SpotPoint[] =>
+      arr
+        .filter((p) => typeof p.v === 'number' && Number.isFinite(p.v as number))
+        .map((p) => ({ t: p.t, v: p.v as number }))
+        .slice(-220);
+    return {
+      up: tokU ? clean(m[tokU] ?? []) : [],
+      down: tokD ? clean(m[tokD] ?? []) : [],
+    };
+  }, [books, chartSeriesBySlug, marketJson, outcomeLabels, selectedSlug]);
+
+  const loadMarket = useCallback(async (slug: string): Promise<LoadMarketResult> => {
+    const clean = normalizeMarketLookupRef(slug);
+    queueMicrotask(() => setMainTab('book'));
+    setSelectedSlug(clean);
+    setSlugInput(clean || slug.trim());
+    setError(null);
+    setMarketJson(null);
+    setBooks(null);
+    if (!clean) return { ok: false };
+    const res = await marketsGet(clean);
+    if (isOk(res)) {
+      setMarketJson(res.data);
+      return { ok: true, slug: clean, data: res.data };
+    }
+    setError(pretty(res));
+    return { ok: false };
+  }, []);
 
   const loadBooks = useCallback(async (ids: string[]) => {
     if (ids.length === 0) {
@@ -120,71 +601,494 @@ function App() {
     setError(null);
     const res = await clobBooks(ids);
     setBooksLoading(false);
-    if (isOk(res)) setBooks(res.data);
+    if (isOk(res)) {
+      setBooks(res.data);
+      const ts = Date.now();
+      setBooksFetchedAt(ts);
+      // update chart series
+      setChartSeriesBySlug((m) => {
+        if (!selectedSlug) return m;
+        const existingForSlug = m[selectedSlug] ?? {};
+        const nextForSlug: Record<string, SeriesPoint[]> = { ...existingForSlug };
+        for (const e of res.data) {
+          const token = e.token;
+          const v = e.error ? null : midPrice(e.book);
+          const prev = nextForSlug[token] ?? [];
+          nextForSlug[token] = [...prev, { t: ts, v }].slice(-180);
+        }
+        return { ...m, [selectedSlug]: nextForSlug };
+      });
+
+      // update order-flow metrics series (per token)
+      setFlowSeriesBySlug((m) => {
+        if (!selectedSlug) return m;
+        const existingForSlug = m[selectedSlug] ?? {};
+        const nextForSlug: Record<string, BookSnapshot[]> = { ...existingForSlug };
+        for (const e of res.data) {
+          const token = e.token;
+          const key = `${selectedSlug}:${token}`;
+          const prevMaps = prevDepthMapsRef.current[key] ?? null;
+          const prev = nextForSlug[token] ?? [];
+          if (e.error) continue;
+          const { snap, next } = snapshotFromBook(e.book, ts, prevMaps);
+          prevDepthMapsRef.current[key] = next;
+          nextForSlug[token] = [...prev, snap].slice(-360);
+        }
+        return { ...m, [selectedSlug]: nextForSlug };
+      });
+    }
     else setError(pretty(res));
-  }, []);
+  }, [selectedSlug]);
+
+  // When enabled, poll books every 5s to drive the chart.
+  useEffect(() => {
+    if (!chartEnabled) return;
+    if (!tokenIds || tokenIds.length === 0) return;
+    if (!selectedSlug) return;
+    let stopped = false;
+    const tick = async () => {
+      if (stopped) return;
+      await loadBooks(tokenIds);
+    };
+    const id = window.setInterval(() => void tick(), 5_000);
+    return () => {
+      stopped = true;
+      window.clearInterval(id);
+    };
+  }, [chartEnabled, loadBooks, selectedSlug, tokenIds]);
 
   useEffect(() => {
     void (async () => {
+      setMarketsError(null);
       const h = await health();
-      if (isOk(h)) setApiHealth(h.data.polymarket ? `API OK — ${h.data.polymarket}` : 'API OK (polymarket binary not found or empty)');
+      if (isOk(h)) {
+        setAssistantAvailable(h.data.assistant_available === true);
+        const g = h.data.gamma_reachable === true ? ' · Gamma OK' : h.data.gamma_reachable === false ? ' · Gamma unreachable' : '';
+        const ap = h.data.assistant_provider ? ` · ${String(h.data.assistant_provider).toUpperCase()}` : '';
+        const am = h.data.assistant_model ? `/${h.data.assistant_model}` : '';
+        const a =
+          h.data.assistant_available === true
+            ? ` · Assistant${ap}${am}`
+            : h.data.assistant_available === false
+              ? ' · Assistant (set MOONSHOT_API_KEY or OPENAI_API_KEY in repo or api/.env)'
+              : '';
+        setApiHealth(
+          h.data.polymarket
+            ? `API OK — ${h.data.polymarket}${g}${a}`
+            : `API OK (HTTP mode — no polymarket CLI)${g}${a}`,
+        );
+      }
       else setApiHealth(`API error: ${h.error}`);
 
       const list = await marketsList(25);
-      if (isOk(list)) setMarkets(list.data);
+      if (isOk(list)) {
+        setMarkets(asMarketRows(list.data));
+        if (asMarketRows(list.data).length === 0) {
+          setMarketsError('Markets list returned zero rows. Is the Polymarket CLI installed and on PATH? Try `Open by slug` below.');
+        }
+      } else {
+        setMarkets([]);
+        setMarketsError(pretty(list));
+      }
     })();
   }, []);
 
   useEffect(() => {
     if (tokenIds.length === 0) {
-      setBooks(null);
+      queueMicrotask(() => setBooks(null));
       return;
     }
-    void loadBooks(tokenIds);
+    queueMicrotask(() => void loadBooks(tokenIds));
   }, [tokenIds, loadBooks]);
+
+  useEffect(() => {
+    if (!books || books.length === 0) {
+      queueMicrotask(() => setOutcomeTab(0));
+      return;
+    }
+    const n = books.length;
+    queueMicrotask(() => setOutcomeTab((t) => Math.min(Math.max(0, t), n - 1)));
+  }, [books]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const slug = (params.get('slug') ?? params.get('market') ?? '').trim();
+    if (!slug) return;
+    queueMicrotask(() => void loadMarket(slug));
+  }, [loadMarket]);
+
+  useEffect(() => {
+    if (!selectedSlug) return;
+    void (async () => {
+      const ptb = await priceToBeat(selectedSlug);
+      if (isOk(ptb)) setSsrPriceToBeat(ptb.data.price_to_beat);
+      else setSsrPriceToBeat(null);
+    })();
+  }, [selectedSlug]);
+
+  useEffect(() => {
+    writeStringArray(PTB_WATCH_SLUGS_KEY, ptbWatchSlugs);
+  }, [ptbWatchSlugs]);
+
+  useEffect(() => {
+    writeStringArray(PTB_WATCH_RECENT_KEY, ptbWatchRecentSlugs);
+  }, [ptbWatchRecentSlugs]);
+
+  useEffect(() => {
+    const s = selectedSlug.trim();
+    if (!s) return;
+    setPtbWatchRecentSlugs((prev) => {
+      const next = [s, ...prev.filter((x) => x !== s)];
+      return next.slice(0, 24);
+    });
+  }, [selectedSlug]);
+
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    // RTDS spot (Chainlink) for BTC/ETH/SOL windows; derive symbol from slug prefix
+    const slug = selectedSlug.toLowerCase();
+    const sym = slug.startsWith('btc-') ? 'btc/usd' : slug.startsWith('eth-') ? 'eth/usd' : slug.startsWith('sol-') ? 'sol/usd' : null;
+    if (!sym) {
+      queueMicrotask(() => setRtdsSpot(null));
+      return;
+    }
+    let stopped = false;
+    const tick = async () => {
+      if (stopped) return;
+      const p = await rtdsCrypto(sym);
+      if (isOk(p)) {
+        const ts = Date.now();
+        setRtdsSpot(p.data.value);
+        setRtdsTickAt(ts);
+        setSpotSeriesBySlug((m) => ({
+          ...m,
+          [selectedSlug]: [...(m[selectedSlug] ?? []), { t: ts, v: p.data.value }].slice(-600),
+        }));
+      }
+    };
+    void tick();
+    const id = window.setInterval(() => void tick(), 3_000);
+    return () => {
+      stopped = true;
+      window.clearInterval(id);
+    };
+  }, [selectedSlug]);
+
+  const marketEndsInMs = useMemo(() => {
+    if (!marketJson || typeof marketJson !== 'object') return null;
+    const endRaw = (marketJson as Record<string, unknown>).endDate;
+    if (typeof endRaw !== 'string') return null;
+    const t = Date.parse(endRaw);
+    if (!Number.isFinite(t)) return null;
+    return t - now;
+  }, [marketJson, now]);
+
+  const updownParsed = useMemo(() => parseUpdownSlug(selectedSlug), [selectedSlug]);
+  const [updownLiveSlugFromApi, setUpdownLiveSlugFromApi] = useState<string | null>(null);
+
+  // For Up/Down markets, use the API's notion of "live" (bucket) rather than the browser clock.
+  useEffect(() => {
+    if (!updownParsed) {
+      setUpdownLiveSlugFromApi(null);
+      return;
+    }
+    let stopped = false;
+    const tick = async () => {
+      const res = await marketsUpdownShortcut(updownParsed.asset, updownParsed.interval);
+      if (stopped) return;
+      if (isOk(res) && typeof res.data.slug === 'string' && res.data.slug) setUpdownLiveSlugFromApi(res.data.slug);
+    };
+    void tick();
+    const id = window.setInterval(() => void tick(), 20_000);
+    return () => {
+      stopped = true;
+      window.clearInterval(id);
+    };
+  }, [updownParsed]);
+
+  const updownBehindBySec = useMemo(() => {
+    const p = updownParsed;
+    if (!p) return null;
+    const live = updownLiveSlugFromApi ? parseUpdownSlug(updownLiveSlugFromApi) : null;
+    if (!live || live.asset !== p.asset || live.interval !== p.interval) return null;
+    return live.ts - p.ts;
+  }, [updownParsed, updownLiveSlugFromApi]);
+
+  const assistantContext = useMemo(
+    () => buildAssistantContext(selectedSlug, marketJson, books, outcomeLabels),
+    [selectedSlug, marketJson, books, outcomeLabels],
+  );
+
+  const rollingCtxText = useMemo(() => {
+    if (!selectedSlug || !books || books.length === 0) return '';
+    const token = books[outcomeTab]?.token;
+    const flow = token ? flowSeriesBySlug[selectedSlug]?.[token] ?? [] : [];
+    const spot = spotSeriesBySlug[selectedSlug] ?? [];
+    const ctx = buildRollingContext({ spotSeries: spot, priceToBeat: ssrPriceToBeat, flowSeries: flow });
+    return rollingContextText(ctx);
+  }, [books, outcomeTab, flowSeriesBySlug, selectedSlug, spotSeriesBySlug, ssrPriceToBeat]);
+
+  const pushAutoLine = useCallback(
+    (line: AutoLine) => {
+      if (!selectedSlug) return;
+      setAutoLinesBySlug((m) => ({
+        ...m,
+        [selectedSlug]: [...(m[selectedSlug] ?? []), line].slice(-80),
+      }));
+    },
+    [selectedSlug],
+  );
+
+  useEffect(() => {
+    if (!autoEnabled) return;
+    if (!assistantAvailable) return;
+    if (!selectedSlug) return;
+    if (!books || books.length === 0) return;
+
+    let stopped = false;
+    const tick = async () => {
+      if (stopped) return;
+      if (autoBusy) return;
+      setAutoBusy(true);
+      const ts0 = Date.now();
+      pushAutoLine({ ts: ts0, kind: 'sent', text: 'sent context →' });
+      try {
+        const isUpdown = parseUpdownSlug(selectedSlug) != null;
+        const biasSpec = isUpdown ? 'BIAS: UP|DOWN|NEUTRAL' : 'BIAS: ABOVE|BELOW|NEUTRAL';
+        const engineLine = isUpdown
+          ? 'You are a real-time market context engine for UP/DOWN time-window markets.'
+          : 'You are a real-time market context engine for ABOVE/BELOW price-to-beat markets.';
+        const safeRolling = rollingCtxText.length > 4_500 ? `${rollingCtxText.slice(0, 4_500)}\n…(truncated)` : rollingCtxText;
+        const safeAssistantCtx =
+          assistantContext && assistantContext.length > 3_500
+            ? `${assistantContext.slice(0, 3_500)}\n…(truncated)`
+            : assistantContext;
+        const prompt = [
+          engineLine,
+          'Return a compact update with this exact format (keep the whole reply short — under ~120 words):',
+          biasSpec,
+          'CONF: <0-100>% (integer)',
+          'WHY: <one sentence>',
+          'BULLETS:',
+          '- <momentum>',
+          '- <orderbook pressure>',
+          isUpdown ? '- <window time / volatility>' : '- <distance / level interaction>',
+          '- <risk / invalidation>',
+          'Do not give trading instructions; keep it informational.',
+          '',
+          safeRolling,
+        ].join('\n');
+
+        const prior = autoThreadRef.current[selectedSlug] ?? [];
+        const nextThread = [...prior, { role: 'user' as const, content: prompt }].slice(-6);
+        autoThreadRef.current[selectedSlug] = nextThread;
+        setAutoThreadBySlug((m) => ({ ...m, [selectedSlug]: nextThread }));
+
+        const res = await assistantChat({
+          messages: nextThread,
+          context: safeAssistantCtx ? `${safeAssistantCtx}\n\n${safeRolling}` : safeRolling || undefined,
+          max_tokens: 280,
+        });
+        if (isOk(res)) {
+          const msg = res.data.message;
+          pushAutoLine({ ts: Date.now(), kind: 'reply', text: msg });
+          setAutoThreadBySlug((m) => ({
+            ...m,
+            [selectedSlug]: [...(m[selectedSlug] ?? nextThread), { role: 'assistant' as const, content: msg }].slice(-6),
+          }));
+          autoThreadRef.current[selectedSlug] = [
+            ...(autoThreadRef.current[selectedSlug] ?? nextThread),
+            { role: 'assistant' as const, content: msg },
+          ].slice(-6);
+
+          const biasMatch = msg.match(/BIAS:\\s*(ABOVE|BELOW|UP|DOWN|NEUTRAL)/i);
+          const confMatch = msg.match(/CONF:\\s*(\\d{1,3})%/i);
+          const whyMatch = msg.match(/WHY:\\s*(.+)/i);
+          const bias = biasMatch ? biasMatch[1]!.toUpperCase() : '—';
+          const confidence = confMatch ? Number(confMatch[1]) : null;
+          const why = whyMatch ? whyMatch[1]!.trim() : '';
+          setAutoBiasBySlug((m) => ({ ...m, [selectedSlug]: { bias, confidence, why } }));
+        } else {
+          pushAutoLine({ ts: Date.now(), kind: 'error', text: pretty(res) });
+        }
+      } finally {
+        setAutoBusy(false);
+      }
+    };
+
+    // fire once, then every 15s (market snapshot + rolling context → API assistant)
+    void tick();
+    const id = window.setInterval(() => void tick(), 15_000);
+    return () => {
+      stopped = true;
+      window.clearInterval(id);
+    };
+  }, [autoEnabled, assistantAvailable, assistantContext, autoBusy, books, pushAutoLine, rollingCtxText, selectedSlug]);
+
+  async function openUpdownShortcut(asset: UpdownShortcutAsset, interval: UpdownInterval) {
+    setError(null);
+    setMarketsError(null);
+    setShortcutBusy({ asset, interval });
+    setLastShortcut({ asset, interval });
+    try {
+      const res = await marketsUpdownShortcut(asset, interval);
+      if (!isOk(res)) {
+        setMarketsError(pretty(res));
+        return;
+      }
+      if (res.data.start && res.data.end) {
+        setMarketsError(
+          `${asset.toUpperCase()} ${interval} window: ${new Date(res.data.start).toLocaleTimeString()}–${new Date(res.data.end).toLocaleTimeString()} · slug ${res.data.slug}`,
+        );
+      } else {
+        setMarketsError(null);
+      }
+      await loadMarket(res.data.slug);
+    } finally {
+      setShortcutBusy(null);
+    }
+  }
 
   async function runSearch() {
     setError(null);
+    setMarketsError(null);
     const term = q.trim();
     if (!term) {
       const list = await marketsList(25);
-      if (isOk(list)) setMarkets(list.data);
-      else setError(list.error);
+      if (isOk(list)) {
+        const rows = asMarketRows(list.data);
+        setMarkets(rows);
+        if (rows.length === 0) setMarketsError('No markets in this page of results.');
+      } else {
+        setMarkets([]);
+        setMarketsError(pretty(list));
+      }
       return;
     }
     const res = await marketsSearch(term, 25);
-    if (isOk(res)) setMarkets(res.data);
-    else setError(res.error);
-  }
-
-  async function loadMarket(slug: string) {
-    setSelectedSlug(slug);
-    setError(null);
-    setMarketJson(null);
-    setBooks(null);
-    if (!slug) return;
-    const res = await marketsGet(slug);
-    if (isOk(res)) setMarketJson(res.data);
-    else setError(pretty(res));
+    if (isOk(res)) {
+      const rows = asMarketRows(res.data);
+      if (rows.length === 0) {
+        const asRef = normalizeMarketLookupRef(term);
+        if (asRef) {
+          setMarketsError(null);
+          const opened = await loadMarket(asRef);
+          if (opened.ok) setMarkets([opened.data]);
+          return;
+        }
+        setMarkets([]);
+        setMarketsError(`No matches for “${term}”. Try a shorter query or paste a slug from polymarket.com.`);
+        return;
+      }
+      setMarkets(rows);
+      setMarketsError(null);
+      if (rows.length === 1) {
+        const only = pickMarketSlug(rows[0]);
+        if (only) {
+          const opened = await loadMarket(only);
+          if (opened.ok) setMarkets(rows);
+        }
+      }
+    } else {
+      setMarkets([]);
+      setMarketsError(pretty(res));
+    }
   }
 
   return (
-    <div className="min-h-full bg-zinc-950 text-zinc-100">
-      <div className="mx-auto max-w-6xl px-4 py-6">
-        <div className="flex flex-col gap-2">
-          <div className="flex items-center justify-between gap-3">
-            <h1 className="text-xl font-semibold tracking-tight">Polymarket Order Flow (Live)</h1>
-            <div className="text-xs text-zinc-400">{apiHealth}</div>
+    <div className="min-h-full bg-zinc-950 bg-[radial-gradient(100%_60%_at_50%_-10%,rgba(99,102,241,0.08),transparent_52%),linear-gradient(180deg,#0b0b0f_0%,#09090b_45%,#060608_100%)] font-sans text-zinc-200 antialiased">
+      <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
+        <header className="rounded-2xl border border-zinc-800/50 bg-zinc-900/20 px-5 py-5 shadow-lg shadow-black/20 ring-1 ring-white/[0.03] backdrop-blur-sm sm:px-6">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <h1 className="text-2xl font-semibold tracking-tight text-zinc-50 sm:text-[1.65rem]">Polymarket order flow</h1>
+              <p className="mt-1 text-sm text-zinc-500">Live CLOB ladders and a small assistant for reading the book.</p>
+            </div>
+            <div className="shrink-0 rounded-full border border-zinc-700/40 bg-zinc-950/50 px-3 py-1.5 font-mono text-[11px] leading-snug text-zinc-400">
+              {apiHealth}
+            </div>
           </div>
-          <p className="text-sm text-zinc-400">
-            Standalone app: Vite UI proxies to a local API on port <span className="font-mono">8787</span>, which shells out to the
-            official <code className="rounded bg-zinc-900 px-1.5 py-0.5">polymarket</code> CLI. Run{' '}
-            <code className="rounded bg-zinc-900 px-1.5 py-0.5">npm run dev</code> from the repo root.
+          <p className="mt-4 max-w-3xl text-sm leading-relaxed text-zinc-500">
+            The UI proxies to a local API on <span className="rounded-md border border-zinc-700/50 bg-zinc-950/60 px-1.5 py-0.5 font-mono text-zinc-400">8787</span>
+            . With the <code className="rounded-md border border-zinc-700/50 bg-zinc-950/60 px-1.5 py-0.5 font-mono text-[13px] text-zinc-300">polymarket</code> CLI on your PATH it shells out; otherwise it uses Gamma + CLOB over HTTP. Run{' '}
+            <code className="rounded-md border border-zinc-700/50 bg-zinc-950/60 px-1.5 py-0.5 font-mono text-[13px] text-zinc-300">npm run dev</code> from the repo root. Deep link example:{' '}
+            <code className="rounded-md border border-zinc-700/50 bg-zinc-950/60 px-1.5 py-0.5 font-mono text-[13px] text-zinc-300">?slug=btc-updown-15m-1776380400</code> — full Polymarket URLs work in the slug field too.
           </p>
-        </div>
+        </header>
 
-        <div className="mt-6 grid grid-cols-1 gap-4 lg:grid-cols-3">
-          <div className="rounded-xl border border-zinc-800 bg-zinc-950/30 p-4">
+        <div className="mt-8 flex flex-col gap-5 xl:grid xl:grid-cols-12 xl:items-start xl:gap-6">
+          <div className="rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-5 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm xl:col-span-3">
+            <div className="mb-4 flex flex-col gap-2">
+              <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Open market</div>
+              <div className="flex flex-wrap gap-2">
+                {(['btc', 'eth', 'sol'] as const).map((asset) => {
+                  const busy = shortcutBusy?.asset === asset && shortcutBusy.interval === '5m';
+                  return (
+                    <button
+                      key={`5m-${asset}`}
+                      type="button"
+                      disabled={shortcutBusy !== null}
+                      onClick={() => void openUpdownShortcut(asset, '5m')}
+                      className={`min-w-[4.5rem] flex-1 rounded-xl border px-3 py-2.5 text-center text-sm font-semibold uppercase tracking-wide transition-colors disabled:cursor-wait disabled:opacity-50 sm:flex-none ${
+                        asset === 'btc'
+                          ? 'border-amber-700/50 bg-amber-950/30 text-amber-100 hover:bg-amber-950/50'
+                          : asset === 'eth'
+                            ? 'border-indigo-700/50 bg-indigo-950/30 text-indigo-100 hover:bg-indigo-950/50'
+                            : 'border-violet-700/50 bg-violet-950/30 text-violet-100 hover:bg-violet-950/50'
+                      }`}
+                    >
+                      {busy ? '…' : asset}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-[10px] leading-snug text-zinc-600">5m Up/Down — taps resolve the current Gamma slug (live window).</p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                {(['btc', 'eth', 'sol'] as const).map((asset) => {
+                  const busy = shortcutBusy?.asset === asset && shortcutBusy.interval === '15m';
+                  return (
+                    <button
+                      key={`15m-${asset}`}
+                      type="button"
+                      disabled={shortcutBusy !== null}
+                      onClick={() => void openUpdownShortcut(asset, '15m')}
+                      className={`min-w-[4.5rem] flex-1 rounded-xl border px-3 py-2.5 text-center text-sm font-semibold uppercase tracking-wide transition-colors disabled:cursor-wait disabled:opacity-50 sm:flex-none ${
+                        asset === 'btc'
+                          ? 'border-amber-700/50 bg-amber-950/30 text-amber-100 hover:bg-amber-950/50'
+                          : asset === 'eth'
+                            ? 'border-indigo-700/50 bg-indigo-950/30 text-indigo-100 hover:bg-indigo-950/50'
+                            : 'border-violet-700/50 bg-violet-950/30 text-violet-100 hover:bg-violet-950/50'
+                      }`}
+                    >
+                      {busy ? '…' : `${asset} 15m`}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-[10px] leading-snug text-zinc-600">15m Up/Down — same assets, 15-minute windows.</p>
+              <div className="flex gap-2">
+                <input
+                  value={slugInput}
+                  onChange={(e) => setSlugInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') void loadMarket(slugInput.trim());
+                  }}
+                  placeholder="Slug, id, or polymarket.com/event/…"
+                  className="w-full rounded-xl border border-zinc-700/50 bg-zinc-900/35 px-3 py-2.5 text-sm text-zinc-100 outline-none ring-indigo-500/0 transition-shadow placeholder:text-zinc-600 focus:border-indigo-500/40 focus:ring-2 focus:ring-indigo-500/20"
+                />
+                <button
+                  type="button"
+                  onClick={() => void loadMarket(slugInput.trim())}
+                  className="shrink-0 rounded-xl border border-zinc-600/60 bg-zinc-800/80 px-4 py-2.5 text-sm font-medium text-zinc-100 shadow-sm transition-colors hover:border-zinc-500 hover:bg-zinc-700/90"
+                >
+                  Open
+                </button>
+              </div>
+            </div>
             <div className="flex items-center gap-2">
               <input
                 value={q}
@@ -192,37 +1096,44 @@ function App() {
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') void runSearch();
                 }}
-                placeholder="Search markets (e.g. election, bitcoin)…"
-                className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm outline-none focus:border-fuchsia-400"
+                placeholder="Search markets…"
+                className="w-full rounded-xl border border-zinc-700/50 bg-zinc-900/35 px-3 py-2.5 text-sm text-zinc-100 outline-none ring-indigo-500/0 transition-shadow placeholder:text-zinc-600 focus:border-indigo-500/40 focus:ring-2 focus:ring-indigo-500/20"
               />
               <button
                 type="button"
                 onClick={() => void runSearch()}
-                className="rounded-lg bg-fuchsia-500 px-3 py-2 text-sm font-medium text-black hover:bg-fuchsia-400"
+                className="rounded-xl bg-indigo-500 px-4 py-2.5 text-sm font-semibold text-white shadow-md shadow-indigo-950/40 transition-colors hover:bg-indigo-400"
               >
                 Search
               </button>
             </div>
 
-            <div className="mt-3 text-xs text-zinc-400">Pick a market to load CLOB books for each token id.</div>
-            <div className="mt-3 max-h-[60vh] overflow-auto rounded-lg border border-zinc-900">
+            <div className="mt-4 text-xs leading-relaxed text-zinc-500">Choose a row to load both token books.</div>
+            {marketsError ? (
+              <pre className="mt-3 overflow-auto rounded-xl border border-amber-800/30 bg-amber-950/15 p-3 text-xs leading-relaxed text-amber-100/90">{marketsError}</pre>
+            ) : null}
+            <div className="mt-3 max-h-[60vh] overflow-auto rounded-xl border border-zinc-800/50 bg-black/15 shadow-inner shadow-black/20">
               {markets.length === 0 ? (
-                <div className="p-3 text-sm text-zinc-500">No results yet.</div>
+                <div className="p-4 text-sm leading-relaxed text-zinc-500">No results yet. Search or paste a slug above.</div>
               ) : (
-                <ul className="divide-y divide-zinc-900">
+                <ul className="divide-y divide-zinc-800/40">
                   {markets.map((m, idx) => {
                     const obj = m && typeof m === 'object' ? (m as Record<string, unknown>) : null;
-                    const slug = String(obj?.slug ?? obj?.id ?? obj?.question ?? idx);
+                    const slug = pickMarketSlug(m);
                     const label = String(obj?.question ?? obj?.title ?? obj?.slug ?? obj?.id ?? `Market ${idx + 1}`);
+                    const active = selectedSlug === slug;
                     return (
-                      <li key={`${slug}-${idx}`}>
+                      <li key={slug ? `${slug}-${idx}` : `row-${idx}`}>
                         <button
                           type="button"
-                          className={`w-full px-3 py-2 text-left text-sm hover:bg-zinc-900/60 ${selectedSlug === slug ? 'bg-zinc-900/50' : ''}`}
+                          disabled={!slug}
+                          className={`w-full px-3 py-2.5 text-left text-sm transition-colors hover:bg-zinc-800/35 disabled:cursor-not-allowed disabled:opacity-40 ${
+                            active ? 'border-l-2 border-indigo-400 bg-indigo-950/15' : 'border-l-2 border-transparent'
+                          }`}
                           onClick={() => void loadMarket(slug)}
                         >
-                          <div className="truncate text-zinc-100">{label}</div>
-                          <div className="truncate text-xs text-zinc-500">{slug}</div>
+                          <div className="truncate font-medium text-zinc-100">{label}</div>
+                          <div className="truncate font-mono text-[11px] text-zinc-500">{slug || '— no slug/id'}</div>
                         </button>
                       </li>
                     );
@@ -232,64 +1143,378 @@ function App() {
             </div>
           </div>
 
-          <div className="rounded-xl border border-zinc-800 bg-zinc-950/30 p-4 lg:col-span-2">
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="text-sm font-medium">Market</div>
-              <div className="text-xs text-zinc-500">{selectedSlug || '—'}</div>
-              {booksLoading ? <div className="text-xs text-fuchsia-300">Loading books…</div> : null}
+          <div className="rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-5 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm xl:col-span-7">
+            <div className="flex flex-wrap items-center gap-2 border-b border-zinc-800/40 pb-3">
+              <div className="text-[15px] font-semibold text-zinc-100">Book</div>
+              <div className="truncate rounded-md bg-zinc-900/50 px-2 py-0.5 font-mono text-xs text-zinc-400">{selectedSlug || '—'}</div>
+              {booksLoading ? (
+                <div className="rounded-full bg-indigo-500/15 px-2.5 py-0.5 text-xs font-medium text-indigo-200/90">Loading…</div>
+              ) : null}
             </div>
 
-            {tokenIds.length === 0 ? (
-              <div className="mt-3 text-sm text-zinc-500">Select a market to load token ids and order books.</div>
+            <div className="mt-4 flex flex-wrap gap-x-0.5 gap-y-0 border-b border-zinc-800/80">
+              <MainTabButton id="book" label="Book" active={mainTab === 'book'} onSelect={setMainTab} />
+              <MainTabButton id="flowzones" label="Flow" title="Flow Zones" active={mainTab === 'flowzones'} onSelect={setMainTab} />
+              <MainTabButton id="signals" label="Signals" active={mainTab === 'signals'} onSelect={setMainTab} />
+              <MainTabButton id="momentum" label="Momentum" title="Momentum + Alerts" active={mainTab === 'momentum'} onSelect={setMainTab} />
+              <MainTabButton id="watch" label="Watch" title="PTB Watch" active={mainTab === 'watch'} onSelect={setMainTab} />
+              <MainTabButton id="assistant" label="Assistant" active={mainTab === 'assistant'} onSelect={setMainTab} />
+              <MainTabButton id="raw" label="Raw" active={mainTab === 'raw'} onSelect={setMainTab} />
+            </div>
+
+            {isMarketClosed(marketJson) ? (
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-800/25 bg-amber-950/15 px-3 py-2 text-xs text-amber-100/85">
+                <div className="leading-relaxed">
+                  {updownParsed ? (
+                    <>
+                      This {updownParsed.interval} window market looks <span className="font-medium text-amber-100">closed</span>, and CLOB books may not exist.
+                      Tap the shortcut again to load the newest window.
+                    </>
+                  ) : (
+                    <>
+                      This market looks <span className="font-medium text-amber-100">closed</span>, and CLOB books may not exist.
+                      Try opening a different slug or search.
+                    </>
+                  )}
+                </div>
+                {lastShortcut ? (
+                  <button
+                    type="button"
+                    onClick={() => void openUpdownShortcut(lastShortcut.asset, lastShortcut.interval)}
+                    className="rounded-lg border border-amber-700/40 bg-amber-950/30 px-3 py-2 text-xs font-semibold text-amber-100 hover:bg-amber-950/50"
+                  >
+                    Refresh {lastShortcut.asset.toUpperCase()} {lastShortcut.interval}
+                  </button>
+                ) : null}
+              </div>
+            ) : updownBehindBySec != null && updownParsed != null && updownBehindBySec >= updownParsed.stepSec ? (
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-800/25 bg-amber-950/15 px-3 py-2 text-xs text-amber-100/85">
+                <div className="leading-relaxed">
+                  You’re viewing an older {updownParsed.interval} window (behind by <span className="font-mono">{Math.round(updownBehindBySec / 60)}m</span>).
+                  Jump to the live window.
+                </div>
+                <div className="flex gap-2">
+                  {nextUpdownSlug(selectedSlug, -1) ? (
+                    <button
+                      type="button"
+                      onClick={() => void loadMarket(nextUpdownSlug(selectedSlug, -1)!)}
+                      className="rounded-lg border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
+                    >
+                      Prev
+                    </button>
+                  ) : null}
+                  {updownParsed ? (
+                    <button
+                      type="button"
+                      onClick={() => void openUpdownShortcut(updownParsed.asset, updownParsed.interval)}
+                      className="rounded-lg border border-amber-700/40 bg-amber-950/30 px-3 py-2 text-xs font-semibold text-amber-100 hover:bg-amber-950/50"
+                    >
+                      Jump to live
+                    </button>
+                  ) : null}
+                  {nextUpdownSlug(selectedSlug, 1) ? (
+                    <button
+                      type="button"
+                      onClick={() => void loadMarket(nextUpdownSlug(selectedSlug, 1)!)}
+                      className="rounded-lg border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
+                    >
+                      +{updownParsed.stepSec}s
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+            ) : marketEndsInMs != null && marketEndsInMs < -5_000 ? (
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-800/25 bg-amber-950/15 px-3 py-2 text-xs text-amber-100/85">
+                <div className="leading-relaxed">
+                  This window likely ended already. Load the next{' '}
+                  <span className="font-mono">+{updownParsed?.stepSec ?? 300}s</span> market for the live book.
+                </div>
+                <div className="flex gap-2">
+                  {nextUpdownSlug(selectedSlug, -1) ? (
+                    <button
+                      type="button"
+                      onClick={() => void loadMarket(nextUpdownSlug(selectedSlug, -1)!)}
+                      className="rounded-lg border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
+                    >
+                      Prev
+                    </button>
+                  ) : null}
+                  {nextUpdownSlug(selectedSlug, 1) ? (
+                    <button
+                      type="button"
+                      onClick={() => void loadMarket(nextUpdownSlug(selectedSlug, 1)!)}
+                      className="rounded-lg border border-amber-700/40 bg-amber-950/30 px-3 py-2 text-xs font-semibold text-amber-100 hover:bg-amber-950/50"
+                    >
+                      Next
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+
+            {tokenIds.length === 0 && mainTab !== 'watch' && mainTab !== 'momentum' ? (
+              <div className="mt-4 text-sm leading-relaxed text-zinc-500">Select a market to load token ids and ladders.</div>
             ) : null}
 
             {error ? (
-              <pre className="mt-4 overflow-auto rounded-lg border border-red-900/50 bg-red-950/20 p-3 text-xs text-red-200">{error}</pre>
+              <pre className="mt-4 overflow-auto rounded-xl border border-red-800/30 bg-red-950/15 p-3 text-xs leading-relaxed text-red-200/90">{error}</pre>
             ) : null}
 
-            {books && books.length > 0 ? (
-              <div className="mt-4 space-y-6">
-                {books.map((entry, idx) => {
-                  const label = outcomeLabels[idx] ?? `Outcome ${idx + 1}`;
-                  const parsed = pickBookLevels(entry.book);
-                  return (
-                    <div key={entry.token} className="rounded-xl border border-zinc-800 bg-zinc-950/20 p-3">
-                      <div className="flex flex-wrap items-baseline justify-between gap-2">
-                        <div className="text-sm font-medium text-zinc-200">{label}</div>
-                        <div className="font-mono text-[11px] text-zinc-500">{shortToken(entry.token)}</div>
-                      </div>
-                      {entry.error ? (
-                        <div className="mt-2 rounded border border-amber-900/40 bg-amber-950/20 p-2 text-xs text-amber-200">{entry.error}</div>
-                      ) : null}
-                      <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
-                        <BookSide title="Buyable (asks)" levels={parsed.asks} tone="ask" />
-                        <BookSide title="Sellable (bids)" levels={parsed.bids} tone="bid" />
-                      </div>
+            {mainTab === 'book' ? (
+              <div className="mt-5">
+                <div className="mb-4 rounded-2xl border border-zinc-800/40 bg-zinc-900/20 p-3 ring-1 ring-white/[0.02]">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Momentum</div>
+                    <div className="flex flex-wrap gap-2">
+                      <TradeSegmentedControl
+                        value={flowMode}
+                        onChange={setFlowMode}
+                        options={[
+                          { value: 'price', label: 'Price' },
+                          { value: 'flow', label: 'Order flow' },
+                        ]}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setChartEnabled((v) => !v)}
+                        className={`rounded-lg border px-3 py-1.5 text-[11px] font-semibold transition-colors ${
+                          chartEnabled
+                            ? 'border-emerald-700/40 bg-emerald-950/20 text-emerald-100 hover:bg-emerald-950/35'
+                            : 'border-zinc-700/50 bg-zinc-950/20 text-zinc-300 hover:bg-zinc-900/40'
+                        }`}
+                        title="Polls books every 5s when on"
+                      >
+                        {chartEnabled ? 'On' : 'Off'}
+                      </button>
                     </div>
-                  );
-                })}
+                  </div>
+                  {books && books.length >= 2 ? (
+                    <div className="mt-3">
+                      {flowMode === 'price' ? (
+                        <MomentumChart
+                          title="Outcome mids (price momentum)"
+                          aLabel={outcomeLabels[0] ?? 'A'}
+                          aTone="up"
+                          a={(chartSeriesBySlug[selectedSlug]?.[books[0]!.token] ?? []).slice(-120)}
+                          bLabel={outcomeLabels[1] ?? 'B'}
+                          bTone="down"
+                          b={(chartSeriesBySlug[selectedSlug]?.[books[1]!.token] ?? []).slice(-120)}
+                          lastUpdateMs={booksFetchedAt}
+                          priceToBeatUsd={ssrPriceToBeat}
+                        />
+                      ) : (
+                        <OrderFlowChart
+                          title={`Order flow (active: ${outcomeLabels[outcomeTab] ?? `Outcome ${outcomeTab + 1}`})`}
+                          series={(flowSeriesBySlug[selectedSlug]?.[books[outcomeTab]!.token] ?? []).slice(-180)}
+                          lastUpdateMs={booksFetchedAt}
+                          priceToBeatUsd={ssrPriceToBeat}
+                        />
+                      )}
+                    </div>
+                  ) : (
+                    <div className="mt-2 text-xs text-zinc-600">Load a two-outcome market to see the live sparkline.</div>
+                  )}
+                </div>
+                {books && books.length > 1 ? (
+                  <div className="mb-4 flex flex-wrap gap-1 rounded-xl bg-zinc-900/40 p-1 ring-1 ring-zinc-800/50">
+                    {books.map((entry, idx) => {
+                      const label = outcomeLabels[idx] ?? `Outcome ${idx + 1}`;
+                      const active = outcomeTab === idx;
+                      return (
+                        <button
+                          key={entry.token}
+                          type="button"
+                          onClick={() => setOutcomeTab(idx)}
+                          className={`rounded-lg px-3 py-2 text-sm font-medium transition-all ${
+                            active
+                              ? 'bg-zinc-800 text-zinc-50 shadow-sm ring-1 ring-zinc-700/60'
+                              : 'text-zinc-500 hover:bg-zinc-800/50 hover:text-zinc-300'
+                          }`}
+                        >
+                          {label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : null}
+                {books && books[outcomeTab] ? (
+                  <OutcomePane
+                    entry={books[outcomeTab]!}
+                    label={outcomeLabels[outcomeTab] ?? `Outcome ${outcomeTab + 1}`}
+                    autoLines={autoLinesBySlug[selectedSlug] ?? []}
+                    fetchedAt={booksFetchedAt}
+                    market={marketJson}
+                  />
+                ) : tokenIds.length > 0 && !booksLoading && !error ? (
+                  <div className="mt-4 text-sm leading-relaxed text-zinc-500">No book payload yet.</div>
+                ) : null}
+                <AboveBelowDashboard
+                  market={marketJson}
+                  books={books}
+                  outcomeLabels={outcomeLabels}
+                  flowSeriesForSlug={flowSeriesBySlug[selectedSlug] ?? null}
+                  priceToBeat={ssrPriceToBeat}
+                  refPrice={rtdsSpot}
+                />
               </div>
-            ) : tokenIds.length > 0 && !booksLoading && !error ? (
-              <div className="mt-4 text-sm text-zinc-500">No book payload yet.</div>
             ) : null}
 
-            <details className="mt-6 rounded-xl border border-zinc-900 bg-zinc-950/50 p-3">
-              <summary className="cursor-pointer text-sm text-zinc-300">Raw JSON</summary>
-              <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
+            {mainTab === 'momentum' ? (
+              <MomentumAlertsTab
+                currentSlug={selectedSlug}
+                priceToBeatUsd={ssrPriceToBeat}
+                onOpenInBook={(slug) => {
+                  void loadMarket(slug);
+                  setMainTab('book');
+                }}
+              />
+            ) : null}
+
+            {mainTab === 'watch' ? (
+              <PtbWatchTab
+                watchedSlugs={ptbWatchSlugs}
+                onChangeWatchedSlugs={setPtbWatchSlugs}
+                recentSlugs={ptbWatchRecentSlugs}
+                currentSlug={selectedSlug}
+                onOpenInBook={(slug) => {
+                  void loadMarket(slug);
+                }}
+              />
+            ) : null}
+
+            {mainTab === 'flowzones' ? (
+              <div className="mt-5">
+                <FlowZonesTab
+                  market={marketJson}
+                  books={books}
+                  outcomeLabels={outcomeLabels}
+                  flowSeriesForSlug={flowSeriesBySlug[selectedSlug] ?? null}
+                  booksFetchedAt={booksFetchedAt}
+                  priceToBeatUsd={ssrPriceToBeat}
+                  endsInMs={marketEndsInMs}
+                />
+              </div>
+            ) : null}
+
+            {mainTab === 'signals' ? (
+              <div className="mt-5">
+                <SignalsPtbOnly
+                  market={marketJson}
+                  books={books}
+                  outcomeLabels={outcomeLabels}
+                  priceToBeat={ssrPriceToBeat}
+                  spot={spotSeriesBySlug[selectedSlug] ?? []}
+                  spotLastUpdateMs={rtdsTickAt}
+                  probUp={signalsProbMids.up}
+                  probDown={signalsProbMids.down}
+                  probLastUpdateMs={booksFetchedAt}
+                  flowSeriesForSlug={flowSeriesBySlug[selectedSlug] ?? null}
+                  endsInMs={marketEndsInMs}
+                  booksFetchedAt={booksFetchedAt}
+                />
+                <p className="mt-3 text-center text-[11px] text-zinc-600">
+                  Book tab: order flow, ladders, and above/below context. Assistant tab: chat + digest.
+                </p>
+              </div>
+            ) : null}
+
+            {mainTab === 'assistant' ? (
+              <div className="mt-5">
+                <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-zinc-800/50 bg-zinc-900/20 p-4 ring-1 ring-white/[0.02]">
+                  <div>
+                    <div className="text-sm font-semibold text-zinc-100">Auto context</div>
+                    <div className="mt-1 text-xs leading-relaxed text-zinc-500">
+                      When enabled, sends a trimmed snapshot every <span className="font-mono text-zinc-400">15s</span> (small context + short
+                      reply budget) so auto-updates stay quicker than a full manual chat.
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={!assistantAvailable || autoBusy}
+                    onClick={() => setAutoEnabled((v) => !v)}
+                    className={`rounded-xl px-4 py-2 text-xs font-semibold transition-colors disabled:opacity-50 ${
+                      autoEnabled
+                        ? 'border border-emerald-700/40 bg-emerald-950/30 text-emerald-100 hover:bg-emerald-950/50'
+                        : 'border border-zinc-700/50 bg-zinc-900/30 text-zinc-200 hover:bg-zinc-900/50'
+                    }`}
+                  >
+                    {autoEnabled ? (autoBusy ? 'Auto: on…' : 'Auto: on') : 'Auto: off'}
+                  </button>
+                </div>
+
+                <OrderFlowAssistant key={selectedSlug} apiAvailable={assistantAvailable} context={assistantContext} />
+              </div>
+            ) : null}
+
+            {mainTab === 'raw' ? (
+              <div className="mt-5 grid grid-cols-1 gap-4 lg:grid-cols-2">
                 <div>
-                  <div className="mb-1 text-xs text-zinc-500">Market</div>
-                  <pre className="max-h-[40vh] overflow-auto rounded-lg border border-zinc-900 bg-black/20 p-3 text-xs text-zinc-200">
+                  <div className="mb-2 text-xs font-medium uppercase tracking-wide text-zinc-500">Market</div>
+                  <pre className="max-h-[55vh] overflow-auto rounded-xl border border-zinc-800/50 bg-black/25 p-3 font-mono text-[11px] leading-relaxed text-zinc-300">
                     {marketJson ? pretty(marketJson) : '—'}
                   </pre>
                 </div>
                 <div>
-                  <div className="mb-1 text-xs text-zinc-500">Books</div>
-                  <pre className="max-h-[40vh] overflow-auto rounded-lg border border-zinc-900 bg-black/20 p-3 text-xs text-zinc-200">
+                  <div className="mb-2 text-xs font-medium uppercase tracking-wide text-zinc-500">Books</div>
+                  <pre className="max-h-[55vh] overflow-auto rounded-xl border border-zinc-800/50 bg-black/25 p-3 font-mono text-[11px] leading-relaxed text-zinc-300">
                     {books ? pretty(books) : '—'}
                   </pre>
                 </div>
               </div>
-            </details>
+            ) : null}
+          </div>
+
+          <div className="xl:col-span-2">
+            <div className="rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-5 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm">
+              <div className="text-[15px] font-semibold text-zinc-100">Quick actions</div>
+              <div className="mt-2 text-xs leading-relaxed text-zinc-500">
+                Use the tabs in the Book panel. This right column is kept minimal to avoid the “everything stacked” feel.
+              </div>
+              <div className="mt-4 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => setMainTab('book')}
+                  className="rounded-xl border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
+                >
+                  Book
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMainTab('signals')}
+                  className="rounded-xl border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
+                >
+                  Signals
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMainTab('momentum')}
+                  className="rounded-xl border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
+                >
+                  Momentum + Alerts
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMainTab('watch')}
+                  className="rounded-xl border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
+                >
+                  PTB Watch
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMainTab('assistant')}
+                  className="rounded-xl border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
+                >
+                  Assistant
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMainTab('raw')}
+                  className="rounded-xl border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
+                >
+                  Raw
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       </div>
