@@ -1280,8 +1280,24 @@ function App() {
               <p className="mt-1 text-sm text-zinc-500">Live CLOB ladders and a small assistant for reading the book.</p>
               <p className="mt-2 max-w-2xl text-[12px] leading-relaxed text-zinc-500">{STREAM_ATTRIBUTION_LINE}</p>
             </div>
-            <div className="shrink-0 rounded-full border border-zinc-700/40 bg-zinc-950/50 px-3 py-1.5 font-mono text-[11px] leading-snug text-zinc-400">
-              {apiHealth}
+            <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setGlobalTradeOpenNonce((n) => n + 1)}
+                className="min-h-[34px] rounded-full border border-amber-500/35 bg-zinc-950/70 px-4 text-[12px] font-black tracking-wide text-amber-100 shadow-lg shadow-black/20 ring-1 ring-white/[0.04] transition-colors hover:bg-zinc-900/80"
+                title={
+                  !globalTradeReady
+                    ? 'Open trade (market not ready yet)'
+                    : globalTradeEnabled
+                      ? 'Open trade'
+                      : 'Open trade (tokens not resolved yet)'
+                }
+              >
+                Trade
+              </button>
+              <div className="rounded-full border border-zinc-700/40 bg-zinc-950/50 px-3 py-1.5 font-mono text-[11px] leading-snug text-zinc-400">
+                {apiHealth}
+              </div>
             </div>
           </div>
           <p className="mt-4 max-w-3xl text-sm leading-relaxed text-zinc-500">

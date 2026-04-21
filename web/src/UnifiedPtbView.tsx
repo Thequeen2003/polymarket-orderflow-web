@@ -3,7 +3,6 @@ import type { ClobBookEntry } from './lib/api';
 import { FlowZonesTab } from './FlowZonesTab';
 import { OverallOrderBookPanel } from './OverallOrderBookPanel';
 import { PtbOpportunityModeChart } from './PtbOpportunityModeChart';
-import { SignalsTradePanel } from './SignalsTradePanel';
 import type { SpotPoint } from './SpotLevelChart';
 import { underlyingChartTitle } from './underlyingChartTitle';
 import { resolveUpDownIndices } from './upDown';
@@ -83,11 +82,8 @@ export function UnifiedPtbView(props: {
   const upToken = upEntry?.token ?? '';
   const downToken = downEntry?.token ?? '';
   const [activeBookLane, setActiveBookLane] = useState<'up' | 'down'>('up');
-  const [tradeLane, setTradeLane] = useState<'up' | 'down'>('up');
-  const [tradeOpen, setTradeOpen] = useState(false);
   const activeBook = activeBookLane === 'up' ? upEntry?.book : downEntry?.book;
   const activeBookLabel = activeBookLane === 'up' ? upLabel : downLabel;
-  const tradeEnabled = Boolean(upToken && downToken);
 
   const upMid = probUp.length ? (probUp[probUp.length - 1]!.v ?? null) : null;
   const downMid = probDown.length ? (probDown[probDown.length - 1]!.v ?? null) : null;
@@ -136,58 +132,7 @@ export function UnifiedPtbView(props: {
               <div className="truncate text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Spot vs PTB</div>
               <div className="truncate text-[12px] font-semibold text-zinc-200">{underlyingChartTitle(market)}</div>
             </div>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                disabled={!tradeEnabled}
-                onClick={() => setTradeOpen((v) => !v)}
-                className={`min-h-[38px] rounded-xl border px-3 text-[12px] font-black tracking-wide ring-1 ring-white/[0.04] transition-colors ${
-                  tradeEnabled
-                    ? tradeOpen
-                      ? 'border-amber-500/50 bg-amber-500/10 text-amber-100 hover:bg-amber-500/15'
-                      : 'border-zinc-700/70 bg-black/20 text-zinc-200 hover:bg-black/30'
-                    : 'border-zinc-800/70 bg-black/15 text-zinc-500'
-                }`}
-                title={tradeEnabled ? (tradeOpen ? 'Close trade' : 'Open trade') : 'Trade unavailable (needs outcome tokens)'}
-              >
-                Trade
-              </button>
-            </div>
           </div>
-
-          {tradeOpen ? (
-            <div className="mt-2 overflow-hidden rounded-[24px] border border-zinc-800/70 bg-zinc-950/75 shadow-[0_18px_60px_rgba(0,0,0,0.35)] ring-1 ring-white/[0.04] backdrop-blur-xl">
-              <div className="flex items-center justify-between gap-2 border-b border-zinc-800/70 bg-black/20 px-3 py-2">
-                <div className="text-[11px] font-black uppercase tracking-[0.16em] text-amber-200/90">Trade</div>
-                <button
-                  type="button"
-                  onClick={() => setTradeOpen(false)}
-                  className="rounded-xl border border-zinc-800/70 bg-black/15 px-2.5 py-1.5 text-[10px] font-bold text-zinc-300 hover:bg-black/25"
-                >
-                  Close
-                </button>
-              </div>
-              <div className="max-h-[min(58vh,720px)] overflow-auto p-3">
-                {tradeEnabled ? (
-                  <SignalsTradePanel
-                    upLabel={upLabel}
-                    downLabel={downLabel}
-                    upToken={upToken}
-                    downToken={downToken}
-                    upMid={upMid}
-                    downMid={downMid}
-                    lane={tradeLane}
-                    onLaneChange={setTradeLane}
-                    visualStyle="sidebar"
-                  />
-                ) : (
-                  <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-4 text-sm text-zinc-500">
-                    Load a two-outcome market to enable trading. Your API needs <code className="text-zinc-400">POLYMARKET_PRIVATE_KEY</code> set to place real orders.
-                  </div>
-                )}
-              </div>
-            </div>
-          ) : null}
         </div>
 
         {spot.length < 2 ? (
