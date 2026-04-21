@@ -3,6 +3,7 @@ import type { ClobBookEntry } from './lib/api';
 import { OverallOrderBookPanel } from './OverallOrderBookPanel';
 import { PtbOpportunityModeChart } from './PtbOpportunityModeChart';
 import { SignalsTradePanel } from './SignalsTradePanel';
+import { FloatingTradeDock } from './FloatingTradeDock';
 import type { SpotPoint } from './SpotLevelChart';
 import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
 import { underlyingChartTitle } from './underlyingChartTitle';
@@ -171,16 +172,34 @@ export function DualPtbReferenceTab(props: {
 
         <div className="xl:sticky xl:top-4">
           {upToken && downToken ? (
-            <SignalsTradePanel
-              upLabel={upLabel}
-              downLabel={downLabel}
-              upToken={upToken}
-              downToken={downToken}
-              upMid={upMid}
-              downMid={downMid}
-              lane={activeLane}
-              onLaneChange={setActiveLane}
-              visualStyle="sidebar"
+            <FloatingTradeDock
+              enabled={Boolean(upToken && downToken)}
+              inline={
+                <SignalsTradePanel
+                  upLabel={upLabel}
+                  downLabel={downLabel}
+                  upToken={upToken}
+                  downToken={downToken}
+                  upMid={upMid}
+                  downMid={downMid}
+                  lane={activeLane}
+                  onLaneChange={setActiveLane}
+                  visualStyle="sidebar"
+                />
+              }
+              floating={
+                <SignalsTradePanel
+                  upLabel={upLabel}
+                  downLabel={downLabel}
+                  upToken={upToken}
+                  downToken={downToken}
+                  upMid={upMid}
+                  downMid={downMid}
+                  lane={activeLane}
+                  onLaneChange={setActiveLane}
+                  visualStyle="sidebar"
+                />
+              }
             />
           ) : (
             <div className="rounded-[28px] border border-zinc-800/70 bg-[#0d1219] p-5 text-sm text-zinc-500 ring-1 ring-white/[0.03]">

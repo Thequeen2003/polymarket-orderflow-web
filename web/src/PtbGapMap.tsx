@@ -83,11 +83,6 @@ function pickActiveWalls(levels: { price: number; size: number }[], n = 3): { pr
   return xs.slice(0, n);
 }
 
-function arrowPath(x: number, y: number, dir: 'up' | 'down'): string {
-  const s = 4.5;
-  if (dir === 'up') return `M ${x} ${y + s} L ${x} ${y - s} M ${x - 3} ${y - s + 3} L ${x} ${y - s} L ${x + 3} ${y - s + 3}`;
-  return `M ${x} ${y - s} L ${x} ${y + s} M ${x - 3} ${y + s - 3} L ${x} ${y + s} L ${x + 3} ${y + s - 3}`;
-}
 
 function contiguousMaxMean(scores: number[], i0: number, i1: number): { mean: number; a: number; b: number } | null {
   const lo = Math.min(i0, i1);
@@ -408,38 +403,29 @@ export function PtbGapMap(props: {
           const x0 = xT(c.t0);
           const x1 = xT(c.t1);
           const xc = (x0 + x1) / 2;
-          const bw = Math.max(2.2, (x1 - x0) * 0.52);
+          const bw = Math.max(10, (x1 - x0) * 0.74);
           const yH = yD(c.h);
           const yL = yD(c.l);
           const yO = yD(c.o);
           const yC = yD(c.c);
-          const top = Math.min(yO, yC);
-          const bot = Math.max(yO, yC);
-          const bodyH = Math.max(1.2, bot - top);
+          const bodyTop = Math.min(yO, yC);
+          const bodyBot = Math.max(yO, yC);
+          const rawBodyH = bodyBot - bodyTop;
+          const bodyH = Math.max(3, rawBodyH);
+          const bodyY = bodyTop - (bodyH - rawBodyH) / 2;
           const bull = c.c >= c.o;
-          const wickTowardPtb = Math.abs(c.h) < Math.abs(c.o) && Math.abs(c.h) < Math.abs(c.c);
           const toward = Math.abs(c.c) < Math.abs(c.o);
-          const arrowDir: 'up' | 'down' = c.c >= c.o ? 'up' : 'down';
-          const stroke = bull ? 'rgb(52 211 153 / 0.92)' : 'rgb(251 113 133 / 0.9)';
-          const fill = bull ? 'rgba(16,185,129,0.42)' : 'rgba(244,63,94,0.38)';
+          const wickColor = toward ? 'rgb(250 204 21)' : bull ? 'rgb(34 197 94)' : 'rgb(239 68 68)';
+          const bodyFill = bull ? 'rgb(22 163 74)' : 'rgb(220 38 38)';
+          const bodyStroke = bull ? 'rgb(74 222 128)' : 'rgb(248 113 113)';
           return (
             <g key={`${c.t0}-${i}`}>
-              <line
-                x1={xc}
-                x2={xc}
-                y1={yH}
-                y2={yL}
-                stroke={wickTowardPtb ? 'rgb(250 204 21)' : stroke}
-                strokeWidth={wickTowardPtb ? 1.45 : 1.05}
-                opacity={0.95}
-              />
-              <rect x={xc - bw / 2} y={top} width={bw} height={bodyH} rx={1} fill={fill} stroke={stroke} strokeWidth={0.9} />
+              <line x1={xc} x2={xc} y1={yH} y2={bodyY} stroke={wickColor} strokeWidth={1.5} />
+              <line x1={xc} x2={xc} y1={bodyY + bodyH} y2={yL} stroke={wickColor} strokeWidth={1.5} />
+              <rect x={xc - bw / 2} y={bodyY} width={bw} height={bodyH} fill={bodyFill} stroke={bodyStroke} strokeWidth={1} />
               {/* Micro “better candle” marker: small arrow + tiny wick emphasis when moving toward PTB */}
               {toward ? (
-                <>
-                  <path d={arrowPath(xc, top - 6, arrowDir)} fill="none" stroke="rgb(250 204 21)" strokeWidth={1.3} opacity={0.9} />
-                  <circle cx={xc} cy={top - 6} r={1.6} fill="rgb(250 204 21)" opacity={0.85} />
-                </>
+                <circle cx={xc} cy={bodyY - 5} r={1.6} fill="rgb(250 204 21)" opacity={0.85} />
               ) : null}
             </g>
           );

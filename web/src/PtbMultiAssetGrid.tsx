@@ -2,7 +2,7 @@ import { useDeferredValue, useMemo, useState, type ReactElement } from 'react';
 import { computePtbChartDerivatives } from './ptbChartDerivatives';
 import type { PtbControlSignal } from './ptbChartDerivatives';
 import type { SpotPoint } from './SpotLevelChart';
-import { anchorPriceScale, buildSpotCandles, ptbTouchEpsilonUsd } from './spotVsPtb';
+import { buildSpotCandles, ptbTouchEpsilonUsd } from './spotVsPtb';
 
 export type PtbMultiAssetRow = {
   slug: string;
@@ -74,12 +74,13 @@ function PtbMiniPanel(props: {
     const candles = buildSpotCandles(deferredPts, Math.min(24, Math.max(8, Math.floor(deferredPts.length * 0.35))));
     const values = deferredPts.map((p) => p.v);
     const last = values[values.length - 1]!;
-    const { plotMin, plotMax } = anchorPriceScale({
-      level: ptb,
-      spotMin: Math.min(...values),
-      spotMax: Math.max(...values),
-      anchorFrac: 0.42,
-    });
+    const spotMin = Math.min(...values);
+    const spotMax = Math.max(...values);
+    const needAbove = Math.max(0, spotMax - ptb);
+    const needBelow = Math.max(0, ptb - spotMin);
+    const halfSpan = Math.max(needAbove, needBelow, Math.abs(ptb) * 3e-5, 1);
+    const plotMin = ptb - halfSpan * 1.08;
+    const plotMax = ptb + halfSpan * 1.08;
     if (!Number.isFinite(plotMin) || !Number.isFinite(plotMax) || !(plotMax > plotMin)) return null;
     const band = ptbTouchEpsilonUsd(deferredPts, ptb);
     const tMin = deferredPts[0]!.t;
@@ -166,20 +167,25 @@ function PtbMiniPanel(props: {
                 const x1 = xPx(c.t1);
                 const xc = (x0 + x1) / 2;
                 const slotW = x1 - x0;
-                const bodyW = Math.max(5, Math.min(slotW * 0.9, innerW * 0.045));
+                const bodyW = Math.max(10, Math.min(slotW * 0.82, innerW * 0.065));
                 const yO = yPx(c.o);
                 const yC = yPx(c.c);
                 const yH = yPx(c.h);
                 const yL = yPx(c.l);
                 const bullish = c.c >= c.o;
-                const stroke = bullish ? 'rgb(52 211 153)' : 'rgb(251 113 133)';
-                const fill = bullish ? 'rgba(34,197,94,0.5)' : 'rgba(251,113,113,0.45)';
-                const bodyH = Math.max(3, Math.abs(yC - yO));
-                const yBody = yC < yO ? yC : yO;
+                const bodyTop = Math.min(yO, yC);
+                const bodyBot = Math.max(yO, yC);
+                const rawBodyH = bodyBot - bodyTop;
+                const bodyH = Math.max(3, rawBodyH);
+                const bodyY = bodyTop - (bodyH - rawBodyH) / 2;
+                const wickColor = bullish ? 'rgb(34 197 94)' : 'rgb(239 68 68)';
+                const bodyFill = bullish ? 'rgb(22 163 74)' : 'rgb(220 38 38)';
+                const bodyStroke = bullish ? 'rgb(74 222 128)' : 'rgb(248 113 113)';
                 return (
                   <g key={`mc-${i}`}>
-                    <line x1={xc} x2={xc} y1={yH} y2={yL} stroke={stroke} strokeWidth={1.6} />
-                    <rect x={xc - bodyW / 2} y={yBody} width={bodyW} height={bodyH} rx="1.5" fill={fill} stroke={stroke} strokeWidth={1} />
+                    <line x1={xc} x2={xc} y1={yH} y2={bodyY} stroke={wickColor} strokeWidth={1.4} />
+                    <line x1={xc} x2={xc} y1={bodyY + bodyH} y2={yL} stroke={wickColor} strokeWidth={1.4} />
+                    <rect x={xc - bodyW / 2} y={bodyY} width={bodyW} height={bodyH} fill={bodyFill} stroke={bodyStroke} strokeWidth={1} />
                   </g>
                 );
               })}

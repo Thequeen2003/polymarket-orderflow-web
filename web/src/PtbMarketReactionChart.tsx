@@ -211,22 +211,25 @@ export function PtbMarketReactionChart(props: {
               const x0 = xT(c.t0);
               const x1 = xT(c.t1);
               const xc = (x0 + x1) / 2;
-              const bw = Math.max(2.5, (x1 - x0) * 0.55);
+              const bw = Math.max(10, (x1 - x0) * 0.75);
               const yH = yD(c.h);
               const yL = yD(c.l);
               const yO = yD(c.o);
               const yC = yD(c.c);
-              const top = Math.min(yO, yC);
-              const bot = Math.max(yO, yC);
-              const bodyH = Math.max(1.2, bot - top);
+              const bodyTop = Math.min(yO, yC);
+              const bodyBot = Math.max(yO, yC);
+              const rawBodyH = bodyBot - bodyTop;
+              const bodyH = Math.max(3, rawBodyH);
+              const bodyY = bodyTop - (bodyH - rawBodyH) / 2;
               const bull = c.c >= c.o;
-              const wicky = c.bodyFrac < 0.22;
-              const stroke = bull ? (wicky ? 'rgb(52 211 153 / 0.55)' : 'rgb(52 211 153 / 0.95)') : wicky ? 'rgb(251 113 133 / 0.55)' : 'rgb(251 113 133 / 0.95)';
-              const fill = bull ? (wicky ? 'rgba(16,185,129,0.15)' : 'rgba(16,185,129,0.4)') : wicky ? 'rgba(244,63,94,0.15)' : 'rgba(244,63,94,0.38)';
+              const wickColor = bull ? 'rgb(34 197 94)' : 'rgb(239 68 68)';
+              const bodyFill = bull ? 'rgb(22 163 74)' : 'rgb(220 38 38)';
+              const bodyStroke = bull ? 'rgb(74 222 128)' : 'rgb(248 113 113)';
               return (
                 <g key={`${c.t0}-${i}`}>
-                  <line x1={xc} x2={xc} y1={yH} y2={yL} stroke={stroke} strokeWidth={1.05} opacity={0.9} />
-                  <rect x={xc - bw / 2} y={top} width={bw} height={bodyH} rx={1} fill={fill} stroke={stroke} strokeWidth={1} />
+                  <line x1={xc} x2={xc} y1={yH} y2={bodyY} stroke={wickColor} strokeWidth={1.5} />
+                  <line x1={xc} x2={xc} y1={bodyY + bodyH} y2={yL} stroke={wickColor} strokeWidth={1.5} />
+                  <rect x={xc - bw / 2} y={bodyY} width={bw} height={bodyH} fill={bodyFill} stroke={bodyStroke} strokeWidth={1} />
                 </g>
               );
             })}
@@ -306,14 +309,16 @@ function SessionDeltaCandle({ agg, height }: { agg: AggregateDeltaCandle; height
   const botB = Math.max(yO, yC);
   const bodyH = Math.max(2, botB - topB);
   const bull = agg.c >= agg.o;
-  const stroke = bull ? 'rgb(52 211 153)' : 'rgb(251 113 133)';
-  const fill = bull ? 'rgba(16,185,129,0.35)' : 'rgba(244,63,94,0.35)';
+  const wickColor = bull ? 'rgb(34 197 94)' : 'rgb(239 68 68)';
+  const bodyFill = bull ? 'rgb(22 163 74)' : 'rgb(220 38 38)';
+  const bodyStroke = bull ? 'rgb(74 222 128)' : 'rgb(248 113 113)';
   return (
     <svg width={w} height={height} viewBox={`0 0 ${w} ${height}`} className="shrink-0">
       <rect x="0" y="0" width={w} height={height} rx="10" className="fill-black/30 stroke-zinc-800/50" />
       <line x1={4} x2={w - 4} y1={y0} y2={y0} className="stroke-amber-400/70" strokeWidth={1.5} strokeDasharray="3 2" />
-      <line x1={midX} x2={midX} y1={yH} y2={yL} stroke={stroke} strokeWidth={2} opacity={0.85} />
-      <rect x={midX - 10} y={topB} width={20} height={bodyH} rx={2} fill={fill} stroke={stroke} strokeWidth={1.2} />
+      <line x1={midX} x2={midX} y1={yH} y2={topB} stroke={wickColor} strokeWidth={1.8} />
+      <line x1={midX} x2={midX} y1={topB + bodyH} y2={yL} stroke={wickColor} strokeWidth={1.8} />
+      <rect x={midX - 14} y={topB} width={28} height={bodyH} fill={bodyFill} stroke={bodyStroke} strokeWidth={1.2} />
       <text x={w / 2} y={pad + 7} textAnchor="middle" className="fill-zinc-500" fontSize="7" fontFamily="ui-monospace, monospace">
         +H
       </text>

@@ -23,11 +23,13 @@ import { MomentumAlertsTab } from './MomentumAlertsTab';
 import { AboveBelowDashboard } from './AboveBelowDashboard';
 import { FlowZonesTab } from './FlowZonesTab';
 import { SignalsPtbOnly } from './SignalsPtbOnly';
+import { SignalsTradePanel } from './SignalsTradePanel';
 import { TradeSegmentedControl } from './tradeUi';
 import { PtbWatchTab } from './PtbWatchTab';
 import { priceToBeat, rtdsCrypto, type RtdsCryptoPoint } from './lib/api';
 import { WorkspaceTab } from './WorkspaceTab';
 import { DualPtbReferenceTab } from './DualPtbReferenceTab';
+import { FloatingTradeDock } from './FloatingTradeDock';
 import { PtbMultiAssetGrid, type PtbMultiAssetRow } from './PtbMultiAssetGrid';
 import { UnifiedPtbView } from './UnifiedPtbView';
 import { PtbThreeUp } from './PtbThreeUp';
@@ -237,19 +239,23 @@ function mergeSpotHistory(
 }
 
 function parseUpdownSlug(slug: string): {
-  asset: 'btc' | 'eth' | 'sol';
+  asset: string;
   ts: number;
   interval: UpdownInterval;
   stepSec: number;
 } | null {
-  const m = slug.trim().toLowerCase().match(/^(btc|eth|sol)-updown-(5m|15m)-(\d+)$/);
+  const m = slug.trim().toLowerCase().match(/^([a-z0-9]{2,10})-updown-(5m|15m)-(\d+)$/);
   if (!m) return null;
-  const asset = m[1] as 'btc' | 'eth' | 'sol';
+  const asset = m[1]!;
   const interval = m[2] as UpdownInterval;
   const ts = Number(m[3]);
   if (!Number.isFinite(ts) || ts <= 0) return null;
   const stepSec = interval === '15m' ? 900 : 300;
   return { asset, ts, interval, stepSec };
+}
+
+function isShortcutAsset(asset: string): asset is UpdownShortcutAsset {
+  return asset === 'btc' || asset === 'eth' || asset === 'sol';
 }
 
 function nextUpdownSlug(slug: string, dir: -1 | 1): string | null {
@@ -607,7 +613,7 @@ function App() {
   const [lastShortcut, setLastShortcut] = useState<{ asset: UpdownShortcutAsset; interval: UpdownInterval } | null>(null);
   const [mainTab, setMainTab] = useState<MainTab>('dualptb');
   const [threeUpInterval, setThreeUpInterval] = useState<UpdownInterval>('5m');
-  const [threeUpSlugs, setThreeUpSlugs] = useState<Record<string, string>>({});
+  const [_threeUpSlugs, setThreeUpSlugs] = useState<Record<string, string>>({});
   const [threeUpMeta, setThreeUpMeta] = useState<Record<string, { ptb: number | null; endsInMs: number | null }>>({});
   const [ptbWatchSlugs, setPtbWatchSlugs] = useState<string[]>(() => readStringArray(PTB_WATCH_SLUGS_KEY, 12));
   const [ptbWatchRecentSlugs, setPtbWatchRecentSlugs] = useState<string[]>(() => readStringArray(PTB_WATCH_RECENT_KEY, 24));
@@ -632,6 +638,9 @@ function App() {
   const [now, setNow] = useState(() => Date.now());
   const spotBySymbolRef = useRef<Record<string, SpotPoint[]>>({});
 
+  const [globalTradeLane, setGlobalTradeLane] = useState<'up' | 'down'>('up');
+  const [globalTradeOpenNonce, setGlobalTradeOpenNonce] = useState(0);
+
   useEffect(() => {
     spotBySymbolRef.current = spotBySymbol;
   }, [spotBySymbol]);
@@ -640,6 +649,20 @@ function App() {
 
   const tokenIds = useMemo(() => pickTokenIds(marketJson), [marketJson]);
   const outcomeLabels = useMemo(() => pickOutcomeLabels(marketJson), [marketJson]);
+
+  const globalUpDown = useMemo(() => {
+    const resolved = resolveUpDownIndices(outcomeLabels, marketJson);
+    if (resolved) return resolved;
+    // Fallback for non UP/DOWN markets: just use first 2 outcomes if available.
+    if (outcomeLabels.length >= 2) return { up: 0, down: 1 };
+    return null;
+  }, [outcomeLabels, marketJson]);
+  const globalTradeReady = Boolean(books && books.length >= 2 && outcomeLabels.length >= 2 && globalUpDown);
+  const globalUpLabel = globalUpDown ? (outcomeLabels[globalUpDown.up] ?? 'UP') : 'UP';
+  const globalDownLabel = globalUpDown ? (outcomeLabels[globalUpDown.down] ?? 'DOWN') : 'DOWN';
+  const globalUpToken = globalUpDown && books ? books[globalUpDown.up]?.token ?? '' : '';
+  const globalDownToken = globalUpDown && books ? books[globalUpDown.down]?.token ?? '' : '';
+  const globalTradeEnabled = Boolean(globalUpToken && globalDownToken);
 
   const signalsProbMids = useMemo(() => {
     if (!selectedSlug || !books || books.length < 2 || outcomeLabels.length < 2) {
@@ -886,7 +909,7 @@ function App() {
   }, [selectedSlug]);
 
   useEffect(() => {
-    const id = window.setInterval(() => setNow(Date.now()), 1_000);
+    const id = window.setInterval(() => setNow(Date.now()), 5_000);
     return () => window.clearInterval(id);
   }, []);
 
@@ -945,7 +968,7 @@ function App() {
       });
     };
     void tick();
-    const id = window.setInterval(() => void tick(), 1_200);
+    const id = window.setInterval(() => void tick(), 2_000);
     return () => {
       stopped = true;
       window.clearInterval(id);
@@ -1036,9 +1059,15 @@ function App() {
       setUpdownLiveSlugFromApi(null);
       return;
     }
+    const shortcutAsset = updownParsed.asset;
+    if (!isShortcutAsset(shortcutAsset)) {
+      // We can still stream spot from RTDS if available, but the shortcut API is BTC/ETH/SOL only.
+      setUpdownLiveSlugFromApi(null);
+      return;
+    }
     let stopped = false;
     const tick = async () => {
-      const res = await marketsUpdownShortcut(updownParsed.asset, updownParsed.interval);
+      const res = await marketsUpdownShortcut(shortcutAsset, updownParsed.interval);
       if (stopped) return;
       if (isOk(res) && typeof res.data.slug === 'string' && res.data.slug) setUpdownLiveSlugFromApi(res.data.slug);
     };
@@ -1393,6 +1422,25 @@ function App() {
               {booksLoading ? (
                 <div className="rounded-full bg-indigo-500/15 px-2.5 py-0.5 text-xs font-medium text-indigo-200/90">Loading…</div>
               ) : null}
+
+              <div className="ml-auto flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setGlobalTradeOpenNonce((n) => n + 1)}
+                  className={`min-h-[34px] rounded-xl border px-3 text-[12px] font-black tracking-wide ring-1 ring-white/[0.04] transition-colors ${
+                    'border-zinc-700/70 bg-black/20 text-zinc-200 hover:bg-black/30'
+                  }`}
+                  title={
+                    !globalTradeReady
+                      ? 'Open trade (market not ready yet)'
+                      : globalTradeEnabled
+                        ? 'Open trade'
+                        : 'Open trade (tokens not resolved yet)'
+                  }
+                >
+                  Trade
+                </button>
+              </div>
             </div>
 
             <div className="mt-4 flex flex-wrap gap-x-0.5 gap-y-0 border-b border-zinc-800/80">
@@ -1410,6 +1458,38 @@ function App() {
               <MainTabButton id="raw" label="Raw" active={mainTab === 'raw'} onSelect={setMainTab} />
             </div>
 
+            <FloatingTradeDock
+              title="Trade"
+              enabled
+              hideLauncher
+              openNonce={globalTradeOpenNonce}
+              inline={<></>}
+              floating={
+                globalTradeEnabled ? (
+                  <SignalsTradePanel
+                    upLabel={globalUpLabel}
+                    downLabel={globalDownLabel}
+                    upToken={globalUpToken}
+                    downToken={globalDownToken}
+                    upMid={signalsProbMids.up.length ? (signalsProbMids.up[signalsProbMids.up.length - 1]!.v ?? null) : null}
+                    downMid={signalsProbMids.down.length ? (signalsProbMids.down[signalsProbMids.down.length - 1]!.v ?? null) : null}
+                    lane={globalTradeLane}
+                    onLaneChange={setGlobalTradeLane}
+                    visualStyle="sidebar"
+                  />
+                ) : !globalTradeReady ? (
+                  <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-4 text-sm text-zinc-500">
+                    Load a market (with books) to enable trading. Once a market is loaded, open this dock again.
+                  </div>
+                ) : (
+                  <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-4 text-sm text-zinc-500">
+                    Trading UI is ready, but this market’s outcome tokens aren’t resolved yet. Load a 2-outcome market (or wait for books), and ensure your API has{' '}
+                    <code className="text-zinc-400">POLYMARKET_PRIVATE_KEY</code> set to place real orders.
+                  </div>
+                )
+              }
+            />
+
             {isMarketClosed(marketJson) ? (
               <div className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-800/25 bg-amber-950/15 px-3 py-2 text-xs text-amber-100/85">
                 <div className="leading-relaxed">
@@ -1425,12 +1505,12 @@ function App() {
                     </>
                   )}
                 </div>
-                {updownParsed || lastShortcut ? (
+                {(updownParsed && isShortcutAsset(updownParsed.asset)) || lastShortcut ? (
                   <button
                     type="button"
                     onClick={() =>
                       void openUpdownShortcut(
-                        (updownParsed?.asset ?? lastShortcut!.asset) as UpdownShortcutAsset,
+                        (updownParsed && isShortcutAsset(updownParsed.asset) ? updownParsed.asset : lastShortcut!.asset) as UpdownShortcutAsset,
                         (updownParsed?.interval ?? lastShortcut!.interval) as UpdownInterval,
                       )
                     }
@@ -1456,10 +1536,10 @@ function App() {
                       Prev
                     </button>
                   ) : null}
-                  {updownParsed ? (
+                  {updownParsed && isShortcutAsset(updownParsed.asset) ? (
                     <button
                       type="button"
-                      onClick={() => void openUpdownShortcut(updownParsed.asset, updownParsed.interval)}
+                      onClick={() => void openUpdownShortcut(updownParsed.asset as UpdownShortcutAsset, updownParsed.interval)}
                       className="rounded-lg border border-amber-700/40 bg-amber-950/30 px-3 py-2 text-xs font-semibold text-amber-100 hover:bg-amber-950/50"
                     >
                       Jump to live

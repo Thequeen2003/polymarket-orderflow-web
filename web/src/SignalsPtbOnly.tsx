@@ -7,6 +7,7 @@ import { OverallOrderBookPanel } from './OverallOrderBookPanel';
 import type { BookSnapshot } from './orderflowMetrics';
 import type { SpotPoint } from './SpotLevelChart';
 import { SignalsTradePanel } from './SignalsTradePanel';
+import { FloatingTradeDock } from './FloatingTradeDock';
 import { underlyingChartTitle } from './underlyingChartTitle';
 import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
 import { resolveUpDownIndices } from './upDown';
@@ -155,13 +156,29 @@ export function SignalsPtbOnly(props: {
         bookDown={bookBelow}
       />
       {upToken && downToken ? (
-        <SignalsTradePanel
-          upLabel={upLabel}
-          downLabel={downLabel}
-          upToken={upToken}
-          downToken={downToken}
-          upMid={probUp.length ? (probUp[probUp.length - 1]!.v ?? null) : null}
-          downMid={probDown.length ? (probDown[probDown.length - 1]!.v ?? null) : null}
+        <FloatingTradeDock
+          enabled={Boolean(upToken && downToken)}
+          inline={
+            <SignalsTradePanel
+              upLabel={upLabel}
+              downLabel={downLabel}
+              upToken={upToken}
+              downToken={downToken}
+              upMid={probUp.length ? (probUp[probUp.length - 1]!.v ?? null) : null}
+              downMid={probDown.length ? (probDown[probDown.length - 1]!.v ?? null) : null}
+            />
+          }
+          floating={
+            <SignalsTradePanel
+              upLabel={upLabel}
+              downLabel={downLabel}
+              upToken={upToken}
+              downToken={downToken}
+              upMid={probUp.length ? (probUp[probUp.length - 1]!.v ?? null) : null}
+              downMid={probDown.length ? (probDown[probDown.length - 1]!.v ?? null) : null}
+              visualStyle="sidebar"
+            />
+          }
         />
       ) : null}
       <div className="grid gap-3 lg:grid-cols-2">

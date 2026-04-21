@@ -3,7 +3,7 @@ import { spotVsLevelSentence } from './chartReadouts';
 import { describeSpot } from './liveContext';
 import type { BookSnapshot } from './orderflowMetrics';
 import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
-import { anchorPriceScale, analyzePtbReaction, buildSpotCandles, candleStraddlesPtb } from './spotVsPtb';
+import { analyzePtbReaction, buildSpotCandles, candleStraddlesPtb } from './spotVsPtb';
 
 export type SpotPoint = { t: number; v: number };
 
@@ -35,7 +35,6 @@ function fmtUsd(x: number): string {
 }
 
 const BUCKET_N = 20;
-const ANCHOR_FRAC = 0.48;
 
 function kindLabel(k: string): string {
   const m: Record<string, string> = {
@@ -123,13 +122,10 @@ export function SpotLevelChart({
 
   const scale = useMemo(() => {
     if (priceToBeat != null && pts.length >= 2) {
-      const { plotMin, plotMax } = anchorPriceScale({
-        level: priceToBeat,
-        spotMin,
-        spotMax,
-        anchorFrac: ANCHOR_FRAC,
-      });
-      return { plotMin, plotMax };
+      const needAbove = Math.max(0, spotMax - priceToBeat);
+      const needBelow = Math.max(0, priceToBeat - spotMin);
+      const halfSpan = Math.max(needAbove, needBelow, Math.abs(priceToBeat) * 3e-5, 1);
+      return { plotMin: priceToBeat - halfSpan * 1.08, plotMax: priceToBeat + halfSpan * 1.08 };
     }
     const allVals = priceToBeat != null ? [...vals, priceToBeat] : vals;
     const { min, max } = extent(allVals.length ? allVals : [0, 1]);
@@ -344,14 +340,14 @@ export function SpotLevelChart({
           const x0 = xTime(c.t0);
           const x1 = xTime(c.t1);
           const xc = (x0 + x1) / 2;
-          const bw = Math.max(3, (x1 - x0) * 0.62);
+          const bw = Math.max(12, (x1 - x0) * 0.78);
           const yH = yPrice(c.h);
           const yL = yPrice(c.l);
           const yO = yPrice(c.o);
           const yC = yPrice(c.c);
           const top = Math.min(yO, yC);
           const bot = Math.max(yO, yC);
-          const bodyH = Math.max(1.2, bot - top);
+          const bodyH = Math.max(3, bot - top);
           const level = priceToBeat ?? null;
           const atPtb = level != null && eps > 0 && candleStraddlesPtb(c, level, eps);
           const bull = c.c >= c.o;
@@ -375,18 +371,19 @@ export function SpotLevelChart({
             stroke = 'rgb(244 114 182 / 0.65)';
             fill = 'rgba(244,114,182,0.15)';
           }
+          const wickColor = atPtb ? 'rgb(250 204 21)' : stroke;
           return (
             <g key={`${c.t0}-${i}`}>
-              <line x1={xc} x2={xc} y1={yH} y2={yL} stroke={stroke} strokeWidth={atPtb ? 1.35 : 1.1} opacity={0.95} />
+              <line x1={xc} x2={xc} y1={yH} y2={top} stroke={wickColor} strokeWidth={1.6} />
+              <line x1={xc} x2={xc} y1={top + bodyH} y2={yL} stroke={wickColor} strokeWidth={1.6} />
               <rect
                 x={xc - bw / 2}
                 y={top}
                 width={bw}
                 height={bodyH}
-                rx={1.2}
                 fill={fill}
                 stroke={stroke}
-                strokeWidth={atPtb ? 1.45 : 1}
+                strokeWidth={1}
               />
             </g>
           );

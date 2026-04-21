@@ -1,12 +1,30 @@
-import { useDeferredValue, useId, useMemo, useState, type ReactElement } from 'react';
+import { memo, useId, useMemo, useState, type ReactElement } from 'react';
 import type { SpotPoint } from './SpotLevelChart';
 import { computePtbChartDerivatives, type PtbControlSignal } from './ptbChartDerivatives';
 import { PTB_REACTION_DIMENSIONS, PTB_REACTION_ONE_LINER } from './ptbReactionFramework';
 import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
-import { anchorPriceScale, buildSpotCandles, candleStraddlesPtb, ptbTouchEpsilonUsd } from './spotVsPtb';
+import { buildSpotCandles, candleStraddlesPtb, ptbTouchEpsilonUsd } from './spotVsPtb';
+import { computeTickSlopeUsdPerSec } from './ptbCoreEngine';
 
 type Mode = 'up' | 'down';
 type DominanceStatus = 'UP BIAS' | 'DOWN BIAS' | 'AT PTB';
+
+type MomentumBuildup = {
+  score: number;
+  direction: 'UP' | 'DOWN' | 'NEUTRAL';
+  label: string;
+  tier: 'LOADING' | 'BUILDING' | 'READY' | 'FIRING' | 'NONE';
+  signals: string[];
+};
+
+type BiasShift = {
+  bias: 'STRONG UP' | 'UP' | 'NEUTRAL' | 'DOWN' | 'STRONG DOWN';
+  biasScore: number;
+  shifting: boolean;
+  shiftDir: 'TO UP' | 'TO DOWN' | null;
+  shiftUrgency: 'IMMINENT' | 'FORMING' | null;
+  reasons: string[];
+};
 
 const MODE_META: Record<Mode, { label: string; accent: string; soft: string; strongText: string; zoneLabel: string }> = {
   up: {
@@ -54,13 +72,6 @@ function fmtAxisPrice(p: number): string {
   return `$${p.toFixed(2)}`;
 }
 
-function fmtDwell(ms: number): string {
-  if (ms < 500) return '0s';
-  if (ms < 60_000) return `${(ms / 1000).toFixed(0)}s`;
-  const m = ms / 60_000;
-  return m >= 10 ? `${m.toFixed(0)}m` : `${m.toFixed(1)}m`;
-}
-
 /** `m:ss` countdown from remaining ms (market round). */
 function fmtTimeRemaining(endsInMs: number | null | undefined): string {
   if (endsInMs == null || !Number.isFinite(endsInMs)) return '—';
@@ -89,11 +100,6 @@ function statusSubtitle(params: {
   return null;
 }
 
-function withAlpha(rgb: string, alpha: number): string {
-  const m = rgb.match(/\d+/g);
-  if (!m || m.length < 3) return rgb;
-  return `rgba(${m[0]}, ${m[1]}, ${m[2]}, ${alpha})`;
-}
 
 function statusFor(params: { price: number; level: number; band: number; recentMove: number }): DominanceStatus {
   const { price, level, band, recentMove } = params;
@@ -105,7 +111,7 @@ function statusFor(params: { price: number; level: number; band: number; recentM
 }
 
 const W = 920;
-const H = 420;
+const H = 560;
 
 /**
  * OHLC bucket count: scales with tick count but stays below ~1 bucket / 2 ticks
@@ -113,9 +119,8 @@ const H = 420;
  */
 function candleBucketCount(ptsLen: number): number {
   if (ptsLen < 4) return Math.max(2, ptsLen - 1);
-  const n = Math.floor(ptsLen * 0.38);
-  // Rendering cost is dominated by candle SVG elements; keep this modest for smoothness.
-  return Math.min(36, Math.max(14, n));
+  const n = Math.floor(ptsLen * 0.22);
+  return Math.min(20, Math.max(8, n));
 }
 
 /** Evenly spaced time ticks (short windows get more labels, like Polymarket’s intraday strip). */
@@ -129,7 +134,7 @@ const PAD_L = 18;
 const PAD_R = 64;
 const PAD_Y = 18;
 
-export function PtbOpportunityModeChart(props: {
+export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(props: {
   mode: Mode;
   spot: SpotPoint[];
   priceToBeat: number | null;
@@ -142,37 +147,49 @@ export function PtbOpportunityModeChart(props: {
 }): ReactElement {
   const { mode, spot, priceToBeat, lastUpdateMs, endsInMs = null, chartTitle = 'Spot (USD)', upLabel = 'UP', downLabel = 'DOWN' } = props;
   const gradId = useId().replace(/:/g, '');
-  /** LINE first matches common Polymarket UX: early window reads as a path on a short clock; switch to OHLC when you want buckets. */
   const [displayMode, setDisplayMode] = useState<'line' | 'ohlc'>('line');
+  const [zoomWindow, setZoomWindow] = useState<60 | 120 | 300>(300);
 
-  // Smaller window reduces SVG work and keeps UI responsive.
-  const pts = useMemo(() => spot.filter((p) => isFiniteNumber(p.t) && isFiniteNumber(p.v)).slice(-260), [spot]);
-  const deferredPts = useDeferredValue(pts);
+  const pts = useMemo(() => {
+    const all = spot.filter((p) => isFiniteNumber(p.t) && isFiniteNumber(p.v));
+    if (all.length < 2) return all;
+    const cutoff = all[all.length - 1]!.t - zoomWindow * 1000;
+    const windowed = all.filter((p) => p.t >= cutoff);
+    return windowed.length >= 2 ? windowed.slice(-160) : all.slice(-160);
+  }, [spot, zoomWindow]);
   const meta = MODE_META[mode];
   const stale = lastUpdateMs == null || Date.now() - lastUpdateMs > 12_000;
 
   const model = useMemo(() => {
     if (priceToBeat == null || !Number.isFinite(priceToBeat) || pts.length < 2) return null;
     const candles = buildSpotCandles(pts, candleBucketCount(pts.length));
-    const values = pts.map((p) => p.v);
-    if (values.length < 2 || values.some((v) => !Number.isFinite(v))) return null;
-    const last = values[values.length - 1]!;
-    const first = values[0]!;
-    const recentBase = values[Math.max(0, values.length - 7)] ?? first;
+    let spotMin = Infinity;
+    let spotMax = -Infinity;
+    let maxAbs = 0;
+    for (let i = 0; i < pts.length; i++) {
+      const v = pts[i]!.v;
+      if (!Number.isFinite(v)) continue;
+      if (v < spotMin) spotMin = v;
+      if (v > spotMax) spotMax = v;
+      const d = Math.abs(v - priceToBeat);
+      if (d > maxAbs) maxAbs = d;
+    }
+    if (!Number.isFinite(spotMin)) return null;
+    const last = pts[pts.length - 1]!.v;
+    const first = pts[0]!.v;
+    const recentBase = pts[Math.max(0, pts.length - 7)]?.v ?? first;
     const recentMove = last - recentBase;
     const pctChange = Math.abs(first) > 1e-12 ? ((last - first) / first) * 100 : 0;
     const distancePct = ((last - priceToBeat) / priceToBeat) * 100;
-    // Keep PTB visually centered so the user can read drift cleanly.
-    const { plotMin, plotMax } = anchorPriceScale({
-      level: priceToBeat,
-      spotMin: Math.min(...values),
-      spotMax: Math.max(...values),
-      anchorFrac: 0.5,
-    });
-    if (!Number.isFinite(plotMin) || !Number.isFinite(plotMax) || !(plotMax > plotMin)) return null;
+    const needAbove = Math.max(0, spotMax - priceToBeat);
+    const needBelow = Math.max(0, priceToBeat - spotMin);
+    const halfSpan = Math.max(needAbove, needBelow, Math.abs(priceToBeat) * 3e-5, 1);
+    const plotMin = priceToBeat - halfSpan * 1.08;
+    const plotMax = priceToBeat + halfSpan * 1.08;
+    if (!(plotMax > plotMin)) return null;
     const band = ptbTouchEpsilonUsd(pts, priceToBeat);
     if (!Number.isFinite(band)) return null;
-    const maxAbs = Math.max(band * 1.5, ...values.map((v) => Math.abs(v - priceToBeat)));
+    if (maxAbs < band * 1.5) maxAbs = band * 1.5;
     const status = statusFor({ price: last, level: priceToBeat, band, recentMove });
     const favorableNow = mode === 'up' ? last > priceToBeat + band : last < priceToBeat - band;
     const selectedLabel = mode === 'up' ? upLabel : downLabel;
@@ -187,53 +204,253 @@ export function PtbOpportunityModeChart(props: {
           ? `Price is on the ${selectedLabel} side of PTB, so ${selectedLabel} has the bias.`
           : `Price is on the ${oppositeLabel} side of PTB, so this view is weak.`;
     return {
-      candles,
-      last,
-      first,
-      recentMove,
-      pctChange,
-      distancePct,
-      plotMin,
-      plotMax,
-      band,
-      maxAbs,
-      status,
-      conviction,
-      hint,
-      tMin: pts[0]!.t,
-      tMax: pts[pts.length - 1]!.t,
+      candles, last, first, recentMove, pctChange, distancePct,
+      plotMin, plotMax, band, maxAbs, status, conviction, hint,
+      tMin: pts[0]!.t, tMax: pts[pts.length - 1]!.t,
     };
   }, [mode, priceToBeat, pts, upLabel, downLabel]);
 
-  /** Deferred so heavy `analyzePtbReaction` does not block candle paints. */
   const derivedStrip = useMemo(() => {
-    if (priceToBeat == null || !Number.isFinite(priceToBeat) || deferredPts.length < 2) return null;
-    const candles = buildSpotCandles(deferredPts, candleBucketCount(deferredPts.length));
-    return computePtbChartDerivatives({ pts: deferredPts, candles, ptb: priceToBeat });
-  }, [deferredPts, priceToBeat]);
+    if (!model || priceToBeat == null || !Number.isFinite(priceToBeat)) return null;
+    return computePtbChartDerivatives({ pts, candles: model.candles, ptb: priceToBeat });
+  }, [model, priceToBeat, pts]);
 
-  // IMPORTANT: keep hook call order stable (do not add hooks after early returns).
+  /** Key price levels — swing highs/lows from candles for S/R. */
+  const priceLevels = useMemo(() => {
+    if (!model || model.candles.length < 5) return [];
+    const candles = model.candles;
+    const levels: { price: number; kind: 'high' | 'low' }[] = [];
+    for (let i = 2; i < candles.length - 2; i++) {
+      const c = candles[i]!;
+      const prevH = Math.max(candles[i - 1]!.h, candles[i - 2]!.h);
+      const nextH = Math.max(candles[i + 1]!.h, candles[i + 2]!.h);
+      if (c.h > prevH && c.h > nextH) levels.push({ price: c.h, kind: 'high' });
+      const prevL = Math.min(candles[i - 1]!.l, candles[i - 2]!.l);
+      const nextL = Math.min(candles[i + 1]!.l, candles[i + 2]!.l);
+      if (c.l < prevL && c.l < nextL) levels.push({ price: c.l, kind: 'low' });
+    }
+    const eps = (model.plotMax - model.plotMin) * 0.02;
+    const deduped: typeof levels = [];
+    for (const lv of levels) {
+      if (!deduped.some((d) => Math.abs(d.price - lv.price) < eps)) deduped.push(lv);
+    }
+    return deduped.slice(0, 6);
+  }, [model]);
+
+  const buildup: MomentumBuildup | null = useMemo(() => {
+    if (!model || !derivedStrip || model.candles.length < 4) return null;
+    const candles = model.candles;
+    const n = candles.length;
+    let score = 0;
+    const signals: string[] = [];
+
+    // 1. Consecutive closes in same direction (streak)
+    const streak = derivedStrip.momentumStreak;
+    const mom = derivedStrip.momentum;
+    if (streak >= 4) { score += 30; signals.push(`${streak}-candle streak`); }
+    else if (streak >= 3) { score += 20; signals.push(`${streak}-candle streak`); }
+    else if (streak >= 2) { score += 8; }
+
+    // 2. Body expansion — are recent bodies getting bigger? (momentum loading)
+    const recentBodies: number[] = [];
+    const olderBodies: number[] = [];
+    const half = Math.floor(n / 2);
+    for (let i = 0; i < n; i++) {
+      const body = Math.abs(candles[i]!.c - candles[i]!.o);
+      if (i >= half) recentBodies.push(body); else olderBodies.push(body);
+    }
+    const avgRecent = recentBodies.length > 0 ? recentBodies.reduce((a, b) => a + b, 0) / recentBodies.length : 0;
+    const avgOlder = olderBodies.length > 0 ? olderBodies.reduce((a, b) => a + b, 0) / olderBodies.length : 0;
+    if (avgOlder > 0 && avgRecent > avgOlder * 1.8) { score += 20; signals.push('bodies expanding'); }
+    else if (avgOlder > 0 && avgRecent > avgOlder * 1.3) { score += 10; signals.push('bodies growing'); }
+
+    // 3. Squeeze detection — tight range then expansion
+    const lastThree = candles.slice(-3);
+    const priorFive = candles.slice(Math.max(0, n - 8), Math.max(0, n - 3));
+    if (priorFive.length >= 2 && lastThree.length >= 2) {
+      const priorAvgRange = priorFive.reduce((s, c) => s + (c.h - c.l), 0) / priorFive.length;
+      const lastRange = lastThree[lastThree.length - 1]!.h - lastThree[lastThree.length - 1]!.l;
+      const priorMinRange = Math.min(...priorFive.map(c => c.h - c.l));
+      if (priorMinRange < priorAvgRange * 0.5 && lastRange > priorAvgRange * 1.4) {
+        score += 25; signals.push('squeeze breakout');
+      } else if (priorMinRange < priorAvgRange * 0.65 && lastRange > priorAvgRange * 1.1) {
+        score += 12; signals.push('range expanding');
+      }
+    }
+
+    // 4. Slope acceleration — current slope faster than earlier slope
+    if (pts.length >= 8) {
+      const halfPts = Math.floor(pts.length / 2);
+      const earlySlope = computeTickSlopeUsdPerSec(pts.slice(0, halfPts));
+      const lateSlope = computeTickSlopeUsdPerSec(pts.slice(halfPts));
+      const accel = Math.abs(lateSlope.slopeUsdPerSec) - Math.abs(earlySlope.slopeUsdPerSec);
+      if (accel > 0 && Math.abs(lateSlope.slopeUsdPerSec) > Math.abs(earlySlope.slopeUsdPerSec) * 1.8) {
+        score += 20; signals.push('accelerating');
+      } else if (accel > 0 && Math.abs(lateSlope.slopeUsdPerSec) > Math.abs(earlySlope.slopeUsdPerSec) * 1.3) {
+        score += 10; signals.push('slope rising');
+      }
+      if (accel < 0 && Math.abs(lateSlope.slopeUsdPerSec) < Math.abs(earlySlope.slopeUsdPerSec) * 0.4) {
+        score -= 15; signals.push('decelerating');
+      }
+    }
+
+    // 5. Stacking closes further from PTB (accumulating separation)
+    if (priceToBeat != null && n >= 4) {
+      const lastFour = candles.slice(-4);
+      const dists = lastFour.map(c => c.c - priceToBeat!);
+      const allSameSign = dists.every(d => d > 0) || dists.every(d => d < 0);
+      const increasing = allSameSign && Math.abs(dists[3]!) > Math.abs(dists[0]!) * 1.15;
+      if (increasing) { score += 15; signals.push('separating from PTB'); }
+    }
+
+    score = Math.max(0, Math.min(100, score));
+    const direction = mom === 'UP' || mom === 'DOWN' ? mom : (score >= 20 ? (derivedStrip.slopeUsdPerSec > 0 ? 'UP' : 'DOWN') : 'NEUTRAL');
+    let tier: MomentumBuildup['tier'];
+    let label: string;
+    if (score >= 70) { tier = 'FIRING'; label = 'Momentum firing — strong directional move underway'; }
+    else if (score >= 45) { tier = 'READY'; label = 'Momentum ready — breakout conditions met'; }
+    else if (score >= 25) { tier = 'BUILDING'; label = 'Momentum building — watch for continuation'; }
+    else if (score >= 10) { tier = 'LOADING'; label = 'Momentum loading — early signs of buildup'; }
+    else { tier = 'NONE'; label = 'No momentum buildup detected'; }
+
+    return { score, direction, label, tier, signals };
+  }, [model, derivedStrip, pts, priceToBeat]);
+
+  const biasShift: BiasShift | null = useMemo(() => {
+    if (!model || !derivedStrip || model.candles.length < 5 || priceToBeat == null) return null;
+    const candles = model.candles;
+    const n = candles.length;
+    const reasons: string[] = [];
+
+    // --- Bias score: -100 (strong down) to +100 (strong up) ---
+    let raw = 0;
+
+    // Candle streak direction
+    const streak = derivedStrip.momentumStreak;
+    const mom = derivedStrip.momentum;
+    if (mom === 'UP') raw += Math.min(35, streak * 10);
+    else if (mom === 'DOWN') raw -= Math.min(35, streak * 10);
+
+    // Slope direction and magnitude
+    const slope = derivedStrip.slopeUsdPerSec;
+    const slopeContrib = Math.min(25, Math.abs(slope) * 800);
+    raw += slope > 0 ? slopeContrib : -slopeContrib;
+
+    // Position vs PTB
+    const dist = model.last - priceToBeat;
+    const distNorm = Math.min(20, (Math.abs(dist) / Math.max(model.band, 0.01)) * 5);
+    raw += dist > 0 ? distNorm : -distNorm;
+
+    // Last 3 candles: net direction
+    const last3 = candles.slice(-3);
+    const net3 = last3.reduce((s, c) => s + (c.c >= c.o ? 1 : -1), 0);
+    raw += net3 * 7;
+
+    const biasScore = Math.max(-100, Math.min(100, Math.round(raw)));
+    const bias: BiasShift['bias'] = biasScore >= 50 ? 'STRONG UP' : biasScore >= 15 ? 'UP' : biasScore <= -50 ? 'STRONG DOWN' : biasScore <= -15 ? 'DOWN' : 'NEUTRAL';
+
+    // --- Shift detection: is momentum about to reverse? ---
+    let shifting = false;
+    let shiftDir: BiasShift['shiftDir'] = null;
+    let shiftUrgency: BiasShift['shiftUrgency'] = null;
+    let shiftScore = 0;
+
+    // 1. Opposing candle after streak (first sign of reversal)
+    if (streak >= 2 && n >= 2) {
+      const prev = candles[n - 2]!;
+      const last = candles[n - 1]!;
+      const prevBull = prev.c >= prev.o;
+      const lastBull = last.c >= last.o;
+      if (prevBull !== lastBull) {
+        shiftScore += 25;
+        reasons.push(lastBull ? 'first green after red streak' : 'first red after green streak');
+      }
+    }
+
+    // 2. Wick rejection — long wick in opposite direction of trend
+    if (n >= 1) {
+      const last = candles[n - 1]!;
+      const body = Math.abs(last.c - last.o);
+      const range = last.h - last.l;
+      if (range > 0) {
+        const upperWick = last.h - Math.max(last.o, last.c);
+        const lowerWick = Math.min(last.o, last.c) - last.l;
+        if (mom === 'UP' && upperWick > body * 1.5 && upperWick > range * 0.45) {
+          shiftScore += 30; reasons.push('rejection wick at top');
+        }
+        if (mom === 'DOWN' && lowerWick > body * 1.5 && lowerWick > range * 0.45) {
+          shiftScore += 30; reasons.push('rejection wick at bottom');
+        }
+      }
+    }
+
+    // 3. Slope deceleration — was fast, now slowing
+    if (pts.length >= 10) {
+      const third = Math.floor(pts.length / 3);
+      const earlySlope = computeTickSlopeUsdPerSec(pts.slice(0, third));
+      const lateSlope = computeTickSlopeUsdPerSec(pts.slice(-third));
+      const earlyAbs = Math.abs(earlySlope.slopeUsdPerSec);
+      const lateAbs = Math.abs(lateSlope.slopeUsdPerSec);
+      if (earlyAbs > 1e-9 && lateAbs < earlyAbs * 0.35) {
+        shiftScore += 25; reasons.push('momentum fading');
+      } else if (earlyAbs > 1e-9 && lateAbs < earlyAbs * 0.6) {
+        shiftScore += 12; reasons.push('momentum slowing');
+      }
+      // Slope sign flip
+      if (earlySlope.slopeUsdPerSec > 1e-9 && lateSlope.slopeUsdPerSec < -1e-9) {
+        shiftScore += 30; reasons.push('slope flipped to sell');
+      } else if (earlySlope.slopeUsdPerSec < -1e-9 && lateSlope.slopeUsdPerSec > 1e-9) {
+        shiftScore += 30; reasons.push('slope flipped to buy');
+      }
+    }
+
+    // 4. Body exhaustion — bodies shrinking in trend direction
+    if (n >= 4 && (mom === 'UP' || mom === 'DOWN')) {
+      const recent = candles.slice(-3);
+      const prior = candles.slice(-6, -3);
+      if (prior.length >= 2) {
+        const avgRecentBody = recent.reduce((s, c) => s + Math.abs(c.c - c.o), 0) / recent.length;
+        const avgPriorBody = prior.reduce((s, c) => s + Math.abs(c.c - c.o), 0) / prior.length;
+        if (avgPriorBody > 0 && avgRecentBody < avgPriorBody * 0.45) {
+          shiftScore += 20; reasons.push('bodies exhausting');
+        }
+      }
+    }
+
+    // 5. Failed new high/low — tried to extend but closed back
+    if (n >= 3) {
+      const c1 = candles[n - 3]!;
+      const c2 = candles[n - 2]!;
+      const c3 = candles[n - 1]!;
+      if (mom === 'UP' && c2.h > c1.h && c3.c < c2.c && c3.c < c2.o) {
+        shiftScore += 20; reasons.push('failed new high');
+      }
+      if (mom === 'DOWN' && c2.l < c1.l && c3.c > c2.c && c3.c > c2.o) {
+        shiftScore += 20; reasons.push('failed new low');
+      }
+    }
+
+    if (shiftScore >= 35) {
+      shifting = true;
+      shiftDir = biasScore > 0 ? 'TO DOWN' : biasScore < 0 ? 'TO UP' : (slope < 0 ? 'TO DOWN' : 'TO UP');
+      shiftUrgency = shiftScore >= 60 ? 'IMMINENT' : 'FORMING';
+    }
+
+    return { bias, biasScore, shifting, shiftDir, shiftUrgency, reasons };
+  }, [model, derivedStrip, pts, priceToBeat]);
+
   const trailPointsStr = useMemo(() => {
-    if (!model || !derivedStrip) return null;
+    if (!model || model.candles.length < 3) return null;
     const iw = W - PAD_L - PAD_R;
     const ih = H - PAD_Y * 2;
     const span = Math.max(1e-9, model.plotMax - model.plotMin);
     const tSpan = Math.max(1, model.tMax - model.tMin);
     const xTime = (t: number) => PAD_L + ((t - model.tMin) / tSpan) * iw;
     const yPrice = (v: number) => PAD_Y + (1 - (v - model.plotMin) / span) * ih;
-    const closeSeries =
-      model.candles.length >= 2
-        ? model.candles.map((c) => ({ x: xTime((c.t0 + c.t1) / 2), y: yPrice(c.c) }))
-        : pts.map((p) => ({ x: xTime(p.t), y: yPrice(p.v) }));
-    if (closeSeries.length < 2) return null;
-    const show =
-      derivedStrip.structureEvent === 'drift' ||
-      (derivedStrip.momentumStreak >= 2 && derivedStrip.momentum !== 'NEUTRAL');
-    if (!show) return null;
-    const take = closeSeries.slice(-14);
-    if (take.length < 2) return null;
-    return take.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
-  }, [derivedStrip, model, pts]);
+    const take = model.candles.slice(-6);
+    if (take.length < 3) return null;
+    return take.map((c) => `${xTime((c.t0 + c.t1) / 2).toFixed(1)},${yPrice(c.c).toFixed(1)}`).join(' ');
+  }, [model]);
 
   const ptbMarkers = useMemo(() => {
     if (!model || priceToBeat == null || !derivedStrip)
@@ -273,10 +490,10 @@ export function PtbOpportunityModeChart(props: {
         const x1 = xOf(cur.t1);
         const xc = (x0 + x1) / 2;
         const slotW = x1 - x0;
-        const bodyW = Math.max(6, Math.min(slotW * 0.88, iw * 0.028));
+        const bodyW = Math.max(14, Math.min(slotW * 0.88, iw * 0.05));
         const yO = yOf(cur.o);
         const yC = yOf(cur.c);
-        const bodyH = Math.max(4, Math.abs(yC - yO) * 1.12);
+        const bodyH = Math.max(6, Math.abs(yC - yO) * 1.12);
         const yBody = yC < yO ? yC : yO;
         breakBox = { xc, y: yBody - (bodyH - Math.abs(yC - yO)) / 2, w: bodyW, h: bodyH };
         break;
@@ -296,15 +513,19 @@ export function PtbOpportunityModeChart(props: {
   /** Visual frame when PTB exists but we cannot plot candles yet (or no PTB at all). */
   const skeleton = useMemo(() => {
     if (priceToBeat != null && Number.isFinite(priceToBeat)) {
-      const vals = pts.map((p) => p.v).filter((v) => Number.isFinite(v));
-      const spotMin = vals.length ? Math.min(...vals, priceToBeat) : priceToBeat;
-      const spotMax = vals.length ? Math.max(...vals, priceToBeat) : priceToBeat;
-      let { plotMin, plotMax } = anchorPriceScale({
-        level: priceToBeat,
-        spotMin,
-        spotMax,
-        anchorFrac: 0.5,
-      });
+      let spotMin = priceToBeat;
+      let spotMax = priceToBeat;
+      for (let i = 0; i < pts.length; i++) {
+        const v = pts[i]!.v;
+        if (!Number.isFinite(v)) continue;
+        if (v < spotMin) spotMin = v;
+        if (v > spotMax) spotMax = v;
+      }
+      const needAbove = Math.max(0, spotMax - priceToBeat);
+      const needBelow = Math.max(0, priceToBeat - spotMin);
+      const halfSpan = Math.max(needAbove, needBelow, Math.abs(priceToBeat) * 3e-5, 1);
+      let plotMin = priceToBeat - halfSpan * 1.08;
+      let plotMax = priceToBeat + halfSpan * 1.08;
       if (!Number.isFinite(plotMin) || !Number.isFinite(plotMax) || !(plotMax > plotMin)) {
         plotMin = priceToBeat - Math.max(Math.abs(priceToBeat) * 5e-5, 2);
         plotMax = priceToBeat + Math.max(Math.abs(priceToBeat) * 5e-5, 2);
@@ -505,8 +726,6 @@ export function PtbOpportunityModeChart(props: {
   const linePathSeries = lineSeries.length >= 2 ? lineSeries : closeSeries;
   const lastPt = pts[pts.length - 1]!;
   const heatIntensity = clamp01(Math.abs(model.last - priceToBeat!) / Math.max(model.maxAbs, model.band * 1.5));
-  const momUpStr = derivedStrip?.momentum === 'UP' && derivedStrip.momentumStreak >= 2;
-  const momDnStr = derivedStrip?.momentum === 'DOWN' && derivedStrip.momentumStreak >= 2;
   const controlSig = derivedStrip?.controlSignal;
   const statusBarBorder =
     controlSig === 'UP_CONTROL'
@@ -570,6 +789,20 @@ export function PtbOpportunityModeChart(props: {
                 OHLC
               </button>
             </div>
+            <div className="inline-flex rounded-2xl border border-zinc-800/80 bg-black/25 p-1 shadow-inner shadow-black/30">
+              {([60, 120, 300] as const).map((sec) => (
+                <button
+                  key={sec}
+                  type="button"
+                  onClick={() => setZoomWindow(sec)}
+                  className={`rounded-xl px-2.5 py-2 text-[11px] font-semibold ${
+                    zoomWindow === sec ? 'bg-indigo-600 text-white' : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  {sec < 120 ? '1m' : sec < 300 ? '2m' : '5m'}
+                </button>
+              ))}
+            </div>
             <div className={`rounded-2xl border px-3 py-2 text-[10px] font-semibold uppercase tracking-wide ${
               model.status === 'UP BIAS'
                 ? 'border-emerald-800/50 bg-emerald-950/30 text-emerald-200'
@@ -598,7 +831,7 @@ export function PtbOpportunityModeChart(props: {
       <div className="min-h-0 flex-1 px-3 pt-2 sm:px-4 [contain:paint]">
         <svg
           viewBox={`0 0 ${width} ${height}`}
-          className="block h-full min-h-[min(52vh,560px)] max-h-[73vh] w-full rounded-[24px] bg-[#0a0f16]"
+          className="block h-full min-h-[min(52vh,560px)] max-h-[73vh] w-full rounded-[24px] bg-[#0a0f16] [contain:strict]"
           preserveAspectRatio="xMidYMid meet"
           role="img"
           aria-label="Spot price versus PTB"
@@ -616,8 +849,8 @@ export function PtbOpportunityModeChart(props: {
               <stop offset="0%" stopColor="rgb(248 113 113)" stopOpacity={0} />
               <stop offset="100%" stopColor="rgb(185 28 28)" stopOpacity={0.06 + 0.22 * heatIntensity} />
             </linearGradient>
-            <marker id={`trailArr-${gradId}`} markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto" markerUnits="strokeWidth">
-              <polygon points="0 0, 7 3.5, 0 7" fill="rgb(148 163 184)" fillOpacity={0.55} />
+            <marker id={`trailArr-${gradId}`} markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+              <polygon points="0 1, 10 5, 0 9" fill="rgb(226 232 240)" fillOpacity={0.85} />
             </marker>
           </defs>
 
@@ -637,21 +870,13 @@ export function PtbOpportunityModeChart(props: {
           <rect x={padL} y={padY} width={innerW} height={Math.max(0, yBeat - padY)} fill={`url(#heatAbove-${gradId})`} className="pointer-events-none" />
           <rect x={padL} y={yBeat} width={innerW} height={Math.max(0, padY + innerH - yBeat)} fill={`url(#heatBelow-${gradId})`} className="pointer-events-none" />
 
-          {closeSeries.length <= 52
-            ? closeSeries.slice(1).map((p, i) => {
-                const prev = closeSeries[i]!;
-                const avg = (p.v + prev.v) / 2;
-                const favorableDist =
-                  mode === 'up' ? Math.max(0, avg - priceToBeat! - model.band) : Math.max(0, priceToBeat! - avg - model.band);
-                const weakDist =
-                  mode === 'up' ? Math.max(0, priceToBeat! - avg - model.band) : Math.max(0, avg - priceToBeat! - model.band);
-                const opacity =
-                  favorableDist > 0 ? 0.18 + 0.42 * clamp01(favorableDist / model.maxAbs) : 0.04 + 0.12 * clamp01(weakDist / model.maxAbs);
-                const fill = favorableDist > 0 ? withAlpha(meta.accent, opacity) : `rgba(113, 113, 122, ${Math.min(0.12, opacity)})`;
-                const d = `M ${prev.x.toFixed(2)} ${yBeat.toFixed(2)} L ${prev.x.toFixed(2)} ${prev.y.toFixed(2)} L ${p.x.toFixed(2)} ${p.y.toFixed(2)} L ${p.x.toFixed(2)} ${yBeat.toFixed(2)} Z`;
-                return <path key={`gap-${i}`} d={d} fill={fill} className="pointer-events-none" />;
-              })
-            : null}
+          {closeSeries.length >= 2 ? (
+            <path
+              d={`M ${closeSeries[0]!.x.toFixed(1)} ${yBeat.toFixed(1)} ${closeSeries.map((p) => `L ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ')} L ${closeSeries[closeSeries.length - 1]!.x.toFixed(1)} ${yBeat.toFixed(1)} Z`}
+              fill={meta.soft}
+              className="pointer-events-none"
+            />
+          ) : null}
 
           {tickPrices.map((tp, i) => (
             <g key={`grid-${i}`}>
@@ -662,65 +887,74 @@ export function PtbOpportunityModeChart(props: {
             </g>
           ))}
 
-          {displayMode === 'line' ? (
-            <>
-              <path
-                d={`M ${linePathSeries.map((p) => `${p.x.toFixed(2)} ${p.y.toFixed(2)}`).join(' L ')} L ${linePathSeries[linePathSeries.length - 1]!.x.toFixed(2)} ${(
-                  padY + innerH
-                ).toFixed(2)} L ${linePathSeries[0]!.x.toFixed(2)} ${(padY + innerH).toFixed(2)} Z`}
-                fill={lineFill}
-                className="pointer-events-none"
-              />
-              {linePathSeries.slice(1).map((p, i) => {
-                const prev = linePathSeries[i]!;
-                const segUp = p.v >= prev.v;
-                const stroke = segUp ? 'rgb(74 222 128)' : 'rgb(248 113 113)';
-                return (
-                  <line
-                    key={`ls-${i}`}
-                    x1={prev.x}
-                    y1={prev.y}
-                    x2={p.x}
-                    y2={p.y}
-                    stroke={stroke}
-                    strokeWidth={2.75}
-                    strokeLinecap="round"
-                  />
-                );
-              })}
-            </>
-          ) : (
+          {/* Price levels (S/R) */}
+          {priceLevels.map((lv, i) => {
+            const y = yPrice(lv.price);
+            const isHigh = lv.kind === 'high';
+            const color = isHigh ? 'rgb(251 146 60)' : 'rgb(96 165 250)';
+            return (
+              <g key={`lvl-${i}`} className="pointer-events-none">
+                <line x1={padL} x2={padL + innerW} y1={y} y2={y} stroke={color} strokeWidth="1.2" strokeDasharray="6 3" opacity={0.6} />
+                <rect x={padL + 2} y={y - 8} width={isHigh ? 12 : 10} height={14} rx="3" fill={color} fillOpacity={0.15} />
+                <text x={padL + 5} y={y + 3} fill={color} fontSize="8" fontWeight="700" opacity={0.85}>
+                  {isHigh ? 'R' : 'S'}
+                </text>
+                <text x={padL + 18} y={y - 2} fill={color} fontSize="9" fontFamily="ui-monospace, monospace" opacity={0.7}>
+                  {fmtAxisPrice(lv.price)}
+                </text>
+              </g>
+            );
+          })}
+
+          {displayMode === 'line' ? (() => {
+              const fill_d = `M ${linePathSeries[0]!.x.toFixed(1)} ${(padY + innerH).toFixed(1)} ${linePathSeries.map((p) => `L ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ')} L ${linePathSeries[linePathSeries.length - 1]!.x.toFixed(1)} ${(padY + innerH).toFixed(1)} Z`;
+              let upD = '';
+              let dnD = '';
+              for (let i = 1; i < linePathSeries.length; i++) {
+                const prev = linePathSeries[i - 1]!;
+                const cur = linePathSeries[i]!;
+                const seg = `M${prev.x.toFixed(1)} ${prev.y.toFixed(1)}L${cur.x.toFixed(1)} ${cur.y.toFixed(1)}`;
+                if (cur.v >= prev.v) upD += seg; else dnD += seg;
+              }
+              return (
+                <>
+                  <path d={fill_d} fill={lineFill} className="pointer-events-none" />
+                  {upD && <path d={upD} fill="none" stroke="rgb(74 222 128)" strokeWidth={2.75} strokeLinecap="round" />}
+                  {dnD && <path d={dnD} fill="none" stroke="rgb(248 113 113)" strokeWidth={2.75} strokeLinecap="round" />}
+                </>
+              );
+            })() : (
             model.candles.map((c, i) => {
               const x0 = xTime(c.t0);
               const x1 = xTime(c.t1);
               const xc = (x0 + x1) / 2;
               const slotW = x1 - x0;
-              const bodyW = Math.max(9, Math.min(slotW * 0.92, innerW * 0.038));
+              const bodyW = Math.max(18, Math.min(slotW * 0.82, innerW * 0.07));
               const yO = yPrice(c.o);
               const yC = yPrice(c.c);
               const yH = yPrice(c.h);
               const yL = yPrice(c.l);
               const bullish = c.c >= c.o;
-              const aligned = mode === 'up' ? bullish && c.c > priceToBeat! : !bullish && c.c < priceToBeat!;
-              const momBar = Boolean((momUpStr && bullish) || (momDnStr && !bullish));
-              const stroke = aligned ? meta.accent : bullish ? 'rgb(52 211 153)' : 'rgb(251 113 133)';
-              const fill = aligned ? (mode === 'up' ? 'rgba(16,185,129,0.55)' : 'rgba(248,113,113,0.55)') : bullish ? 'rgba(34,197,94,0.42)' : 'rgba(251,113,133,0.42)';
-              const bodyH = Math.max(4, Math.abs(yC - yO) * (aligned || momBar ? 1.12 : 1));
-              const yBody = yC < yO ? yC : yO;
-              const wickW = momBar ? 2.65 : aligned ? 2.1 : 1.45;
-              const bodyStrokeW = momBar ? 1.55 : aligned ? 1.35 : 1;
+              const bodyTop = Math.min(yO, yC);
+              const bodyBot = Math.max(yO, yC);
+              const rawBodyH = bodyBot - bodyTop;
+              const bodyH = Math.max(4, rawBodyH);
+              const bodyY = bodyTop - (bodyH - rawBodyH) / 2;
+              const wickColor = bullish ? 'rgb(34 197 94)' : 'rgb(239 68 68)';
+              const bodyFill = bullish ? 'rgb(22 163 74)' : 'rgb(220 38 38)';
+              const bodyStroke = bullish ? 'rgb(74 222 128)' : 'rgb(248 113 113)';
               return (
                 <g key={`candle-${i}`}>
-                  <line x1={xc} x2={xc} y1={yH} y2={yL} stroke={stroke} strokeWidth={wickW} opacity={0.98} />
+                  <line x1={xc} x2={xc} y1={yH} y2={bodyY} stroke={wickColor} strokeWidth={1.6} />
+                  <line x1={xc} x2={xc} y1={bodyY + bodyH} y2={yL} stroke={wickColor} strokeWidth={1.6} />
                   <rect
                     x={xc - bodyW / 2}
-                    y={yBody - (bodyH - Math.abs(yC - yO)) / 2}
+                    y={bodyY}
                     width={bodyW}
                     height={bodyH}
-                    rx="2"
-                    fill={fill}
-                    stroke={stroke}
-                    strokeWidth={bodyStrokeW}
+                    fill={bodyFill}
+                    stroke={bodyStroke}
+                    strokeWidth={1.2}
                   />
                 </g>
               );
@@ -731,10 +965,9 @@ export function PtbOpportunityModeChart(props: {
             <polyline
               points={trailPointsStr}
               fill="none"
-              stroke="rgb(148 163 184)"
-              strokeWidth="1.75"
-              strokeDasharray="5 4"
-              strokeOpacity={0.45}
+              stroke="rgb(226 232 240)"
+              strokeWidth="2.2"
+              strokeOpacity={0.7}
               strokeLinecap="round"
               strokeLinejoin="round"
               markerEnd={`url(#trailArr-${gradId})`}
@@ -781,7 +1014,89 @@ export function PtbOpportunityModeChart(props: {
             </g>
           ) : null}
 
-          <circle cx={xTime(lastPt.t)} cy={yPrice(lastPt.v)} r={6} fill="white" stroke={lineStroke} strokeWidth={2.2} />
+          <circle cx={xTime(lastPt.t)} cy={yPrice(lastPt.v)} r={7} fill="white" stroke={lineStroke} strokeWidth={2.5} />
+
+          {/* Momentum badge on chart */}
+          {derivedStrip ? (() => {
+            const momLabel = derivedStrip.momentum === 'UP' ? '↑ MOM' : derivedStrip.momentum === 'DOWN' ? '↓ MOM' : '→ FLAT';
+            const momColor = derivedStrip.momentum === 'UP' ? 'rgb(52 211 153)' : derivedStrip.momentum === 'DOWN' ? 'rgb(251 113 133)' : 'rgb(161 161 170)';
+            const momBg = derivedStrip.momentum === 'UP' ? 'rgba(16,185,129,0.2)' : derivedStrip.momentum === 'DOWN' ? 'rgba(248,113,113,0.2)' : 'rgba(113,113,122,0.15)';
+            const badgeX = xTime(lastPt.t) + 14;
+            const badgeY = yPrice(lastPt.v) - 16;
+            const streak = derivedStrip.momentumStreak;
+            return (
+              <g className="pointer-events-none">
+                <rect x={badgeX - 2} y={badgeY - 10} width={streak >= 2 ? 72 : 56} height={18} rx="9" fill={momBg} stroke={momColor} strokeWidth="1.2" strokeOpacity={0.7} />
+                <text x={badgeX + 4} y={badgeY + 2} fill={momColor} fontSize="10" fontWeight="800" fontFamily="ui-monospace, monospace">
+                  {momLabel}{streak >= 2 ? ` x${streak}` : ''}
+                </text>
+              </g>
+            );
+          })() : null}
+
+          {/* Momentum buildup gauge — top-right of chart */}
+          {buildup && buildup.tier !== 'NONE' ? (() => {
+            const gx = width - padR - 160;
+            const gy = padY + 6;
+            const barW = 100;
+            const barH = 8;
+            const fill01 = buildup.score / 100;
+            const tierColor = buildup.tier === 'FIRING' ? 'rgb(250 204 21)' :
+              buildup.tier === 'READY' ? 'rgb(52 211 153)' :
+              buildup.tier === 'BUILDING' ? 'rgb(96 165 250)' : 'rgb(161 161 170)';
+            const tierBg = buildup.tier === 'FIRING' ? 'rgba(250,204,21,0.15)' :
+              buildup.tier === 'READY' ? 'rgba(52,211,153,0.12)' :
+              buildup.tier === 'BUILDING' ? 'rgba(96,165,250,0.1)' : 'rgba(161,161,170,0.08)';
+            const arrow = buildup.direction === 'UP' ? '▲' : buildup.direction === 'DOWN' ? '▼' : '◆';
+            return (
+              <g className="pointer-events-none">
+                <rect x={gx - 6} y={gy - 2} width={barW + 68} height={34} rx="8" fill={tierBg} stroke={tierColor} strokeWidth="0.8" strokeOpacity={0.5} />
+                <text x={gx} y={gy + 10} fill={tierColor} fontSize="9" fontWeight="800" fontFamily="ui-monospace, monospace">
+                  {arrow} {buildup.tier}
+                </text>
+                <rect x={gx} y={gy + 16} width={barW} height={barH} rx={barH / 2} fill="rgba(39,39,42,0.8)" />
+                <rect x={gx} y={gy + 16} width={barW * fill01} height={barH} rx={barH / 2} fill={tierColor} />
+                <text x={gx + barW + 6} y={gy + 24} fill={tierColor} fontSize="10" fontWeight="700" fontFamily="ui-monospace, monospace">
+                  {buildup.score}
+                </text>
+              </g>
+            );
+          })() : null}
+
+          {/* Bias meter — left side vertical bar */}
+          {biasShift ? (() => {
+            const bx = padL + 4;
+            const by = padY + 8;
+            const bH = Math.min(innerH - 20, 160);
+            const mid = by + bH / 2;
+            const fill01 = (biasShift.biasScore + 100) / 200;
+            const needleY = by + bH * (1 - fill01);
+            const biasColor = biasShift.biasScore >= 30 ? 'rgb(52 211 153)' : biasShift.biasScore <= -30 ? 'rgb(248 113 113)' : 'rgb(161 161 170)';
+            return (
+              <g className="pointer-events-none">
+                <rect x={bx} y={by} width={6} height={bH} rx={3} fill="rgba(39,39,42,0.7)" />
+                <rect x={bx} y={mid} width={6} height={1} fill="rgba(161,161,170,0.5)" />
+                <rect x={bx - 1} y={Math.min(needleY, mid)} width={8} height={Math.max(2, Math.abs(needleY - mid))} rx={2}
+                  fill={biasColor} opacity={0.85} />
+                <circle cx={bx + 3} cy={needleY} r={5} fill={biasColor} stroke="#0a0f16" strokeWidth={2} />
+                <text x={bx + 14} y={by + 3} fill="rgb(113 113 122)" fontSize="7" fontWeight="700">BUY</text>
+                <text x={bx + 14} y={by + bH + 1} fill="rgb(113 113 122)" fontSize="7" fontWeight="700">SELL</text>
+                <text x={bx + 14} y={needleY + 3} fill={biasColor} fontSize="9" fontWeight="800" fontFamily="ui-monospace, monospace">
+                  {biasShift.bias}
+                </text>
+                {biasShift.shifting ? (
+                  <g>
+                    <rect x={bx + 14} y={needleY + 8} width={biasShift.shiftUrgency === 'IMMINENT' ? 80 : 66} height={16} rx={4}
+                      fill={biasShift.shiftUrgency === 'IMMINENT' ? 'rgba(250,204,21,0.2)' : 'rgba(250,204,21,0.1)'}
+                      stroke="rgb(250 204 21)" strokeWidth={biasShift.shiftUrgency === 'IMMINENT' ? 1.2 : 0.8} />
+                    <text x={bx + 18} y={needleY + 20} fill="rgb(250 204 21)" fontSize="8" fontWeight="800" fontFamily="ui-monospace, monospace">
+                      ⚡ {biasShift.shiftUrgency} {biasShift.shiftDir}
+                    </text>
+                  </g>
+                ) : null}
+              </g>
+            );
+          })() : null}
 
           {xTickTs.map((ts, i) => (
             <text
@@ -852,6 +1167,87 @@ export function PtbOpportunityModeChart(props: {
             {model.conviction}
           </span>
         </div>
+
+        {buildup && buildup.tier !== 'NONE' ? (() => {
+          const tierColor = buildup.tier === 'FIRING' ? 'border-yellow-500/60 bg-yellow-950/30'
+            : buildup.tier === 'READY' ? 'border-emerald-500/50 bg-emerald-950/25'
+            : buildup.tier === 'BUILDING' ? 'border-blue-500/40 bg-blue-950/20'
+            : 'border-zinc-700/50 bg-zinc-900/30';
+          const textColor = buildup.tier === 'FIRING' ? 'text-yellow-200'
+            : buildup.tier === 'READY' ? 'text-emerald-200'
+            : buildup.tier === 'BUILDING' ? 'text-blue-200'
+            : 'text-zinc-400';
+          const barColor = buildup.tier === 'FIRING' ? 'bg-yellow-400'
+            : buildup.tier === 'READY' ? 'bg-emerald-400'
+            : buildup.tier === 'BUILDING' ? 'bg-blue-400'
+            : 'bg-zinc-500';
+          const arrow = buildup.direction === 'UP' ? '▲' : buildup.direction === 'DOWN' ? '▼' : '◆';
+          return (
+            <div className={`mt-3 rounded-xl border px-3 py-2.5 ${tierColor}`}>
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <span className={`font-mono text-base font-black ${textColor}`}>{arrow} {buildup.tier}</span>
+                  <span className={`font-mono text-xs font-bold tabular-nums ${textColor}`}>{buildup.score}/100</span>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {buildup.signals.map((s, i) => (
+                    <span key={i} className={`rounded-md border border-current/20 px-1.5 py-0.5 text-[10px] font-semibold ${textColor}`}>{s}</span>
+                  ))}
+                </div>
+              </div>
+              <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-zinc-800/80">
+                <div className={`h-full rounded-full transition-all ${barColor}`} style={{ width: `${buildup.score}%` }} />
+              </div>
+              <p className={`mt-1.5 text-[10px] leading-snug ${textColor} opacity-80`}>{buildup.label}</p>
+            </div>
+          );
+        })() : null}
+
+        {biasShift ? (() => {
+          const isUp = biasShift.biasScore > 0;
+          const strength = Math.abs(biasShift.biasScore);
+          const biasBarColor = isUp ? 'bg-emerald-400' : biasShift.biasScore < 0 ? 'bg-rose-400' : 'bg-zinc-500';
+          const biasTextColor = isUp ? 'text-emerald-200' : biasShift.biasScore < 0 ? 'text-rose-200' : 'text-zinc-400';
+          const biasBorder = biasShift.shifting
+            ? (biasShift.shiftUrgency === 'IMMINENT' ? 'border-yellow-500/70 bg-yellow-950/20' : 'border-yellow-600/40 bg-yellow-950/10')
+            : (isUp ? 'border-emerald-700/40 bg-emerald-950/15' : biasShift.biasScore < 0 ? 'border-rose-700/40 bg-rose-950/15' : 'border-zinc-700/40 bg-zinc-900/20');
+          return (
+            <div className={`mt-3 rounded-xl border px-3 py-2.5 ${biasBorder}`}>
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-3">
+                  <div>
+                    <div className="text-[9px] font-bold uppercase tracking-wide text-zinc-500">Bias</div>
+                    <div className={`font-mono text-lg font-black leading-tight ${biasTextColor}`}>
+                      {isUp ? '▲' : biasShift.biasScore < 0 ? '▼' : '◆'} {biasShift.bias}
+                    </div>
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <div className="h-2 w-28 overflow-hidden rounded-full bg-zinc-800/80">
+                      <div className={`h-full rounded-full ${biasBarColor}`} style={{ width: `${strength}%`, marginLeft: isUp ? '50%' : `${50 - strength}%` }} />
+                    </div>
+                    <div className="flex justify-between text-[7px] font-bold text-zinc-600">
+                      <span>SELL</span><span>NEUTRAL</span><span>BUY</span>
+                    </div>
+                  </div>
+                </div>
+                {biasShift.shifting ? (
+                  <div className={`rounded-lg border px-2.5 py-1.5 ${biasShift.shiftUrgency === 'IMMINENT' ? 'border-yellow-400/60 bg-yellow-400/10' : 'border-yellow-500/30 bg-yellow-500/5'}`}>
+                    <div className={`font-mono text-xs font-black ${biasShift.shiftUrgency === 'IMMINENT' ? 'text-yellow-200' : 'text-yellow-300/80'}`}>
+                      ⚡ SHIFT {biasShift.shiftUrgency} {biasShift.shiftDir}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+              {biasShift.reasons.length > 0 ? (
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {biasShift.reasons.map((r, i) => (
+                    <span key={i} className="rounded-md border border-yellow-600/30 bg-yellow-950/15 px-1.5 py-0.5 text-[10px] font-semibold text-yellow-200/80">{r}</span>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          );
+        })() : null}
       </section>
 
       <details className="mx-4 mb-3 mt-1 rounded-xl border border-zinc-800/50 bg-zinc-900/20 px-3 py-2 text-[11px] text-zinc-500 ring-1 ring-white/[0.02]">
@@ -871,4 +1267,4 @@ export function PtbOpportunityModeChart(props: {
       </details>
     </div>
   );
-}
+});
