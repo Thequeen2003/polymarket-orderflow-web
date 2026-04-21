@@ -196,6 +196,7 @@ function WatchCard(props: {
           bookUp={bookUp}
           bookDown={bookDown}
           compactHeader
+          playbookSlug={slug}
         />
       </div>
     </div>

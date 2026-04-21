@@ -23,24 +23,32 @@ export function buildSpotCandles(pts: SpotTick[], bucketCount: number): SpotCand
   const t1 = pts[pts.length - 1]!.t;
   const span = Math.max(1, t1 - t0);
   const out: SpotCandle[] = [];
+  const step = span / bucketCount;
+  let i = 0;
   for (let b = 0; b < bucketCount; b++) {
-    const a = t0 + (span * b) / bucketCount;
-    const z = t0 + (span * (b + 1)) / bucketCount;
-    const lastBucket = b === bucketCount - 1;
-    const slice = pts.filter((p) => p.t >= a && (lastBucket ? p.t <= z : p.t < z));
-    if (slice.length === 0) continue;
-    const o = slice[0]!.v;
-    const c = slice[slice.length - 1]!.v;
-    let h = -Infinity;
-    let l = Infinity;
-    for (const p of slice) {
-      if (p.v > h) h = p.v;
-      if (p.v < l) l = p.v;
+    const a = t0 + step * b;
+    const z = b === bucketCount - 1 ? t1 + 1 : t0 + step * (b + 1);
+    while (i < pts.length && pts[i]!.t < a) i++;
+    if (i >= pts.length) break;
+    if (pts[i]!.t >= z) continue;
+    const o = pts[i]!.v;
+    let c = o;
+    let h = o;
+    let l = o;
+    let j = i;
+    while (j < pts.length && pts[j]!.t < z) {
+      const v = pts[j]!.v;
+      c = v;
+      if (v > h) h = v;
+      if (v < l) l = v;
+      j++;
     }
+    if (j === i) continue;
     const rangeUsd = h - l;
     const body = Math.abs(c - o);
     const bodyFrac = rangeUsd > 1e-12 ? Math.min(1, body / rangeUsd) : 1;
-    out.push({ t0: a, t1: z, o, h, l, c, bodyFrac, rangeUsd });
+    out.push({ t0: a, t1: Math.min(t1, z), o, h, l, c, bodyFrac, rangeUsd });
+    i = j;
   }
   return out;
 }
@@ -50,24 +58,33 @@ export function buildSpotCandlesInRange(pts: SpotTick[], t0: number, t1: number,
   if (pts.length < 2 || bucketCount < 2 || !(t1 > t0)) return [];
   const span = t1 - t0;
   const out: SpotCandle[] = [];
+  const step = span / bucketCount;
+  let i = 0;
+  while (i < pts.length && pts[i]!.t < t0) i++;
   for (let b = 0; b < bucketCount; b++) {
-    const a = t0 + (span * b) / bucketCount;
-    const z = t0 + (span * (b + 1)) / bucketCount;
-    const lastBucket = b === bucketCount - 1;
-    const slice = pts.filter((p) => p.t >= a && (lastBucket ? p.t <= z : p.t < z));
-    if (slice.length === 0) continue;
-    const o = slice[0]!.v;
-    const c = slice[slice.length - 1]!.v;
-    let h = -Infinity;
-    let l = Infinity;
-    for (const p of slice) {
-      if (p.v > h) h = p.v;
-      if (p.v < l) l = p.v;
+    const a = t0 + step * b;
+    const z = b === bucketCount - 1 ? t1 + 1 : t0 + step * (b + 1);
+    while (i < pts.length && pts[i]!.t < a) i++;
+    if (i >= pts.length) break;
+    if (pts[i]!.t >= z) continue;
+    const o = pts[i]!.v;
+    let c = o;
+    let h = o;
+    let l = o;
+    let j = i;
+    while (j < pts.length && pts[j]!.t < z) {
+      const v = pts[j]!.v;
+      c = v;
+      if (v > h) h = v;
+      if (v < l) l = v;
+      j++;
     }
+    if (j === i) continue;
     const rangeUsd = h - l;
     const body = Math.abs(c - o);
     const bodyFrac = rangeUsd > 1e-12 ? Math.min(1, body / rangeUsd) : 1;
-    out.push({ t0: a, t1: z, o, h, l, c, bodyFrac, rangeUsd });
+    out.push({ t0: a, t1: Math.min(t1, z), o, h, l, c, bodyFrac, rangeUsd });
+    i = j;
   }
   return out;
 }

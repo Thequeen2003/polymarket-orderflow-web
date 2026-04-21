@@ -1,10 +1,14 @@
-import { useEffect, useMemo, useState, type ReactElement } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
 import type { SpotPoint } from './SpotLevelChart';
 import { buildSpotCandlesInRange, type SpotCandle } from './spotVsPtb';
 import { pickBookLevels } from './bookLevels';
 import { computeProbMicrostructure } from './ptbAdvancedContext';
 import { computePtbSystemDecision, PTB_DECISION_FALLBACK } from './ptbDecisionEngine';
-import { computePtbTargetEngine } from './ptbTargetEngine';
+import { appendPtbDualSample, loadPtbDualSamples, sampleFromPtbEvent, summarizePtbDual, updatePtbDualSampleById } from './ptbDualPlaybookStats';
+import { estimateNet4cLong } from './executionEstimator';
+import { computePtbNet4cRoom } from './ptbNet4cTradeability';
+import { computePtbPathToTarget } from './ptbPathToTarget';
+import { computePtbTargetEngine, topBookBias01 } from './ptbTargetEngine';
 import { PtbUnifiedLineChartSvg } from './PtbUnifiedLineChartSvg';
 
 const BUCKET_N = 26;
@@ -312,6 +316,8 @@ export function PtbDualProbabilityChart(props: {
   }) => void;
   /** Watch cards: strip analyst chrome, keep a thin regime / gate strip. */
   compactHeader?: boolean;
+  /** Optional: localStorage key grouping for PTB Dual playbook samples. */
+  playbookSlug?: string;
 }): ReactElement | null {
   const {
     probUp,
@@ -326,6 +332,7 @@ export function PtbDualProbabilityChart(props: {
     onTapProb,
     onGapsUpdate,
     compactHeader = false,
+    playbookSlug = '',
   } = props;
   const [now, setNow] = useState(() => Date.now());
   const [flowOpen, setFlowOpen] = useState(() =>
@@ -334,6 +341,10 @@ export function PtbDualProbabilityChart(props: {
   const [detailsOpen, setDetailsOpen] = useState(() =>
     typeof window !== 'undefined' && window.localStorage.getItem('ptbChart.detailsOpen') === '1',
   );
+  const [playbookRev, setPlaybookRev] = useState(0);
+  /** Previous poll best ask sizes (for consumption proxy in preMove). */
+  const lagAskRef = useRef<{ u: number | null; d: number | null }>({ u: null, d: null });
+  const lastPlaybookAppendMsRef = useRef(0);
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 2000);
     return () => window.clearInterval(id);
@@ -352,6 +363,16 @@ export function PtbDualProbabilityChart(props: {
       /* ignore */
     }
   }, [detailsOpen]);
+
+  useEffect(() => {
+    try {
+      const u = pickBookLevels(bookUp).asks[0]?.size ?? null;
+      const d = pickBookLevels(bookDown).asks[0]?.size ?? null;
+      lagAskRef.current = { u, d };
+    } catch {
+      /* ignore */
+    }
+  }, [bookUp, bookDown]);
 
   const model = useMemo((): PtbDualChartModel | null => {
     const u0 = padProbSeries(probUp.map((p) => ({ t: p.t, v: clamp01(p.v) })));
@@ -660,6 +681,41 @@ export function PtbDualProbabilityChart(props: {
       return g.hi >= cur + 0.02 && g.lo >= cur - 0.003;
     };
 
+    const prev = lagAskRef.current;
+    let currU: number | null = null;
+    let currD: number | null = null;
+    try {
+      currU = pickBookLevels(bookUp).asks[0]?.size ?? null;
+      currD = pickBookLevels(bookDown).asks[0]?.size ?? null;
+    } catch {
+      /* ignore */
+    }
+    const askEatU =
+      prev.u != null && currU != null && prev.u > 0 && (prev.u - currU) / prev.u > 0.22;
+    const askEatD =
+      prev.d != null && currD != null && prev.d > 0 && (prev.d - currD) / prev.d > 0.22;
+
+    const twoBucketUp = (() => {
+      if (tailU.length < 2) return false;
+      const a = tailU[tailU.length - 2]!;
+      const b = tailU[tailU.length - 1]!;
+      return b.c > a.c + 0.003 && b.c >= b.o - 1e-9;
+    })();
+    const twoBucketDn = (() => {
+      if (tailD.length < 2) return false;
+      const a = tailD[tailD.length - 2]!;
+      const b = tailD[tailD.length - 1]!;
+      return b.c > a.c + 0.003 && b.c >= b.o - 1e-9;
+    })();
+
+    const biasU = topBookBias01(bookUp);
+    const biasD = topBookBias01(bookDown);
+    const biasAlignU = biasU != null && biasU > 0.06;
+    const alignD = biasD != null && biasD > 0.06;
+
+    const confirmU = askEatU || biasAlignU || twoBucketUp;
+    const confirmD = askEatD || alignD || twoBucketDn;
+
     const uPressure = pressureBuilding(tailU);
     const dPressure = pressureBuilding(tailD);
     const uGapAbove = gapAbove(gapU, lastU);
@@ -667,8 +723,8 @@ export function PtbDualProbabilityChart(props: {
     const uTrig = triggerLevel(tailU);
     const dTrig = triggerLevel(tailD);
 
-    const uReady = uPressure && uGapAbove && uTrig != null;
-    const dReady = dPressure && dGapAbove && dTrig != null;
+    const uReady = uPressure && uGapAbove && uTrig != null && confirmU;
+    const dReady = dPressure && dGapAbove && dTrig != null && confirmD;
 
     let chosen: { lane: 'up' | 'down'; trigger: number } | null = null;
     if (uReady && dReady) {
@@ -679,11 +735,11 @@ export function PtbDualProbabilityChart(props: {
     else if (dReady) chosen = { lane: 'down', trigger: dTrig! };
 
     return {
-      up: { pressure: uPressure, gapAbove: uGapAbove, trigger: uTrig, ready: uReady },
-      down: { pressure: dPressure, gapAbove: dGapAbove, trigger: dTrig, ready: dReady },
+      up: { pressure: uPressure, gapAbove: uGapAbove, trigger: uTrig, ready: uReady, confirm: confirmU },
+      down: { pressure: dPressure, gapAbove: dGapAbove, trigger: dTrig, ready: dReady, confirm: confirmD },
       chosen,
     };
-  }, [candlesDn, candlesUp, gapD, gapU, lastD, lastU, speedLabel, speedScore01]);
+  }, [bookDown, bookUp, candlesDn, candlesUp, gapD, gapU, lastD, lastU, speedLabel, speedScore01]);
 
   const ptbTarget = useMemo(
     () =>
@@ -712,6 +768,62 @@ export function PtbDualProbabilityChart(props: {
   );
 
   const chartAccent = ptbTarget.engineLane === 'up' ? 'text-emerald-200' : 'text-rose-200';
+
+  const primaryBook = ptbTarget.engineLane === 'up' ? bookUp : bookDown;
+  const nowLaneProb = ptbTarget.engineLane === 'up' ? lastU : lastD;
+  const activeGap = ptbTarget.engineLane === 'up' ? gapU : gapD;
+
+  const net4cTradeability = useMemo(
+    () =>
+      computePtbNet4cRoom({
+        book: primaryBook,
+        refShares: 100,
+        nowProb: nowLaneProb,
+        wallProb: ptbTarget.wall01,
+        targetHiProb: ptbTarget.hi01,
+      }),
+    [nowLaneProb, primaryBook, ptbTarget.hi01, ptbTarget.wall01],
+  );
+
+  const pathToTarget = useMemo(
+    () =>
+      computePtbPathToTarget({
+        lane: ptbTarget.engineLane,
+        nowProb: nowLaneProb,
+        next01: ptbTarget.next01,
+        lo01: ptbTarget.lo01,
+        hi01: ptbTarget.hi01,
+        wall01: ptbTarget.wall01,
+        gap: activeGap,
+        speedLabel,
+        speedScore01,
+        micro: engine.microstructure,
+        wallClearanceCents: net4cTradeability.wallClearanceCents,
+      }),
+    [
+      activeGap,
+      engine.microstructure,
+      net4cTradeability.wallClearanceCents,
+      nowLaneProb,
+      ptbTarget.engineLane,
+      ptbTarget.hi01,
+      ptbTarget.lo01,
+      ptbTarget.next01,
+      ptbTarget.wall01,
+      speedLabel,
+      speedScore01,
+    ],
+  );
+
+  const displayVerdict = useMemo(() => {
+    if (net4cTradeability.room === 'NO') return 'WAIT' as const;
+    return engine.verdict;
+  }, [engine.verdict, net4cTradeability.room]);
+
+  const invalidationShort =
+    engine.invalidation[0] != null ? engine.invalidation[0]!.slice(0, 72) + (engine.invalidation[0]!.length > 72 ? '…' : '') : '—';
+
+  const playbookSummary = useMemo(() => summarizePtbDual(loadPtbDualSamples()), [playbookRev]);
 
   /** Single execution condition: break level + tape speed (kill switch for guessing). */
   const tradeTrigger = useMemo(() => {
@@ -797,6 +909,50 @@ export function PtbDualProbabilityChart(props: {
     }),
     [preMove, speedLabel, lastU, lastD, upLabel, downLabel],
   );
+
+  useEffect(() => {
+    if (!playbookSlug) return;
+    const armed = tradeTrigger.triggerPill === 'ARMED';
+    if (!armed && displayVerdict !== 'ENTER' && displayVerdict !== 'SCALP') return;
+    const t = Date.now();
+    if (t - lastPlaybookAppendMsRef.current < 28_000) return;
+    lastPlaybookAppendMsRef.current = t;
+
+    const sample = sampleFromPtbEvent({
+      slug: playbookSlug,
+      verdict: displayVerdict,
+      gateArmed: armed,
+      room: net4cTradeability.room,
+      net4c: net4cTradeability.net4c,
+      wallClearanceCents: net4cTradeability.wallClearanceCents,
+    });
+    appendPtbDualSample(sample);
+    setPlaybookRev((x) => x + 1);
+
+    const sampleId = sample.id;
+    const b = primaryBook;
+    const run = (slot: 'outcome30s' | 'outcome2m') => {
+      try {
+        const { bids, asks } = pickBookLevels(b);
+        const n = estimateNet4cLong({ asks, bids, shares: 100, maxLevels: 18 });
+        const payload = { t: Date.now(), ok: n.ok, profitCents: n.net.profitCents };
+        updatePtbDualSampleById(sampleId, slot === 'outcome30s' ? { outcome30s: payload } : { outcome2m: payload });
+        setPlaybookRev((x) => x + 1);
+      } catch {
+        /* ignore */
+      }
+    };
+    window.setTimeout(() => run('outcome30s'), 30_000);
+    window.setTimeout(() => run('outcome2m'), 120_000);
+  }, [
+    playbookSlug,
+    tradeTrigger.triggerPill,
+    displayVerdict,
+    net4cTradeability.room,
+    net4cTradeability.net4c,
+    net4cTradeability.wallClearanceCents,
+    primaryBook,
+  ]);
 
   const counterCase = useMemo(() => {
     if (lastU > lastD + 0.02) {
@@ -1012,14 +1168,24 @@ export function PtbDualProbabilityChart(props: {
               <div className="flex flex-wrap gap-1.5">
                 <span
                   className={`rounded-lg border px-2 py-0.5 text-[9px] font-black ${
-                    engine.verdict === 'ENTER'
+                    displayVerdict === 'ENTER'
                       ? 'border-emerald-500/50 text-emerald-200'
-                      : engine.verdict === 'SCALP'
+                      : displayVerdict === 'SCALP'
                         ? 'border-amber-500/45 text-amber-100'
                         : 'border-zinc-700 text-zinc-300'
                   }`}
                 >
-                  {engine.verdict === 'ENTER' ? 'ENTER' : engine.verdict === 'SCALP' ? 'SCALP' : 'WAIT'}
+                  {displayVerdict === 'ENTER' ? 'ENTER' : displayVerdict === 'SCALP' ? 'SCALP' : 'WAIT'}
+                </span>
+                <span className="rounded-lg border border-zinc-700 px-2 py-0.5 font-mono text-[9px] text-zinc-400">
+                  +4¢{' '}
+                  <span
+                    className={
+                      net4cTradeability.room === 'YES' ? 'text-emerald-300' : net4cTradeability.room === 'MARGINAL' ? 'text-amber-200' : 'text-rose-300'
+                    }
+                  >
+                    {net4cTradeability.room}
+                  </span>
                 </span>
                 <span className="rounded-lg border border-zinc-700 px-2 py-0.5 font-mono text-[9px] text-zinc-400">
                   Gate{' '}
@@ -1032,102 +1198,132 @@ export function PtbDualProbabilityChart(props: {
         ) : (
           <>
             <div
-              className="rounded-2xl border border-zinc-700/55 bg-gradient-to-br from-zinc-900/85 via-zinc-950/80 to-black/50 px-4 py-3.5 ring-1 ring-white/[0.05]"
+              className="rounded-2xl border border-zinc-700/55 bg-gradient-to-br from-zinc-900/85 via-zinc-950/80 to-black/50 px-3 py-2.5 ring-1 ring-white/[0.05]"
               title={ptbTarget.summaryLine}
             >
-              <div className="text-[11px] font-black tracking-[0.12em] text-amber-200/95">PTB TARGET ENGINE</div>
-              <div className={`mt-3 space-y-1.5 font-mono text-[clamp(14px,3.2vw,18px)] font-bold leading-snug ${chartAccent}`}>
-                <div>Side: {ptbTarget.side}</div>
-                <div>Now: {ptbTarget.nowLabel}</div>
-                <div>Momentum: {ptbTarget.momentum}</div>
-                <div>Next Target: {ptbTarget.nextTargetLabel}</div>
-                <div>Target Range: {ptbTarget.targetRangeLabel}</div>
-                <div className="text-zinc-100">First Wall: {ptbTarget.firstWallLabel}</div>
-                <div className="text-zinc-200">Reversal Risk: {ptbTarget.reversalRisk}</div>
+              <div className="text-[10px] font-black tracking-wide text-amber-200/95">PTB TARGET ENGINE</div>
+              <div className={`mt-1 font-mono text-[12px] font-bold leading-snug ${chartAccent}`}>
+                {ptbTarget.side} · now {ptbTarget.nowLabel} · mom {ptbTarget.momentum} · next {ptbTarget.nextTargetLabel} · range{' '}
+                {ptbTarget.targetRangeLabel} · wall {ptbTarget.firstWallLabel} · rev {ptbTarget.reversalRisk}
               </div>
             </div>
 
-            <p className="mt-2 text-[10px] leading-snug text-zinc-600">{engine.regimeSubtitle}</p>
+            <p className="mt-2 text-[9px] leading-snug text-zinc-600">{engine.regimeSubtitle}</p>
 
-            <div className="mt-3 grid gap-2 sm:grid-cols-3">
-              <div className="rounded-xl border border-zinc-800/60 bg-zinc-950/50 px-3 py-2.5 text-center ring-1 ring-white/[0.02] transition hover:border-zinc-700/60">
-                <div className="text-[9px] font-semibold uppercase tracking-wide text-zinc-500">Regime</div>
-                <div className="mt-0.5 text-[12px] font-black text-zinc-100">
-                  {engine.verdict === 'ENTER' ? 'ENTER' : engine.verdict === 'SCALP' ? 'SCALP' : 'WAIT'}
-                </div>
-              </div>
-              <div
-                className={`rounded-xl border px-3 py-2.5 text-center ring-1 transition hover:brightness-[1.03] ${
-                  tradeTrigger.triggerPill === 'ARMED'
-                    ? 'border-emerald-500/55 bg-emerald-950/35 text-emerald-100 ring-emerald-500/15'
-                    : tradeTrigger.triggerPill === 'PARTIAL'
-                      ? 'border-amber-500/50 bg-amber-950/35 text-amber-100 ring-amber-500/12'
-                      : 'border-zinc-800/60 bg-zinc-950/50 text-zinc-300 ring-white/[0.02]'
+            <div className="mt-3 flex flex-wrap items-center gap-x-2.5 gap-y-2 rounded-xl border border-zinc-800/70 bg-zinc-950/55 px-3 py-2.5 text-[10px] leading-tight text-zinc-200">
+              <span className="font-semibold text-zinc-500">Lane</span>
+              <span className="font-mono font-bold text-zinc-100">{ptbTarget.engineLane === 'up' ? upLabel : downLabel}</span>
+              <span className="text-zinc-600">·</span>
+              <span className="font-semibold text-zinc-500">Disposition</span>
+              <span
+                className={`font-black ${
+                  displayVerdict === 'ENTER' ? 'text-emerald-300' : displayVerdict === 'SCALP' ? 'text-amber-200' : 'text-zinc-300'
                 }`}
               >
-                <div className="text-[9px] font-semibold uppercase tracking-wide text-zinc-500">Execution gate</div>
-                <div className="mt-0.5 text-[12px] font-black">
-                  {tradeTrigger.triggerPill === 'ARMED' ? 'ARMED' : tradeTrigger.triggerPill === 'PARTIAL' ? 'PARTIAL' : 'NOT ARMED'}
-                </div>
-              </div>
-              <div
-                className={`rounded-xl border px-3 py-2.5 text-center ring-1 transition hover:brightness-[1.03] ${
-                  tradeTrigger.setupReady
-                    ? 'border-sky-500/45 bg-sky-950/25 text-sky-100 ring-sky-500/10'
-                    : 'border-zinc-800/60 bg-zinc-950/50 text-zinc-400 ring-white/[0.02]'
+                {displayVerdict}
+                {tradeTrigger.triggerPill === 'ARMED' && displayVerdict !== 'ENTER' ? (
+                  <span className="ml-1 font-mono text-[9px] font-semibold text-emerald-400/90">· gate ARMED</span>
+                ) : null}
+              </span>
+              <span className="text-zinc-600">·</span>
+              <span className="font-semibold text-zinc-500">Enter line</span>
+              <span className="font-mono text-zinc-100">{tradeTrigger.line != null ? fmtCents(tradeTrigger.line) : '—'}</span>
+              <span className="text-zinc-600">·</span>
+              <span className="font-semibold text-zinc-500">Wall</span>
+              <span className="font-mono text-zinc-100">{ptbTarget.firstWallLabel}</span>
+              <span className="text-zinc-600">·</span>
+              <span className="font-semibold text-zinc-500">Net +4¢</span>
+              <span
+                className={`font-mono font-bold ${
+                  net4cTradeability.room === 'YES' ? 'text-emerald-300' : net4cTradeability.room === 'MARGINAL' ? 'text-amber-200' : 'text-rose-300'
                 }`}
               >
-                <div className="text-[9px] font-semibold uppercase tracking-wide text-zinc-500">Structure ready</div>
-                <div className="mt-0.5 text-[12px] font-black">{tradeTrigger.setupReady ? 'READY' : 'NOT READY'}</div>
-              </div>
+                {net4cTradeability.room}
+              </span>
+              <span className="text-zinc-600">·</span>
+              <span className="font-semibold text-zinc-500">Invalidate</span>
+              <span className="min-w-0 max-w-[16rem] truncate font-mono text-[9px] text-zinc-400" title={engine.invalidation[0]}>
+                {invalidationShort}
+              </span>
             </div>
 
-            <div className="mt-3 rounded-2xl border border-amber-500/35 bg-gradient-to-br from-amber-950/30 via-zinc-950/40 to-zinc-950/30 px-3 py-3 ring-1 ring-amber-500/10">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="text-[10px] font-black uppercase tracking-wide text-amber-200/95">Trade trigger</div>
-                <div className="font-mono text-[10px] text-zinc-500">Primary: {tradeTrigger.laneTitle}</div>
-              </div>
-              <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                <div
-                  className={`rounded-xl border px-3 py-2.5 ${
-                    tradeTrigger.lane === 'up'
-                      ? 'border-amber-400/45 bg-black/25 ring-1 ring-amber-500/25'
-                      : 'border-emerald-900/40 bg-emerald-950/10'
-                  }`}
-                >
-                  <div className="text-[10px] font-semibold uppercase tracking-wide text-emerald-200/90">{upLabel}</div>
-                  <div className="mt-1 text-[11px] font-semibold leading-snug text-zinc-100">{pairedExec.up.hintLine}</div>
-                  <div className="mt-1 text-[10px] leading-snug text-zinc-400">{pairedExec.up.enterOnlyIf}</div>
-                </div>
-                <div
-                  className={`rounded-xl border px-3 py-2.5 ${
-                    tradeTrigger.lane === 'down'
-                      ? 'border-amber-400/45 bg-black/25 ring-1 ring-amber-500/25'
-                      : 'border-sky-900/40 bg-sky-950/10'
-                  }`}
-                >
-                  <div className="text-[10px] font-semibold uppercase tracking-wide text-sky-200/90">{downLabel}</div>
-                  <div className="mt-1 text-[11px] font-semibold leading-snug text-zinc-100">{pairedExec.down.hintLine}</div>
-                  <div className="mt-1 text-[10px] leading-snug text-zinc-400">{pairedExec.down.enterOnlyIf}</div>
-                </div>
-              </div>
-              <div className="mt-2 text-[11px] leading-relaxed text-zinc-400">
-                <span className="font-semibold text-zinc-500">{tradeTrigger.laneTitle}: </span>
-                {tradeTrigger.triggerReason}
-              </div>
-              <p className="mt-2 text-[11px] leading-snug text-zinc-300">{counterCase}</p>
-              {engine.balanceNote ? (
-                <p className="mt-1.5 rounded-lg border border-amber-800/35 bg-amber-950/20 px-2 py-1.5 text-[11px] font-semibold text-amber-100/95">
-                  {engine.balanceNote}
-                </p>
-              ) : null}
-              {tradeTrigger.fadeText ? (
-                <div className="mt-2 rounded-xl border border-rose-800/40 bg-rose-950/20 px-2.5 py-2 text-[11px] font-semibold leading-snug text-rose-100/90">
-                  <span className="text-[10px] font-black uppercase tracking-wide text-rose-300/90">Fade trigger · </span>
-                  {tradeTrigger.fadeText}
-                </div>
-              ) : null}
+            {engine.enterBlockReason === 'dual_lane_tight' ? (
+              <p className="mt-2 text-[11px] font-bold text-amber-200">WAIT FOR BREAK — both lanes competitive; ENTER suppressed.</p>
+            ) : null}
+            {net4cTradeability.room === 'NO' ? (
+              <p className="mt-2 text-[11px] font-semibold text-rose-200/90">
+                Tradeability veto: {net4cTradeability.detail}
+              </p>
+            ) : null}
+
+            <div className="mt-2 rounded-lg border border-zinc-800/60 bg-black/25 px-3 py-2 text-[10px] text-zinc-300">
+              <span className="font-semibold text-zinc-500">Path · </span>
+              Desired ~{pathToTarget.desiredLabel} · Reach{' '}
+              <span className="font-bold text-zinc-100">{pathToTarget.reach}</span> ·{' '}
+              <span className="font-mono text-zinc-400">{pathToTarget.pathSketch.join(' → ')}</span>
+              <div className="mt-1 text-[9px] text-zinc-500">{pathToTarget.line}</div>
             </div>
+
+            {playbookSlug ? (
+              <div className="mt-2 text-[9px] text-zinc-500">
+                PTB Dual log: n={playbookSummary.n} · armed/edge samples {playbookSummary.armedOrEnter}
+                {playbookSummary.hit4cRate != null ? (
+                  <span> · 30s ok-rate ~{(playbookSummary.hit4cRate * 100).toFixed(0)}%</span>
+                ) : null}
+              </div>
+            ) : null}
+
+            <details className="group mt-3 overflow-hidden rounded-xl border border-amber-500/30 bg-amber-950/10 transition-colors open:border-amber-500/50">
+              <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2.5 text-[11px] font-semibold text-amber-100/95 outline-none marker:content-none [&::-webkit-details-marker]:hidden hover:bg-amber-950/20">
+                <span className="text-zinc-500 transition-transform duration-200 group-open:rotate-90" aria-hidden>
+                  ▸
+                </span>
+                Trade trigger · paired execution
+                <span className="font-normal text-zinc-500">· {tradeTrigger.laneTitle}</span>
+              </summary>
+              <div className="border-t border-zinc-800/50 px-3 pb-3 pt-2">
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <div
+                    className={`rounded-xl border px-3 py-2.5 ${
+                      tradeTrigger.lane === 'up'
+                        ? 'border-amber-400/45 bg-black/25 ring-1 ring-amber-500/25'
+                        : 'border-emerald-900/40 bg-emerald-950/10'
+                    }`}
+                  >
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-emerald-200/90">{upLabel}</div>
+                    <div className="mt-1 text-[11px] font-semibold leading-snug text-zinc-100">{pairedExec.up.hintLine}</div>
+                    <div className="mt-1 text-[10px] leading-snug text-zinc-400">{pairedExec.up.enterOnlyIf}</div>
+                  </div>
+                  <div
+                    className={`rounded-xl border px-3 py-2.5 ${
+                      tradeTrigger.lane === 'down'
+                        ? 'border-amber-400/45 bg-black/25 ring-1 ring-amber-500/25'
+                        : 'border-sky-900/40 bg-sky-950/10'
+                    }`}
+                  >
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-sky-200/90">{downLabel}</div>
+                    <div className="mt-1 text-[11px] font-semibold leading-snug text-zinc-100">{pairedExec.down.hintLine}</div>
+                    <div className="mt-1 text-[10px] leading-snug text-zinc-400">{pairedExec.down.enterOnlyIf}</div>
+                  </div>
+                </div>
+                <div className="mt-2 text-[11px] leading-relaxed text-zinc-400">
+                  <span className="font-semibold text-zinc-500">{tradeTrigger.laneTitle}: </span>
+                  {tradeTrigger.triggerReason}
+                </div>
+                <p className="mt-2 text-[11px] leading-snug text-zinc-300">{counterCase}</p>
+                {engine.balanceNote ? (
+                  <p className="mt-1.5 rounded-lg border border-amber-800/35 bg-amber-950/20 px-2 py-1.5 text-[11px] font-semibold text-amber-100/95">
+                    {engine.balanceNote}
+                  </p>
+                ) : null}
+                {tradeTrigger.fadeText ? (
+                  <div className="mt-2 rounded-xl border border-rose-800/40 bg-rose-950/20 px-2.5 py-2 text-[11px] font-semibold leading-snug text-rose-100/90">
+                    <span className="text-[10px] font-black uppercase tracking-wide text-rose-300/90">Fade trigger · </span>
+                    {tradeTrigger.fadeText}
+                  </div>
+                ) : null}
+              </div>
+            </details>
 
             <details
               className="group mt-3 overflow-hidden rounded-xl border border-zinc-800/60 bg-zinc-950/40 transition-colors open:border-zinc-700/70 open:bg-zinc-950/55"
@@ -1247,8 +1443,9 @@ export function PtbDualProbabilityChart(props: {
                 <div className="mt-3 rounded-xl border border-zinc-800/55 bg-black/20 px-3 py-2 font-mono text-[10px] leading-relaxed text-zinc-400">
                   <span className="font-semibold text-zinc-500">Structure: </span>
                   {upLabel} pressure {preMove.up.pressure ? '✓' : '—'} gap {preMove.up.gapAbove ? '✓' : '—'} line{' '}
-                  {preMove.up.trigger != null ? fmtCents(preMove.up.trigger) : '—'} · {downLabel} pressure {preMove.down.pressure ? '✓' : '—'} gap{' '}
-                  {preMove.down.gapAbove ? '✓' : '—'} line {preMove.down.trigger != null ? fmtCents(preMove.down.trigger) : '—'}
+                  {preMove.up.trigger != null ? fmtCents(preMove.up.trigger) : '—'} · confirm {preMove.up.confirm ? '✓' : '—'} · {downLabel} pressure{' '}
+                  {preMove.down.pressure ? '✓' : '—'} gap {preMove.down.gapAbove ? '✓' : '—'} line{' '}
+                  {preMove.down.trigger != null ? fmtCents(preMove.down.trigger) : '—'} · confirm {preMove.down.confirm ? '✓' : '—'}
                 </div>
               </div>
             </details>

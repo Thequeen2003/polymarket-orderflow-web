@@ -1,29 +1,47 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
 import { clobBooks, marketsGet } from './lib/api';
 import { midPrice, pickBookLevels } from './bookLevels';
+import { estimateNet4cLong } from './executionEstimator';
+import {
+  appendSample,
+  bucketConfidence,
+  bucketSpread,
+  computeStats,
+  loadSamples,
+  sampleFromNet4c,
+  updateSampleById,
+} from './playbookStats';
 import { snapshotFromBook, type BookSnapshot } from './orderflowMetrics';
 import type { SeriesPoint } from './MomentumChart';
 import { seriesWindowDelta } from './chartReadouts';
 import {
-  buildEntryVerdict,
+  buildUpScalpVerdict,
   detectWalls,
   evaluateTick,
   linearSlopePerSec,
-  parseMomentumThreshold,
 } from './entryDecisionEngine';
 import type {
   AlertEvent,
   AlertKind,
+  AlertCooldowns,
   AlertPrefs,
-  TradePlan,
+  UpScalpSettings,
   WatchlistEntry,
 } from './momentumAlertsTypes';
-import { defaultAlertPrefs, defaultTradePlan } from './momentumAlertsTypes';
+import {
+  defaultAlertCooldowns,
+  defaultAlertPrefs,
+  defaultTradePlan,
+  defaultUpScalpSettings,
+} from './momentumAlertsTypes';
 
 const LS_WL = 'pm-momentum-watchlist-v1';
-const LS_PLAN = 'pm-momentum-trade-plan-v1';
+const LS_SCALP = 'pm-momentum-up-scalp-v1';
 const LS_PREFS = 'pm-momentum-alert-prefs-v1';
 const LS_FOCUS = 'pm-momentum-focus-slug-v1';
+const LS_COOLDOWNS = 'pm-momentum-alert-cooldowns-v1';
+const LS_FEED_FILTERS = 'pm-momentum-alert-feed-filters-v1';
+const LS_PLAYBOOK_VIEW = 'pm-playbook-view-v1';
 
 function isOk<T>(x: unknown): x is { ok: true; data: T } {
   return typeof x === 'object' && x !== null && (x as { ok?: boolean }).ok === true && 'data' in (x as object);
@@ -135,11 +153,15 @@ export function MomentumAlertsTab(props: {
 }): ReactElement {
   const { currentSlug, priceToBeatUsd, onOpenInBook } = props;
   const [watchlist, setWatchlist] = useState<WatchlistEntry[]>([]);
-  const [plan, setPlan] = useState<TradePlan>(() => defaultTradePlan());
+  const [scalpSettings, setScalpSettings] = useState<UpScalpSettings>(() => defaultUpScalpSettings());
   const [prefs, setPrefs] = useState<AlertPrefs>(() => defaultAlertPrefs());
+  const [cooldowns, setCooldowns] = useState<AlertCooldowns>(() => defaultAlertCooldowns());
   const [focusSlug, setFocusSlug] = useState<string>('');
   const [slugInput, setSlugInput] = useState('');
   const [busy, setBusy] = useState(false);
+  const [minConfidence, setMinConfidence] = useState<number>(55);
+  const [hideLowConfidence, setHideLowConfidence] = useState<boolean>(false);
+  const [playbookView, setPlaybookView] = useState<'kind' | 'confidence' | 'spread'>(() => 'kind');
 
   const [midsBySlug, setMidsBySlug] = useState<Record<string, SeriesPoint[]>>({});
   const [snapsBySlug, setSnapsBySlug] = useState<Record<string, BookSnapshot[]>>({});
@@ -152,17 +174,58 @@ export function MomentumAlertsTab(props: {
   const prevSlopeRef = useRef<Record<string, number | null>>({});
   const depthRef = useRef<Record<string, { bids: Map<string, number>; asks: Map<string, number> }>>({});
   const lastFireRef = useRef<Record<string, number>>({});
+  const feedRef = useRef<AlertEvent[]>([]);
+  const lastBookRef = useRef<Record<string, unknown>>({});
+  const scalpSettingsRef = useRef<UpScalpSettings>(defaultUpScalpSettings());
+
+  useEffect(() => {
+    feedRef.current = feed;
+  }, [feed]);
+  useEffect(() => {
+    lastBookRef.current = lastBook;
+  }, [lastBook]);
+  useEffect(() => {
+    scalpSettingsRef.current = scalpSettings;
+  }, [scalpSettings]);
+
+  const scheduleReadyOutcomes = useCallback((sampleId: string, slug: string) => {
+    const run = (slot: 'outcome30s' | 'outcome2m') => {
+      const book = lastBookRef.current[slug];
+      if (!book || typeof book !== 'object') return;
+      const { bids, asks } = pickBookLevels(book);
+      const n = estimateNet4cLong({
+        asks,
+        bids,
+        shares: scalpSettingsRef.current.refShares,
+        maxLevels: 18,
+      });
+      const payload = { t: Date.now(), ok: n.ok, profitCents: n.net.profitCents };
+      updateSampleById(sampleId, slot === 'outcome30s' ? { outcome30s: payload } : { outcome2m: payload });
+    };
+    window.setTimeout(() => run('outcome30s'), 30_000);
+    window.setTimeout(() => run('outcome2m'), 120_000);
+  }, []);
 
   useEffect(() => {
     try {
       const w = localStorage.getItem(LS_WL);
       if (w) setWatchlist(JSON.parse(w) as WatchlistEntry[]);
-      const p = localStorage.getItem(LS_PLAN);
-      if (p) setPlan({ ...defaultTradePlan(), ...JSON.parse(p) });
+      const sc = localStorage.getItem(LS_SCALP);
+      if (sc) setScalpSettings({ ...defaultUpScalpSettings(), ...JSON.parse(sc) });
       const a = localStorage.getItem(LS_PREFS);
       if (a) setPrefs({ ...defaultAlertPrefs(), ...JSON.parse(a) });
+      const c = localStorage.getItem(LS_COOLDOWNS);
+      if (c) setCooldowns({ ...defaultAlertCooldowns(), ...JSON.parse(c) });
+      const ff = localStorage.getItem(LS_FEED_FILTERS);
+      if (ff) {
+        const o = JSON.parse(ff) as { minConfidence?: number; hideLowConfidence?: boolean };
+        if (typeof o.minConfidence === 'number' && Number.isFinite(o.minConfidence)) setMinConfidence(Math.max(0, Math.min(100, o.minConfidence)));
+        if (typeof o.hideLowConfidence === 'boolean') setHideLowConfidence(o.hideLowConfidence);
+      }
       const f = localStorage.getItem(LS_FOCUS);
       if (f) setFocusSlug(f);
+      const pv = localStorage.getItem(LS_PLAYBOOK_VIEW);
+      if (pv === 'kind' || pv === 'confidence' || pv === 'spread') setPlaybookView(pv);
     } catch {
       /* ignore */
     }
@@ -172,11 +235,24 @@ export function MomentumAlertsTab(props: {
     localStorage.setItem(LS_WL, JSON.stringify(watchlist));
   }, [watchlist]);
   useEffect(() => {
-    localStorage.setItem(LS_PLAN, JSON.stringify(plan));
-  }, [plan]);
+    try {
+      localStorage.setItem(LS_SCALP, JSON.stringify(scalpSettings));
+    } catch {
+      /* ignore */
+    }
+  }, [scalpSettings]);
   useEffect(() => {
     localStorage.setItem(LS_PREFS, JSON.stringify(prefs));
   }, [prefs]);
+  useEffect(() => {
+    localStorage.setItem(LS_COOLDOWNS, JSON.stringify(cooldowns));
+  }, [cooldowns]);
+  useEffect(() => {
+    localStorage.setItem(LS_FEED_FILTERS, JSON.stringify({ minConfidence, hideLowConfidence }));
+  }, [minConfidence, hideLowConfidence]);
+  useEffect(() => {
+    localStorage.setItem(LS_PLAYBOOK_VIEW, playbookView);
+  }, [playbookView]);
   useEffect(() => {
     if (focusSlug) localStorage.setItem(LS_FOCUS, focusSlug);
   }, [focusSlug]);
@@ -184,8 +260,6 @@ export function MomentumAlertsTab(props: {
   useEffect(() => {
     if (!focusSlug && watchlist[0]) setFocusSlug(watchlist[0]!.slug);
   }, [watchlist, focusSlug]);
-
-  const momentumTh = useMemo(() => parseMomentumThreshold(plan), [plan]);
 
   const addEntry = useCallback(async (rawSlug: string) => {
     const slug = rawSlug.trim();
@@ -213,7 +287,8 @@ export function MomentumAlertsTab(props: {
 
   const poll = useCallback(async () => {
     if (watchlist.length === 0) return;
-    const th = parseMomentumThreshold(plan);
+    const th = scalpSettingsRef.current.minMomentum;
+    const scalp = scalpSettingsRef.current;
     for (const e of watchlist) {
       const ids = e.tokenIds;
       if (!ids?.length) continue;
@@ -232,6 +307,7 @@ export function MomentumAlertsTab(props: {
       const bb = bids[0]?.size ?? 0;
       const ba = asks[0]?.size ?? 0;
       const wall = detectWalls({ bids, asks });
+      const net4c = estimateNet4cLong({ asks, bids, shares: scalp.refShares, maxLevels: 18 });
 
       const prevMids = midsRef.current[e.slug] ?? [];
       const nextMids = mid != null ? [...prevMids, { t: snap.t, v: mid }].slice(-120) : prevMids;
@@ -258,7 +334,7 @@ export function MomentumAlertsTab(props: {
         prevBestBid: pb?.bid ?? null,
         prevBestAsk: pb?.ask ?? null,
         prevSlope: ps,
-        plan,
+        plan: { ...defaultTradePlan(), momentumThreshold: String(scalp.minMomentum) },
         prefs,
         momentumThreshold: th,
       });
@@ -279,15 +355,85 @@ export function MomentumAlertsTab(props: {
         if (!prefs[ev.kind]) return false;
         const k = `${ev.slug}:${ev.kind}`;
         const last = lastFireRef.current[k] ?? 0;
-        if (now - last < 45_000) return false;
+        const cd = cooldowns[ev.kind] ?? 45_000;
+        if (now - last < cd) return false;
         lastFireRef.current[k] = now;
         return true;
       });
       if (cooled.length > 0) {
-        setFeed((f) => [...cooled, ...f].slice(0, 120));
+        // Record playbook samples for each fired event (local only).
+        const nowCool = Date.now();
+        const recentKinds = (slug: string, kinds: AlertKind[]) => {
+          const fromFeed = feedRef.current
+            .filter((a) => a.slug === slug && nowCool - a.t < 90_000)
+            .map((a) => a.kind);
+          return [...new Set([...fromFeed, ...kinds])];
+        };
+        for (const ev of cooled) {
+          const kindsForVerdict = recentKinds(
+            ev.slug,
+            cooled.filter((x) => x.slug === ev.slug).map((x) => x.kind),
+          );
+          const scalpVerdictSnap = buildUpScalpVerdict({
+            net4c,
+            settings: scalp,
+            mid,
+            slope,
+            snap,
+            wall,
+            asks,
+            recentAlertKinds: kindsForVerdict,
+          });
+          const sample = sampleFromNet4c({
+            slug: ev.slug,
+            kind: ev.kind,
+            confidenceScore: ev.confidenceScore,
+            spreadCents: bids[0]?.price != null && asks[0]?.price != null ? (asks[0]!.price - bids[0]!.price) * 100 : null,
+            churn: snap.churn ?? null,
+            verdict: scalpVerdictSnap.state,
+            net4c,
+          });
+          appendSample(sample);
+          if (scalpVerdictSnap.state === 'READY') {
+            scheduleReadyOutcomes(sample.id, ev.slug);
+          }
+        }
+        // Append (newest last) to avoid scroll-jumping when the feed is in an overflow container.
+        setFeed((f) => [...f, ...cooled].slice(-120));
+      }
+
+      // Attach a quick “room to +4¢” context event when it’s clearly impossible.
+      if (!net4c.ok && prefs.context) {
+        const why = net4c.flags.slice(0, 2).join(', ');
+        const msg = why
+          ? `Net +4¢ looks hard for ${scalp.refShares}sh (${why}).`
+          : `Net +4¢ looks hard for ${scalp.refShares}sh.`;
+        const contextEv: AlertEvent = {
+          id: `ctx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          t: Date.now(),
+          slug: e.slug,
+          kind: 'context',
+          message: msg,
+          severity: 'info',
+          confidenceScore: net4c.net.profitCents != null ? Math.max(0, Math.min(100, 50 + net4c.net.profitCents * 6)) : undefined,
+          flags: net4c.flags.map((id) => ({ id, label: id, severity: id.includes('Wide') || id.includes('No') ? 'warn' : 'info' })),
+          drivers: [
+            { key: 'net4c.refShares', label: 'Ref size', value: `${scalp.refShares} sh`, raw: scalp.refShares },
+            { key: 'net4c.profitCents', label: 'Est net (¢)', value: net4c.net.profitCents != null ? net4c.net.profitCents.toFixed(1) : '—', raw: net4c.net.profitCents ?? undefined },
+            { key: 'net4c.requiredGrossCents', label: 'Req gross (¢)', value: net4c.net.requiredGrossCents != null ? net4c.net.requiredGrossCents.toFixed(1) : '—', raw: net4c.net.requiredGrossCents ?? undefined },
+          ],
+        };
+        // Use cooldown gate to avoid spamming.
+        const k = `${contextEv.slug}:${contextEv.kind}`;
+        const last = lastFireRef.current[k] ?? 0;
+        const cd = cooldowns[contextEv.kind] ?? 45_000;
+        if (Date.now() - last >= cd) {
+          lastFireRef.current[k] = Date.now();
+          setFeed((f) => [...f, contextEv].slice(-120));
+        }
       }
     }
-  }, [watchlist, plan, prefs]);
+  }, [watchlist, prefs, cooldowns, scheduleReadyOutcomes]);
 
   useEffect(() => {
     const id = window.setInterval(() => void poll(), 4_000);
@@ -299,24 +445,19 @@ export function MomentumAlertsTab(props: {
   const focusBook = focusEntry ? lastBook[focusEntry.slug] : null;
   const focusMidSeries = focusEntry ? midsBySlug[focusEntry.slug] ?? [] : [];
   const focusSnaps = focusEntry ? snapsBySlug[focusEntry.slug] ?? [] : [];
-  const verdict = useMemo(() => {
-    if (!focusEntry || !focusBook) {
-      return buildEntryVerdict({
-        mid: null,
-        slope: null,
-        snap: { t: 0, mid: null, spread: null, bidDepth: 0, askDepth: 0, imbalance: null, churn: null },
-        wall: { bidWall: false, askWall: false, bidRatio: 0, askRatio: 0 },
-        asks: [],
-        plan,
-        momentumThreshold: momentumTh,
-      });
-    }
-    const mid = midPrice(focusBook);
-    const slope = linearSlopePerSec(focusMidSeries.filter((p) => p.v != null) as { t: number; v: number }[]);
-    const { bids, asks } = pickBookLevels(focusBook);
-    const wall = detectWalls({ bids, asks });
-    const lastSnap = focusSnaps[focusSnaps.length - 1] ?? {
-      t: Date.now(),
+  const recentKindsForFocus = useMemo(() => {
+    if (!focusEntry) return [] as AlertKind[];
+    const now = Date.now();
+    return [
+      ...new Set(
+        feed.filter((a) => a.slug === focusEntry.slug && now - a.t < 90_000).map((a) => a.kind),
+      ),
+    ];
+  }, [feed, focusEntry]);
+
+  const scalpVerdict = useMemo(() => {
+    const emptySnap: BookSnapshot = {
+      t: 0,
       mid: null,
       spread: null,
       bidDepth: 0,
@@ -324,29 +465,112 @@ export function MomentumAlertsTab(props: {
       imbalance: null,
       churn: null,
     };
-    return buildEntryVerdict({ mid, slope, snap: lastSnap, wall, asks, plan, momentumThreshold: momentumTh });
-  }, [focusEntry, focusBook, focusMidSeries, focusSnaps, plan, momentumTh]);
+    if (!focusBook || !focusEntry) {
+      const net4c = estimateNet4cLong({
+        asks: [],
+        bids: [],
+        shares: scalpSettings.refShares,
+        maxLevels: 18,
+      });
+      return buildUpScalpVerdict({
+        net4c,
+        settings: scalpSettings,
+        mid: null,
+        slope: null,
+        snap: emptySnap,
+        wall: { bidWall: false, askWall: false, bidRatio: 0, askRatio: 0 },
+        asks: [],
+        recentAlertKinds: recentKindsForFocus,
+      });
+    }
+    const mid = midPrice(focusBook);
+    const slope = linearSlopePerSec(focusMidSeries.filter((p) => p.v != null) as { t: number; v: number }[]);
+    const { bids, asks } = pickBookLevels(focusBook);
+    const wall = detectWalls({ bids, asks });
+    const net4c = estimateNet4cLong({ asks, bids, shares: scalpSettings.refShares, maxLevels: 18 });
+    const lastSnap = focusSnaps[focusSnaps.length - 1] ?? emptySnap;
+    return buildUpScalpVerdict({
+      net4c,
+      settings: scalpSettings,
+      mid,
+      slope,
+      snap: lastSnap,
+      wall,
+      asks,
+      recentAlertKinds: recentKindsForFocus,
+    });
+  }, [focusBook, focusEntry, focusMidSeries, focusSnaps, scalpSettings, recentKindsForFocus]);
 
   const ranked = useMemo(() => {
     return [...watchlist].sort((a, b) => (strength[b.slug] ?? 0) - (strength[a.slug] ?? 0));
   }, [watchlist, strength]);
 
-  const toneClass =
-    verdict.tone === 'good'
+  const filteredFeed = useMemo(() => {
+    if (!hideLowConfidence) return feed;
+    return feed.filter((a) => (a.confidenceScore ?? 100) >= minConfidence);
+  }, [feed, hideLowConfidence, minConfidence]);
+
+  const scalpFeedRank = useCallback((k: AlertKind): number => {
+    const scores: Partial<Record<AlertKind, number>> = {
+      momentum_start: 4,
+      asks_eaten: 4,
+      bid_wall: 3,
+      near_entry: 1,
+      near_target: 0,
+      momentum_slow: -1,
+      ask_wall: -2,
+      weak_follow: -4,
+      context: -1,
+      bids_pulled: -1,
+      spoof_suspect: -2,
+      do_not_enter_signal: -3,
+    };
+    return scores[k] ?? 0;
+  }, []);
+
+  const rankedFeed = useMemo(() => {
+    return [...filteredFeed].sort((a, b) => {
+      const d = scalpFeedRank(b.kind) - scalpFeedRank(a.kind);
+      if (d !== 0) return d;
+      return b.t - a.t;
+    });
+  }, [filteredFeed, scalpFeedRank]);
+
+  const playbookSamples = useMemo(() => loadSamples(), [feed]);
+  const playbookGroups = useMemo(() => {
+    const groups = new Map<string, typeof playbookSamples>();
+    for (const s of playbookSamples) {
+      const key =
+        playbookView === 'kind'
+          ? s.kind
+          : playbookView === 'confidence'
+            ? bucketConfidence(s.confidenceScore)
+            : bucketSpread(s.spreadCents);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key)!.push(s);
+    }
+    const rows = [...groups.entries()].map(([k, list]) => ({ key: k, stats: computeStats(list) }));
+    rows.sort((a, b) => b.stats.okRate - a.stats.okRate);
+    return rows;
+  }, [playbookSamples, playbookView]);
+
+  const scalpToneClass =
+    scalpVerdict.state === 'READY'
       ? 'border-emerald-800/40 bg-emerald-950/25 text-emerald-100'
-      : verdict.tone === 'wait'
+      : scalpVerdict.state === 'WAIT'
         ? 'border-amber-800/40 bg-amber-950/20 text-amber-100'
-        : verdict.tone === 'bad'
-          ? 'border-red-800/40 bg-red-950/25 text-red-100'
-          : 'border-zinc-800/50 bg-zinc-950/30 text-zinc-200';
+        : 'border-red-800/40 bg-red-950/25 text-red-100';
+
+  const rowStatusClass = (s: 'pass' | 'warn' | 'fail') =>
+    s === 'pass' ? 'text-emerald-300' : s === 'warn' ? 'text-amber-200' : 'text-red-300';
 
   return (
     <div className="mt-5 space-y-5">
       <div className="rounded-2xl border border-zinc-800/50 bg-zinc-950/35 p-4 ring-1 ring-white/[0.02]">
         <div className="text-[13px] font-semibold text-zinc-100">Momentum + Alerts</div>
         <p className="mt-1 text-xs leading-relaxed text-zinc-500">
-          Watch live mids and order-flow-derived signals across every market you track. Set your plan and alert rules; the feed
-          surfaces entries to double-check before you click.
+          Watch live mids and bullish 4¢ scalp-style signals. Tune execution gates on the right; the card above the feed scores READY /
+          WAIT / AVOID using net+4¢ feasibility first, then tape. Not financial advice.
         </p>
       </div>
 
@@ -467,73 +691,125 @@ export function MomentumAlertsTab(props: {
 
         <div className="space-y-3">
           <div className="rounded-2xl border border-zinc-800/50 bg-zinc-900/20 p-4">
-            <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Trade plan</div>
+            <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">4¢ Up Scalp settings</div>
+            <p className="mt-1 text-[10px] text-zinc-600">
+              Tunes the READY / WAIT / AVOID verdict and net+4¢ checks (ref size applies to feasibility estimates).
+            </p>
             <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
               <label className="block text-[10px] text-zinc-500">
-                Planned entry
+                Target net (¢)
                 <input
-                  value={plan.plannedEntry}
-                  onChange={(e) => setPlan((p) => ({ ...p, plannedEntry: e.target.value }))}
+                  type="number"
+                  min={1}
+                  max={20}
+                  step={0.5}
+                  value={scalpSettings.targetNetCents}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (!Number.isFinite(v)) return;
+                    setScalpSettings((s) => ({ ...s, targetNetCents: Math.max(1, Math.min(20, v)) }));
+                  }}
                   className="mt-0.5 w-full rounded-lg border border-zinc-700/50 bg-zinc-950/50 px-2 py-1.5 font-mono text-xs text-zinc-200"
                 />
               </label>
               <label className="block text-[10px] text-zinc-500">
-                Entry range low
+                Max spread (¢)
                 <input
-                  value={plan.entryRangeLow}
-                  onChange={(e) => setPlan((p) => ({ ...p, entryRangeLow: e.target.value }))}
+                  type="number"
+                  min={1}
+                  max={25}
+                  step={0.5}
+                  value={scalpSettings.maxSpreadCents}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (!Number.isFinite(v)) return;
+                    setScalpSettings((s) => ({ ...s, maxSpreadCents: Math.max(1, Math.min(25, v)) }));
+                  }}
                   className="mt-0.5 w-full rounded-lg border border-zinc-700/50 bg-zinc-950/50 px-2 py-1.5 font-mono text-xs text-zinc-200"
                 />
               </label>
               <label className="block text-[10px] text-zinc-500">
-                Entry range high
+                Max req gross (¢)
                 <input
-                  value={plan.entryRangeHigh}
-                  onChange={(e) => setPlan((p) => ({ ...p, entryRangeHigh: e.target.value }))}
+                  type="number"
+                  min={4}
+                  max={40}
+                  step={0.5}
+                  value={scalpSettings.maxRequiredGrossCents}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (!Number.isFinite(v)) return;
+                    setScalpSettings((s) => ({ ...s, maxRequiredGrossCents: Math.max(4, Math.min(40, v)) }));
+                  }}
                   className="mt-0.5 w-full rounded-lg border border-zinc-700/50 bg-zinc-950/50 px-2 py-1.5 font-mono text-xs text-zinc-200"
                 />
               </label>
               <label className="block text-[10px] text-zinc-500">
-                Target sell
+                Min clearance to ask wall (×0.01 price)
                 <input
-                  value={plan.targetSell}
-                  onChange={(e) => setPlan((p) => ({ ...p, targetSell: e.target.value }))}
+                  type="number"
+                  min={0.002}
+                  max={0.2}
+                  step={0.001}
+                  value={scalpSettings.minAskWallDistance}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (!Number.isFinite(v)) return;
+                    setScalpSettings((s) => ({ ...s, minAskWallDistance: Math.max(0.002, Math.min(0.2, v)) }));
+                  }}
                   className="mt-0.5 w-full rounded-lg border border-zinc-700/50 bg-zinc-950/50 px-2 py-1.5 font-mono text-xs text-zinc-200"
                 />
               </label>
               <label className="block text-[10px] text-zinc-500">
-                Risk
-                <select
-                  value={plan.riskLevel}
-                  onChange={(e) => setPlan((p) => ({ ...p, riskLevel: e.target.value as TradePlan['riskLevel'] }))}
-                  className="mt-0.5 w-full rounded-lg border border-zinc-700/50 bg-zinc-950/50 px-2 py-1.5 text-xs text-zinc-200"
-                >
-                  <option value="">—</option>
-                  <option value="low">Low</option>
-                  <option value="med">Medium</option>
-                  <option value="high">High</option>
-                </select>
+                Min context confidence (0–100)
+                <input
+                  type="number"
+                  min={0}
+                  max={100}
+                  value={scalpSettings.minConfidence}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (!Number.isFinite(v)) return;
+                    setScalpSettings((s) => ({ ...s, minConfidence: Math.max(0, Math.min(100, Math.floor(v))) }));
+                  }}
+                  className="mt-0.5 w-full rounded-lg border border-zinc-700/50 bg-zinc-950/50 px-2 py-1.5 font-mono text-xs text-zinc-200"
+                />
               </label>
               <label className="block text-[10px] text-zinc-500">
-                Momentum threshold (/s)
+                Min momentum (/s)
                 <input
-                  value={plan.momentumThreshold}
-                  onChange={(e) => setPlan((p) => ({ ...p, momentumThreshold: e.target.value }))}
+                  type="number"
+                  min={0.001}
+                  max={0.2}
+                  step={0.001}
+                  value={scalpSettings.minMomentum}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (!Number.isFinite(v)) return;
+                    setScalpSettings((s) => ({ ...s, minMomentum: Math.max(0.001, Math.min(0.2, v)) }));
+                  }}
+                  className="mt-0.5 w-full rounded-lg border border-zinc-700/50 bg-zinc-950/50 px-2 py-1.5 font-mono text-xs text-zinc-200"
+                />
+              </label>
+              <label className="block text-[10px] text-zinc-500 sm:col-span-2">
+                Ref shares (net+4¢ path)
+                <input
+                  type="number"
+                  min={1}
+                  max={10_000}
+                  step={1}
+                  value={scalpSettings.refShares}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (!Number.isFinite(v)) return;
+                    setScalpSettings((s) => ({ ...s, refShares: Math.max(1, Math.min(10_000, Math.floor(v))) }));
+                  }}
                   className="mt-0.5 w-full rounded-lg border border-zinc-700/50 bg-zinc-950/50 px-2 py-1.5 font-mono text-xs text-zinc-200"
                 />
               </label>
             </div>
             <label className="mt-2 block text-[10px] text-zinc-500">
-              Do not enter (notes)
-              <textarea
-                value={plan.doNotEnter}
-                onChange={(e) => setPlan((p) => ({ ...p, doNotEnter: e.target.value }))}
-                rows={2}
-                className="mt-0.5 w-full rounded-lg border border-zinc-700/50 bg-zinc-950/50 px-2 py-1.5 text-xs text-zinc-200"
-              />
-            </label>
-            <label className="mt-2 block text-[10px] text-zinc-500">
-              Entry assistant — focus market
+              Verdict focus market
               <select
                 value={focusSlug}
                 onChange={(e) => setFocusSlug(e.target.value)}
@@ -548,18 +824,73 @@ export function MomentumAlertsTab(props: {
             </label>
           </div>
 
-          <div className={`rounded-2xl border p-4 ${toneClass}`}>
-            <div className="text-[11px] font-semibold uppercase tracking-wide opacity-80">Entry decision assistant</div>
-            <div className="mt-2 text-sm font-semibold">{verdict.headline}</div>
-            <ul className="mt-2 list-inside list-disc space-y-1 text-xs leading-relaxed opacity-95">
-              {verdict.bullets.map((b, i) => (
-                <li key={i}>{b}</li>
+          <div className={`rounded-2xl border p-4 ${scalpToneClass}`}>
+            <div className="flex flex-wrap items-baseline justify-between gap-2">
+              <div className="text-[11px] font-semibold uppercase tracking-wide opacity-80">4¢ Up Scalp verdict</div>
+              <div className="font-mono text-lg font-bold">{scalpVerdict.state}</div>
+            </div>
+            <div className="mt-1 text-sm font-semibold leading-snug">{scalpVerdict.headline}</div>
+            {scalpVerdict.tickConfidence != null ? (
+              <div className="mt-1 text-[10px] opacity-80">Snapshot confidence ~{scalpVerdict.tickConfidence.toFixed(0)}/100</div>
+            ) : null}
+            <div className="mt-3 space-y-2">
+              {scalpVerdict.rows.map((r) => (
+                <div
+                  key={r.id}
+                  className="flex flex-wrap items-start justify-between gap-2 rounded-lg border border-white/10 bg-black/20 px-2 py-1.5 text-[11px]"
+                >
+                  <div className="min-w-0 font-semibold text-zinc-200/95">{r.label}</div>
+                  <div className={`shrink-0 font-mono text-[10px] uppercase ${rowStatusClass(r.status)}`}>{r.status}</div>
+                  <div className="w-full text-[10px] leading-snug text-zinc-400/95">{r.detail}</div>
+                </div>
               ))}
-            </ul>
+            </div>
             <p className="mt-3 text-[10px] leading-snug opacity-70">
-              Rule-based read from live book snapshots — not financial advice. For real entries/exits, always line up mid drift with the
-              actual best bid/ask on the Book tab (that is where prints anchor).
+              Net+4¢ estimate runs first at your ref size — if execution fails, AVOID even when momentum looks good. Not financial
+              advice; line up prints with the Book tab.
             </p>
+          </div>
+
+          <div className="rounded-2xl border border-zinc-800/50 bg-zinc-900/20 p-4">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Playbook (net +4¢ feasibility)</div>
+                <p className="mt-1 text-[11px] text-zinc-500">
+                  Local stats from fired alerts; includes scalp verdict when recorded. READY rows schedule 30s / 2m net+4¢ follow-ups.
+                </p>
+              </div>
+              <select
+                value={playbookView}
+                onChange={(e) => setPlaybookView(e.target.value as 'kind' | 'confidence' | 'spread')}
+                className="rounded-lg border border-zinc-700/50 bg-zinc-950/50 px-2 py-1 text-[11px] text-zinc-200"
+              >
+                <option value="kind">By kind</option>
+                <option value="confidence">By confidence</option>
+                <option value="spread">By spread</option>
+              </select>
+            </div>
+            {playbookGroups.length === 0 ? (
+              <div className="mt-3 text-xs text-zinc-600">No samples yet — let alerts run for a bit.</div>
+            ) : (
+              <div className="mt-3 space-y-2">
+                {playbookGroups.slice(0, 10).map((r) => (
+                  <div key={r.key} className="rounded-xl border border-zinc-800/60 bg-black/20 px-3 py-2">
+                    <div className="flex items-baseline justify-between gap-2">
+                      <div className="text-xs font-semibold text-zinc-200">{r.key || '—'}</div>
+                      <div className="font-mono text-[11px] text-zinc-500">n={r.stats.n}</div>
+                    </div>
+                    <div className="mt-1 flex flex-wrap gap-3 text-[11px] text-zinc-400">
+                      <span>
+                        ok-rate <span className="font-mono text-zinc-200">{(r.stats.okRate * 100).toFixed(0)}%</span>
+                      </span>
+                      <span>
+                        avg est <span className="font-mono text-zinc-200">{r.stats.avgProfitCents != null ? `${r.stats.avgProfitCents.toFixed(1)}¢` : '—'}</span>
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
 
           <div className="rounded-2xl border border-zinc-800/50 bg-zinc-900/20 p-4">
@@ -576,6 +907,48 @@ export function MomentumAlertsTab(props: {
                 </label>
               ))}
             </div>
+            <div className="mt-3 grid gap-2 rounded-xl border border-zinc-800/60 bg-black/20 p-3 sm:grid-cols-2">
+              <div>
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Feed filter</div>
+                <label className="mt-2 flex cursor-pointer items-center gap-2 text-[10px] text-zinc-400">
+                  <input type="checkbox" checked={hideLowConfidence} onChange={(e) => setHideLowConfidence(e.target.checked)} />
+                  Hide low-confidence alerts
+                </label>
+                <label className="mt-2 block text-[10px] text-zinc-500">
+                  Min confidence: <span className="font-mono text-zinc-300">{minConfidence.toFixed(0)}</span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    value={minConfidence}
+                    onChange={(e) => setMinConfidence(Number(e.target.value))}
+                    className="mt-1 w-full"
+                  />
+                </label>
+              </div>
+              <div>
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Cooldown (per kind)</div>
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  {(Object.keys(prefs) as AlertKind[]).slice(0, 6).map((k) => (
+                    <label key={k} className="block text-[10px] text-zinc-500">
+                      {ALERT_LABELS[k]}
+                      <input
+                        value={Math.round((cooldowns[k] ?? 45_000) / 1000)}
+                        onChange={(e) => {
+                          const s = Number(e.target.value);
+                          const v = Number.isFinite(s) ? Math.max(0, Math.min(600, Math.floor(s))) * 1000 : 45_000;
+                          setCooldowns((c) => ({ ...c, [k]: v }));
+                        }}
+                        inputMode="numeric"
+                        className="mt-0.5 w-full rounded-lg border border-zinc-700/50 bg-zinc-950/50 px-2 py-1.5 font-mono text-xs text-zinc-200"
+                      />
+                      <div className="mt-0.5 text-[10px] text-zinc-600">sec</div>
+                    </label>
+                  ))}
+                </div>
+                <div className="mt-2 text-[10px] text-zinc-600">Tip: other kinds use the defaults; we can expose all if you want.</div>
+              </div>
+            </div>
           </div>
 
           <div className="rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-4">
@@ -590,14 +963,63 @@ export function MomentumAlertsTab(props: {
               </button>
             </div>
             <div className="mt-2 max-h-64 space-y-1.5 overflow-y-auto">
-              {feed.length === 0 ? (
+              {rankedFeed.length === 0 ? (
                 <div className="text-xs text-zinc-600">No alerts yet — tracking must run a few polls.</div>
               ) : (
-                feed.map((a) => (
-                  <div key={a.id} className="rounded-lg border border-zinc-800/60 bg-black/25 px-2 py-1.5 text-[11px] leading-snug text-zinc-300">
-                    <span className="font-mono text-[10px] text-zinc-500">{new Date(a.t).toLocaleTimeString()}</span>{' '}
-                    <span className="text-zinc-500">{a.slug.slice(0, 24)}</span> · {a.message}
-                  </div>
+                rankedFeed.map((a) => (
+                  <details
+                    key={a.id}
+                    className="rounded-lg border border-zinc-800/60 bg-black/25 px-2 py-1.5 text-[11px] leading-snug text-zinc-300"
+                  >
+                    <summary className="cursor-pointer list-none outline-none marker:content-none [&::-webkit-details-marker]:hidden">
+                      <span className="font-mono text-[10px] text-zinc-500">{new Date(a.t).toLocaleTimeString()}</span>{' '}
+                      <span className="text-zinc-500">{a.slug.slice(0, 24)}</span> · {a.message}{' '}
+                      {typeof a.confidenceScore === 'number' ? (
+                        <span className="ml-2 font-mono text-[10px] text-zinc-500">conf {a.confidenceScore.toFixed(0)}</span>
+                      ) : null}
+                      {a.severity ? (
+                        <span
+                          className={`ml-2 rounded border px-1.5 py-0.5 text-[10px] font-semibold ${
+                            a.severity === 'critical'
+                              ? 'border-rose-700/40 bg-rose-950/25 text-rose-200'
+                              : a.severity === 'warn'
+                                ? 'border-amber-700/35 bg-amber-950/20 text-amber-100'
+                                : 'border-zinc-700/40 bg-zinc-950/30 text-zinc-300'
+                          }`}
+                        >
+                          {a.severity.toUpperCase()}
+                        </span>
+                      ) : null}
+                    </summary>
+                    {a.flags?.length ? (
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {a.flags.map((f) => (
+                          <span
+                            key={f.id}
+                            className={`rounded border px-1.5 py-0.5 text-[10px] font-semibold ${
+                              f.severity === 'warn'
+                                ? 'border-amber-700/35 bg-amber-950/20 text-amber-100/90'
+                                : 'border-zinc-700/40 bg-zinc-950/30 text-zinc-300'
+                            }`}
+                          >
+                            {f.label}
+                          </span>
+                        ))}
+                      </div>
+                    ) : null}
+                    {a.drivers?.length ? (
+                      <div className="mt-2 grid gap-1.5 sm:grid-cols-2">
+                        {a.drivers.slice(0, 10).map((d) => (
+                          <div key={d.key} className="rounded border border-zinc-800/60 bg-zinc-950/30 px-2 py-1">
+                            <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">{d.label}</div>
+                            <div className="mt-0.5 font-mono text-[11px] text-zinc-200">{d.value}</div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="mt-2 text-[10px] text-zinc-600">No driver details for this alert.</div>
+                    )}
+                  </details>
                 ))
               )}
             </div>

@@ -1,10 +1,23 @@
 export type ApiOk<T> = { ok: true; data: T };
 export type ApiErr = { ok: false; error: string; details?: unknown; raw?: string };
 
+/** When set (e.g. `http://127.0.0.1:8787`), all `/api/...` calls go there — needed for `vite preview` or web-only dev without the Vite proxy. */
+function apiBase(): string {
+  const raw = import.meta.env.VITE_API_BASE;
+  if (typeof raw !== 'string') return '';
+  return raw.trim().replace(/\/+$/, '');
+}
+
+function apiUrl(path: string): string {
+  const base = apiBase();
+  const p = path.startsWith('/') ? path : `/${path}`;
+  return base ? `${base}${p}` : p;
+}
+
 export async function postJson<T>(path: string, body: unknown): Promise<ApiOk<T> | ApiErr> {
   let text = '';
   try {
-    const res = await fetch(path, {
+    const res = await fetch(apiUrl(path), {
       method: 'POST',
       headers: { accept: 'application/json', 'content-type': 'application/json' },
       body: JSON.stringify(body),
@@ -25,7 +38,7 @@ export async function postJson<T>(path: string, body: unknown): Promise<ApiOk<T>
 async function getJson<T>(path: string): Promise<ApiOk<T> | ApiErr> {
   let text = '';
   try {
-    const res = await fetch(path, { headers: { accept: 'application/json' } });
+    const res = await fetch(apiUrl(path), { headers: { accept: 'application/json' } });
     text = await res.text();
     try {
       const parsed = JSON.parse(text) as unknown;
@@ -85,10 +98,19 @@ export function priceToBeat(slugOrId: string) {
   return getJson<{ slug: string; price_to_beat: number; source: string }>(`/api/price-to-beat/${encodeURIComponent(slugOrId)}`);
 }
 
-export function rtdsCrypto(symbol: 'btc/usd' | 'eth/usd' | 'sol/usd') {
-  return getJson<{ symbol: string; value: number; ts: number; receivedAt: number; source: string }>(
-    `/api/rtds/crypto?symbol=${encodeURIComponent(symbol)}`,
-  );
+export type RtdsCryptoPoint = { t: number; v: number };
+
+/** Latest underlying from Polymarket RTDS (Chainlink primary on WS; server may label Binance fallback). */
+export function rtdsCrypto(symbol: string) {
+  return getJson<{
+    symbol: string;
+    value: number;
+    ts: number;
+    receivedAt: number;
+    source: string;
+    /** Server-side Chainlink history (hydrates chart on load). */
+    history?: RtdsCryptoPoint[];
+  }>(`/api/rtds/crypto?symbol=${encodeURIComponent(symbol)}`);
 }
 
 export function clobBook(tokenId: string) {
