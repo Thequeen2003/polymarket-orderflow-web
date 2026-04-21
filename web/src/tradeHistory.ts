@@ -113,3 +113,72 @@ export function appendTradeHistory(row: Omit<TradeHistoryRow, 'id' | 'ts'> & { i
   return merged;
 }
 
+export function appendTradeHistoryWithId(
+  row: Omit<TradeHistoryRow, 'id' | 'ts'> & { id?: string; ts?: number },
+): { id: string; rows: TradeHistoryRow[] } {
+  const id = row.id ?? randomId();
+  const rows = appendTradeHistory({ ...row, id });
+  return { id, rows };
+}
+
+export function updateTradeHistoryRow(
+  id: string,
+  patch: Partial<Pick<TradeHistoryRow, 'status' | 'error' | 'price01' | 'shares' | 'usdCents'>>,
+): TradeHistoryRow[] {
+  const rows = loadTradeHistory();
+  let changed = false;
+  const next = rows.map((r) => {
+    if (r.id !== id) return r;
+    changed = true;
+    return { ...r, ...patch };
+  });
+  if (changed) saveTradeHistory(next);
+  return next;
+}
+
+function csvEscape(s: string): string {
+  if (/[,"\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+export function tradeHistoryToCsv(rows: TradeHistoryRow[]): string {
+  const header = [
+    'ts',
+    'time',
+    'mode',
+    'exec',
+    'side',
+    'label',
+    'token',
+    'price01',
+    'price_cents',
+    'shares',
+    'usd_cents_abs',
+    'status',
+    'error',
+  ];
+  const lines: string[] = [];
+  lines.push(header.join(','));
+  for (const r of rows) {
+    const priceCents = r.price01 == null ? '' : (r.price01 * 100).toFixed(2);
+    lines.push(
+      [
+        String(r.ts),
+        csvEscape(new Date(r.ts).toISOString()),
+        csvEscape(r.mode),
+        csvEscape(r.exec),
+        csvEscape(r.side),
+        csvEscape(r.label),
+        csvEscape(r.token),
+        r.price01 == null ? '' : String(r.price01),
+        csvEscape(priceCents),
+        r.shares == null ? '' : String(r.shares),
+        r.usdCents == null ? '' : String(Math.abs(r.usdCents)),
+        csvEscape(r.status),
+        csvEscape(r.error ?? ''),
+      ].join(','),
+    );
+  }
+  return lines.join('\n');
+}
+

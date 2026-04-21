@@ -1,9 +1,23 @@
 import { type ReactElement, useCallback, useEffect, useId, useMemo, useState } from 'react';
 import type { ApiErr } from './lib/api';
-import { tradeAvgEntry, tradeBalanceAllowance, tradeCreateOrder, tradeMarketOrder, tradeUpdateBalanceAllowance } from './lib/api';
+import {
+  tradeAvgEntry,
+  tradeBalanceAllowance,
+  tradeCreateOrderWithOpts,
+  tradeMarketOrderWithOpts,
+  tradeUpdateBalanceAllowance,
+} from './lib/api';
 import { TradeSegmentedControl } from './tradeUi';
-import { getPaperPosition, loadPaperAccount, markToMarket, paperTrade, resetPaperAccount } from './paperTrading';
-import { appendTradeHistory, clearTradeHistory, loadTradeHistory, type TradeHistoryRow } from './tradeHistory';
+import { addPaperOrder, getPaperPosition, loadPaperAccount, markToMarket, matchPaperOrders, paperTrade, resetPaperAccount } from './paperTrading';
+import {
+  appendTradeHistory,
+  appendTradeHistoryWithId,
+  clearTradeHistory,
+  loadTradeHistory,
+  tradeHistoryToCsv,
+  updateTradeHistoryRow,
+  type TradeHistoryRow,
+} from './tradeHistory';
 
 function isOk<T>(res: { ok: boolean } & Record<string, unknown>): res is { ok: true; data: T } {
   return res.ok === true;
@@ -48,7 +62,23 @@ function fmtTime(ts: number): string {
   }
 }
 
+function downloadTextFile(filename: string, content: string, mime = 'text/plain;charset=utf-8') {
+  try {
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch {
+    // ignore
+  }
+}
+
 export type SignalsTradePanelProps = {
+  marketSlug?: string;
+  marketQuestion?: string;
   upLabel: string;
   downLabel: string;
   upToken: string;
@@ -64,7 +94,19 @@ export type SignalsTradePanelProps = {
  * Signals tab: order entry (buy/sell, market/limit, amounts) against Polymarket CLOB via API.
  */
 export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
-  const { upLabel, downLabel, upToken, downToken, upMid, downMid, lane: controlledLane, onLaneChange, visualStyle = 'default' } = props;
+  const {
+    marketSlug,
+    marketQuestion,
+    upLabel,
+    downLabel,
+    upToken,
+    downToken,
+    upMid,
+    downMid,
+    lane: controlledLane,
+    onLaneChange,
+    visualStyle = 'default',
+  } = props;
   const idBase = useId();
   const idAmount = `${idBase}-amount`;
   const idLimitBuy = `${idBase}-limit-buy`;
@@ -78,12 +120,18 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const [accountMode, setAccountMode] = useState<'paper' | 'live'>('paper');
   const [paperAccount, setPaperAccount] = useState(() => loadPaperAccount());
   const [historyRows, setHistoryRows] = useState<TradeHistoryRow[]>(() => loadTradeHistory());
+  const [historyQuery, setHistoryQuery] = useState('');
+  const [historySide, setHistorySide] = useState<'all' | 'buy' | 'sell'>('all');
+  const [historyMode, setHistoryMode] = useState<'all' | 'paper' | 'live'>('all');
+  const [historyStatus, setHistoryStatus] = useState<'all' | 'filled' | 'submitted' | 'error'>('all');
 
   const [amount, setAmount] = useState('10');
   const [sellQty, setSellQty] = useState('');
   const [limitPriceCents, setLimitPriceCents] = useState('');
 
-  const [busy, setBusy] = useState(false);
+  const [busySubmit, setBusySubmit] = useState(false);
+  const [busyRefresh, setBusyRefresh] = useState(false);
+  const [submitAbort, setSubmitAbort] = useState<AbortController | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [okMsg, setOkMsg] = useState<string | null>(null);
   const [availUsdc, setAvailUsdc] = useState<number | null>(null);
@@ -208,7 +256,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
 
   const applyMaxBuy = useCallback(async () => {
     setErr(null);
-    setBusy(true);
+    setBusyRefresh(true);
     try {
       if (accountMode === 'paper') {
         if (unit === 'dollars') {
@@ -240,14 +288,14 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         setAmount(v > 0 ? String(v) : '0');
       }
     } finally {
-      setBusy(false);
+      setBusyRefresh(false);
     }
   }, [accountMode, mid, paperAccount.cashUsdCents, unit]);
 
   const refreshPositionAndMaxSell = useCallback(async () => {
     if (!token) return;
     setErr(null);
-    setBusy(true);
+    setBusyRefresh(true);
     try {
       if (accountMode === 'paper') {
         const sh = paperPos.shares;
@@ -275,7 +323,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       const v = Math.floor(sh * 1e4) / 1e4;
       setSellQty(v > 0 ? String(v) : '0');
     } finally {
-      setBusy(false);
+      setBusyRefresh(false);
     }
   }, [accountMode, paperPos.shares, token, upToken, downToken]);
 
@@ -344,10 +392,33 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       }
       return;
     }
-    const res = await tradeMarketOrder({ token, side: 'sell', amount: shares, signatureType: null });
+    const optimistic = appendTradeHistoryWithId({
+      mode: 'live',
+      exec: 'market',
+      side: 'sell',
+      token,
+      label,
+      price01: null,
+      shares,
+      usdCents: null,
+      status: 'submitted',
+    });
+    setHistoryRows(optimistic.rows);
+    const controller = new AbortController();
+    setSubmitAbort(controller);
+    const res = await tradeMarketOrderWithOpts(
+      { token, side: 'sell', amount: shares, signatureType: null },
+      { signal: controller.signal, timeoutMs: 12_000 },
+    );
     if (!isOk(res)) {
       const e = res as ApiErr;
       setErr(`${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`);
+      setHistoryRows(
+        updateTradeHistoryRow(optimistic.id, {
+          status: 'error',
+          error: `${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`,
+        }),
+      );
       setHistoryRows(
         appendTradeHistory({
           mode: 'live',
@@ -364,19 +435,6 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       );
     } else {
       setOkMsg(`Sold ${shares.toFixed(2)} shares of ${label}`);
-      setHistoryRows(
-        appendTradeHistory({
-          mode: 'live',
-          exec: 'market',
-          side: 'sell',
-          token,
-          label,
-          price01: null,
-          shares,
-          usdCents: null, // unknown until fill events are wired
-          status: 'submitted',
-        }),
-      );
       setSellQty('');
       void (async () => {
         const r = await tradeBalanceAllowance({ tokenId: token, assetType: 'conditional' });
@@ -387,10 +445,73 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         }
       })();
     }
+    setSubmitAbort(null);
   };
 
   const dismissOk = () => setOkMsg(null);
   const isSidebar = visualStyle === 'sidebar';
+
+  // Paper mode: auto-fill resting orders when mid crosses.
+  useEffect(() => {
+    if (accountMode !== 'paper') return;
+    if (!token) return;
+    if (mid == null) return;
+    const res = matchPaperOrders({ account: paperAccount, tokenId: token, mid01: mid });
+    if (!res.ok) return;
+    if (!res.filled.length) return;
+    setPaperAccount(res.account);
+    setHistoryRows((prev) => {
+      let rows = prev;
+      for (const f of res.filled) {
+        // Update the optimistic 'submitted' row (id = order id) into a filled row with the actual fill data.
+        rows = updateTradeHistoryRow(f.order.id, {
+          status: 'filled',
+          price01: f.fillPrice01,
+          shares: f.order.shares,
+          usdCents: Math.abs(f.usdCents),
+          error: undefined,
+        });
+      }
+      return rows;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accountMode, mid, paperAccount, token]);
+
+  const filteredHistory = useMemo(() => {
+    const q = historyQuery.trim().toLowerCase();
+    const out: TradeHistoryRow[] = [];
+    for (let i = 0; i < historyRows.length; i++) {
+      const r = historyRows[i]!;
+      if (historySide !== 'all' && r.side !== historySide) continue;
+      if (historyMode !== 'all' && r.mode !== historyMode) continue;
+      if (historyStatus !== 'all' && r.status !== historyStatus) continue;
+      if (q) {
+        const hay = `${r.label} ${r.token} ${r.exec} ${r.mode} ${r.side} ${r.status}`.toLowerCase();
+        if (!hay.includes(q)) continue;
+      }
+      out.push(r);
+    }
+    return out;
+  }, [historyMode, historyQuery, historyRows, historySide, historyStatus]);
+
+  const historySummary = useMemo(() => {
+    let buys = 0;
+    let sells = 0;
+    let submitted = 0;
+    let errors = 0;
+    let netUsdCents = 0;
+    for (const r of filteredHistory) {
+      if (r.side === 'buy') buys++;
+      else sells++;
+      if (r.status === 'submitted') submitted++;
+      else if (r.status === 'error') errors++;
+      if (r.usdCents != null) {
+        const abs = Math.abs(r.usdCents);
+        netUsdCents += r.side === 'buy' ? -abs : abs;
+      }
+    }
+    return { buys, sells, submitted, errors, netUsdCents };
+  }, [filteredHistory]);
 
   return (
     <div
@@ -405,6 +526,12 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         <div>
           <h1 className="text-lg font-semibold tracking-tight text-zinc-100">Trade</h1>
           <p className="mt-0.5 text-[11px] text-zinc-500">Order type · outcome · size · review</p>
+          {marketSlug || marketQuestion ? (
+            <div className="mt-2 space-y-0.5 text-[11px] text-zinc-500">
+              {marketQuestion ? <div className="line-clamp-2 text-zinc-300/90">{marketQuestion}</div> : null}
+              {marketSlug ? <div className="font-mono text-[10px] text-zinc-600">{marketSlug}</div> : null}
+            </div>
+          ) : null}
         </div>
         <div className="flex flex-wrap items-center justify-end gap-2">
           <TradeSegmentedControl
@@ -456,6 +583,33 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         </div>
       </div>
 
+      {accountMode === 'live' ? (
+        <div className="mt-4 rounded-xl border border-sky-800/30 bg-sky-950/10 px-3 py-2 text-[11px] text-sky-100/90">
+          <span className="font-semibold text-sky-200">Live mode:</span> history shows <span className="font-semibold">submitted</span> orders unless fills are tracked.
+          If your balances are blank, set <code className="text-sky-200/90">POLYMARKET_PRIVATE_KEY</code> + restart the API.
+        </div>
+      ) : null}
+      {busySubmit && submitAbort ? (
+        <div className="mt-3 flex items-center justify-between gap-2 rounded-xl border border-zinc-800/60 bg-black/20 px-3 py-2 text-[11px] text-zinc-400">
+          <span>Submitting…</span>
+          <button
+            type="button"
+            onClick={() => {
+              try {
+                submitAbort.abort();
+              } catch {
+                /* ignore */
+              } finally {
+                setSubmitAbort(null);
+              }
+            }}
+            className="rounded-lg border border-zinc-800/70 bg-black/15 px-2.5 py-1.5 text-[10px] font-bold text-zinc-200 hover:bg-black/25"
+          >
+            Cancel
+          </button>
+        </div>
+      ) : null}
+
       {accountMode === 'live' && balError ? (
         <div className="mt-4 rounded-lg border border-amber-800/35 bg-amber-950/20 px-3 py-2 text-[11px] text-amber-100/90">{balError}</div>
       ) : null}
@@ -496,6 +650,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
           >
             <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">{upLabel}</div>
             <div className="mt-1 text-2xl font-black tabular-nums text-emerald-100">{fmtCents(upMid)}</div>
+            <div className="mt-0.5 text-[10px] font-mono text-zinc-500">{upToken ? `${upToken.slice(0, 6)}…${upToken.slice(-4)}` : '—'}</div>
             <div className="mt-1 text-[11px] text-zinc-500">
               You hold{' '}
               <span className="font-mono text-zinc-300">
@@ -520,6 +675,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
           >
             <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">{downLabel}</div>
             <div className="mt-1 text-2xl font-black tabular-nums text-zinc-100">{fmtCents(downMid)}</div>
+            <div className="mt-0.5 text-[10px] font-mono text-zinc-500">{downToken ? `${downToken.slice(0, 6)}…${downToken.slice(-4)}` : '—'}</div>
             <div className="mt-1 text-[11px] text-zinc-500">
               You hold{' '}
               <span className="font-mono text-zinc-300">
@@ -637,11 +793,12 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
               type="button"
               onClick={() => void applyMaxBuy()}
               disabled={
-                busy ||
+                busySubmit ||
+                busyRefresh ||
                 (accountMode === 'paper' ? paperAccount.cashUsdCents <= 0 : !availUsdc) ||
                 (unit === 'shares' && (mid == null || mid <= 0))
               }
-              aria-busy={busy}
+              aria-busy={busySubmit || busyRefresh}
               title={maxBuyDisabledReason}
               className="min-h-[40px] rounded-lg border border-zinc-600/80 bg-zinc-900/60 px-4 py-2 text-xs font-semibold text-zinc-100 hover:bg-zinc-800/80 disabled:cursor-not-allowed disabled:opacity-40"
             >
@@ -699,60 +856,131 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
 
           <button
             type="button"
-            disabled={busy || !amtOk || (execMode !== 'market' && (limit01 == null || !Number.isFinite(limit01)))}
-            aria-busy={busy}
+            disabled={busySubmit || !amtOk || (execMode !== 'market' && (limit01 == null || !Number.isFinite(limit01)))}
+            aria-busy={busySubmit}
             className="mt-4 min-h-[52px] w-full rounded-xl bg-emerald-400 px-4 py-3 text-sm font-bold text-black shadow-lg shadow-emerald-950/30 hover:bg-emerald-300 disabled:cursor-not-allowed disabled:opacity-40"
             onClick={async () => {
               setErr(null);
               setOkMsg(null);
-              setBusy(true);
+              setBusySubmit(true);
               try {
                 if (accountMode === 'paper') {
                   const px = execMode === 'market' ? mid : limit01;
                   const shares = unit === 'shares' ? amtNum : px != null && px > 0 ? amtNum / px : NaN;
-                  const r = paperTrade({ account: paperAccount, tokenId: token, side: 'buy', shares, price01: px });
-                  if (!r.ok) {
-                    setErr(r.error);
-                    setHistoryRows(
-                      appendTradeHistory({
-                        mode: 'paper',
-                        exec: execMode,
-                        side: 'buy',
-                        token,
-                        label,
-                        price01: px ?? null,
-                        shares: Number.isFinite(shares) ? shares : null,
-                        usdCents: null,
-                        status: 'error',
-                        error: r.error,
-                      }),
-                    );
-                  }
-                  else {
-                    setPaperAccount(r.account);
-                    setOkMsg(`Paper bought ${shares.toFixed(2)} sh of ${label} @ ${(px! * 100).toFixed(1)}¢`);
-                    setHistoryRows(
-                      appendTradeHistory({
-                        mode: 'paper',
-                        exec: execMode,
-                        side: 'buy',
-                        token,
-                        label,
-                        price01: r.fill.price01,
-                        shares: r.fill.shares,
-                        usdCents: Math.abs(r.fill.usdCents),
-                        status: 'filled',
-                      }),
-                    );
+                  if (execMode === 'market') {
+                    const r = paperTrade({ account: paperAccount, tokenId: token, side: 'buy', shares, price01: px });
+                    if (!r.ok) {
+                      setErr(r.error);
+                      setHistoryRows(
+                        appendTradeHistory({
+                          mode: 'paper',
+                          exec: execMode,
+                          side: 'buy',
+                          token,
+                          label,
+                          price01: px ?? null,
+                          shares: Number.isFinite(shares) ? shares : null,
+                          usdCents: null,
+                          status: 'error',
+                          error: r.error,
+                        }),
+                      );
+                    } else {
+                      setPaperAccount(r.account);
+                      setOkMsg(`Paper bought ${shares.toFixed(2)} sh of ${label} @ ${(px! * 100).toFixed(1)}¢`);
+                      setHistoryRows(
+                        appendTradeHistory({
+                          mode: 'paper',
+                          exec: execMode,
+                          side: 'buy',
+                          token,
+                          label,
+                          price01: r.fill.price01,
+                          shares: r.fill.shares,
+                          usdCents: Math.abs(r.fill.usdCents),
+                          status: 'filled',
+                        }),
+                      );
+                    }
+                  } else {
+                    // Limit/touch in paper mode: rest if not marketable, auto-fill later when mid crosses.
+                    if (mid == null || limit01 == null) {
+                      setErr('Need a valid mid and limit price.');
+                    } else {
+                      const limit = limit01;
+                      const marketable = mid <= limit;
+                      if (marketable) {
+                        const r = paperTrade({ account: paperAccount, tokenId: token, side: 'buy', shares, price01: Math.min(mid, limit) });
+                        if (!r.ok) setErr(r.error);
+                        else {
+                          setPaperAccount(r.account);
+                          setOkMsg(`Paper filled buy ${shares.toFixed(2)} sh of ${label}`);
+                          setHistoryRows(
+                            appendTradeHistory({
+                              mode: 'paper',
+                              exec: execMode,
+                              side: 'buy',
+                              token,
+                              label,
+                              price01: r.fill.price01,
+                              shares: r.fill.shares,
+                              usdCents: Math.abs(r.fill.usdCents),
+                              status: 'filled',
+                            }),
+                          );
+                        }
+                      } else {
+                        const o = addPaperOrder({ tokenId: token, side: 'buy', limit01: limit, shares });
+                        setOkMsg(`Paper order resting: buy ${shares.toFixed(2)} sh ≤ ${(limit * 100).toFixed(1)}¢`);
+                        setHistoryRows(
+                          appendTradeHistory({
+                            id: o.id,
+                            ts: o.createdAt,
+                            mode: 'paper',
+                            exec: execMode,
+                            side: 'buy',
+                            token,
+                            label,
+                            price01: limit,
+                            shares,
+                            usdCents: Math.abs(Math.round(limit * shares * 100)),
+                            status: 'submitted',
+                          }),
+                        );
+                      }
+                    }
                   }
                   return;
                 }
                 if (execMode === 'market') {
                   const amountUsd = unit === 'dollars' ? amtNum : mid != null ? amtNum * mid : NaN;
-                  const res = await tradeMarketOrder({ token, side: 'buy', amount: amountUsd, signatureType: null });
+                  const optimistic = appendTradeHistoryWithId({
+                    mode: 'live',
+                    exec: 'market',
+                    side: 'buy',
+                    token,
+                    label,
+                    price01: null,
+                    shares: unit === 'shares' && Number.isFinite(amtNum) ? amtNum : null,
+                    usdCents: Number.isFinite(amountUsd) ? Math.abs(Math.round(amountUsd * 100)) : null,
+                    status: 'submitted',
+                  });
+                  setHistoryRows(optimistic.rows);
+                  const controller = new AbortController();
+                  setSubmitAbort(controller);
+                  const res = await tradeMarketOrderWithOpts(
+                    { token, side: 'buy', amount: amountUsd, signatureType: null },
+                    { signal: controller.signal, timeoutMs: 12_000 },
+                  );
                   if (!isOk(res)) {
                     const e = res as ApiErr;
                     setErr(`${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`);
+                    setHistoryRows(
+                      updateTradeHistoryRow(optimistic.id, {
+                        status: 'error',
+                        error: `${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`,
+                      }),
+                    );
                     setHistoryRows(
                       appendTradeHistory({
                         mode: 'live',
@@ -768,28 +996,36 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                       }),
                     );
                   } else setOkMsg(`Bought ~$${amountUsd.toFixed(2)} of ${label}`);
-                  if (isOk(res)) {
-                    setHistoryRows(
-                      appendTradeHistory({
-                        mode: 'live',
-                        exec: 'market',
-                        side: 'buy',
-                        token,
-                        label,
-                        price01: null,
-                        shares: unit === 'shares' && Number.isFinite(amtNum) ? amtNum : null,
-                        usdCents: Number.isFinite(amountUsd) ? Math.abs(Math.round(amountUsd * 100)) : null,
-                        status: 'submitted',
-                      }),
-                    );
-                  }
                 } else {
                   const price = limit01 ?? NaN;
                   const sizeShares = unit === 'shares' ? amtNum : price > 0 ? amtNum / price : NaN;
-                  const res = await tradeCreateOrder({ token, side: 'buy', price, size: sizeShares, signatureType: null });
+                  const optimistic = appendTradeHistoryWithId({
+                    mode: 'live',
+                    exec: execMode,
+                    side: 'buy',
+                    token,
+                    label,
+                    price01: Number.isFinite(price) ? price : null,
+                    shares: Number.isFinite(sizeShares) ? sizeShares : null,
+                    usdCents: Number.isFinite(price) && Number.isFinite(sizeShares) ? Math.abs(Math.round(price * sizeShares * 100)) : null,
+                    status: 'submitted',
+                  });
+                  setHistoryRows(optimistic.rows);
+                  const controller = new AbortController();
+                  setSubmitAbort(controller);
+                  const res = await tradeCreateOrderWithOpts(
+                    { token, side: 'buy', price, size: sizeShares, signatureType: null },
+                    { signal: controller.signal, timeoutMs: 12_000 },
+                  );
                   if (!isOk(res)) {
                     const e = res as ApiErr;
                     setErr(`${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`);
+                    setHistoryRows(
+                      updateTradeHistoryRow(optimistic.id, {
+                        status: 'error',
+                        error: `${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`,
+                      }),
+                    );
                     setHistoryRows(
                       appendTradeHistory({
                         mode: 'live',
@@ -805,28 +1041,14 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                       }),
                     );
                   } else setOkMsg(`${execMode === 'touch' ? 'Touch' : 'Limit'} buy ${label} ${sizeShares.toFixed(2)} @ ${(price * 100).toFixed(1)}¢`);
-                  if (isOk(res)) {
-                    setHistoryRows(
-                      appendTradeHistory({
-                        mode: 'live',
-                        exec: execMode,
-                        side: 'buy',
-                        token,
-                        label,
-                        price01: Number.isFinite(price) ? price : null,
-                        shares: Number.isFinite(sizeShares) ? sizeShares : null,
-                        usdCents: Number.isFinite(price) && Number.isFinite(sizeShares) ? Math.abs(Math.round(price * sizeShares * 100)) : null,
-                        status: 'submitted',
-                      }),
-                    );
-                  }
                 }
               } finally {
-                setBusy(false);
+                setBusySubmit(false);
+                setSubmitAbort(null);
               }
             }}
           >
-            {busy ? 'Submitting…' : `Buy ${label}`}
+            {busySubmit ? 'Submitting…' : `Buy ${label}`}
           </button>
         </>
       ) : (
@@ -953,8 +1175,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   <button
                     type="button"
                     onClick={() => void refreshPositionAndMaxSell()}
-                    disabled={busy}
-                    aria-busy={busy}
+                    disabled={busySubmit || busyRefresh}
+                    aria-busy={busySubmit || busyRefresh}
                     className="min-h-[48px] min-w-[4.5rem] rounded-xl border border-zinc-600/80 bg-zinc-900/70 px-4 text-sm font-semibold text-zinc-100 hover:bg-zinc-800 disabled:opacity-40"
                   >
                     Max
@@ -962,26 +1184,54 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   <button
                     type="button"
                     disabled={
-                      busy ||
+                      busySubmit ||
                       sellSharesClamped == null ||
                       sellSharesClamped <= 0 ||
                       (execMode !== 'market' && (limit01 == null || !Number.isFinite(limit01)))
                     }
-                    aria-busy={busy}
+                    aria-busy={busySubmit}
                     className="min-h-[48px] min-w-[6rem] rounded-xl bg-rose-500 px-4 text-sm font-bold text-black shadow-md shadow-rose-950/40 hover:bg-rose-400 disabled:cursor-not-allowed disabled:opacity-40"
                     onClick={async () => {
                       setErr(null);
                       setOkMsg(null);
                       if (sellSharesClamped == null || sellSharesClamped <= 0) return;
-                      setBusy(true);
+                      setBusySubmit(true);
                       try {
                         if (accountMode === 'paper') {
                           const px = execMode === 'market' ? mid : limit01;
                           const r = paperTrade({ account: paperAccount, tokenId: token, side: 'sell', shares: sellSharesClamped, price01: px });
-                          if (!r.ok) setErr(r.error);
-                          else {
+                          if (!r.ok) {
+                            setErr(r.error);
+                            setHistoryRows(
+                              appendTradeHistory({
+                                mode: 'paper',
+                                exec: execMode,
+                                side: 'sell',
+                                token,
+                                label,
+                                price01: px ?? null,
+                                shares: sellSharesClamped,
+                                usdCents: null,
+                                status: 'error',
+                                error: r.error,
+                              }),
+                            );
+                          } else {
                             setPaperAccount(r.account);
                             setOkMsg(`Paper sold ${sellSharesClamped.toFixed(2)} sh of ${label} @ ${(px! * 100).toFixed(1)}¢`);
+                            setHistoryRows(
+                              appendTradeHistory({
+                                mode: 'paper',
+                                exec: execMode,
+                                side: 'sell',
+                                token,
+                                label,
+                                price01: r.fill.price01,
+                                shares: r.fill.shares,
+                                usdCents: Math.abs(r.fill.usdCents),
+                                status: 'filled',
+                              }),
+                            );
                             setSellQty('');
                           }
                           return;
@@ -990,24 +1240,59 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                           await runMarketSell(sellSharesClamped);
                         } else {
                           const price = limit01 ?? NaN;
-                          const res = await tradeCreateOrder({
-                            token,
-                            side: 'sell',
-                            price,
-                            size: sellSharesClamped,
-                            signatureType: null,
-                          });
+                          const controller = new AbortController();
+                          setSubmitAbort(controller);
+                          const res = await tradeCreateOrderWithOpts(
+                            {
+                              token,
+                              side: 'sell',
+                              price,
+                              size: sellSharesClamped,
+                              signatureType: null,
+                            },
+                            { signal: controller.signal, timeoutMs: 12_000 },
+                          );
                           if (!isOk(res)) {
                             const e = res as ApiErr;
                             setErr(`${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`);
+                            setHistoryRows(
+                              appendTradeHistory({
+                                mode: 'live',
+                                exec: execMode,
+                                side: 'sell',
+                                token,
+                                label,
+                                price01: Number.isFinite(price) ? price : null,
+                                shares: sellSharesClamped,
+                                usdCents: Number.isFinite(price) ? Math.abs(Math.round(price * sellSharesClamped * 100)) : null,
+                                status: 'error',
+                                error: `${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`,
+                              }),
+                            );
                           } else setOkMsg(`${execMode === 'touch' ? 'Touch' : 'Limit'} sell ${label} ${sellSharesClamped.toFixed(2)} @ ${(price * 100).toFixed(1)}¢`);
+                          if (isOk(res)) {
+                            setHistoryRows(
+                              appendTradeHistory({
+                                mode: 'live',
+                                exec: execMode,
+                                side: 'sell',
+                                token,
+                                label,
+                                price01: Number.isFinite(price) ? price : null,
+                                shares: sellSharesClamped,
+                                usdCents: Number.isFinite(price) ? Math.abs(Math.round(price * sellSharesClamped * 100)) : null,
+                                status: 'submitted',
+                              }),
+                            );
+                          }
                         }
                       } finally {
-                        setBusy(false);
+                        setBusySubmit(false);
+                        setSubmitAbort(null);
                       }
                     }}
                   >
-                    {busy ? '…' : `Sell ${label}`}
+                    {busySubmit ? '…' : `Sell ${label}`}
                   </button>
                 </div>
               </div>
@@ -1030,7 +1315,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   <button
                     key={t}
                     type="button"
-                    disabled={!can || busy}
+                    disabled={!can || busySubmit || busyRefresh}
                     onClick={() => applyPct(pct)}
                     className={`min-h-[36px] rounded-lg border px-3 py-1.5 text-xs font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/35 ${
                       can ? 'border-zinc-700/70 bg-zinc-900/50 text-zinc-200 hover:bg-zinc-800/70' : 'border-zinc-800/70 text-zinc-600'
@@ -1045,26 +1330,54 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
             <button
               type="button"
               disabled={
-                busy ||
+                busySubmit ||
                 positionShares == null ||
                 positionShares <= 0 ||
                 (execMode !== 'market' && (limit01 == null || !Number.isFinite(limit01)))
               }
-              aria-busy={busy}
+              aria-busy={busySubmit}
               className="mt-4 min-h-[48px] w-full rounded-xl border-2 border-rose-600/50 bg-transparent px-4 py-3 text-sm font-bold text-rose-200 hover:bg-rose-950/35 disabled:cursor-not-allowed disabled:opacity-40"
               onClick={async () => {
                 setErr(null);
                 setOkMsg(null);
                 if (positionShares == null || positionShares <= 0) return;
-                setBusy(true);
+                setBusySubmit(true);
                 try {
                   if (accountMode === 'paper') {
                     const px = execMode === 'market' ? mid : limit01;
                     const r = paperTrade({ account: paperAccount, tokenId: token, side: 'sell', shares: positionShares, price01: px });
-                    if (!r.ok) setErr(r.error);
-                    else {
+                    if (!r.ok) {
+                      setErr(r.error);
+                      setHistoryRows(
+                        appendTradeHistory({
+                          mode: 'paper',
+                          exec: execMode,
+                          side: 'sell',
+                          token,
+                          label,
+                          price01: px ?? null,
+                          shares: positionShares,
+                          usdCents: null,
+                          status: 'error',
+                          error: r.error,
+                        }),
+                      );
+                    } else {
                       setPaperAccount(r.account);
                       setOkMsg(`Paper sold all ${label} ${positionShares.toFixed(2)} sh @ ${(px! * 100).toFixed(1)}¢`);
+                      setHistoryRows(
+                        appendTradeHistory({
+                          mode: 'paper',
+                          exec: execMode,
+                          side: 'sell',
+                          token,
+                          label,
+                          price01: r.fill.price01,
+                          shares: r.fill.shares,
+                          usdCents: Math.abs(r.fill.usdCents),
+                          status: 'filled',
+                        }),
+                      );
                       setSellQty('');
                     }
                     return;
@@ -1073,24 +1386,59 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                     await runMarketSell(positionShares);
                   } else {
                     const price = limit01 ?? NaN;
-                    const res = await tradeCreateOrder({
-                      token,
-                      side: 'sell',
-                      price,
-                      size: positionShares,
-                      signatureType: null,
-                    });
+                    const controller = new AbortController();
+                    setSubmitAbort(controller);
+                    const res = await tradeCreateOrderWithOpts(
+                      {
+                        token,
+                        side: 'sell',
+                        price,
+                        size: positionShares,
+                        signatureType: null,
+                      },
+                      { signal: controller.signal, timeoutMs: 12_000 },
+                    );
                     if (!isOk(res)) {
                       const e = res as ApiErr;
                       setErr(`${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`);
+                      setHistoryRows(
+                        appendTradeHistory({
+                          mode: 'live',
+                          exec: execMode,
+                          side: 'sell',
+                          token,
+                          label,
+                          price01: Number.isFinite(price) ? price : null,
+                          shares: positionShares,
+                          usdCents: Number.isFinite(price) ? Math.abs(Math.round(price * positionShares * 100)) : null,
+                          status: 'error',
+                          error: `${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`,
+                        }),
+                      );
                     } else setOkMsg(`${execMode === 'touch' ? 'Touch' : 'Limit'} sell all ${label} ${positionShares.toFixed(2)} @ ${(price * 100).toFixed(1)}¢`);
+                    if (isOk(res)) {
+                      setHistoryRows(
+                        appendTradeHistory({
+                          mode: 'live',
+                          exec: execMode,
+                          side: 'sell',
+                          token,
+                          label,
+                          price01: Number.isFinite(price) ? price : null,
+                          shares: positionShares,
+                          usdCents: Number.isFinite(price) ? Math.abs(Math.round(price * positionShares * 100)) : null,
+                          status: 'submitted',
+                        }),
+                      );
+                    }
                   }
                 } finally {
-                  setBusy(false);
+                  setBusySubmit(false);
+                  setSubmitAbort(null);
                 }
               }}
             >
-              {busy ? 'Submitting…' : `Sell entire position (${fmtShares(positionShares, 'compact')} sh)`}
+              {busySubmit ? 'Submitting…' : `Sell entire position (${fmtShares(positionShares, 'compact')} sh)`}
             </button>
           </div>
         </>
@@ -1128,20 +1476,93 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         <div className="border-t border-zinc-800/50 p-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="text-[11px] text-zinc-500">Stored locally in your browser.</div>
-            <button
-              type="button"
-              onClick={() => {
-                clearTradeHistory();
-                setHistoryRows([]);
-              }}
-              className="rounded-lg border border-zinc-800/70 bg-black/20 px-2.5 py-1.5 text-[10px] font-bold text-zinc-300 hover:bg-black/30"
-            >
-              Clear
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  const csv = tradeHistoryToCsv(historyRows);
+                  downloadTextFile(`polymarket-trade-history-${new Date().toISOString().slice(0, 10)}.csv`, csv, 'text/csv;charset=utf-8');
+                }}
+                className="rounded-lg border border-zinc-800/70 bg-black/20 px-2.5 py-1.5 text-[10px] font-bold text-zinc-300 hover:bg-black/30"
+              >
+                Export CSV
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  clearTradeHistory();
+                  setHistoryRows([]);
+                }}
+                className="rounded-lg border border-zinc-800/70 bg-black/20 px-2.5 py-1.5 text-[10px] font-bold text-zinc-300 hover:bg-black/30"
+              >
+                Clear
+              </button>
+            </div>
           </div>
 
           {historyRows.length ? (
             <div className="mt-3 max-h-[260px] overflow-auto rounded-xl border border-zinc-800/60 bg-black/15">
+              <div className="sticky top-0 z-10 border-b border-zinc-800/60 bg-zinc-950/80 p-2 backdrop-blur">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input
+                      value={historyQuery}
+                      onChange={(e) => setHistoryQuery(e.target.value)}
+                      placeholder="Search label/token/side/status…"
+                      className="h-9 w-full min-w-0 rounded-lg border border-zinc-800/70 bg-black/25 px-2.5 text-[12px] text-zinc-200 placeholder:text-zinc-600 outline-none sm:w-[260px]"
+                    />
+                    <select
+                      value={historySide}
+                      onChange={(e) => setHistorySide(e.target.value as any)}
+                      className="h-9 rounded-lg border border-zinc-800/70 bg-black/25 px-2.5 text-[12px] text-zinc-200 outline-none"
+                      aria-label="Filter by side"
+                    >
+                      <option value="all">All sides</option>
+                      <option value="buy">Buys</option>
+                      <option value="sell">Sells</option>
+                    </select>
+                    <select
+                      value={historyMode}
+                      onChange={(e) => setHistoryMode(e.target.value as any)}
+                      className="h-9 rounded-lg border border-zinc-800/70 bg-black/25 px-2.5 text-[12px] text-zinc-200 outline-none"
+                      aria-label="Filter by mode"
+                    >
+                      <option value="all">All modes</option>
+                      <option value="paper">Paper</option>
+                      <option value="live">Live</option>
+                    </select>
+                    <select
+                      value={historyStatus}
+                      onChange={(e) => setHistoryStatus(e.target.value as any)}
+                      className="h-9 rounded-lg border border-zinc-800/70 bg-black/25 px-2.5 text-[12px] text-zinc-200 outline-none"
+                      aria-label="Filter by status"
+                    >
+                      <option value="all">All status</option>
+                      <option value="filled">Filled</option>
+                      <option value="submitted">Submitted</option>
+                      <option value="error">Errors</option>
+                    </select>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2 text-[11px] text-zinc-400">
+                    <span className="font-mono text-zinc-500">
+                      Showing {filteredHistory.length}/{historyRows.length}
+                    </span>
+                    <span className="rounded-full border border-zinc-800/70 bg-black/20 px-2 py-0.5 font-mono text-zinc-300">
+                      Net {fmtUsdCents(historySummary.netUsdCents)}
+                    </span>
+                    {historySummary.submitted ? (
+                      <span className="rounded-full border border-zinc-800/70 bg-black/20 px-2 py-0.5 font-mono text-zinc-300">
+                        Submitted {historySummary.submitted}
+                      </span>
+                    ) : null}
+                    {historySummary.errors ? (
+                      <span className="rounded-full border border-rose-800/40 bg-rose-950/15 px-2 py-0.5 font-mono text-rose-200/90">
+                        Errors {historySummary.errors}
+                      </span>
+                    ) : null}
+                  </div>
+                </div>
+              </div>
               <table className="w-full border-collapse text-left text-[11px]">
                 <thead className="sticky top-0 bg-zinc-950/80 backdrop-blur">
                   <tr className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
@@ -1149,6 +1570,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                     <th className="px-2 py-2">Mode</th>
                     <th className="px-2 py-2">Side</th>
                     <th className="px-2 py-2">Exec</th>
+                    <th className="px-2 py-2">Outcome</th>
                     <th className="px-2 py-2">Price</th>
                     <th className="px-2 py-2 text-right">Shares</th>
                     <th className="px-2 py-2 text-right">USD</th>
@@ -1156,7 +1578,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   </tr>
                 </thead>
                 <tbody className="align-top">
-                  {historyRows.slice(0, 60).map((r) => (
+                  {filteredHistory.slice(0, 120).map((r) => (
                     <tr key={r.id} className="border-t border-zinc-900/70">
                       <td className="px-2 py-2 font-mono text-zinc-500">{fmtTime(r.ts)}</td>
                       <td className="px-2 py-2">
@@ -1168,9 +1590,14 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                         <span className={`font-bold ${r.side === 'buy' ? 'text-emerald-200' : 'text-rose-200'}`}>{r.side}</span>
                       </td>
                       <td className="px-2 py-2 text-zinc-400">{r.exec}</td>
+                      <td className="px-2 py-2">
+                        <span className="inline-flex max-w-[16rem] truncate rounded-lg border border-zinc-800/70 bg-black/15 px-2 py-0.5 text-[10px] font-semibold text-zinc-200/90">
+                          {r.label || '—'}
+                        </span>
+                      </td>
                       <td className="px-2 py-2 font-mono text-zinc-300">{r.price01 == null ? '—' : `${(r.price01 * 100).toFixed(1)}¢`}</td>
                       <td className="px-2 py-2 text-right font-mono text-zinc-300">{r.shares == null ? '—' : r.shares.toFixed(2)}</td>
-                      <td className="px-2 py-2 text-right font-mono tabular-nums text-zinc-300">
+                      <td className={`px-2 py-2 text-right font-mono tabular-nums ${r.side === 'buy' ? 'text-zinc-200' : 'text-emerald-200/90'}`}>
                         {r.usdCents == null ? '—' : fmtUsdCents(r.side === 'buy' ? -Math.abs(r.usdCents) : Math.abs(r.usdCents))}
                       </td>
                       <td className="px-2 py-2">

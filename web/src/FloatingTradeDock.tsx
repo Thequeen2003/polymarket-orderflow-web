@@ -78,6 +78,21 @@ export function FloatingTradeDock(props: FloatingTradeDockProps): ReactElement {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openNonce]);
 
+  // Snap the dock back on-screen when opened (prevents “lost” panels).
+  useEffect(() => {
+    if (!st.open) return;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    setSt((s) => {
+      const x = clamp(s.x, 8, Math.max(8, vw - 160));
+      const y = clamp(s.y, 8, Math.max(8, vh - 120));
+      const w = clamp(s.w, 320, Math.max(320, vw - 16));
+      const h = clamp(s.h, 360, Math.max(360, vh - 16));
+      if (x === s.x && y === s.y && w === s.w && h === s.h) return s;
+      return { ...s, x, y, w, h };
+    });
+  }, [st.open]);
+
   // Keep dock on screen on resize.
   useEffect(() => {
     const onResize = () => {
