@@ -48,7 +48,8 @@ function fmtProb01(p: number): string {
   return fmtCentsLabel(clamp01(p) * 100);
 }
 
-function topBookBias01(book: unknown): number | null {
+/** Bid-heavy → positive; ask-heavy → negative. */
+export function topBookBias01(book: unknown): number | null {
   try {
     const { bids, asks } = pickBookLevels(book);
     const sum = (arr: { size: number }[], n: number) =>

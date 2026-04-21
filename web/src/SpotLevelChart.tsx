@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState, type ReactElement } from 'react';
 import { spotVsLevelSentence } from './chartReadouts';
 import { describeSpot } from './liveContext';
 import type { BookSnapshot } from './orderflowMetrics';
+import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
 import { anchorPriceScale, analyzePtbReaction, buildSpotCandles, candleStraddlesPtb } from './spotVsPtb';
 
 export type SpotPoint = { t: number; v: number };
@@ -148,6 +149,14 @@ export function SpotLevelChart({
   const ctx = useMemo(() => describeSpot({ spot, priceToBeat }), [priceToBeat, spot]);
 
   const yBeat = priceToBeat != null ? yPrice(priceToBeat) : null;
+  const ptbPillText = priceToBeat != null ? `PTB ${fmtUsd(priceToBeat)}` : '';
+  const ptbPillH = 22;
+  const ptbPillW = priceToBeat != null ? Math.min(172, Math.max(92, 14 + ptbPillText.length * 6.4)) : 0;
+  const ptbPillX = width - pad - ptbPillW - 6;
+  const ptbPillY =
+    yBeat != null
+      ? Math.max(pad + 4, Math.min(yBeat - ptbPillH / 2, height - pad - ptbPillH - 4))
+      : 0;
 
   const maxExtAbove =
     priceToBeat != null && vals.length ? Math.max(0, spotMax - priceToBeat) : 0;
@@ -411,21 +420,6 @@ export function SpotLevelChart({
           />
         ) : null}
 
-        {yBeat != null ? (
-          <g>
-            <line x1={pad} x2={width - pad} y1={yBeat} y2={yBeat} className="stroke-amber-200" strokeWidth={3.2} />
-            <text
-              x={pad + 6}
-              y={Math.max(13, yBeat - 8)}
-              className="fill-amber-100 font-bold"
-              fontSize="11"
-              fontFamily="ui-monospace, monospace"
-            >
-              price-to-beat (anchor)
-            </text>
-          </g>
-        ) : null}
-
         <g opacity={0.85} fontSize="9" fontFamily="ui-monospace, monospace">
           <text x={width - pad - 2} y={pad + 11} textAnchor="end" className="fill-zinc-500">
             {fmtUsd(scale.plotMax)}
@@ -434,6 +428,54 @@ export function SpotLevelChart({
             {fmtUsd(scale.plotMin)}
           </text>
         </g>
+
+        {yBeat != null && priceToBeat != null ? (
+          <g className="pointer-events-none" aria-label="Price to beat">
+            {/* Soft track so the dashed PTB line stays visible on busy candles */}
+            <line
+              x1={pad}
+              x2={width - pad}
+              y1={yBeat}
+              y2={yBeat}
+              stroke="rgb(250 204 21)"
+              strokeWidth={7}
+              strokeLinecap="round"
+              opacity={0.18}
+            />
+            <line
+              x1={pad}
+              x2={width - pad}
+              y1={yBeat}
+              y2={yBeat}
+              stroke="rgb(250 204 21)"
+              strokeWidth={1.6}
+              strokeDasharray="6 5"
+              strokeLinecap="round"
+            />
+            <text
+              x={pad + 4}
+              y={Math.max(pad + 12, Math.min(yBeat - 5, height - pad - 28))}
+              fill="rgb(250 204 21)"
+              fontSize="11"
+              fontWeight={700}
+              fontFamily="ui-sans-serif, system-ui, sans-serif"
+            >
+              Price to Beat
+            </text>
+            <rect x={ptbPillX} y={ptbPillY} width={ptbPillW} height={ptbPillH} rx={11} fill="rgb(250 204 21)" fillOpacity={0.96} />
+            <text
+              x={ptbPillX + ptbPillW / 2}
+              y={ptbPillY + 15.5}
+              textAnchor="middle"
+              fill="#0a0a0a"
+              fontSize="10.5"
+              fontWeight={800}
+              fontFamily="ui-monospace, monospace"
+            >
+              {ptbPillText}
+            </text>
+          </g>
+        ) : null}
       </svg>
 
       <div className="mt-2 flex flex-wrap gap-3 text-[10px] leading-snug text-zinc-500">
@@ -488,7 +530,7 @@ export function SpotLevelChart({
         <summary className="cursor-pointer font-semibold text-zinc-300">Visual priority and logic</summary>
         <ul className="mt-2 list-inside list-disc space-y-1.5 leading-relaxed">
           <li>
-            <span className="text-amber-200">PTB line</span> is drawn last so it stays the anchor on top; then read inward: extension wings → interaction band → candles → thin shells (liquidity).
+            <span className="text-amber-200">PTB line</span> is a dashed yellow track with a right-axis PTB pill (reference-style); then read inward: extension wings → interaction band → candles → thin shells (liquidity).
           </li>
           <li>
             <span className="text-teal-200">Reaction strength</span> is the primary text read (bodies vs wicks, clean push vs hesitation vs rejection) — direction-agnostic.
@@ -503,7 +545,7 @@ export function SpotLevelChart({
       </details>
 
       <p className="mt-2 text-[10px] leading-snug text-zinc-600">
-        Spot: Polymarket RTDS (Chainlink). PTB: SSR anchor. Trade read is heuristic context, not a signal service.
+        {STREAM_ATTRIBUTION_LINE} PTB: SSR anchor. Trade read is heuristic context, not a signal service.
       </p>
     </div>
   );

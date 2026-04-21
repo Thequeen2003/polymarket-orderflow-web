@@ -7,6 +7,7 @@ const EPS_SIDE = 0.35;
 const BIN_COUNT = 52;
 const HOLD_FRAC = 0.56;
 const GAP_CLEAN = 0.44;
+const LADDER_TICKS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
 
 function extentWithZero(minV: number, maxV: number): { min: number; max: number } {
   const lo = Math.min(0, minV);
@@ -74,6 +75,18 @@ function addBookMass(
 function normalize01(vals: number[]): number[] {
   const m = Math.max(1e-9, ...vals);
   return vals.map((v) => Math.min(1, v / m));
+}
+
+function pickActiveWalls(levels: { price: number; size: number }[], n = 3): { price: number; size: number }[] {
+  const xs = levels.filter((l) => Number.isFinite(l.price) && Number.isFinite(l.size) && l.size > 0).slice(0, 28);
+  xs.sort((a, b) => b.size - a.size);
+  return xs.slice(0, n);
+}
+
+function arrowPath(x: number, y: number, dir: 'up' | 'down'): string {
+  const s = 4.5;
+  if (dir === 'up') return `M ${x} ${y + s} L ${x} ${y - s} M ${x - 3} ${y - s + 3} L ${x} ${y - s} L ${x + 3} ${y - s + 3}`;
+  return `M ${x} ${y - s} L ${x} ${y + s} M ${x - 3} ${y + s - 3} L ${x} ${y + s} L ${x + 3} ${y + s - 3}`;
 }
 
 function contiguousMaxMean(scores: number[], i0: number, i1: number): { mean: number; a: number; b: number } | null {
@@ -150,6 +163,39 @@ export function PtbGapMap(props: {
     const bookVac = bookN.map((t) => 1 - t);
     const composite = bins.map((_, i) => Math.max(tickVac[i]! * 0.62 + bookVac[i]! * 0.38, tickVac[i]! * 0.85));
 
+    // For side ladder + wall overlay we need a representative mapping from share-price -> ΔUSD.
+    const spreads: number[] = [];
+    const levelsAll = [
+      ...(bA.slice(0, 18) as { price: number; size: number }[]),
+      ...(aA.slice(0, 18) as { price: number; size: number }[]),
+      ...(bB.slice(0, 18) as { price: number; size: number }[]),
+      ...(aB.slice(0, 18) as { price: number; size: number }[]),
+    ];
+    if (levelsAll.length) {
+      const maxP = Math.max(...levelsAll.map((l) => l.price));
+      const minP = Math.min(...levelsAll.map((l) => l.price));
+      if (Number.isFinite(maxP) && Number.isFinite(minP)) spreads.push(maxP - minP);
+    }
+    const spread = spreads.length ? Math.max(0, ...spreads) : 0.12;
+    const scale = sessionRange / Math.max(0.06, Math.min(0.45, spread + 0.02));
+    const midRef =
+      midA != null && midB != null ? (midA + midB) / 2 : midA != null ? midA : midB != null ? midB : 0.5;
+
+    const ladder = LADDER_TICKS.map((p) => ({
+      p,
+      d: dSpot + (p - midRef) * scale,
+    }));
+
+    const walls = [
+      ...pickActiveWalls(aA, 3).map((w) => ({ ...w, side: 'ask' as const, source: 'above' as const })),
+      ...pickActiveWalls(bA, 3).map((w) => ({ ...w, side: 'bid' as const, source: 'above' as const })),
+      ...pickActiveWalls(aB, 3).map((w) => ({ ...w, side: 'ask' as const, source: 'below' as const })),
+      ...pickActiveWalls(bB, 3).map((w) => ({ ...w, side: 'bid' as const, source: 'below' as const })),
+    ].map((w) => ({
+      ...w,
+      d: dSpot + (w.price - midRef) * scale,
+    }));
+
     let aboveClose = 0;
     let belowClose = 0;
     for (const c of candles) {
@@ -224,6 +270,8 @@ export function PtbGapMap(props: {
       highlight,
       label,
       ruleLine,
+      ladder,
+      walls,
     };
   }, [level, deltaPts, candles, bookAbove, bookBelow]);
 
@@ -235,7 +283,7 @@ export function PtbGapMap(props: {
     );
   }
 
-  const { plotMin, plotMax, span, dSpot, bins, composite, highlight, label, ruleLine } = model;
+  const { plotMin, plotMax, span, dSpot, bins, composite, highlight, label, ruleLine, ladder, walls } = model;
   const width = 600;
   const height = 212;
   const pad = 14;
@@ -276,6 +324,27 @@ export function PtbGapMap(props: {
       <svg viewBox={`0 0 ${width} ${height}`} className="mt-1 h-[212px] w-full">
         <rect x="0" y="0" width={width} height={height} rx="14" className="fill-black/30 stroke-zinc-800/45" />
 
+        {/* Side ladder (10..90) mapped into Δ space */}
+        {ladder.map((t) => {
+          const y = yD(t.d);
+          const on = y >= pad && y <= height - pad;
+          if (!on) return null;
+          return (
+            <g key={`lad-${t.p}`}>
+              <line x1={pad} x2={width - pad} y1={y} y2={y} stroke="rgb(63 63 70)" strokeWidth={1} opacity={0.25} />
+              <text
+                x={width - pad + 2}
+                y={y + 3}
+                fill="rgb(161 161 170)"
+                fontSize="9"
+                fontFamily="ui-monospace, monospace"
+              >
+                {Math.round(t.p * 100)}
+              </text>
+            </g>
+          );
+        })}
+
         {/* Heatmap / ladder: per-bin horizontal strip */}
         {bins.map((b, i) => {
           const y1 = yD(b.hi);
@@ -312,6 +381,29 @@ export function PtbGapMap(props: {
 
         <line x1={pad} x2={width - pad} y1={y0} y2={y0} className="stroke-amber-300" strokeWidth={2.2} />
 
+        {/* Active walls (immediate): horizontal markers */}
+        {walls.map((w, i) => {
+          const y = yD(w.d);
+          if (y < pad || y > height - pad) return null;
+          const stroke = w.side === 'ask' ? 'rgb(251 113 133)' : 'rgb(52 211 153)';
+          const op = 0.55;
+          return (
+            <g key={`w-${w.source}-${w.side}-${w.price}-${i}`}>
+              <line x1={pad} x2={width - pad} y1={y} y2={y} stroke={stroke} strokeWidth={1.6} opacity={op} strokeDasharray="3 3" />
+              <text
+                x={pad + 6}
+                y={y - 2}
+                fill={stroke}
+                opacity={0.85}
+                fontSize="9"
+                fontFamily="ui-monospace, monospace"
+              >
+                {w.side === 'ask' ? 'ask' : 'bid'} wall {w.price.toFixed(2)}
+              </text>
+            </g>
+          );
+        })}
+
         {candles.map((c, i) => {
           const x0 = xT(c.t0);
           const x1 = xT(c.t1);
@@ -325,12 +417,30 @@ export function PtbGapMap(props: {
           const bot = Math.max(yO, yC);
           const bodyH = Math.max(1.2, bot - top);
           const bull = c.c >= c.o;
+          const wickTowardPtb = Math.abs(c.h) < Math.abs(c.o) && Math.abs(c.h) < Math.abs(c.c);
+          const toward = Math.abs(c.c) < Math.abs(c.o);
+          const arrowDir: 'up' | 'down' = c.c >= c.o ? 'up' : 'down';
           const stroke = bull ? 'rgb(52 211 153 / 0.92)' : 'rgb(251 113 133 / 0.9)';
           const fill = bull ? 'rgba(16,185,129,0.42)' : 'rgba(244,63,94,0.38)';
           return (
             <g key={`${c.t0}-${i}`}>
-              <line x1={xc} x2={xc} y1={yH} y2={yL} stroke={stroke} strokeWidth={1.05} opacity={0.95} />
+              <line
+                x1={xc}
+                x2={xc}
+                y1={yH}
+                y2={yL}
+                stroke={wickTowardPtb ? 'rgb(250 204 21)' : stroke}
+                strokeWidth={wickTowardPtb ? 1.45 : 1.05}
+                opacity={0.95}
+              />
               <rect x={xc - bw / 2} y={top} width={bw} height={bodyH} rx={1} fill={fill} stroke={stroke} strokeWidth={0.9} />
+              {/* Micro “better candle” marker: small arrow + tiny wick emphasis when moving toward PTB */}
+              {toward ? (
+                <>
+                  <path d={arrowPath(xc, top - 6, arrowDir)} fill="none" stroke="rgb(250 204 21)" strokeWidth={1.3} opacity={0.9} />
+                  <circle cx={xc} cy={top - 6} r={1.6} fill="rgb(250 204 21)" opacity={0.85} />
+                </>
+              ) : null}
             </g>
           );
         })}

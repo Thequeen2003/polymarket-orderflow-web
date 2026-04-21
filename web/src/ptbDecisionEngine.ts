@@ -6,9 +6,13 @@ import type { ProbMicrostructure } from './ptbAdvancedContext';
 
 export type SystemVerdict = 'ENTER' | 'WAIT' | 'SCALP';
 
+export type EnterBlockReason = 'dual_lane_tight' | null;
+
 export type PtbSystemDecision = {
   state: 'NEUTRAL';
   verdict: SystemVerdict;
+  /** When both lanes are competitively tight, ENTER is suppressed (verdict forced to WAIT). */
+  enterBlockReason: EnterBlockReason;
   edgeScore: number;
   edgeReasonLines: string[];
   evidence: { k: string; v: string }[];
@@ -209,6 +213,19 @@ export function computePtbSystemDecision(params: {
   else if ((edge >= 4.8 && edge < 7.1 && hasAnyGap) || (hasActiveGap && (overUp || overDn))) verdict = 'SCALP';
   else verdict = 'WAIT';
 
+  let enterBlockReason: EnterBlockReason = null;
+  const gapScoreU = gapU ? gapU.strength10 + (gapU.active ? 0.8 : 0) : 0;
+  const gapScoreD = gapD ? gapD.strength10 + (gapD.active ? 0.8 : 0) : 0;
+  const bothCompetitive =
+    gapU &&
+    gapD &&
+    ((gapU.active && gapD.active) ||
+      (Math.abs(gapScoreU - gapScoreD) <= 1.5 && gapScoreU >= 1.8 && gapScoreD >= 1.8));
+  if (bothCompetitive && verdict === 'ENTER') {
+    verdict = 'WAIT';
+    enterBlockReason = 'dual_lane_tight';
+  }
+
   if (micro && verdict === 'ENTER') {
     if (micro.takeoverRisk === 'high' && speedLabel !== 'FAST') verdict = 'SCALP';
     else if (micro.takeoverRisk === 'high' && micro.jumpRisk01 >= 0.48) verdict = 'SCALP';
@@ -315,6 +332,7 @@ export function computePtbSystemDecision(params: {
   return {
     state: 'NEUTRAL',
     verdict,
+    enterBlockReason,
     edgeScore: edge,
     edgeReasonLines,
     evidence,
@@ -343,6 +361,7 @@ function clamp(x: number, lo: number, hi: number): number {
 export const PTB_DECISION_FALLBACK: PtbSystemDecision = {
   state: 'NEUTRAL',
   verdict: 'WAIT',
+  enterBlockReason: null,
   edgeScore: 0,
   edgeReasonLines: [],
   evidence: [{ k: 'Data', v: 'need mid history on both outcomes' }],

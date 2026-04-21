@@ -340,10 +340,72 @@ async function tryPriceToBeat(slug: string): Promise<{ value: number; source: st
   throw new Error(`price_to_beat_unavailable: ${String(lastErr)}`);
 }
 
+function parseUpdownBucketFromSlug(slug: string): { symbol: string; bucketStartMs: number } | null {
+  const s = slug.trim().toLowerCase();
+  // Current API shortcut slugs look like: btc-updown-5m-1776735900
+  const m = /^([a-z0-9]{2,10})-updown-(5m|15m)-(\d{9,12})$/.exec(s);
+  if (!m) return null;
+  const asset = m[1]!;
+  const startSec = Number(m[3]!);
+  if (!Number.isFinite(startSec)) return null;
+  return { symbol: `${asset}/usd`, bucketStartMs: startSec * 1000 };
+}
+
+function derivePtbFromRtdsHistory(symbol: string, bucketStartMs: number): number | null {
+  const hist = rtdsHistory.get(symbol) ?? [];
+  if (hist.length === 0) return null;
+  // Prefer last tick at/before bucket start; else first tick after bucket start.
+  let before: RtdsHistPoint | null = null;
+  let after: RtdsHistPoint | null = null;
+  for (let i = 0; i < hist.length; i++) {
+    const p = hist[i]!;
+    if (p.t <= bucketStartMs) before = p;
+    else {
+      after = p;
+      break;
+    }
+  }
+  const chosen = before ?? after;
+  if (!chosen) return null;
+  const v = Number(chosen.v);
+  return Number.isFinite(v) ? v : null;
+}
+
+/** Polymarket RTDS websocket: `crypto_prices_chainlink` preferred; `crypto_prices` may supply Binance-backed values. */
 type RtdsPrice = { symbol: string; value: number; ts: number; receivedAt: number; source: 'chainlink' | 'binance' };
+type RtdsHistPoint = { t: number; v: number };
 const rtdsCache = new Map<string, RtdsPrice>();
+/** Ring buffer of Chainlink ticks per symbol (WS pushes) — returned to the web client to hydrate charts. */
+const rtdsHistory = new Map<string, RtdsHistPoint[]>();
+const RTDS_HIST_CAP = 900;
 let rtdsWs: WebSocket | null = null;
 let rtdsWsStarting: Promise<void> | null = null;
+
+function normalizeChainlinkTsMs(tsRaw: number): number {
+  if (!Number.isFinite(tsRaw)) return Date.now();
+  return tsRaw < 1e12 ? tsRaw * 1000 : tsRaw;
+}
+
+function recordRtdsTick(symbol: string, value: number, tsRaw: number, source: RtdsPrice['source']): void {
+  const sym = symbol.toLowerCase();
+  const tsMs = normalizeChainlinkTsMs(tsRaw);
+  rtdsCache.set(sym, {
+    symbol: sym,
+    value,
+    ts: tsMs,
+    receivedAt: Date.now(),
+    source,
+  });
+  const arr = rtdsHistory.get(sym) ?? [];
+  const last = arr[arr.length - 1];
+  if (last && last.t === tsMs) {
+    last.v = value;
+  } else {
+    arr.push({ t: tsMs, v: value });
+    if (arr.length > RTDS_HIST_CAP) arr.splice(0, arr.length - RTDS_HIST_CAP);
+  }
+  rtdsHistory.set(sym, arr);
+}
 
 async function ensureRtdsWs(): Promise<void> {
   if (rtdsWs && rtdsWs.readyState === WebSocket.OPEN) return;
@@ -353,17 +415,13 @@ async function ensureRtdsWs(): Promise<void> {
     const ws = new WebSocket('wss://ws-live-data.polymarket.com');
     rtdsWs = ws;
     ws.onopen = () => {
-      // Subscribe to chainlink crypto prices (btc/usd, eth/usd, sol/usd)
-      ws.send(
-        JSON.stringify({
-          action: 'subscribe',
-          subscriptions: [
-            { topic: 'crypto_prices_chainlink', type: '*', filters: JSON.stringify({ symbol: 'btc/usd' }) },
-            { topic: 'crypto_prices_chainlink', type: '*', filters: JSON.stringify({ symbol: 'eth/usd' }) },
-            { topic: 'crypto_prices_chainlink', type: '*', filters: JSON.stringify({ symbol: 'sol/usd' }) },
-          ],
-        }),
-      );
+      // Subscribe to a small default set; additional symbols are subscribed on-demand by the /api/rtds/crypto endpoint.
+      const subs = ['btc/usd', 'eth/usd', 'sol/usd'].map((symbol) => ({
+        topic: 'crypto_prices_chainlink',
+        type: '*',
+        filters: JSON.stringify({ symbol }),
+      }));
+      ws.send(JSON.stringify({ action: 'subscribe', subscriptions: subs }));
       resolve();
     };
     ws.onmessage = (ev) => {
@@ -376,13 +434,12 @@ async function ensureRtdsWs(): Promise<void> {
         const value = Number(payload.value);
         const ts = Number(payload.timestamp ?? msg.timestamp);
         if (!symbol || !Number.isFinite(value)) return;
-        rtdsCache.set(symbol.toLowerCase(), {
-          symbol: symbol.toLowerCase(),
+        recordRtdsTick(
+          symbol,
           value,
-          ts: Number.isFinite(ts) ? ts : Date.now(),
-          receivedAt: Date.now(),
-          source: topic === 'crypto_prices_chainlink' ? 'chainlink' : 'binance',
-        });
+          Number.isFinite(ts) ? ts : Date.now(),
+          topic === 'crypto_prices_chainlink' ? 'chainlink' : 'binance',
+        );
       } catch {
         /* ignore */
       }
@@ -398,7 +455,45 @@ async function ensureRtdsWs(): Promise<void> {
   return rtdsWsStarting;
 }
 
+const rtdsSubscribed = new Set<string>(['btc/usd', 'eth/usd', 'sol/usd']);
+
+function normalizeRtdsSymbol(s: string): string | null {
+  const sym = s.trim().toLowerCase();
+  if (!/^[a-z0-9]{2,12}\/usd$/.test(sym)) return null;
+  return sym;
+}
+
+function ensureRtdsSubscribed(symbol: string): void {
+  const sym = normalizeRtdsSymbol(symbol);
+  if (!sym) return;
+  if (rtdsSubscribed.has(sym)) return;
+  rtdsSubscribed.add(sym);
+  try {
+    if (rtdsWs && rtdsWs.readyState === WebSocket.OPEN) {
+      rtdsWs.send(
+        JSON.stringify({
+          action: 'subscribe',
+          subscriptions: [{ topic: 'crypto_prices_chainlink', type: '*', filters: JSON.stringify({ symbol: sym }) }],
+        }),
+      );
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
 const app = express();
+/** Allow browser → API on another origin (e.g. `VITE_API_BASE=http://127.0.0.1:8787` with Vite preview). */
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'accept, content-type');
+  if (req.method === 'OPTIONS') {
+    res.sendStatus(204);
+    return;
+  }
+  next();
+});
 app.use(express.json({ limit: '256kb' }));
 
 const ASSISTANT_SYSTEM =
@@ -706,6 +801,23 @@ app.get('/api/price-to-beat/:slug', async (req, res) => {
     const out = await tryPriceToBeat(slug);
     return json(res, 200, { ok: true, data: { slug, price_to_beat: out.value, source: out.source } });
   } catch (e) {
+    // Fallback for up/down shortcut slugs when Polymarket SSR endpoint format changes.
+    const b = parseUpdownBucketFromSlug(slug);
+    if (b) {
+      try {
+        await ensureRtdsWs();
+        const v = derivePtbFromRtdsHistory(b.symbol, b.bucketStartMs);
+        if (v != null) {
+          return json(res, 200, { ok: true, data: { slug, price_to_beat: v, source: 'rtds_chainlink_bucket_floor' } });
+        }
+        const cached = rtdsCache.get(b.symbol);
+        if (cached && Number.isFinite(cached.value)) {
+          return json(res, 200, { ok: true, data: { slug, price_to_beat: cached.value, source: 'rtds_chainlink_latest' } });
+        }
+      } catch {
+        // fallthrough to error
+      }
+    }
     return json(res, 502, { ok: false, error: 'price_to_beat_failed', details: { slug, err: String(e) } });
   }
 });
@@ -784,16 +896,19 @@ app.get('/api/clob/last-trade-price', async (req, res) => {
 });
 
 app.get('/api/rtds/crypto', async (req, res) => {
-  const symbol = String(req.query.symbol ?? '').trim().toLowerCase();
-  if (!symbol) return json(res, 400, { ok: false, error: 'missing_symbol' });
+  const raw = String(req.query.symbol ?? '');
+  const symbol = normalizeRtdsSymbol(raw);
+  if (!symbol) return json(res, 400, { ok: false, error: 'bad_symbol', details: { hint: 'expected e.g. btc/usd', symbol: raw } });
   try {
     await ensureRtdsWs();
+    ensureRtdsSubscribed(symbol);
   } catch (e) {
     return json(res, 502, { ok: false, error: 'rtds_unavailable', details: String(e) });
   }
   const v = rtdsCache.get(symbol);
   if (!v) return json(res, 404, { ok: false, error: 'no_price_yet', details: { symbol } });
-  return json(res, 200, { ok: true, data: v });
+  const history = rtdsHistory.get(symbol) ?? [];
+  return json(res, 200, { ok: true, data: { ...v, history } });
 });
 
 /** Parallel order books (CLI first, HTTP fallback per token). */
@@ -1340,4 +1455,7 @@ app.post('/api/trade/create-order', async (req, res) => {
 const port = Number(process.env.PORT ?? 8787);
 app.listen(port, () => {
   console.log(`[api] listening on http://127.0.0.1:${port}`);
+  void ensureRtdsWs().catch(() => {
+    /* RTDS warms on first /api/rtds/crypto request if this fails */
+  });
 });

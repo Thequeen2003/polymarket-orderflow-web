@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactElement } from 'react';
 import type { ClobBookEntry } from './lib/api';
 import { displayPrice, midPrice, pickBookLevels } from './bookLevels';
 import type { BookSnapshot } from './orderflowMetrics';
+import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
 import { resolveUpDownIndices } from './upDown';
 
 function parseIsoMs(v: unknown): number | null {
@@ -156,7 +157,7 @@ export function AboveBelowDashboard({
               </div>
             </div>
             <p className="mt-2 text-[10px] leading-snug text-zinc-600">
-              Price-to-beat from Polymarket SSR; spot from Polymarket RTDS Chainlink. This distance is the actual underlying price vs the level.
+              {STREAM_ATTRIBUTION_LINE} PTB: Polymarket SSR. This distance is underlying vs the level.
             </p>
           </div>
         ) : null}

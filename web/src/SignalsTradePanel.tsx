@@ -38,13 +38,16 @@ export type SignalsTradePanelProps = {
   downToken: string;
   upMid: number | null;
   downMid: number | null;
+  lane?: 'up' | 'down';
+  onLaneChange?: (lane: 'up' | 'down') => void;
+  visualStyle?: 'default' | 'sidebar';
 };
 
 /**
  * Signals tab: order entry (buy/sell, market/limit, amounts) against Polymarket CLOB via API.
  */
 export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
-  const { upLabel, downLabel, upToken, downToken, upMid, downMid } = props;
+  const { upLabel, downLabel, upToken, downToken, upMid, downMid, lane: controlledLane, onLaneChange, visualStyle = 'default' } = props;
   const idBase = useId();
   const idAmount = `${idBase}-amount`;
   const idLimitBuy = `${idBase}-limit-buy`;
@@ -52,7 +55,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const idSellQty = `${idBase}-sell-qty`;
 
   const [action, setAction] = useState<'buy' | 'sell'>('buy');
-  const [lane, setLane] = useState<'up' | 'down'>('up');
+  const [laneState, setLaneState] = useState<'up' | 'down'>(controlledLane ?? 'up');
   const [mode, setMode] = useState<'market' | 'limit'>('market');
   const [unit, setUnit] = useState<'dollars' | 'shares'>('dollars');
 
@@ -71,6 +74,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const [avgEntryUp, setAvgEntryUp] = useState<number | null>(null);
   const [avgEntryDown, setAvgEntryDown] = useState<number | null>(null);
 
+  const lane = controlledLane ?? laneState;
   const token = lane === 'up' ? upToken : downToken;
   const label = lane === 'up' ? upLabel : downLabel;
   const mid = lane === 'up' ? upMid : downMid;
@@ -152,12 +156,13 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
 
   const chooseLane = useCallback(
     (L: 'up' | 'down') => {
-      setLane(L);
+      if (controlledLane == null) setLaneState(L);
+      onLaneChange?.(L);
       setErr(null);
       setOkMsg(null);
       if (action === 'sell') setSellQty('');
     },
-    [action],
+    [action, controlledLane, onLaneChange],
   );
 
   const setUnitBuy = useCallback((u: 'dollars' | 'shares') => {
@@ -276,9 +281,16 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   };
 
   const dismissOk = () => setOkMsg(null);
+  const isSidebar = visualStyle === 'sidebar';
 
   return (
-    <div className="rounded-2xl border border-zinc-800/60 bg-gradient-to-b from-zinc-950/90 to-zinc-950/50 p-4 ring-1 ring-white/[0.04] sm:p-5">
+    <div
+      className={`border ring-1 ring-white/[0.04] ${
+        isSidebar
+          ? 'rounded-[28px] border-zinc-800/80 bg-[#0d1219] p-5 shadow-[0_18px_60px_rgba(0,0,0,0.35)]'
+          : 'rounded-2xl border-zinc-800/60 bg-gradient-to-b from-zinc-950/90 to-zinc-950/50 p-4 sm:p-5'
+      }`}
+    >
       {/* Header */}
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>

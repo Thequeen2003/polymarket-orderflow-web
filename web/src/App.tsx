@@ -25,7 +25,13 @@ import { FlowZonesTab } from './FlowZonesTab';
 import { SignalsPtbOnly } from './SignalsPtbOnly';
 import { TradeSegmentedControl } from './tradeUi';
 import { PtbWatchTab } from './PtbWatchTab';
-import { priceToBeat, rtdsCrypto } from './lib/api';
+import { priceToBeat, rtdsCrypto, type RtdsCryptoPoint } from './lib/api';
+import { WorkspaceTab } from './WorkspaceTab';
+import { DualPtbReferenceTab } from './DualPtbReferenceTab';
+import { PtbMultiAssetGrid, type PtbMultiAssetRow } from './PtbMultiAssetGrid';
+import { UnifiedPtbView } from './UnifiedPtbView';
+import { PtbThreeUp } from './PtbThreeUp';
+import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
 import type { SpotPoint } from './SpotLevelChart';
 import {
   bookIntelForAssistant,
@@ -39,6 +45,18 @@ import { buildRollingContext, rollingContextText } from './contextSummary';
 
 function pretty(value: unknown) {
   return JSON.stringify(value, null, 2);
+}
+
+function apiReachabilityHint(err: ApiErr): string {
+  if (err.error !== 'fetch_failed') return '';
+  const d = err.details != null ? String(err.details) : '';
+  return (
+    '\n\nCould not reach the backend. Typical fixes:\n' +
+    '• From repo root: npm run dev (starts API :8787 + Vite; markets use the /api proxy).\n' +
+    '• Or: npm run dev -w api in one terminal, npm run dev -w web in another.\n' +
+    '• vite preview / static dist: create web/.env with VITE_API_BASE=http://127.0.0.1:8787, rebuild, and keep the API running.\n' +
+    (d ? `Details: ${d}\n` : '')
+  );
 }
 
 const PTB_WATCH_SLUGS_KEY = 'ptbWatchSlugs.v1';
@@ -199,6 +217,23 @@ function isMarketClosed(m: unknown | null): boolean {
   if (!m || typeof m !== 'object') return false;
   const o = m as Record<string, unknown>;
   return o.closed === true;
+}
+
+function mergeSpotHistory(
+  prev: SpotPoint[],
+  data: { value: number; ts: number; history?: RtdsCryptoPoint[] },
+): SpotPoint[] {
+  const serverTs = Number.isFinite(data.ts) ? data.ts : Date.now();
+  const hist = data.history;
+  const cleaned =
+    Array.isArray(hist) && hist.length > 0
+      ? hist
+          .filter((q) => typeof q.t === 'number' && typeof q.v === 'number' && Number.isFinite(q.t) && Number.isFinite(q.v))
+          .sort((a, b) => a.t - b.t)
+          .slice(-600)
+      : null;
+  if (cleaned != null && cleaned.length > 0) return cleaned;
+  return [...prev, { t: serverTs, v: data.value }].slice(-600);
 }
 
 function parseUpdownSlug(slug: string): {
@@ -482,7 +517,48 @@ function OrderFlowAssistant({ apiAvailable, context }: { apiAvailable: boolean; 
 }
 
 type LoadMarketResult = { ok: true; slug: string; data: unknown } | { ok: false };
-type MainTab = 'book' | 'flowzones' | 'signals' | 'momentum' | 'watch' | 'assistant' | 'raw';
+type MainTab =
+  | 'book'
+  | 'flowzones'
+  | 'signals'
+  | 'dualptb'
+  | 'threeup'
+  | 'unified'
+  | 'multiscan'
+  | 'momentum'
+  | 'watch'
+  | 'workspace'
+  | 'assistant'
+  | 'raw';
+
+function mainTabTitle(tab: MainTab): string {
+  switch (tab) {
+    case 'book':
+      return 'Book';
+    case 'flowzones':
+      return 'Flow Zones';
+    case 'signals':
+      return 'Signals';
+    case 'dualptb':
+      return 'Dual PTB';
+    case 'threeup':
+      return '3-up';
+    case 'unified':
+      return 'Unified';
+    case 'multiscan':
+      return 'Multi scan';
+    case 'momentum':
+      return 'Momentum';
+    case 'watch':
+      return 'Watch';
+    case 'workspace':
+      return 'Workspace';
+    case 'assistant':
+      return 'Assistant';
+    case 'raw':
+      return 'Raw';
+  }
+}
 
 function MainTabButton({
   id,
@@ -529,7 +605,10 @@ function App() {
   const [assistantAvailable, setAssistantAvailable] = useState(false);
   const [shortcutBusy, setShortcutBusy] = useState<{ asset: UpdownShortcutAsset; interval: UpdownInterval } | null>(null);
   const [lastShortcut, setLastShortcut] = useState<{ asset: UpdownShortcutAsset; interval: UpdownInterval } | null>(null);
-  const [mainTab, setMainTab] = useState<MainTab>('book');
+  const [mainTab, setMainTab] = useState<MainTab>('dualptb');
+  const [threeUpInterval, setThreeUpInterval] = useState<UpdownInterval>('5m');
+  const [threeUpSlugs, setThreeUpSlugs] = useState<Record<string, string>>({});
+  const [threeUpMeta, setThreeUpMeta] = useState<Record<string, { ptb: number | null; endsInMs: number | null }>>({});
   const [ptbWatchSlugs, setPtbWatchSlugs] = useState<string[]>(() => readStringArray(PTB_WATCH_SLUGS_KEY, 12));
   const [ptbWatchRecentSlugs, setPtbWatchRecentSlugs] = useState<string[]>(() => readStringArray(PTB_WATCH_RECENT_KEY, 24));
   const [autoEnabled, setAutoEnabled] = useState(false);
@@ -547,7 +626,15 @@ function App() {
   const [rtdsSpot, setRtdsSpot] = useState<number | null>(null);
   const [rtdsTickAt, setRtdsTickAt] = useState<number | null>(null);
   const [spotSeriesBySlug, setSpotSeriesBySlug] = useState<Record<string, SpotPoint[]>>({});
+  /** RTDS Chainlink series per `btc/usd` | `eth/usd` | `sol/usd` — drives multi-asset scan + selected slug. */
+  const [spotBySymbol, setSpotBySymbol] = useState<Record<string, SpotPoint[]>>({});
+  const [watchMetaBySlug, setWatchMetaBySlug] = useState<Record<string, { ptb: number | null; endsInMs: number | null }>>({});
   const [now, setNow] = useState(() => Date.now());
+  const spotBySymbolRef = useRef<Record<string, SpotPoint[]>>({});
+
+  useEffect(() => {
+    spotBySymbolRef.current = spotBySymbol;
+  }, [spotBySymbol]);
 
   const prevDepthMapsRef = useRef<Record<string, { bids: Map<string, number>; asks: Map<string, number> }>>({});
 
@@ -576,7 +663,7 @@ function App() {
 
   const loadMarket = useCallback(async (slug: string): Promise<LoadMarketResult> => {
     const clean = normalizeMarketLookupRef(slug);
-    queueMicrotask(() => setMainTab('book'));
+    queueMicrotask(() => setMainTab((tab) => (tab === 'dualptb' ? tab : 'book')));
     setSelectedSlug(clean);
     setSlugInput(clean || slug.trim());
     setError(null);
@@ -638,7 +725,7 @@ function App() {
       });
     }
     else setError(pretty(res));
-  }, [selectedSlug]);
+  }, [selectedSlug, ptbWatchSlugs]);
 
   // When enabled, poll books every 5s to drive the chart.
   useEffect(() => {
@@ -678,7 +765,7 @@ function App() {
             : `API OK (HTTP mode — no polymarket CLI)${g}${a}`,
         );
       }
-      else setApiHealth(`API error: ${h.error}`);
+      else setApiHealth(`API error: ${h.error}${!isOk(h) && h.error === 'fetch_failed' ? ' — is the API running on :8787?' : ''}`);
 
       const list = await marketsList(25);
       if (isOk(list)) {
@@ -688,7 +775,7 @@ function App() {
         }
       } else {
         setMarkets([]);
-        setMarketsError(pretty(list));
+        setMarketsError(pretty(list) + apiReachabilityHint(list));
       }
     })();
   }, []);
@@ -718,17 +805,72 @@ function App() {
   }, [loadMarket]);
 
   useEffect(() => {
-    if (!selectedSlug) return;
-    void (async () => {
-      const ptb = await priceToBeat(selectedSlug);
+    const slug = selectedSlug.trim();
+    if (!slug) return;
+    let stopped = false;
+    const tick = async () => {
+      const ptb = await priceToBeat(slug);
+      if (stopped) return;
+      // Keep last good PTB on transient fetch errors (prevents chart flicker).
       if (isOk(ptb)) setSsrPriceToBeat(ptb.data.price_to_beat);
-      else setSsrPriceToBeat(null);
-    })();
+    };
+    void tick();
+    const id = window.setInterval(() => void tick(), 20_000);
+    return () => {
+      stopped = true;
+      window.clearInterval(id);
+    };
   }, [selectedSlug]);
 
   useEffect(() => {
     writeStringArray(PTB_WATCH_SLUGS_KEY, ptbWatchSlugs);
   }, [ptbWatchSlugs]);
+
+  useEffect(() => {
+    let stopped = false;
+    const assets: UpdownShortcutAsset[] = ['btc', 'eth', 'sol'];
+    const tick = async () => {
+      const res = await Promise.all(assets.map((a) => marketsUpdownShortcut(a, threeUpInterval)));
+      if (stopped) return;
+      const nextSlugs: Record<string, string> = {};
+      for (let i = 0; i < assets.length; i++) {
+        const a = assets[i]!;
+        const r = res[i]!;
+        if (!isOk(r)) continue;
+        const prior = nextUpdownSlug(r.data.slug, -1) ?? r.data.slug;
+        nextSlugs[a] = prior;
+      }
+      setThreeUpSlugs(nextSlugs);
+
+      const metas = await Promise.all(
+        Object.entries(nextSlugs).map(async ([asset, slug]) => {
+          const [mRes, pRes] = await Promise.all([marketsGet(slug), priceToBeat(slug)]);
+          const ptb = isOk(pRes) ? pRes.data.price_to_beat : null;
+          let endsInMs: number | null = null;
+          if (isOk(mRes) && mRes.data && typeof mRes.data === 'object') {
+            const endRaw = (mRes.data as Record<string, unknown>).endDate;
+            if (typeof endRaw === 'string') {
+              const t = Date.parse(endRaw);
+              if (Number.isFinite(t)) endsInMs = t - Date.now();
+            }
+          }
+          return { asset, ptb, endsInMs };
+        }),
+      );
+      if (stopped) return;
+      setThreeUpMeta((prev) => {
+        const next = { ...prev };
+        for (const m of metas) next[m.asset] = { ptb: m.ptb, endsInMs: m.endsInMs };
+        return next;
+      });
+    };
+    void tick();
+    const id = window.setInterval(() => void tick(), 20_000);
+    return () => {
+      stopped = true;
+      window.clearInterval(id);
+    };
+  }, [threeUpInterval]);
 
   useEffect(() => {
     writeStringArray(PTB_WATCH_RECENT_KEY, ptbWatchRecentSlugs);
@@ -749,34 +891,108 @@ function App() {
   }, []);
 
   useEffect(() => {
-    // RTDS spot (Chainlink) for BTC/ETH/SOL windows; derive symbol from slug prefix
-    const slug = selectedSlug.toLowerCase();
-    const sym = slug.startsWith('btc-') ? 'btc/usd' : slug.startsWith('eth-') ? 'eth/usd' : slug.startsWith('sol-') ? 'sol/usd' : null;
-    if (!sym) {
-      queueMicrotask(() => setRtdsSpot(null));
-      return;
-    }
+    const symFromSlug = (slug: string): string | null => {
+      const m = slug.trim().toLowerCase().match(/^([a-z0-9]{2,10})-updown-(5m|15m)-(\d+)$/);
+      if (!m) return null;
+      return `${m[1]!}/usd`;
+    };
+    const collect = (): string[] => {
+      const s = new Set<string>(['btc/usd', 'eth/usd', 'sol/usd']);
+      const a = symFromSlug(selectedSlug);
+      if (a) s.add(a);
+      for (const w of ptbWatchSlugs) {
+        const sym = symFromSlug(w);
+        if (sym) s.add(sym);
+      }
+      return Array.from(s).slice(0, 10);
+    };
+    const SYMS = collect();
     let stopped = false;
     const tick = async () => {
       if (stopped) return;
-      const p = await rtdsCrypto(sym);
-      if (isOk(p)) {
-        const ts = Date.now();
-        setRtdsSpot(p.data.value);
-        setRtdsTickAt(ts);
-        setSpotSeriesBySlug((m) => ({
-          ...m,
-          [selectedSlug]: [...(m[selectedSlug] ?? []), { t: ts, v: p.data.value }].slice(-600),
-        }));
+      const results = await Promise.all(SYMS.map((s) => rtdsCrypto(s)));
+      const base = spotBySymbolRef.current;
+      const next: Record<string, SpotPoint[]> = { ...base };
+      for (let i = 0; i < SYMS.length; i++) {
+        const sym = SYMS[i]!;
+        const res = results[i]!;
+        if (!isOk(res)) continue;
+        next[sym] = mergeSpotHistory(base[sym] ?? [], res.data);
       }
+      setSpotBySymbol(next);
+      const p = parseUpdownSlug(selectedSlug);
+      if (!p) {
+        queueMicrotask(() => {
+          setRtdsSpot(null);
+          setRtdsTickAt(null);
+          setSpotSeriesBySlug((m) => {
+            if (!selectedSlug.trim()) return m;
+            const { [selectedSlug]: _removed, ...rest } = m;
+            return rest;
+          });
+        });
+        return;
+      }
+      const sym = `${p.asset}/usd`;
+      const series = next[sym] ?? [];
+      queueMicrotask(() => {
+        setSpotSeriesBySlug((m) => ({ ...m, [selectedSlug]: series }));
+        if (series.length > 0) {
+          const last = series[series.length - 1]!;
+          setRtdsSpot(last.v);
+          setRtdsTickAt(last.t);
+        }
+      });
     };
     void tick();
-    const id = window.setInterval(() => void tick(), 3_000);
+    const id = window.setInterval(() => void tick(), 1_200);
     return () => {
       stopped = true;
       window.clearInterval(id);
     };
   }, [selectedSlug]);
+
+  useEffect(() => {
+    const slugs = [...new Set(ptbWatchSlugs.filter((s) => parseUpdownSlug(s) != null))];
+    if (slugs.length === 0) {
+      queueMicrotask(() => setWatchMetaBySlug({}));
+      return;
+    }
+    let cancelled = false;
+    const run = async () => {
+      const results = await Promise.all(
+        slugs.map(async (slug) => {
+          const [mRes, pRes] = await Promise.all([marketsGet(slug), priceToBeat(slug)]);
+          // Keep last good PTB if one poll fails (prevents watch grid flicker).
+          const prevPtb = watchMetaBySlug[slug]?.ptb ?? null;
+          const ptb = isOk(pRes) ? pRes.data.price_to_beat : prevPtb;
+          let endsInMs: number | null = null;
+          if (isOk(mRes) && mRes.data && typeof mRes.data === 'object') {
+            const endRaw = (mRes.data as Record<string, unknown>).endDate;
+            if (typeof endRaw === 'string') {
+              const t = Date.parse(endRaw);
+              if (Number.isFinite(t)) endsInMs = t - Date.now();
+            }
+          }
+          return { slug, ptb, endsInMs };
+        }),
+      );
+      if (cancelled) return;
+      setWatchMetaBySlug((prev) => {
+        const next = { ...prev };
+        for (const r of results) {
+          next[r.slug] = { ptb: r.ptb, endsInMs: r.endsInMs };
+        }
+        return next;
+      });
+    };
+    void run();
+    const id = window.setInterval(() => void run(), 20_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [ptbWatchSlugs]);
 
   const marketEndsInMs = useMemo(() => {
     if (!marketJson || typeof marketJson !== 'object') return null;
@@ -786,6 +1002,30 @@ function App() {
     if (!Number.isFinite(t)) return null;
     return t - now;
   }, [marketJson, now]);
+
+  const multiScanRows: PtbMultiAssetRow[] = useMemo(() => {
+    return ptbWatchSlugs
+      .map((slug) => {
+        const p = parseUpdownSlug(slug);
+        if (!p) return null;
+        const sym = `${p.asset}/usd`;
+        const spot = spotBySymbol[sym] ?? [];
+        const meta = watchMetaBySlug[slug];
+        const ptb = meta?.ptb ?? (slug === selectedSlug ? ssrPriceToBeat : null);
+        let endsMs: number | null = meta?.endsInMs ?? null;
+        if (slug === selectedSlug && marketEndsInMs != null) endsMs = marketEndsInMs;
+        const lastMs = spot.length ? spot[spot.length - 1]!.t : null;
+        return {
+          slug,
+          label: `${p.asset.toUpperCase()}/USD`,
+          spot,
+          priceToBeat: ptb,
+          endsInMs: endsMs,
+          lastUpdateMs: lastMs,
+        };
+      })
+      .filter((x): x is PtbMultiAssetRow => x != null);
+  }, [ptbWatchSlugs, spotBySymbol, watchMetaBySlug, selectedSlug, ssrPriceToBeat, marketEndsInMs]);
 
   const updownParsed = useMemo(() => parseUpdownSlug(selectedSlug), [selectedSlug]);
   const [updownLiveSlugFromApi, setUpdownLiveSlugFromApi] = useState<string | null>(null);
@@ -947,7 +1187,9 @@ function App() {
       } else {
         setMarketsError(null);
       }
-      await loadMarket(res.data.slug);
+      // Default to the prior round (more stable: PTB is the previous bucket's open and you avoid the just-rolled window).
+      const prior = nextUpdownSlug(res.data.slug, -1) ?? res.data.slug;
+      await loadMarket(prior);
     } finally {
       setShortcutBusy(null);
     }
@@ -1007,6 +1249,7 @@ function App() {
             <div>
               <h1 className="text-2xl font-semibold tracking-tight text-zinc-50 sm:text-[1.65rem]">Polymarket order flow</h1>
               <p className="mt-1 text-sm text-zinc-500">Live CLOB ladders and a small assistant for reading the book.</p>
+              <p className="mt-2 max-w-2xl text-[12px] leading-relaxed text-zinc-500">{STREAM_ATTRIBUTION_LINE}</p>
             </div>
             <div className="shrink-0 rounded-full border border-zinc-700/40 bg-zinc-950/50 px-3 py-1.5 font-mono text-[11px] leading-snug text-zinc-400">
               {apiHealth}
@@ -1145,7 +1388,7 @@ function App() {
 
           <div className="rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-5 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm xl:col-span-7">
             <div className="flex flex-wrap items-center gap-2 border-b border-zinc-800/40 pb-3">
-              <div className="text-[15px] font-semibold text-zinc-100">Book</div>
+              <div className="text-[15px] font-semibold text-zinc-100">{mainTabTitle(mainTab)}</div>
               <div className="truncate rounded-md bg-zinc-900/50 px-2 py-0.5 font-mono text-xs text-zinc-400">{selectedSlug || '—'}</div>
               {booksLoading ? (
                 <div className="rounded-full bg-indigo-500/15 px-2.5 py-0.5 text-xs font-medium text-indigo-200/90">Loading…</div>
@@ -1156,8 +1399,13 @@ function App() {
               <MainTabButton id="book" label="Book" active={mainTab === 'book'} onSelect={setMainTab} />
               <MainTabButton id="flowzones" label="Flow" title="Flow Zones" active={mainTab === 'flowzones'} onSelect={setMainTab} />
               <MainTabButton id="signals" label="Signals" active={mainTab === 'signals'} onSelect={setMainTab} />
+              <MainTabButton id="dualptb" label="Dual PTB" title="Reference PTB continuation tab" active={mainTab === 'dualptb'} onSelect={setMainTab} />
+              <MainTabButton id="threeup" label="3-up" title="BTC/ETH/SOL spot vs PTB (simultaneous)" active={mainTab === 'threeup'} onSelect={setMainTab} />
+              <MainTabButton id="unified" label="Unified" title="Unified PTB view (chart + panel)" active={mainTab === 'unified'} onSelect={setMainTab} />
+              <MainTabButton id="multiscan" label="Multi" title="Multi-asset PTB scan" active={mainTab === 'multiscan'} onSelect={setMainTab} />
               <MainTabButton id="momentum" label="Momentum" title="Momentum + Alerts" active={mainTab === 'momentum'} onSelect={setMainTab} />
               <MainTabButton id="watch" label="Watch" title="PTB Watch" active={mainTab === 'watch'} onSelect={setMainTab} />
+              <MainTabButton id="workspace" label="Workspace" title="Drag + resize board" active={mainTab === 'workspace'} onSelect={setMainTab} />
               <MainTabButton id="assistant" label="Assistant" active={mainTab === 'assistant'} onSelect={setMainTab} />
               <MainTabButton id="raw" label="Raw" active={mainTab === 'raw'} onSelect={setMainTab} />
             </div>
@@ -1177,13 +1425,18 @@ function App() {
                     </>
                   )}
                 </div>
-                {lastShortcut ? (
+                {updownParsed || lastShortcut ? (
                   <button
                     type="button"
-                    onClick={() => void openUpdownShortcut(lastShortcut.asset, lastShortcut.interval)}
+                    onClick={() =>
+                      void openUpdownShortcut(
+                        (updownParsed?.asset ?? lastShortcut!.asset) as UpdownShortcutAsset,
+                        (updownParsed?.interval ?? lastShortcut!.interval) as UpdownInterval,
+                      )
+                    }
                     className="rounded-lg border border-amber-700/40 bg-amber-950/30 px-3 py-2 text-xs font-semibold text-amber-100 hover:bg-amber-950/50"
                   >
-                    Refresh {lastShortcut.asset.toUpperCase()} {lastShortcut.interval}
+                    Refresh {(updownParsed?.asset ?? lastShortcut!.asset).toUpperCase()} {updownParsed?.interval ?? lastShortcut!.interval}
                   </button>
                 ) : null}
               </div>
@@ -1382,6 +1635,23 @@ function App() {
               />
             ) : null}
 
+            {mainTab === 'workspace' ? (
+              <WorkspaceTab
+                currentSlug={selectedSlug}
+                market={marketJson}
+                books={books}
+                outcomeLabels={outcomeLabels}
+                flowSeriesForSlug={flowSeriesBySlug[selectedSlug] ?? null}
+                booksFetchedAt={booksFetchedAt}
+                priceToBeatUsd={ssrPriceToBeat}
+                endsInMs={marketEndsInMs}
+                onOpenInBook={(slug) => {
+                  void loadMarket(slug);
+                  setMainTab('book');
+                }}
+              />
+            ) : null}
+
             {mainTab === 'flowzones' ? (
               <div className="mt-5">
                 <FlowZonesTab
@@ -1411,10 +1681,115 @@ function App() {
                   flowSeriesForSlug={flowSeriesBySlug[selectedSlug] ?? null}
                   endsInMs={marketEndsInMs}
                   booksFetchedAt={booksFetchedAt}
+                  spotStreamEligible={updownParsed != null}
                 />
                 <p className="mt-3 text-center text-[11px] text-zinc-600">
                   Book tab: order flow, ladders, and above/below context. Assistant tab: chat + digest.
                 </p>
+              </div>
+            ) : null}
+
+            {mainTab === 'multiscan' ? (
+              <div className="mt-5">
+                <PtbMultiAssetGrid
+                  rows={multiScanRows}
+                  onOpenSlug={(slug) => {
+                    void loadMarket(slug);
+                    setMainTab('dualptb');
+                  }}
+                  onAddMarkets={() => setMainTab('watch')}
+                />
+              </div>
+            ) : null}
+
+            {mainTab === 'threeup' ? (
+              <div className="mt-5">
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+                  <div className="text-sm font-semibold text-zinc-200">BTC / ETH / SOL · spot vs PTB</div>
+                  <div className="flex gap-1 rounded-xl border border-zinc-800/60 bg-black/20 p-1">
+                    <button
+                      type="button"
+                      onClick={() => setThreeUpInterval('5m')}
+                      className={`rounded-lg px-3 py-1.5 text-[12px] font-semibold ${
+                        threeUpInterval === '5m' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
+                      }`}
+                    >
+                      5m
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setThreeUpInterval('15m')}
+                      className={`rounded-lg px-3 py-1.5 text-[12px] font-semibold ${
+                        threeUpInterval === '15m' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
+                      }`}
+                    >
+                      15m
+                    </button>
+                  </div>
+                </div>
+                <PtbThreeUp
+                  rows={[
+                    {
+                      label: 'BTC/USD',
+                      spot: spotBySymbol['btc/usd'] ?? [],
+                      ptb: threeUpMeta.btc?.ptb ?? null,
+                      endsInMs: threeUpMeta.btc?.endsInMs ?? null,
+                      lastUpdateMs: (spotBySymbol['btc/usd'] ?? []).slice(-1)[0]?.t ?? null,
+                    },
+                    {
+                      label: 'ETH/USD',
+                      spot: spotBySymbol['eth/usd'] ?? [],
+                      ptb: threeUpMeta.eth?.ptb ?? null,
+                      endsInMs: threeUpMeta.eth?.endsInMs ?? null,
+                      lastUpdateMs: (spotBySymbol['eth/usd'] ?? []).slice(-1)[0]?.t ?? null,
+                    },
+                    {
+                      label: 'SOL/USD',
+                      spot: spotBySymbol['sol/usd'] ?? [],
+                      ptb: threeUpMeta.sol?.ptb ?? null,
+                      endsInMs: threeUpMeta.sol?.endsInMs ?? null,
+                      lastUpdateMs: (spotBySymbol['sol/usd'] ?? []).slice(-1)[0]?.t ?? null,
+                    },
+                  ]}
+                />
+              </div>
+            ) : null}
+
+            {mainTab === 'unified' ? (
+              <div className="mt-5">
+                <UnifiedPtbView
+                  market={marketJson}
+                  books={books}
+                  outcomeLabels={outcomeLabels}
+                  priceToBeat={ssrPriceToBeat}
+                  spot={spotSeriesBySlug[selectedSlug] ?? []}
+                  spotLastUpdateMs={rtdsTickAt}
+                  probUp={signalsProbMids.up}
+                  probDown={signalsProbMids.down}
+                  probLastUpdateMs={booksFetchedAt}
+                  flowSeriesForSlug={flowSeriesBySlug[selectedSlug] ?? null}
+                  booksFetchedAt={booksFetchedAt}
+                  endsInMs={marketEndsInMs}
+                  spotStreamEligible={updownParsed != null}
+                />
+              </div>
+            ) : null}
+
+            {mainTab === 'dualptb' ? (
+              <div className="mt-5">
+                <DualPtbReferenceTab
+                  market={marketJson}
+                  books={books}
+                  outcomeLabels={outcomeLabels}
+                  priceToBeat={ssrPriceToBeat}
+                  spot={spotSeriesBySlug[selectedSlug] ?? []}
+                  spotLastUpdateMs={rtdsTickAt}
+                  probUp={signalsProbMids.up}
+                  probDown={signalsProbMids.down}
+                  probLastUpdateMs={booksFetchedAt}
+                  endsInMs={marketEndsInMs}
+                  spotStreamEligible={updownParsed != null}
+                />
               </div>
             ) : null}
 
@@ -1484,6 +1859,13 @@ function App() {
                   className="rounded-xl border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
                 >
                   Signals
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMainTab('dualptb')}
+                  className="rounded-xl border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
+                >
+                  Dual PTB
                 </button>
                 <button
                   type="button"
