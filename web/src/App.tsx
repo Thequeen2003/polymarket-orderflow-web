@@ -30,9 +30,11 @@ import { priceToBeat, rtdsCrypto, type RtdsCryptoPoint } from './lib/api';
 import { WorkspaceTab } from './WorkspaceTab';
 import { DualPtbReferenceTab } from './DualPtbReferenceTab';
 import { FloatingTradeDock } from './FloatingTradeDock';
+import { shortTradeTabLabel, TradeSessionTabsBar, type TradeSessionTab } from './TradeSessionTabsBar';
 import { PtbMultiAssetGrid, type PtbMultiAssetRow } from './PtbMultiAssetGrid';
 import { UnifiedPtbView } from './UnifiedPtbView';
 import { PtbThreeUp } from './PtbThreeUp';
+import { MultiMarketCommandView, type MarketKey, type MultiMarketRow } from './MultiMarketCommandView';
 import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
 import type { SpotPoint } from './SpotLevelChart';
 import {
@@ -352,8 +354,9 @@ function OutcomePane({
   const gammaLines = useMemo(() => formatGammaVolumeLines(gammaStats), [gammaStats]);
   const [now, setNow] = useState(() => Date.now());
 
+  // Global clock tick for freshness badges / relative time. Keep low-frequency to avoid re-render thrash.
   useEffect(() => {
-    const id = window.setInterval(() => setNow(Date.now()), 2_000);
+    const id = window.setInterval(() => setNow(Date.now()), 5_000);
     return () => window.clearInterval(id);
   }, []);
 
@@ -529,6 +532,7 @@ type MainTab =
   | 'signals'
   | 'dualptb'
   | 'threeup'
+  | 'command'
   | 'unified'
   | 'multiscan'
   | 'momentum'
@@ -549,6 +553,8 @@ function mainTabTitle(tab: MainTab): string {
       return 'Dual PTB';
     case 'threeup':
       return '3-up';
+    case 'command':
+      return 'Command';
     case 'unified':
       return 'Unified';
     case 'multiscan':
@@ -615,6 +621,7 @@ function App() {
   const [threeUpInterval, setThreeUpInterval] = useState<UpdownInterval>('5m');
   const [_threeUpSlugs, setThreeUpSlugs] = useState<Record<string, string>>({});
   const [threeUpMeta, setThreeUpMeta] = useState<Record<string, { ptb: number | null; endsInMs: number | null }>>({});
+  const [commandSelected, setCommandSelected] = useState<MarketKey>('btc');
   const [ptbWatchSlugs, setPtbWatchSlugs] = useState<string[]>(() => readStringArray(PTB_WATCH_SLUGS_KEY, 12));
   const [ptbWatchRecentSlugs, setPtbWatchRecentSlugs] = useState<string[]>(() => readStringArray(PTB_WATCH_RECENT_KEY, 24));
   const [autoEnabled, setAutoEnabled] = useState(false);
@@ -640,6 +647,21 @@ function App() {
 
   const [globalTradeLane, setGlobalTradeLane] = useState<'up' | 'down'>('up');
   const [globalTradeOpenNonce, setGlobalTradeOpenNonce] = useState(0);
+  const [globalTradeLocked, setGlobalTradeLocked] = useState(false);
+  /** Multiple trade “sessions” in the floating dock; switching re-loads that slug (one CLOB at a time). */
+  const [tradeSessionTabs, setTradeSessionTabs] = useState<TradeSessionTab[]>([]);
+  const [activeTradeSessionTabId, setActiveTradeSessionTabId] = useState<string | null>(null);
+  const pendingTradeTabSlugRef = useRef<string | null>(null);
+  /** So closing all tabs does not immediately auto-reseed (user can run empty, then + Session). */
+  const tradeSessionAutoSeededRef = useRef(false);
+  const [globalTradeContext, setGlobalTradeContext] = useState<{
+    slug: string;
+    question: string;
+    upLabel: string;
+    downLabel: string;
+    upToken: string;
+    downToken: string;
+  } | null>(null);
 
   useEffect(() => {
     spotBySymbolRef.current = spotBySymbol;
@@ -662,7 +684,32 @@ function App() {
   const globalDownLabel = globalUpDown ? (outcomeLabels[globalUpDown.down] ?? 'DOWN') : 'DOWN';
   const globalUpToken = globalUpDown && books ? books[globalUpDown.up]?.token ?? '' : '';
   const globalDownToken = globalUpDown && books ? books[globalUpDown.down]?.token ?? '' : '';
-  const globalTradeEnabled = Boolean(globalUpToken && globalDownToken);
+  const globalMarketQuestion = useMemo(() => pickMarketQuestion(marketJson), [marketJson]);
+
+  const currentTradeContext = useMemo(() => {
+    const slug = selectedSlug.trim();
+    return {
+      slug,
+      question: globalMarketQuestion,
+      upLabel: globalUpLabel,
+      downLabel: globalDownLabel,
+      upToken: globalUpToken,
+      downToken: globalDownToken,
+    };
+  }, [globalDownLabel, globalDownToken, globalMarketQuestion, globalUpLabel, globalUpToken, selectedSlug]);
+
+  useEffect(() => {
+    if (globalTradeLocked) return;
+    if (!currentTradeContext.slug) {
+      setGlobalTradeContext(null);
+      return;
+    }
+    setGlobalTradeContext(currentTradeContext);
+  }, [currentTradeContext, globalTradeLocked]);
+
+  const effectiveTradeContext = globalTradeLocked && globalTradeContext ? globalTradeContext : currentTradeContext;
+  const effectiveTradeReady = Boolean(effectiveTradeContext.slug) && globalTradeReady;
+  const effectiveTradeEnabled = Boolean(effectiveTradeContext.upToken && effectiveTradeContext.downToken);
 
   const signalsProbMids = useMemo(() => {
     if (!selectedSlug || !books || books.length < 2 || outcomeLabels.length < 2) {
@@ -701,6 +748,101 @@ function App() {
     setError(pretty(res));
     return { ok: false };
   }, []);
+
+  const onGlobalTradeLaneChange = useCallback(
+    (lane: 'up' | 'down') => {
+      setGlobalTradeLane(lane);
+      if (!activeTradeSessionTabId) return;
+      setTradeSessionTabs((list) => list.map((t) => (t.id === activeTradeSessionTabId ? { ...t, lane } : t)));
+    },
+    [activeTradeSessionTabId],
+  );
+
+  const onSelectTradeSessionTab = useCallback(
+    (id: string) => {
+      const t = tradeSessionTabs.find((x) => x.id === id);
+      if (!t?.slug) return;
+      pendingTradeTabSlugRef.current = t.slug;
+      setActiveTradeSessionTabId(id);
+      setGlobalTradeLane(t.lane);
+      void loadMarket(t.slug);
+    },
+    [tradeSessionTabs, loadMarket],
+  );
+
+  const onAddTradeSessionTab = useCallback(() => {
+    const ctx = effectiveTradeContext;
+    if (!ctx.slug) return;
+    const id = `ts-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    setTradeSessionTabs((list) => [
+      ...list,
+      { id, label: shortTradeTabLabel(ctx.question, ctx.slug), slug: ctx.slug, lane: globalTradeLane },
+    ]);
+    setActiveTradeSessionTabId(id);
+  }, [effectiveTradeContext, globalTradeLane]);
+
+  const onCloseTradeSessionTab = useCallback(
+    (id: string) => {
+      setTradeSessionTabs((list) => {
+        const wasActive = id === activeTradeSessionTabId;
+        const next = list.filter((t) => t.id !== id);
+        if (wasActive) {
+          const pick = next[0];
+          queueMicrotask(() => {
+            if (pick) {
+              pendingTradeTabSlugRef.current = pick.slug;
+              setActiveTradeSessionTabId(pick.id);
+              setGlobalTradeLane(pick.lane);
+              void loadMarket(pick.slug);
+            } else {
+              pendingTradeTabSlugRef.current = null;
+              setActiveTradeSessionTabId(null);
+            }
+          });
+        }
+        return next;
+      });
+    },
+    [activeTradeSessionTabId, loadMarket],
+  );
+
+  // First time a market is available, create one default session tab. After the user closes all tabs, do not auto-reseed.
+  useEffect(() => {
+    if (tradeSessionTabs.length > 0) {
+      tradeSessionAutoSeededRef.current = true;
+      return;
+    }
+    if (tradeSessionAutoSeededRef.current) return;
+    const slug = currentTradeContext.slug?.trim();
+    if (!slug) return;
+    tradeSessionAutoSeededRef.current = true;
+    const id = `s0-${slug.replace(/[^a-z0-9-]/gi, '').slice(0, 20)}`;
+    setTradeSessionTabs([{ id, label: shortTradeTabLabel(currentTradeContext.question, slug), slug, lane: globalTradeLane }]);
+    setActiveTradeSessionTabId(id);
+  }, [currentTradeContext.slug, currentTradeContext.question, globalTradeLane, tradeSessionTabs.length]);
+
+  // Keep the active session tab in sync with the loaded market, unless we’re mid tab-switched load.
+  useEffect(() => {
+    const slug = currentTradeContext.slug?.trim();
+    if (!slug) return;
+
+    if (pendingTradeTabSlugRef.current) {
+      if (selectedSlug.trim() !== pendingTradeTabSlugRef.current) {
+        return;
+      }
+      pendingTradeTabSlugRef.current = null;
+    }
+
+    if (!activeTradeSessionTabId) return;
+    setTradeSessionTabs((list) => {
+      if (!list.some((t) => t.id === activeTradeSessionTabId)) return list;
+      return list.map((t) =>
+        t.id === activeTradeSessionTabId
+          ? { ...t, slug, label: shortTradeTabLabel(currentTradeContext.question, slug) }
+          : t,
+      );
+    });
+  }, [activeTradeSessionTabId, currentTradeContext.question, currentTradeContext.slug, selectedSlug]);
 
   const loadBooks = useCallback(async (ids: string[]) => {
     if (ids.length === 0) {
@@ -846,6 +988,11 @@ function App() {
   }, [selectedSlug]);
 
   useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 5_000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  useEffect(() => {
     writeStringArray(PTB_WATCH_SLUGS_KEY, ptbWatchSlugs);
   }, [ptbWatchSlugs]);
 
@@ -908,10 +1055,7 @@ function App() {
     });
   }, [selectedSlug]);
 
-  useEffect(() => {
-    const id = window.setInterval(() => setNow(Date.now()), 5_000);
-    return () => window.clearInterval(id);
-  }, []);
+  // (intentionally no second clock interval)
 
   useEffect(() => {
     const symFromSlug = (slug: string): string | null => {
@@ -1447,9 +1591,9 @@ function App() {
                     'border-zinc-700/70 bg-black/20 text-zinc-200 hover:bg-black/30'
                   }`}
                   title={
-                    !globalTradeReady
+                    !effectiveTradeReady
                       ? 'Open trade (market not ready yet)'
-                      : globalTradeEnabled
+                      : effectiveTradeEnabled
                         ? 'Open trade'
                         : 'Open trade (tokens not resolved yet)'
                   }
@@ -1465,6 +1609,7 @@ function App() {
               <MainTabButton id="signals" label="Signals" active={mainTab === 'signals'} onSelect={setMainTab} />
               <MainTabButton id="dualptb" label="Dual PTB" title="Reference PTB continuation tab" active={mainTab === 'dualptb'} onSelect={setMainTab} />
               <MainTabButton id="threeup" label="3-up" title="BTC/ETH/SOL spot vs PTB (simultaneous)" active={mainTab === 'threeup'} onSelect={setMainTab} />
+              <MainTabButton id="command" label="Command" title="Multi-market command tiles + command center" active={mainTab === 'command'} onSelect={setMainTab} />
               <MainTabButton id="unified" label="Unified" title="Unified PTB view (chart + panel)" active={mainTab === 'unified'} onSelect={setMainTab} />
               <MainTabButton id="multiscan" label="Multi" title="Multi-asset PTB scan" active={mainTab === 'multiscan'} onSelect={setMainTab} />
               <MainTabButton id="momentum" label="Momentum" title="Momentum + Alerts" active={mainTab === 'momentum'} onSelect={setMainTab} />
@@ -1481,28 +1626,67 @@ function App() {
               openNonce={globalTradeOpenNonce}
               inline={<></>}
               floating={
-                globalTradeEnabled ? (
-                  <SignalsTradePanel
-                    upLabel={globalUpLabel}
-                    downLabel={globalDownLabel}
-                    upToken={globalUpToken}
-                    downToken={globalDownToken}
-                    upMid={signalsProbMids.up.length ? (signalsProbMids.up[signalsProbMids.up.length - 1]!.v ?? null) : null}
-                    downMid={signalsProbMids.down.length ? (signalsProbMids.down[signalsProbMids.down.length - 1]!.v ?? null) : null}
-                    lane={globalTradeLane}
-                    onLaneChange={setGlobalTradeLane}
-                    visualStyle="sidebar"
+                <div className="space-y-3">
+                  <TradeSessionTabsBar
+                    tabs={tradeSessionTabs}
+                    activeId={activeTradeSessionTabId}
+                    onSelect={onSelectTradeSessionTab}
+                    onAdd={onAddTradeSessionTab}
+                    onClose={onCloseTradeSessionTab}
                   />
-                ) : !globalTradeReady ? (
-                  <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-4 text-sm text-zinc-500">
-                    Load a market (with books) to enable trading. Once a market is loaded, open this dock again.
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-zinc-800/70 bg-black/20 px-3 py-2">
+                    <div className="min-w-0">
+                      <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Active market (session tab)</div>
+                      <div className="truncate text-[12px] font-semibold text-zinc-200">{effectiveTradeContext.question || effectiveTradeContext.slug || '—'}</div>
+                      {effectiveTradeContext.slug ? <div className="truncate font-mono text-[10px] text-zinc-600">{effectiveTradeContext.slug}</div> : null}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setGlobalTradeLocked((v) => {
+                            const next = !v;
+                            if (next) setGlobalTradeContext(currentTradeContext);
+                            return next;
+                          });
+                        }}
+                        className={`min-h-[34px] rounded-xl border px-3 text-[11px] font-black tracking-wide transition-colors ${
+                          globalTradeLocked
+                            ? 'border-amber-500/50 bg-amber-500/10 text-amber-100 hover:bg-amber-500/15'
+                            : 'border-zinc-800/70 bg-black/15 text-zinc-200 hover:bg-black/25'
+                        }`}
+                        title={globalTradeLocked ? 'Unlock (follow current market)' : 'Lock (stay on this market)'}
+                      >
+                        {globalTradeLocked ? 'Locked' : 'Lock'}
+                      </button>
+                    </div>
                   </div>
-                ) : (
-                  <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-4 text-sm text-zinc-500">
-                    Trading UI is ready, but this market’s outcome tokens aren’t resolved yet. Load a 2-outcome market (or wait for books), and ensure your API has{' '}
-                    <code className="text-zinc-400">POLYMARKET_PRIVATE_KEY</code> set to place real orders.
-                  </div>
-                )
+
+                  {effectiveTradeEnabled ? (
+                    <SignalsTradePanel
+                      marketSlug={effectiveTradeContext.slug}
+                      marketQuestion={effectiveTradeContext.question}
+                      upLabel={effectiveTradeContext.upLabel}
+                      downLabel={effectiveTradeContext.downLabel}
+                      upToken={effectiveTradeContext.upToken}
+                      downToken={effectiveTradeContext.downToken}
+                      upMid={signalsProbMids.up.length ? (signalsProbMids.up[signalsProbMids.up.length - 1]!.v ?? null) : null}
+                      downMid={signalsProbMids.down.length ? (signalsProbMids.down[signalsProbMids.down.length - 1]!.v ?? null) : null}
+                      lane={globalTradeLane}
+                      onLaneChange={onGlobalTradeLaneChange}
+                      visualStyle="sidebar"
+                    />
+                  ) : !effectiveTradeReady ? (
+                    <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-4 text-sm text-zinc-500">
+                      Load a market (with books) to enable trading. Once a market is loaded, open this dock again.
+                    </div>
+                  ) : (
+                    <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-4 text-sm text-zinc-500">
+                      Trading UI is ready, but this market’s outcome tokens aren’t resolved yet. Load a 2-outcome market (or wait for books), and ensure your API has{' '}
+                      <code className="text-zinc-400">POLYMARKET_PRIVATE_KEY</code> set to place real orders.
+                    </div>
+                  )}
+                </div>
               }
             />
 
@@ -1847,6 +2031,79 @@ function App() {
                       lastUpdateMs: (spotBySymbol['sol/usd'] ?? []).slice(-1)[0]?.t ?? null,
                     },
                   ]}
+                />
+              </div>
+            ) : null}
+
+            {mainTab === 'command' ? (
+              <div className="mt-5">
+                <MultiMarketCommandView
+                  intervalLabel={threeUpInterval}
+                  rows={
+                    [
+                      {
+                        key: 'btc',
+                        label: `BTC ${threeUpInterval}`,
+                        slug: _threeUpSlugs.btc ?? '',
+                        spot: spotBySymbol['btc/usd'] ?? [],
+                        ptb: threeUpMeta.btc?.ptb ?? null,
+                        endsInMs: threeUpMeta.btc?.endsInMs ?? null,
+                        lastUpdateMs: (spotBySymbol['btc/usd'] ?? []).slice(-1)[0]?.t ?? null,
+                      },
+                      {
+                        key: 'eth',
+                        label: `ETH ${threeUpInterval}`,
+                        slug: _threeUpSlugs.eth ?? '',
+                        spot: spotBySymbol['eth/usd'] ?? [],
+                        ptb: threeUpMeta.eth?.ptb ?? null,
+                        endsInMs: threeUpMeta.eth?.endsInMs ?? null,
+                        lastUpdateMs: (spotBySymbol['eth/usd'] ?? []).slice(-1)[0]?.t ?? null,
+                      },
+                      {
+                        key: 'sol',
+                        label: `SOL ${threeUpInterval}`,
+                        slug: _threeUpSlugs.sol ?? '',
+                        spot: spotBySymbol['sol/usd'] ?? [],
+                        ptb: threeUpMeta.sol?.ptb ?? null,
+                        endsInMs: threeUpMeta.sol?.endsInMs ?? null,
+                        lastUpdateMs: (spotBySymbol['sol/usd'] ?? []).slice(-1)[0]?.t ?? null,
+                      },
+                      {
+                        key: 'matic',
+                        label: `MATIC ${threeUpInterval}`,
+                        slug: '',
+                        spot: [],
+                        ptb: null,
+                        endsInMs: null,
+                        lastUpdateMs: null,
+                        disabled: true,
+                      },
+                      {
+                        key: 'alt',
+                        label: `ALT ${threeUpInterval}`,
+                        slug: '',
+                        spot: [],
+                        ptb: null,
+                        endsInMs: null,
+                        lastUpdateMs: null,
+                        disabled: true,
+                      },
+                    ] as MultiMarketRow[]
+                  }
+                  selectedKey={commandSelected}
+                  onSelectKey={setCommandSelected}
+                  onFocusMarket={(slug) => {
+                    if (!slug) return;
+                    void loadMarket(slug);
+                    setMainTab('dualptb');
+                  }}
+                  onOpenTradeDock={({ slug, lane }) => {
+                    if (slug) void loadMarket(slug);
+                    // Let the dock auto-bind to the currently loaded market unless user locks manually.
+                    setGlobalTradeLocked(false);
+                    setGlobalTradeLane(lane);
+                    setGlobalTradeOpenNonce((n) => n + 1);
+                  }}
                 />
               </div>
             ) : null}

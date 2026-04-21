@@ -1,6 +1,11 @@
 export type ApiOk<T> = { ok: true; data: T };
 export type ApiErr = { ok: false; error: string; details?: unknown; raw?: string };
 
+type JsonOpts = {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+};
+
 /** When set (e.g. `http://127.0.0.1:8787`), all `/api/...` calls go there — needed for `vite preview` or web-only dev without the Vite proxy. */
 function apiBase(): string {
   const raw = import.meta.env.VITE_API_BASE;
@@ -35,10 +40,25 @@ export async function postJson<T>(path: string, body: unknown): Promise<ApiOk<T>
   }
 }
 
-async function getJson<T>(path: string): Promise<ApiOk<T> | ApiErr> {
+async function getJson<T>(path: string, opts?: JsonOpts): Promise<ApiOk<T> | ApiErr> {
   let text = '';
+  const timeoutMs = opts?.timeoutMs;
+  const controller = timeoutMs ? new AbortController() : null;
+  const t =
+    timeoutMs && controller
+      ? window.setTimeout(() => {
+          try {
+            controller.abort();
+          } catch {
+            /* ignore */
+          }
+        }, timeoutMs)
+      : null;
   try {
-    const res = await fetch(apiUrl(path), { headers: { accept: 'application/json' } });
+    const res = await fetch(apiUrl(path), {
+      headers: { accept: 'application/json' },
+      signal: opts?.signal ?? controller?.signal,
+    });
     text = await res.text();
     try {
       const parsed = JSON.parse(text) as unknown;
@@ -49,6 +69,44 @@ async function getJson<T>(path: string): Promise<ApiOk<T> | ApiErr> {
     }
   } catch (e) {
     return { ok: false, error: 'fetch_failed', details: String(e) };
+  } finally {
+    if (t != null) window.clearTimeout(t);
+  }
+}
+
+export async function postJsonWithOpts<T>(path: string, body: unknown, opts?: JsonOpts): Promise<ApiOk<T> | ApiErr> {
+  let text = '';
+  const timeoutMs = opts?.timeoutMs;
+  const controller = timeoutMs ? new AbortController() : null;
+  const t =
+    timeoutMs && controller
+      ? window.setTimeout(() => {
+          try {
+            controller.abort();
+          } catch {
+            /* ignore */
+          }
+        }, timeoutMs)
+      : null;
+  try {
+    const res = await fetch(apiUrl(path), {
+      method: 'POST',
+      headers: { accept: 'application/json', 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: opts?.signal ?? controller?.signal,
+    });
+    text = await res.text();
+    try {
+      const parsed = JSON.parse(text) as unknown;
+      if (!res.ok) return (parsed as ApiErr) ?? { ok: false, error: `http_${res.status}` };
+      return parsed as ApiOk<T>;
+    } catch {
+      return { ok: false, error: `bad_json_http_${res.status}`, raw: text.slice(0, 4000) };
+    }
+  } catch (e) {
+    return { ok: false, error: 'fetch_failed', details: String(e) };
+  } finally {
+    if (t != null) window.clearTimeout(t);
   }
 }
 
@@ -163,6 +221,13 @@ export function tradeMarketOrder(body: { token: string; side: 'buy' | 'sell'; am
   return postJson<unknown>('/api/trade/market-order', body);
 }
 
+export function tradeMarketOrderWithOpts(
+  body: { token: string; side: 'buy' | 'sell'; amount: number; signatureType?: string | null },
+  opts?: JsonOpts,
+) {
+  return postJsonWithOpts<unknown>('/api/trade/market-order', body, opts);
+}
+
 export function tradeCreateOrder(body: {
   token: string;
   side: 'buy' | 'sell';
@@ -171,6 +236,19 @@ export function tradeCreateOrder(body: {
   signatureType?: string | null;
 }) {
   return postJson<unknown>('/api/trade/create-order', body);
+}
+
+export function tradeCreateOrderWithOpts(
+  body: {
+    token: string;
+    side: 'buy' | 'sell';
+    price: number;
+    size: number;
+    signatureType?: string | null;
+  },
+  opts?: JsonOpts,
+) {
+  return postJsonWithOpts<unknown>('/api/trade/create-order', body, opts);
 }
 
 /** CLOB cached balance (USDC for buys, outcome shares for sells). */
