@@ -4,7 +4,7 @@ import type { ReactElement } from 'react';
 export function TradeSegmentedControl<T extends string>(props: {
   value: T;
   onChange: (v: T) => void;
-  options: { value: T; label: string }[];
+  options: { value: T; label: string; title?: string }[];
   /** Wider min height for primary toolbars */
   size?: 'sm' | 'md';
   className?: string;
@@ -20,6 +20,7 @@ export function TradeSegmentedControl<T extends string>(props: {
         <button
           key={o.value}
           type="button"
+          title={o.title}
           onClick={() => onChange(o.value)}
           className={`${h} flex-1 rounded-lg px-3 py-2 text-xs font-bold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/40 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950 ${
             value === o.value ? 'bg-zinc-800 text-zinc-50 shadow-sm ring-1 ring-zinc-700/50' : 'text-zinc-500 hover:text-zinc-300'

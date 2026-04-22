@@ -26,6 +26,17 @@ const STORAGE_KEY = 'pmof.paperAccount.v1';
 const ORDERS_KEY = 'pmof.paperOrders.v1';
 const STARTING_CASH_USD_CENTS = 5000 * 100;
 
+/** Limit float dust in stored share balances (Polymarket-scale lots). */
+const SHARES_DECIMALS = 6;
+const SHARES_SCALE = 10 ** SHARES_DECIMALS;
+/** Reject sells smaller than this (avoids “0.00 sh” filled rows from float residue). */
+const MIN_SELL_SHARES = 1e-4;
+
+function roundPositionShares(x: number): number {
+  const y = Math.round(x * SHARES_SCALE) / SHARES_SCALE;
+  return Math.abs(y) < 1 / SHARES_SCALE ? 0 : y;
+}
+
 export function freshPaperAccount(now = Date.now()): PaperAccount {
   return {
     cashUsdCents: STARTING_CASH_USD_CENTS,
@@ -73,8 +84,9 @@ export function getPaperPosition(a: PaperAccount, tokenId: string): PaperPositio
   if (!t) return { shares: 0, avgCost01: null };
   const p = a.positionsByToken[t];
   if (!p) return { shares: 0, avgCost01: null };
+  const rawShares = Number.isFinite(Number(p.shares)) ? Math.max(0, Number(p.shares)) : 0;
   return {
-    shares: Number.isFinite(Number(p.shares)) ? Math.max(0, Number(p.shares)) : 0,
+    shares: roundPositionShares(rawShares),
     avgCost01: p.avgCost01 == null ? null : Number.isFinite(Number(p.avgCost01)) ? Math.max(0, Math.min(1, Number(p.avgCost01))) : null,
   };
 }
@@ -236,30 +248,38 @@ export function paperTrade(args: {
   if (!next.positionsByToken[token]) next.positionsByToken[token] = { shares: 0, avgCost01: null };
   const pos = next.positionsByToken[token];
 
-  const usdCents = usdCentsForTrade(price01, shares);
-
   if (args.side === 'buy') {
+    const usdCents = usdCentsForTrade(price01, shares);
     if (usdCents > next.cashUsdCents) return { ok: false, error: 'insufficient_cash' };
     next.cashUsdCents -= usdCents;
-    const prevShares = Number(pos.shares) || 0;
+    const prevShares = roundPositionShares(Number(pos.shares) || 0);
     const prevAvg = pos.avgCost01 == null ? price01 : Number(pos.avgCost01);
-    const nextShares = prevShares + shares;
+    const nextShares = roundPositionShares(prevShares + shares);
     const nextAvg = (prevAvg * prevShares + price01 * shares) / Math.max(1e-9, nextShares);
     pos.shares = nextShares;
     pos.avgCost01 = clamp01(nextAvg);
-  } else {
-    const prevShares = Number(pos.shares) || 0;
-    if (shares > prevShares) return { ok: false, error: 'insufficient_shares' };
-    next.cashUsdCents += usdCents;
-    const avg = pos.avgCost01 == null ? price01 : Number(pos.avgCost01);
-    const costBasis = usdCentsForTrade(avg, shares);
-    next.realizedPnlUsdCents += usdCents - costBasis;
-    pos.shares = Math.max(0, prevShares - shares);
-    if (pos.shares === 0) pos.avgCost01 = null;
+    savePaperAccount(next);
+    return { ok: true, account: next, fill: { token, side: args.side, price01: clamp01(price01), shares, usdCents } };
+  }
+
+  const prevShares = roundPositionShares(Number(pos.shares) || 0);
+  const eff = roundPositionShares(Math.min(shares, prevShares));
+  if (!Number.isFinite(eff) || eff < MIN_SELL_SHARES) {
+    return { ok: false, error: 'Nothing to sell (position is flat or below minimum size).' };
+  }
+  const usdCents = usdCentsForTrade(price01, eff);
+  next.cashUsdCents += usdCents;
+  const avg = pos.avgCost01 == null ? price01 : Number(pos.avgCost01);
+  const costBasis = usdCentsForTrade(avg, eff);
+  next.realizedPnlUsdCents += usdCents - costBasis;
+  pos.shares = roundPositionShares(Math.max(0, prevShares - eff));
+  if (pos.shares < MIN_SELL_SHARES) {
+    pos.shares = 0;
+    pos.avgCost01 = null;
   }
 
   savePaperAccount(next);
-  return { ok: true, account: next, fill: { token, side: args.side, price01: clamp01(price01), shares, usdCents } };
+  return { ok: true, account: next, fill: { token, side: args.side, price01: clamp01(price01), shares: eff, usdCents } };
 }
 
 export function markToMarket(args: { account: PaperAccount; tokenId: string; mid01: number | null }): {

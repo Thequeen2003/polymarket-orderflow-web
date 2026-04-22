@@ -19,6 +19,43 @@ function apiUrl(path: string): string {
   return base ? `${base}${p}` : p;
 }
 
+function parseJsonBody(text: string): { ok: true; value: unknown } | { ok: false } {
+  const trimmed = text.trim();
+  if (!trimmed) return { ok: false };
+  try {
+    return { ok: true, value: JSON.parse(trimmed) as unknown };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/** 502/503 from proxy or crash often return HTML/plain text — surface a useful ApiErr instead of `bad_json_http_*`. */
+function apiErrFromNonJsonResponse(res: Response, text: string): ApiErr {
+  const status = res.status;
+  const preview = (text.trim().slice(0, 280) || '(empty body)').replace(/\s+/g, ' ');
+  const gateway = status === 502 || status === 503 || status === 504;
+  return {
+    ok: false,
+    error: gateway ? 'bad_gateway' : `http_${status}_non_json`,
+    details: {
+      httpStatus: status,
+      hint: gateway
+        ? 'The trade API did not return JSON (server down, proxy error, or crash). From the repo root run `npm run dev -w api` so it listens on port 8787, or set VITE_API_BASE to your API URL for preview/production.'
+        : 'The server returned a non-JSON response.',
+      bodyPreview: preview,
+    },
+    raw: text.slice(0, 4000),
+  };
+}
+
+function interpretParsedJson<T>(res: Response, parsed: unknown): ApiOk<T> | ApiErr {
+  if (!res.ok) return (parsed as ApiErr) ?? { ok: false, error: `http_${res.status}` };
+  if (parsed && typeof parsed === 'object' && 'ok' in parsed && (parsed as { ok: unknown }).ok === false) {
+    return parsed as ApiErr;
+  }
+  return parsed as ApiOk<T>;
+}
+
 export async function postJson<T>(path: string, body: unknown): Promise<ApiOk<T> | ApiErr> {
   let text = '';
   try {
@@ -28,13 +65,9 @@ export async function postJson<T>(path: string, body: unknown): Promise<ApiOk<T>
       body: JSON.stringify(body),
     });
     text = await res.text();
-    try {
-      const parsed = JSON.parse(text) as unknown;
-      if (!res.ok) return (parsed as ApiErr) ?? { ok: false, error: `http_${res.status}` };
-      return parsed as ApiOk<T>;
-    } catch {
-      return { ok: false, error: `bad_json_http_${res.status}`, raw: text.slice(0, 4000) };
-    }
+    const parsedWrap = parseJsonBody(text);
+    if (!parsedWrap.ok) return apiErrFromNonJsonResponse(res, text);
+    return interpretParsedJson<T>(res, parsedWrap.value);
   } catch (e) {
     return { ok: false, error: 'fetch_failed', details: String(e) };
   }
@@ -60,13 +93,9 @@ async function getJson<T>(path: string, opts?: JsonOpts): Promise<ApiOk<T> | Api
       signal: opts?.signal ?? controller?.signal,
     });
     text = await res.text();
-    try {
-      const parsed = JSON.parse(text) as unknown;
-      if (!res.ok) return (parsed as ApiErr) ?? { ok: false, error: `http_${res.status}` };
-      return parsed as ApiOk<T>;
-    } catch {
-      return { ok: false, error: `bad_json_http_${res.status}`, raw: text.slice(0, 4000) };
-    }
+    const parsedWrap = parseJsonBody(text);
+    if (!parsedWrap.ok) return apiErrFromNonJsonResponse(res, text);
+    return interpretParsedJson<T>(res, parsedWrap.value);
   } catch (e) {
     return { ok: false, error: 'fetch_failed', details: String(e) };
   } finally {
@@ -96,13 +125,9 @@ export async function postJsonWithOpts<T>(path: string, body: unknown, opts?: Js
       signal: opts?.signal ?? controller?.signal,
     });
     text = await res.text();
-    try {
-      const parsed = JSON.parse(text) as unknown;
-      if (!res.ok) return (parsed as ApiErr) ?? { ok: false, error: `http_${res.status}` };
-      return parsed as ApiOk<T>;
-    } catch {
-      return { ok: false, error: `bad_json_http_${res.status}`, raw: text.slice(0, 4000) };
-    }
+    const parsedWrap = parseJsonBody(text);
+    if (!parsedWrap.ok) return apiErrFromNonJsonResponse(res, text);
+    return interpretParsedJson<T>(res, parsedWrap.value);
   } catch (e) {
     return { ok: false, error: 'fetch_failed', details: String(e) };
   } finally {
@@ -269,5 +294,18 @@ export function tradeUpdateBalanceAllowance(body: { tokenId?: string; assetType:
 
 export function tradeAvgEntry(tokenId: string) {
   return getJson<{ tokenId: string; avgEntry: number | null; shares: number }>(`/api/trade/avg-entry?token_id=${encodeURIComponent(tokenId)}`);
+}
+
+export function tradeGetOrder(orderId: string, opts?: JsonOpts) {
+  return getJson<unknown>(`/api/trade/order?order_id=${encodeURIComponent(orderId)}`, opts);
+}
+
+export function tradeCancelOrder(orderId: string) {
+  return postJson<{ cancelled: boolean; order_id: string }>('/api/trade/cancel-order', { order_id: orderId });
+}
+
+/** Kill switch — cancels every open order for the authenticated trader. */
+export function tradeCancelAllOrders() {
+  return postJson<unknown>('/api/trade/cancel-all', { confirm: true });
 }
 

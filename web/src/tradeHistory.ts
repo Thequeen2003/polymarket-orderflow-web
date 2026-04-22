@@ -2,6 +2,20 @@ export type TradeHistoryMode = 'paper' | 'live';
 export type TradeHistorySide = 'buy' | 'sell';
 export type TradeHistoryExec = 'touch' | 'market' | 'limit';
 
+/** Live order lifecycle; legacy rows may still read `submitted` / `error` until re-saved. */
+export type TradeHistoryOrderStatus =
+  | 'sending'
+  | 'sent'
+  | 'partial'
+  | 'filled'
+  | 'failed'
+  | 'no_fill'
+  | 'cancelled'
+  /** @deprecated use `sent` */
+  | 'submitted'
+  /** @deprecated use `failed` */
+  | 'error';
+
 export type TradeHistoryRow = {
   id: string;
   ts: number;
@@ -10,17 +24,49 @@ export type TradeHistoryRow = {
   side: TradeHistorySide;
   token: string;
   label: string;
-  /** For market orders: null if unknown, for limit/touch: price 0..1 */
+  /** Gamma / routing slug when known — used by global positions dashboard. */
+  marketSlug?: string;
+  /** Market question / title when known. */
+  marketTitle?: string;
+  /**
+   * Legacy combined price — prefer `fillAvgPrice01` / `submittedPrice01` / `quotedPrice01`.
+   * Kept for CSV export and older UI; reconciler sets this to fill avg when known.
+   */
   price01: number | null;
+  /** Touch / limit quote or mid at intent time (what the UI showed). */
+  quotedPrice01?: number | null;
+  /** Exact limit or cross price sent to the CLOB (after tick rounding). */
+  submittedPrice01?: number | null;
+  /** Volume-weighted average fill when filled or partially filled. */
+  fillAvgPrice01?: number | null;
+  /** Book or chart mid at click (mark), for slippage context. */
+  markPrice01?: number | null;
   shares: number | null;
   usdCents: number | null;
-  /** 'filled' for paper, 'submitted' for live (we don't have fill events yet) */
-  status: 'filled' | 'submitted' | 'error';
+  status: TradeHistoryOrderStatus;
+  /** Client ↔ API round trip (ms), when measured. */
+  roundTripMs?: number | null;
+  /** CLOB order id when resting limit / touch order is placed. */
+  orderId?: string | null;
+  /** Optional mismatch or reconciliation note for support / debugging. */
+  auditNote?: string;
   error?: string;
 };
 
-const STORAGE_KEY = 'pmof.tradeHistory.v1';
+const STORAGE_KEY = 'pmof.tradeHistory.v2';
+const LEGACY_STORAGE_KEY = 'pmof.tradeHistory.v1';
 const MAX_ROWS = 250;
+
+/** Fired after local trade history storage changes (any writer). */
+export const TRADE_HISTORY_CHANGED_EVENT = 'pmof:trade-history-changed';
+
+function notifyTradeHistoryChanged(): void {
+  try {
+    window.dispatchEvent(new Event(TRADE_HISTORY_CHANGED_EVENT));
+  } catch {
+    /* ignore */
+  }
+}
 
 function safeJsonParse(raw: string): unknown {
   try {
@@ -30,35 +76,77 @@ function safeJsonParse(raw: string): unknown {
   }
 }
 
+function migrateStatus(v: string): TradeHistoryOrderStatus {
+  const s = v.toLowerCase();
+  if (s === 'sending' || s === 'sent' || s === 'partial' || s === 'filled' || s === 'failed' || s === 'no_fill' || s === 'cancelled') {
+    return s as TradeHistoryOrderStatus;
+  }
+  if (s === 'submitted') return 'sent';
+  if (s === 'error') return 'failed';
+  return 'filled';
+}
+
+function rowFromPartial(r: Partial<TradeHistoryRow>): TradeHistoryRow {
+  const status = migrateStatus(String(r.status ?? 'filled'));
+  const price01 = r.price01 == null ? null : Number.isFinite(Number(r.price01)) ? Number(r.price01) : null;
+  const quotedPrice01 =
+    r.quotedPrice01 == null ? null : Number.isFinite(Number(r.quotedPrice01)) ? Number(r.quotedPrice01) : null;
+  const submittedPrice01 =
+    r.submittedPrice01 == null ? null : Number.isFinite(Number(r.submittedPrice01)) ? Number(r.submittedPrice01) : null;
+  const fillAvgPrice01 =
+    r.fillAvgPrice01 == null ? null : Number.isFinite(Number(r.fillAvgPrice01)) ? Number(r.fillAvgPrice01) : null;
+  const markPrice01 = r.markPrice01 == null ? null : Number.isFinite(Number(r.markPrice01)) ? Number(r.markPrice01) : null;
+  const roundTripMs =
+    r.roundTripMs == null ? null : Number.isFinite(Number(r.roundTripMs)) ? Number(r.roundTripMs) : null;
+  const orderId = r.orderId != null && String(r.orderId).trim() ? String(r.orderId).trim() : null;
+  return {
+    id: String(r.id ?? ''),
+    ts: typeof r.ts === 'number' && Number.isFinite(r.ts) ? r.ts : 0,
+    mode: String(r.mode ?? '').toLowerCase() === 'live' ? 'live' : 'paper',
+    exec: (() => {
+      const v = String(r.exec ?? '').toLowerCase();
+      return v === 'market' || v === 'limit' || v === 'touch' ? (v as TradeHistoryExec) : 'touch';
+    })(),
+    side: String(r.side ?? '').toLowerCase() === 'sell' ? 'sell' : 'buy',
+    token: String(r.token ?? ''),
+    label: String(r.label ?? ''),
+    marketSlug: r.marketSlug != null && String(r.marketSlug).trim() ? String(r.marketSlug).trim() : undefined,
+    marketTitle: r.marketTitle != null && String(r.marketTitle).trim() ? String(r.marketTitle).trim() : undefined,
+    price01,
+    quotedPrice01: quotedPrice01 ?? (status === 'filled' ? price01 : null),
+    submittedPrice01: submittedPrice01 ?? (status === 'sent' || status === 'filled' || status === 'partial' ? price01 : null),
+    fillAvgPrice01: fillAvgPrice01 ?? (status === 'filled' || status === 'partial' ? price01 : null),
+    markPrice01: markPrice01 ?? null,
+    shares: r.shares == null ? null : Number.isFinite(Number(r.shares)) ? Number(r.shares) : null,
+    usdCents: r.usdCents == null ? null : Number.isFinite(Number(r.usdCents)) ? Number(r.usdCents) : null,
+    status,
+    roundTripMs,
+    orderId,
+    auditNote: r.auditNote != null ? String(r.auditNote) : undefined,
+    error: r.error != null ? String(r.error) : undefined,
+  };
+}
+
 export function loadTradeHistory(): TradeHistoryRow[] {
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
+    let raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) {
+      raw = window.localStorage.getItem(LEGACY_STORAGE_KEY);
+      if (raw) {
+        try {
+          window.localStorage.setItem(STORAGE_KEY, raw);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
     if (!raw) return [];
     const parsed = safeJsonParse(raw);
     if (!Array.isArray(parsed)) return [];
     return (parsed as unknown[])
       .map((x) => x as Partial<TradeHistoryRow>)
       .filter((r) => r && typeof r === 'object')
-      .map((r): TradeHistoryRow => ({
-        id: String(r.id ?? ''),
-        ts: typeof r.ts === 'number' && Number.isFinite(r.ts) ? r.ts : 0,
-        mode: String(r.mode ?? '').toLowerCase() === 'live' ? 'live' : 'paper',
-        exec: (() => {
-          const v = String(r.exec ?? '').toLowerCase();
-          return v === 'market' || v === 'limit' || v === 'touch' ? (v as TradeHistoryExec) : 'touch';
-        })(),
-        side: String(r.side ?? '').toLowerCase() === 'sell' ? 'sell' : 'buy',
-        token: String(r.token ?? ''),
-        label: String(r.label ?? ''),
-        price01: r.price01 == null ? null : Number.isFinite(Number(r.price01)) ? Number(r.price01) : null,
-        shares: r.shares == null ? null : Number.isFinite(Number(r.shares)) ? Number(r.shares) : null,
-        usdCents: r.usdCents == null ? null : Number.isFinite(Number(r.usdCents)) ? Number(r.usdCents) : null,
-        status: (() => {
-          const v = String(r.status ?? '').toLowerCase();
-          return v === 'submitted' || v === 'error' || v === 'filled' ? (v as TradeHistoryRow['status']) : 'filled';
-        })(),
-        error: r.error != null ? String(r.error) : undefined,
-      }))
+      .map((r) => rowFromPartial(r))
       .filter((r) => r.id && r.ts > 0 && r.token)
       .slice(0, MAX_ROWS);
   } catch {
@@ -69,6 +157,7 @@ export function loadTradeHistory(): TradeHistoryRow[] {
 export function saveTradeHistory(rows: TradeHistoryRow[]): void {
   try {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(rows.slice(0, MAX_ROWS)));
+    notifyTradeHistoryChanged();
   } catch {
     /* ignore */
   }
@@ -77,6 +166,8 @@ export function saveTradeHistory(rows: TradeHistoryRow[]): void {
 export function clearTradeHistory(): void {
   try {
     window.localStorage.removeItem(STORAGE_KEY);
+    window.localStorage.removeItem(LEGACY_STORAGE_KEY);
+    notifyTradeHistoryChanged();
   } catch {
     /* ignore */
   }
@@ -101,10 +192,19 @@ export function appendTradeHistory(row: Omit<TradeHistoryRow, 'id' | 'ts'> & { i
     side: row.side,
     token: row.token,
     label: row.label,
+    marketSlug: row.marketSlug,
+    marketTitle: row.marketTitle,
     price01: row.price01 ?? null,
+    quotedPrice01: row.quotedPrice01 ?? null,
+    submittedPrice01: row.submittedPrice01 ?? null,
+    fillAvgPrice01: row.fillAvgPrice01 ?? null,
+    markPrice01: row.markPrice01 ?? null,
     shares: row.shares ?? null,
     usdCents: row.usdCents ?? null,
     status: row.status,
+    roundTripMs: row.roundTripMs ?? null,
+    orderId: row.orderId ?? null,
+    auditNote: row.auditNote,
     error: row.error,
   };
   const rows = loadTradeHistory();
@@ -123,7 +223,23 @@ export function appendTradeHistoryWithId(
 
 export function updateTradeHistoryRow(
   id: string,
-  patch: Partial<Pick<TradeHistoryRow, 'status' | 'error' | 'price01' | 'shares' | 'usdCents'>>,
+  patch: Partial<
+    Pick<
+      TradeHistoryRow,
+      | 'status'
+      | 'error'
+      | 'price01'
+      | 'shares'
+      | 'usdCents'
+      | 'quotedPrice01'
+      | 'submittedPrice01'
+      | 'fillAvgPrice01'
+      | 'markPrice01'
+      | 'roundTripMs'
+      | 'orderId'
+      | 'auditNote'
+    >
+  >,
 ): TradeHistoryRow[] {
   const rows = loadTradeHistory();
   let changed = false;
@@ -149,12 +265,21 @@ export function tradeHistoryToCsv(rows: TradeHistoryRow[]): string {
     'exec',
     'side',
     'label',
+    'market_slug',
+    'market_title',
     'token',
-    'price01',
-    'price_cents',
+    'quoted_price01',
+    'submitted_price01',
+    'fill_avg_price01',
+    'mark_price01',
+    'price01_legacy',
+    'price_cents_legacy',
     'shares',
     'usd_cents_abs',
     'status',
+    'round_trip_ms',
+    'order_id',
+    'audit_note',
     'error',
   ];
   const lines: string[] = [];
@@ -169,12 +294,21 @@ export function tradeHistoryToCsv(rows: TradeHistoryRow[]): string {
         csvEscape(r.exec),
         csvEscape(r.side),
         csvEscape(r.label),
+        csvEscape(r.marketSlug ?? ''),
+        csvEscape(r.marketTitle ?? ''),
         csvEscape(r.token),
+        r.quotedPrice01 == null ? '' : String(r.quotedPrice01),
+        r.submittedPrice01 == null ? '' : String(r.submittedPrice01),
+        r.fillAvgPrice01 == null ? '' : String(r.fillAvgPrice01),
+        r.markPrice01 == null ? '' : String(r.markPrice01),
         r.price01 == null ? '' : String(r.price01),
         csvEscape(priceCents),
         r.shares == null ? '' : String(r.shares),
         r.usdCents == null ? '' : String(Math.abs(r.usdCents)),
         csvEscape(r.status),
+        r.roundTripMs == null ? '' : String(r.roundTripMs),
+        csvEscape(r.orderId ?? ''),
+        csvEscape(r.auditNote ?? ''),
         csvEscape(r.error ?? ''),
       ].join(','),
     );

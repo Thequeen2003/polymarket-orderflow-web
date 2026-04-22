@@ -1,4 +1,4 @@
-import { useState, type ReactElement } from 'react';
+import { useMemo, useState, type ReactElement } from 'react';
 import type { ClobBookEntry } from './lib/api';
 import { FlowZoneSignalsPanel } from './FlowZoneSignalsPanel';
 import { PtbDualProbabilityChart } from './PtbDualProbabilityChart';
@@ -9,7 +9,10 @@ import type { SpotPoint } from './SpotLevelChart';
 import { SignalsTradePanel } from './SignalsTradePanel';
 import { underlyingChartTitle } from './underlyingChartTitle';
 import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
+import { midPrice, topOfBook } from './bookLevels';
 import { resolveUpDownIndices } from './upDown';
+import { buildSpotCandles } from './spotVsPtb';
+import { computePtbChartDerivatives } from './ptbChartDerivatives';
 
 /**
  * Signals tab: dual implied-probability OHLC when book mids exist; else USD spot vs PTB.
@@ -69,10 +72,33 @@ export function SignalsPtbOnly(props: {
   const [spotChartLane, setSpotChartLane] = useState<'up' | 'down'>('up');
   const spotChartLive = priceToBeat != null && spot.length >= 2;
 
+  const ptbContext = useMemo(() => {
+    if (priceToBeat == null || !Number.isFinite(priceToBeat) || spot.length < 2) return null;
+    const pts = spot
+      .filter((p) => Number.isFinite(p.t) && Number.isFinite(p.v))
+      .slice(-320)
+      .map((p) => ({ t: p.t, v: p.v }));
+    if (pts.length < 2) return null;
+    const candles = buildSpotCandles(pts, Math.min(64, Math.max(12, Math.floor(pts.length * 0.22))));
+    const d = computePtbChartDerivatives({ pts, candles, ptb: priceToBeat });
+    return {
+      ptbUsd: priceToBeat,
+      bandUsd: d.reaction.eps,
+      position: d.position,
+      slopeUsdPerSec: d.slopeUsdPerSec,
+    } as const;
+  }, [priceToBeat, spot]);
+
   const spotVsPtbSection = (
     <>
-      <div className="rounded-xl border border-zinc-800/60 bg-zinc-950/35 px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-400">
-        Spot vs PTB (USD · fixed line)
+      <div className="space-y-1 rounded-xl border border-zinc-800/60 bg-zinc-950/35 px-4 py-2">
+        <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-400">Spot vs PTB (USD · fixed line)</div>
+        <p className="text-[10px] leading-relaxed text-zinc-500">
+          Same rules as the big chart: <span className="text-zinc-400">higher $ draws toward the top</span>; yellow PTB;
+          green/red wash is <span className="text-zinc-400">above/below that line</span>, not “price good/bad”. Momentum
+          badges are <span className="text-zinc-400">short-bucket candle trend</span> and can disagree with spot vs PTB on a
+          pullback. Only the last <span className="font-mono text-zinc-400">1m–5m</span> of ticks are shown.
+        </p>
       </div>
       <PtbOpportunityModeChart
         mode={spotChartLane}
@@ -162,6 +188,13 @@ export function SignalsPtbOnly(props: {
           downToken={downToken}
           upMid={probUp.length ? (probUp[probUp.length - 1]!.v ?? null) : null}
           downMid={probDown.length ? (probDown[probDown.length - 1]!.v ?? null) : null}
+          bookMidUp={midPrice(bookAbove)}
+          bookMidDown={midPrice(bookBelow)}
+          bookTouchUp={topOfBook(bookAbove)}
+          bookTouchDown={topOfBook(bookBelow)}
+          bookUp={bookAbove}
+          bookDown={bookBelow}
+          ptbContext={ptbContext}
         />
       ) : null}
       <div className="grid gap-3 lg:grid-cols-2">

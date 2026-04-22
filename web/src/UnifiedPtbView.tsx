@@ -79,8 +79,6 @@ export function UnifiedPtbView(props: {
 
   const upEntry = idx && books ? books[idx.up] ?? null : null;
   const downEntry = idx && books ? books[idx.down] ?? null : null;
-  const upToken = upEntry?.token ?? '';
-  const downToken = downEntry?.token ?? '';
   const [activeBookLane, setActiveBookLane] = useState<'up' | 'down'>('up');
   const activeBook = activeBookLane === 'up' ? upEntry?.book : downEntry?.book;
   const activeBookLabel = activeBookLane === 'up' ? upLabel : downLabel;
@@ -137,11 +135,14 @@ export function UnifiedPtbView(props: {
 
         {spot.length < 2 ? (
           <div className="rounded-2xl border border-amber-900/35 bg-amber-950/15 px-4 py-3 text-sm leading-relaxed text-amber-100/90">
-            <span className="font-semibold text-amber-50">No candle stream yet.</span>{' '}
+            <span className="font-semibold text-amber-50">Spot history is still warming up.</span>{' '}
             {spotStreamEligible ? (
-              <span>RTDS spot should appear within a few seconds — keep this tab open.</span>
+              <span>RTDS ticks usually land within a few seconds on an active tab; the chart unlocks after two ticks.</span>
             ) : (
-              <span>Load a btc/eth/sol up/down market to enable RTDS spot streaming in this view.</span>
+              <span>
+                Open a <span className="font-mono text-amber-50/95">btc|eth|sol-updown-5m-*</span> or{' '}
+                <span className="font-mono text-amber-50/95">*-updown-15m-*</span> slug so this view can subscribe to underlying spot.
+              </span>
             )}
           </div>
         ) : null}
@@ -240,11 +241,16 @@ export function UnifiedPtbView(props: {
             </div>
           </div>
 
-          <div className="mt-4 rounded-2xl border border-zinc-800/60 bg-black/20 p-3">
+            <div className="mt-4 rounded-2xl border border-zinc-800/60 bg-black/20 p-3">
             <div className="grid grid-cols-2 gap-2 text-[12px] text-zinc-300">
               <div>
                 <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Spot</div>
                 <div className="mt-0.5 font-mono text-[13px] text-zinc-100">{fmtUsd(spotLast)}</div>
+                {spotLastUpdateMs ? (
+                  <div className="mt-0.5 font-mono text-[10px] text-zinc-600">
+                    RTDS {new Date(spotLastUpdateMs).toLocaleTimeString()}
+                  </div>
+                ) : null}
               </div>
               <div className="text-right">
                 <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">PTB</div>

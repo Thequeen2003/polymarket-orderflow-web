@@ -6,6 +6,7 @@ import { SignalsTradePanel } from './SignalsTradePanel';
 import type { SpotPoint } from './SpotLevelChart';
 import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
 import { underlyingChartTitle } from './underlyingChartTitle';
+import { midPrice, topOfBook } from './bookLevels';
 import { resolveUpDownIndices } from './upDown';
 
 function fmtUsd(n: number | null): string {
@@ -85,19 +86,19 @@ export function DualPtbReferenceTab(props: {
   return (
     <div className="space-y-4">
       <div className="overflow-hidden rounded-[28px] border border-zinc-800/70 bg-[#0d1219] shadow-[0_18px_60px_rgba(0,0,0,0.3)] ring-1 ring-white/[0.03]">
-        <div className="border-b border-zinc-800/70 px-5 py-3 text-[11px] leading-relaxed text-zinc-500">
-          {STREAM_ATTRIBUTION_LINE} <span className="text-zinc-600">·</span> PTB line is fixed; candles follow underlying spot.
+        <div className="border-b border-zinc-800/70 px-4 py-2.5 text-[11px] leading-relaxed text-zinc-500 sm:px-5">
+          {STREAM_ATTRIBUTION_LINE} <span className="text-zinc-600">·</span> PTB is fixed for the window; candles track underlying spot.
         </div>
-        <div className="grid gap-4 px-5 py-6 md:grid-cols-2">
-          <div>
-            <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Price To Beat</div>
-            <div className="mt-1 text-[44px] font-semibold tracking-tight text-zinc-50">{fmtUsd(priceToBeat)}</div>
-            <div className="mt-1 text-[12px] text-zinc-500">via SSR / decision boundary</div>
+        <div className="grid gap-3 px-4 py-4 sm:px-5 sm:py-5 md:grid-cols-[1fr_auto] md:items-end md:gap-6">
+          <div className="min-w-0">
+            <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Price to beat</div>
+            <div className="mt-0.5 truncate text-3xl font-semibold tracking-tight text-zinc-50 sm:text-4xl">{fmtUsd(priceToBeat)}</div>
+            <div className="mt-1 text-[12px] text-zinc-500">SSR decision boundary</div>
           </div>
-          <div className="text-left md:text-right">
-            <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Time Left</div>
-            <div className="mt-1 text-[44px] font-semibold tracking-tight text-zinc-50">{timeLeft}</div>
-            <div className="mt-1 text-[12px] text-zinc-500">{strategyLine}</div>
+          <div className="min-w-0 md:text-right">
+            <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Time left</div>
+            <div className="mt-0.5 font-mono text-3xl font-semibold tabular-nums tracking-tight text-zinc-50 sm:text-4xl">{timeLeft}</div>
+            <div className="mt-1 text-left text-[12px] leading-snug text-zinc-500 md:text-right">{strategyLine}</div>
           </div>
         </div>
       </div>
@@ -109,13 +110,13 @@ export function DualPtbReferenceTab(props: {
           </div>
           {spot.length < 2 ? (
             <div className="rounded-2xl border border-amber-900/35 bg-amber-950/15 px-4 py-3 text-sm leading-relaxed text-amber-100/90">
-              <span className="font-semibold text-amber-50">No candle stream yet.</span>{' '}
+              <span className="font-semibold text-amber-50">Spot history is still warming up.</span>{' '}
               {spotStreamEligible ? (
-                <span>RTDS spot should appear within a few seconds — keep this tab open.</span>
+                <span>RTDS ticks usually land within a few seconds on an active tab; the candle model needs at least two ticks.</span>
               ) : (
                 <span>
-                  Load a <span className="font-mono text-amber-50/95">btc-updown-5m-*</span>, <span className="font-mono text-amber-50/95">eth-updown-15m-*</span>, or{' '}
-                  <span className="font-mono text-amber-50/95">sol-updown-*</span> market; other slugs do not receive RTDS underlying in this app yet.
+                  Use <span className="font-mono text-amber-50/95">btc|eth|sol-updown-5m-*</span> or{' '}
+                  <span className="font-mono text-amber-50/95">*-updown-15m-*</span> — other slugs do not map to RTDS underlying here yet.
                 </span>
               )}
             </div>
@@ -155,8 +156,17 @@ export function DualPtbReferenceTab(props: {
               {downLabel} book
             </button>
             <div className="rounded-xl border border-zinc-800/60 bg-zinc-950/35 px-3 py-2 text-sm text-zinc-500">
-              Spot {fmtUsd(spotLast)}
-              {probLastUpdateMs ? <span className="ml-2">{new Date(probLastUpdateMs).toLocaleTimeString()}</span> : null}
+              <span className="text-zinc-400">Spot</span> {fmtUsd(spotLast)}
+              {spotLastUpdateMs ? (
+                <span className="ml-2 font-mono text-[11px] text-zinc-600">
+                  RTDS {new Date(spotLastUpdateMs).toLocaleTimeString()}
+                </span>
+              ) : null}
+              {probLastUpdateMs ? (
+                <span className="ml-2 font-mono text-[11px] text-zinc-600">
+                  Mid {new Date(probLastUpdateMs).toLocaleTimeString()}
+                </span>
+              ) : null}
             </div>
           </div>
 
@@ -178,6 +188,10 @@ export function DualPtbReferenceTab(props: {
               downToken={downToken}
               upMid={upMid}
               downMid={downMid}
+              bookMidUp={midPrice(bookAbove)}
+              bookMidDown={midPrice(bookBelow)}
+              bookTouchUp={topOfBook(bookAbove)}
+              bookTouchDown={topOfBook(bookBelow)}
               lane={activeLane}
               onLaneChange={setActiveLane}
               visualStyle="sidebar"

@@ -44,10 +44,21 @@ export function OverallOrderBookPanel(props: {
       if (!best || l.size > best.size) return { price: l.price, size: l.size };
       return best;
     }, null);
-    const thinAsk = asksTop.filter((l) => l.size <= maxAsk * 0.18).length >= Math.max(3, Math.floor(maxLevels * 0.45));
-    const thinBid = bidsTop.filter((l) => l.size <= maxBid * 0.18).length >= Math.max(3, Math.floor(maxLevels * 0.45));
+    const thinAsk =
+      asksTop.length === 0
+        ? null
+        : asksTop.filter((l) => l.size <= maxAsk * 0.18).length >= Math.max(3, Math.floor(maxLevels * 0.45));
+    const thinBid =
+      bidsTop.length === 0
+        ? null
+        : bidsTop.filter((l) => l.size <= maxBid * 0.18).length >= Math.max(3, Math.floor(maxLevels * 0.45));
     return { wallAsk, wallBid, thinAsk, thinBid };
   }, [asksTop, bidsTop, maxAsk, maxBid, maxLevels]);
+
+  const askShapeLabel =
+    insights.thinAsk === null ? 'no ladder' : insights.thinAsk ? 'thin zone' : 'stacked depth';
+  const bidShapeLabel =
+    insights.thinBid === null ? 'no ladder' : insights.thinBid ? 'thin zone' : 'stacked depth';
 
   const Row = (p: { price: number; size: number; tone: 'ask' | 'bid'; max: number }) => {
     const w = Math.max(0, Math.min(1, p.size / p.max));
@@ -90,11 +101,27 @@ export function OverallOrderBookPanel(props: {
       </div>
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800/40 bg-black/10 px-4 py-2 text-[10px] text-zinc-400">
         <div className="flex flex-wrap gap-2">
-          <span className={`rounded-full border px-2 py-0.5 font-mono ${insights.thinAsk ? 'border-violet-700/40 bg-violet-950/20 text-violet-200' : 'border-zinc-800/50 bg-zinc-950/30 text-zinc-500'}`}>
-            asks: {insights.thinAsk ? 'thin zone' : 'blocked'}
+          <span
+            className={`rounded-full border px-2 py-0.5 font-mono ${
+              insights.thinAsk === null
+                ? 'border-zinc-800/50 bg-zinc-950/30 text-zinc-600'
+                : insights.thinAsk
+                  ? 'border-violet-700/40 bg-violet-950/20 text-violet-200'
+                  : 'border-zinc-800/50 bg-zinc-950/30 text-zinc-400'
+            }`}
+          >
+            asks: {askShapeLabel}
           </span>
-          <span className={`rounded-full border px-2 py-0.5 font-mono ${insights.thinBid ? 'border-violet-700/40 bg-violet-950/20 text-violet-200' : 'border-zinc-800/50 bg-zinc-950/30 text-zinc-500'}`}>
-            bids: {insights.thinBid ? 'thin zone' : 'blocked'}
+          <span
+            className={`rounded-full border px-2 py-0.5 font-mono ${
+              insights.thinBid === null
+                ? 'border-zinc-800/50 bg-zinc-950/30 text-zinc-600'
+                : insights.thinBid
+                  ? 'border-violet-700/40 bg-violet-950/20 text-violet-200'
+                  : 'border-zinc-800/50 bg-zinc-950/30 text-zinc-400'
+            }`}
+          >
+            bids: {bidShapeLabel}
           </span>
         </div>
         <div className="font-mono text-zinc-500">

@@ -566,7 +566,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
           ? 'Waiting for first Chainlink spot tick…'
           : 'Waiting for a second tick to draw candles…';
     return (
-      <div className="flex min-h-[min(88vh,920px)] flex-col overflow-hidden rounded-[30px] border border-zinc-800/90 bg-[#0b1018] shadow-[0_28px_80px_rgba(0,0,0,0.35)] ring-1 ring-zinc-700/40">
+      <div className="flex min-h-0 flex-col rounded-[30px] border border-zinc-800/90 bg-[#0b1018] shadow-[0_28px_80px_rgba(0,0,0,0.35)] ring-1 ring-zinc-700/40">
         <header className="shrink-0 border-b border-zinc-800/80 px-4 py-3 sm:px-5">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="min-w-0">
@@ -600,10 +600,10 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             </div>
           </div>
         </header>
-        <div className="min-h-0 flex-1 px-3 pt-2 sm:px-4">
+        <div className="min-h-0 flex-1 overflow-hidden px-3 pt-2 sm:px-4">
           <svg
             viewBox={`0 0 ${width} ${height}`}
-            className="block h-full min-h-[min(52vh,560px)] max-h-[73vh] w-full rounded-[24px] bg-[#0a0f16] [contain:paint]"
+            className="block h-full min-h-[min(44vh,480px)] max-h-[min(62vh,560px)] w-full rounded-[24px] bg-[#0a0f16] [contain:paint]"
             preserveAspectRatio="xMidYMid meet"
             role="img"
             aria-label="Spot versus price to beat chart frame"
@@ -744,8 +744,172 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
   const momArrow =
     derivedStrip?.momentum === 'UP' ? '↑' : derivedStrip?.momentum === 'DOWN' ? '↓' : '→';
 
+  const positionVsPtbLabel = (() => {
+    if (derivedStrip == null) return { title: '—', sub: 'Load data', className: 'border-zinc-600 bg-zinc-900/50 text-zinc-400' };
+    const p = derivedStrip.position;
+    if (p === 'ABOVE') {
+      return {
+        title: 'ABOVE PTB',
+        sub: 'Spot is above the level (favors the "above PTB" side while price stays there)',
+        className: 'border-emerald-500/50 bg-emerald-950/50 text-emerald-100',
+      };
+    }
+    if (p === 'BELOW') {
+      return {
+        title: 'BELOW PTB',
+        sub: 'Spot is under the level (favors the "below PTB" side while price stays there)',
+        className: 'border-rose-500/50 bg-rose-950/50 text-rose-100',
+      };
+    }
+    return {
+      title: 'AT / CHOP',
+      sub: 'Inside the touch band — edge vs settlement still unclear',
+      className: 'border-amber-500/50 bg-amber-950/45 text-amber-100',
+    };
+  })();
+
+  const pathNowLabel = (() => {
+    if (derivedStrip == null) return { title: '—', sub: 'Candles in the visible window only', className: 'border-zinc-600 bg-zinc-900/50 text-zinc-400' };
+    const m = derivedStrip.momentum;
+    if (m === 'UP') {
+      return {
+        title: '↑ Pushing (short run)',
+        sub: 'Recent buckets + slope: upward pressure — can still be below PTB on a bounce',
+        className: 'border-sky-500/45 bg-sky-950/40 text-sky-100',
+      };
+    }
+    if (m === 'DOWN') {
+      return {
+        title: '↓ Pressing (short run)',
+        sub: 'Recent buckets + slope: downward pressure — can still be above PTB on a pullback',
+        className: 'border-violet-500/40 bg-violet-950/35 text-violet-100',
+      };
+    }
+    return {
+      title: '→ Flat / mixed',
+      sub: 'No clear candle push in this zoom — check Distance for side of line',
+      className: 'border-zinc-500/50 bg-zinc-900/55 text-zinc-200',
+    };
+  })();
+
+  const playbook = (() => {
+    if (derivedStrip == null) {
+      return {
+        entry: '—',
+        exit: '—',
+        tp: '—',
+        stop: '—',
+        entryTone: 'border-zinc-700/60 bg-zinc-950/30 text-zinc-400',
+        exitTone: 'border-zinc-700/60 bg-zinc-950/30 text-zinc-400',
+      };
+    }
+    const bandHi = priceToBeat! + model.band;
+    const bandLo = priceToBeat! - model.band;
+    const hiTxt = fmtUsd(bandHi);
+    const loTxt = fmtUsd(bandLo);
+    const ptbTxt = fmtUsd(priceToBeat!);
+
+    const inBand = derivedStrip.position === 'AT';
+    const favorSide = mode === 'up' ? derivedStrip.position === 'ABOVE' : derivedStrip.position === 'BELOW';
+    const againstSide = mode === 'up' ? derivedStrip.position === 'BELOW' : derivedStrip.position === 'ABOVE';
+    const momAgree =
+      mode === 'up' ? derivedStrip.momentum === 'UP' : derivedStrip.momentum === 'DOWN';
+    const momAgainst =
+      mode === 'up' ? derivedStrip.momentum === 'DOWN' : derivedStrip.momentum === 'UP';
+
+    const entryBase = inBand
+      ? `WAIT: let it separate outside the band (>${mode === 'up' ? hiTxt : loTxt}) and hold.`
+      : favorSide
+        ? `ENTER on pullback that stays outside the band (holds ${mode === 'up' ? hiTxt : loTxt}).`
+        : `SKIP / FADE: you’re on the wrong side until reclaim (${mode === 'up' ? hiTxt : loTxt}).`;
+
+    const exitBase = inBand
+      ? `NO EDGE: exit if it can’t leave the band (around ${ptbTxt} ± ε).`
+      : favorSide
+        ? `EXIT if it re-enters the band (${loTxt}–${hiTxt}) or flips slope.`
+        : `EXIT / don’t add until it reclaims the band edge (${mode === 'up' ? hiTxt : loTxt}).`;
+
+    const entryAdd =
+      derivedStrip.controlSignal === 'REJECTION'
+        ? ' Rejection: wait for next clean hold.'
+        : derivedStrip.controlSignal === 'TRANSITION'
+          ? ' Transition: size down; confirm hold.'
+          : momAgainst
+            ? ' Momentum disagrees: avoid chasing.'
+            : momAgree
+              ? ' Momentum agrees: ok to press on confirmation.'
+              : '';
+
+    const exitAdd =
+      derivedStrip.controlSignal === 'REJECTION'
+        ? ' Treat as invalidation until reclaimed.'
+        : derivedStrip.controlSignal === 'TRANSITION'
+          ? ' Tighten risk; watch for rotation.'
+          : '';
+
+    const slope = derivedStrip.slopeUsdPerSec;
+    const canProject = slope != null && Number.isFinite(slope) && !inBand && favorSide;
+    const tpSec = 30;
+    const projTp = canProject ? model.last + slope * tpSec : null;
+    const tp =
+      canProject && projTp != null
+        ? `TP (proj ${tpSec}s): ${fmtUsd(projTp)}`
+        : inBand
+          ? `TP: — (in band)`
+          : favorSide
+            ? 'TP: — (need slope)'
+            : 'TP: — (wrong side)';
+
+    const stop =
+      inBand
+        ? `Stop: ${loTxt}–${hiTxt} (band)`
+        : favorSide
+          ? `Stop: back into band (${loTxt}–${hiTxt})`
+          : `Stop: reclaim ${mode === 'up' ? hiTxt : loTxt}`;
+
+    const entryTone = againstSide
+      ? 'border-rose-700/50 bg-rose-950/20 text-rose-100'
+      : inBand
+        ? 'border-amber-700/50 bg-amber-950/15 text-amber-100'
+        : 'border-emerald-700/50 bg-emerald-950/15 text-emerald-100';
+
+    const exitTone = inBand
+      ? 'border-amber-700/50 bg-amber-950/15 text-amber-100'
+      : favorSide
+        ? 'border-sky-700/45 bg-sky-950/15 text-sky-100'
+        : 'border-zinc-700/60 bg-zinc-950/25 text-zinc-200';
+
+    return {
+      entry: `${entryBase}${entryAdd}`,
+      exit: `${exitBase}${exitAdd}`,
+      tp,
+      stop,
+      entryTone,
+      exitTone,
+    };
+  })();
+
+  const projection = (() => {
+    if (derivedStrip == null) return null;
+    const slope = derivedStrip.slopeUsdPerSec;
+    if (slope == null || !Number.isFinite(slope)) return null;
+    const t1 = 30;
+    const t2 = 60;
+    const p1 = model.last + slope * t1;
+    const p2 = model.last + slope * t2;
+    const hasStreak = derivedStrip.momentumStreak >= 3;
+    return {
+      p1,
+      p2,
+      t1,
+      t2,
+      label: `Proj ${t1}s`,
+      sub: hasStreak ? `${derivedStrip.momentum} ×${derivedStrip.momentumStreak}` : null,
+    };
+  })();
+
   return (
-    <div className="flex min-h-[min(88vh,920px)] flex-col overflow-hidden rounded-[30px] border border-zinc-800/90 bg-[#0b1018] shadow-[0_28px_80px_rgba(0,0,0,0.35)] ring-1 ring-zinc-700/40">
+    <div className="flex min-h-0 flex-col rounded-[30px] border border-zinc-800/90 bg-[#0b1018] shadow-[0_28px_80px_rgba(0,0,0,0.35)] ring-1 ring-zinc-700/40">
       <header className="shrink-0 border-b border-zinc-800/80 bg-[#0b1018] px-4 py-3 sm:px-5">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1">
@@ -822,16 +986,62 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             </div>
           </div>
         </div>
+        <div className="mt-3 flex w-full min-w-0 flex-col gap-2 sm:flex-row sm:items-stretch sm:gap-3">
+          <div
+            className={`min-w-0 flex-1 rounded-xl border-2 px-3 py-2.5 shadow-md shadow-black/30 ${positionVsPtbLabel.className}`}
+            title="Where spot is vs the fixed PTB: which side of the level is ahead right now, not the tick path."
+          >
+            <div className="text-[9px] font-extrabold uppercase tracking-[0.18em] text-inherit/90">1 · Level (vs PTB)</div>
+            <div className="mt-0.5 text-lg font-black leading-tight tracking-tight sm:text-xl">{positionVsPtbLabel.title}</div>
+            <div className="mt-1 text-[10px] leading-snug text-inherit/95">{positionVsPtbLabel.sub}</div>
+          </div>
+          <div
+            className={`min-w-0 flex-1 rounded-xl border-2 px-3 py-2.5 shadow-md shadow-black/30 ${pathNowLabel.className}`}
+            title="Candles + slope in the visible 1m–5m window only — can disagree with the level (pullback, bounce)."
+          >
+            <div className="text-[9px] font-extrabold uppercase tracking-[0.18em] text-inherit/90">2 · Path (this window)</div>
+            <div className="mt-0.5 text-lg font-black leading-tight tracking-tight sm:text-xl">{pathNowLabel.title}</div>
+            <div className="mt-1 text-[10px] leading-snug text-inherit/95">{pathNowLabel.sub}</div>
+          </div>
+        </div>
         <p className="mt-2 text-[10px] leading-snug text-zinc-600">
           <span className="font-semibold text-zinc-500">Read</span> — how spot behaves vs the fixed PTB line ·{' '}
           <span className="text-amber-200/80">Yellow</span> = PTB · LINE = ticks · OHLC = buckets
         </p>
+        <details className="mt-2 rounded-lg border border-zinc-800/70 bg-black/25 px-3 py-2 text-[10px] leading-relaxed text-zinc-500 open:bg-black/35">
+          <summary className="cursor-pointer select-none font-semibold text-zinc-400 marker:text-zinc-600">
+            Chart read — axis, tints, time window, momentum (tap)
+          </summary>
+          <ul className="mt-2 list-disc space-y-1.5 pl-4 text-zinc-500">
+            <li>
+              <span className="text-zinc-400">USD axis is not inverted:</span> higher underlying = toward the{' '}
+              <strong className="text-zinc-300">top</strong> of the chart; PTB is the yellow line.
+            </li>
+            <li>
+              <span className="text-zinc-400">Green / red wash:</span> area <strong className="text-zinc-300">above</strong> PTB = spot
+              <strong className="text-zinc-300"> above</strong> the level; <strong className="text-zinc-300">below</strong> PTB = spot{' '}
+              <strong className="text-zinc-300">below</strong> — not “price good/bad”, only side of the line.
+            </li>
+            <li>
+              <span className="text-zinc-400">Time scope:</span> only the last <strong className="text-zinc-300">{zoomWindow}s</strong> of ticks are
+              plotted; wider swings happened earlier are off-screen.
+            </li>
+            <li>
+              <span className="text-zinc-400">↑ MOM / ↓ MOM badge:</span> recent <strong className="text-zinc-300">bucket candle direction</strong>{' '}
+              (plus slope) — a <strong className="text-zinc-300">↓</strong> pullback can print while spot is still above PTB.
+            </li>
+            <li>
+              <span className="text-zinc-400">{meta.label}:</span> tints the <strong className="text-zinc-300">hint card</strong> for your
+              selected outcome; it does <strong className="text-zinc-300">not</strong> flip the price scale.
+            </li>
+          </ul>
+        </details>
       </header>
 
-      <div className="min-h-0 flex-1 px-3 pt-2 sm:px-4 [contain:paint]">
+      <div className="min-h-0 flex-1 overflow-hidden px-3 pt-2 sm:px-4 [contain:paint]">
         <svg
           viewBox={`0 0 ${width} ${height}`}
-          className="block h-full min-h-[min(52vh,560px)] max-h-[73vh] w-full rounded-[24px] bg-[#0a0f16] [contain:strict]"
+          className="block h-full min-h-[min(44vh,480px)] max-h-[min(62vh,560px)] w-full rounded-[24px] bg-[#0a0f16] [contain:strict]"
           preserveAspectRatio="xMidYMid meet"
           role="img"
           aria-label="Spot price versus PTB"
@@ -857,18 +1067,28 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
           <rect x="0" y="0" width={width} height={height} fill="#0a0f16" />
 
           <rect x={padL} y={Math.min(yBandTop, yBandBottom)} width={innerW} height={Math.max(12, Math.abs(yBandBottom - yBandTop))} fill={`url(#ptbFocusBand-${gradId})`} />
-          <text
-            x={padL + 8}
-            y={Math.min(yBandTop, yBandBottom) - 6}
-            fill="rgb(161 161 170)"
-            fontSize="10"
-            fontWeight="700"
-          >
-            [ NO EDGE ZONE ]
-          </text>
+          <g>
+            <title>
+              Narrow ±ε band around PTB (touch / chop). Wider separation from the line is outside this band — do not
+              confuse band height with how far spot is from PTB in dollars; use the right-hand price labels.
+            </title>
+            <text
+              x={padL + 8}
+              y={Math.min(yBandTop, yBandBottom) - 6}
+              fill="rgb(161 161 170)"
+              fontSize="10"
+              fontWeight="700"
+            >
+              [ NO EDGE ZONE ]
+            </text>
+          </g>
 
-          <rect x={padL} y={padY} width={innerW} height={Math.max(0, yBeat - padY)} fill={`url(#heatAbove-${gradId})`} className="pointer-events-none" />
-          <rect x={padL} y={yBeat} width={innerW} height={Math.max(0, padY + innerH - yBeat)} fill={`url(#heatBelow-${gradId})`} className="pointer-events-none" />
+          <rect x={padL} y={padY} width={innerW} height={Math.max(0, yBeat - padY)} fill={`url(#heatAbove-${gradId})`} className="pointer-events-none">
+            <title>{`USD above PTB (spot > ${fmtUsd(priceToBeat!)}) — green tint`}</title>
+          </rect>
+          <rect x={padL} y={yBeat} width={innerW} height={Math.max(0, padY + innerH - yBeat)} fill={`url(#heatBelow-${gradId})`} className="pointer-events-none">
+            <title>{`USD below PTB (spot < ${fmtUsd(priceToBeat!)}) — red tint`}</title>
+          </rect>
 
           {closeSeries.length >= 2 ? (
             <path
@@ -881,11 +1101,52 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
           {tickPrices.map((tp, i) => (
             <g key={`grid-${i}`}>
               <line x1={padL} x2={padL + innerW} y1={yPrice(tp)} y2={yPrice(tp)} stroke="rgba(39,39,42,0.8)" strokeWidth="1" />
-              <text x={width - padR + 6} y={yPrice(tp) + 4} fill="rgb(161 161 170)" fontSize="10" fontFamily="ui-monospace, monospace">
+              <text
+                x={width - padR + 6}
+                y={yPrice(tp) + 4}
+                fill="rgb(212 212 216)"
+                fontSize="11"
+                fontFamily="ui-monospace, monospace"
+                stroke="rgb(10 15 22)"
+                strokeWidth="0.6"
+                paintOrder="stroke"
+              >
                 {fmtAxisPrice(tp)}
               </text>
             </g>
           ))}
+          <g>
+            <text
+              x={padL + 6}
+              y={padY + 16}
+              textAnchor="start"
+              fontSize="12"
+              fontWeight="800"
+              fontFamily="ui-sans-serif, system-ui, sans-serif"
+              fill="rgb(212 212 216)"
+              stroke="rgb(10 15 22)"
+              strokeWidth="2.2"
+              strokeLinejoin="round"
+              paintOrder="stroke fill"
+            >
+              HIGHER $
+            </text>
+            <text
+              x={padL + 6}
+              y={padY + innerH - 3}
+              textAnchor="start"
+              fontSize="12"
+              fontWeight="800"
+              fontFamily="ui-sans-serif, system-ui, sans-serif"
+              fill="rgb(212 212 216)"
+              stroke="rgb(10 15 22)"
+              strokeWidth="2.2"
+              strokeLinejoin="round"
+              paintOrder="stroke fill"
+            >
+              LOWER $
+            </text>
+          </g>
 
           {/* Price levels (S/R) */}
           {priceLevels.map((lv, i) => {
@@ -1026,6 +1287,10 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             const streak = derivedStrip.momentumStreak;
             return (
               <g className="pointer-events-none">
+                <title>
+                  Recent OHLC bucket direction (and streak). Not the same as “spot above PTB”: e.g. ↓ MOM can show
+                  during a small pullback while spot is still above the yellow line.
+                </title>
                 <rect x={badgeX - 2} y={badgeY - 10} width={streak >= 2 ? 72 : 56} height={18} rx="9" fill={momBg} stroke={momColor} strokeWidth="1.2" strokeOpacity={0.7} />
                 <text x={badgeX + 4} y={badgeY + 2} fill={momColor} fontSize="10" fontWeight="800" fontFamily="ui-monospace, monospace">
                   {momLabel}{streak >= 2 ? ` x${streak}` : ''}
@@ -1079,8 +1344,12 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
                 <rect x={bx - 1} y={Math.min(needleY, mid)} width={8} height={Math.max(2, Math.abs(needleY - mid))} rx={2}
                   fill={biasColor} opacity={0.85} />
                 <circle cx={bx + 3} cy={needleY} r={5} fill={biasColor} stroke="#0a0f16" strokeWidth={2} />
-                <text x={bx + 14} y={by + 3} fill="rgb(113 113 122)" fontSize="7" fontWeight="700">BUY</text>
-                <text x={bx + 14} y={by + bH + 1} fill="rgb(113 113 122)" fontSize="7" fontWeight="700">SELL</text>
+                <text x={bx + 14} y={by + 3} fill="rgb(113 113 122)" fontSize="7" fontWeight="700">
+                  {(upLabel ?? 'UP').slice(0, 6).toUpperCase()}
+                </text>
+                <text x={bx + 14} y={by + bH + 1} fill="rgb(113 113 122)" fontSize="7" fontWeight="700">
+                  {(downLabel ?? 'DOWN').slice(0, 6).toUpperCase()}
+                </text>
                 <text x={bx + 14} y={needleY + 3} fill={biasColor} fontSize="9" fontWeight="800" fontFamily="ui-monospace, monospace">
                   {biasShift.bias}
                 </text>
@@ -1127,7 +1396,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             {statusLine2 ? <div className="mt-1.5 text-sm font-medium text-zinc-500">({statusLine2})</div> : null}
             <p className="mt-2 max-w-prose text-[11px] leading-snug text-zinc-600">{model.hint}</p>
           </div>
-          <div className="grid grid-cols-2 gap-x-8 gap-y-3 sm:grid-cols-4">
+          <div className="grid grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-3 lg:grid-cols-5">
             <div>
               <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Distance</div>
               <div className="mt-0.5 font-mono text-sm font-semibold tabular-nums text-zinc-100">{fmtPctSigned(model.distancePct)}</div>
@@ -1144,8 +1413,14 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
                 {derivedStrip ? pctOfTotal(derivedStrip.dwellAboveMs, dwellTotal) : '—'}
               </div>
             </div>
-            <div>
-              <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Momentum</div>
+            <div title="Share of visible-window time inside the ±ε PTB touch band (chop / no edge).">
+              <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Time at band</div>
+              <div className="mt-0.5 font-mono text-sm font-semibold tabular-nums text-zinc-100">
+                {derivedStrip ? pctOfTotal(derivedStrip.dwellAtMs, dwellTotal) : '—'}
+              </div>
+            </div>
+            <div className="col-span-2 sm:col-span-3 lg:col-span-1" title="Bucket candle direction + slope over the visible window — can disagree with spot still above/below PTB on a pullback.">
+              <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Candle momentum</div>
               <div className="mt-0.5 font-mono text-lg font-bold text-zinc-100">
                 {momArrow}{' '}
                 <span className="text-sm font-semibold text-zinc-400">
@@ -1153,16 +1428,43 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
                   {derivedStrip && derivedStrip.momentumStreak >= 2 ? ` ×${derivedStrip.momentumStreak}` : ''}
                 </span>
               </div>
+              <div className="mt-0.5 text-[9px] leading-snug text-zinc-600">Short-horizon OHLC trend, not “vs PTB” by itself</div>
             </div>
           </div>
         </div>
-        <div className="mt-3 flex flex-wrap gap-2 text-[10px] text-zinc-500">
-          <span className="rounded border border-zinc-700/60 bg-black/30 px-2 py-1 font-mono text-zinc-400">
+        <div className="mt-3 grid gap-2 lg:grid-cols-2">
+          <div className={`rounded-xl border px-3 py-2 ${playbook.entryTone}`} title="Entry trigger is framed as: outside band + hold; not a prediction.">
+            <div className="text-[9px] font-extrabold uppercase tracking-[0.18em] text-inherit/90">Entry</div>
+            <div className="mt-1 text-[11px] leading-snug text-inherit/95">{playbook.entry}</div>
+            <div className="mt-1 text-[10px] font-semibold text-inherit/80">{playbook.stop}</div>
+          </div>
+          <div className={`rounded-xl border px-3 py-2 ${playbook.exitTone}`} title="Exit/invalidation is framed as: back into band or rotation; keep it mechanical.">
+            <div className="text-[9px] font-extrabold uppercase tracking-[0.18em] text-inherit/90">Exit</div>
+            <div className="mt-1 text-[11px] leading-snug text-inherit/95">{playbook.exit}</div>
+            <div className="mt-1 text-[10px] font-semibold text-inherit/85">{playbook.tp}</div>
+          </div>
+        </div>
+        <div className="mt-3 flex flex-wrap gap-2 text-[10px] text-zinc-400">
+          <span
+            className="rounded border border-zinc-600/70 bg-zinc-950/80 px-2 py-1 font-mono text-zinc-200"
+            title={derivedStrip?.structureEventLabel ?? undefined}
+          >
             {derivedStrip?.structureEvent?.replaceAll('_', ' ') ?? '—'} · Δ {derivedStrip ? fmtUsdSigned(derivedStrip.distanceUsd) : '—'}
           </span>
-          <span className="rounded border border-zinc-700/60 bg-black/30 px-2 py-1 font-mono text-zinc-400">
+          <span
+            className="rounded border border-zinc-600/70 bg-zinc-950/80 px-2 py-1 font-mono text-zinc-200"
+            title={derivedStrip != null ? `Tick slope window ~${Math.round(derivedStrip.slopeWindowMs / 1000)}s, n=${derivedStrip.slopeSampleCount}` : undefined}
+          >
             Slope {derivedStrip ? `${derivedStrip.slopeUsdPerMin >= 0 ? '+' : ''}${derivedStrip.slopeUsdPerMin.toFixed(3)}/m` : '—'}
           </span>
+          {projection ? (
+            <span
+              className="rounded border border-indigo-600/40 bg-indigo-950/25 px-2 py-1 font-mono text-indigo-100"
+              title={`Linear extrapolation: current tick slope × time. Not a prediction.\n${projection.t1}s → ${fmtUsd(projection.p1)}\n${projection.t2}s → ${fmtUsd(projection.p2)}${projection.sub ? `\n(${projection.sub})` : ''}`}
+            >
+              {projection.label} → {fmtUsd(projection.p1)}
+            </span>
+          ) : null}
           <span className="rounded border border-zinc-700/60 bg-black/30 px-2 py-1 text-zinc-500">
             {model.conviction}
           </span>

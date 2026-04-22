@@ -29,7 +29,9 @@ import { PtbWatchTab } from './PtbWatchTab';
 import { priceToBeat, rtdsCrypto, type RtdsCryptoPoint } from './lib/api';
 import { WorkspaceTab } from './WorkspaceTab';
 import { DualPtbReferenceTab } from './DualPtbReferenceTab';
-import { FloatingTradeDock } from './FloatingTradeDock';
+import { TradeSlidePanel } from './TradeSlidePanel';
+import { PositionsCommandPanel } from './PositionsCommandPanel';
+import { TradeHistoryTab } from './TradeHistoryTab';
 import { shortTradeTabLabel, TradeSessionTabsBar, type TradeSessionTab } from './TradeSessionTabsBar';
 import { PtbMultiAssetGrid, type PtbMultiAssetRow } from './PtbMultiAssetGrid';
 import { UnifiedPtbView } from './UnifiedPtbView';
@@ -530,6 +532,7 @@ type MainTab =
   | 'book'
   | 'flowzones'
   | 'signals'
+  | 'tradehistory'
   | 'dualptb'
   | 'threeup'
   | 'command'
@@ -549,6 +552,8 @@ function mainTabTitle(tab: MainTab): string {
       return 'Flow Zones';
     case 'signals':
       return 'Signals';
+    case 'tradehistory':
+      return 'Trade history';
     case 'dualptb':
       return 'Dual PTB';
     case 'threeup':
@@ -646,13 +651,14 @@ function App() {
   const spotBySymbolRef = useRef<Record<string, SpotPoint[]>>({});
 
   const [globalTradeLane, setGlobalTradeLane] = useState<'up' | 'down'>('up');
-  const [globalTradeOpenNonce, setGlobalTradeOpenNonce] = useState(0);
+  const [tradePanelOpen, setTradePanelOpen] = useState(false);
+  const [positionsPanelOpen, setPositionsPanelOpen] = useState(false);
   const [globalTradeLocked, setGlobalTradeLocked] = useState(false);
-  /** Multiple trade “sessions” in the floating dock; switching re-loads that slug (one CLOB at a time). */
+  /** Multiple trade tabs in the slide panel; switching re-loads that slug (one CLOB at a time). */
   const [tradeSessionTabs, setTradeSessionTabs] = useState<TradeSessionTab[]>([]);
   const [activeTradeSessionTabId, setActiveTradeSessionTabId] = useState<string | null>(null);
   const pendingTradeTabSlugRef = useRef<string | null>(null);
-  /** So closing all tabs does not immediately auto-reseed (user can run empty, then + Session). */
+  /** So closing all tabs does not immediately auto-reseed (user can run empty, then add a new tab). */
   const tradeSessionAutoSeededRef = useRef(false);
   const [globalTradeContext, setGlobalTradeContext] = useState<{
     slug: string;
@@ -730,6 +736,34 @@ function App() {
       down: tokD ? clean(m[tokD] ?? []) : [],
     };
   }, [books, chartSeriesBySlug, marketJson, outcomeLabels, selectedSlug]);
+
+  const tradePanelBookMids = useMemo(() => {
+    if (!books || books.length < 2 || outcomeLabels.length < 2) {
+      return { up: null as number | null, down: null as number | null };
+    }
+    const idx = resolveUpDownIndices(outcomeLabels, marketJson);
+    if (!idx) return { up: null, down: null };
+    const upE = books[idx.up];
+    const downE = books[idx.down];
+    return {
+      up: upE && !upE.error ? midPrice(upE.book) : null,
+      down: downE && !downE.error ? midPrice(downE.book) : null,
+    };
+  }, [books, marketJson, outcomeLabels]);
+
+  const tradePanelBookTouch = useMemo(() => {
+    if (!books || books.length < 2 || outcomeLabels.length < 2) {
+      return { up: null as ReturnType<typeof topOfBook> | null, down: null as ReturnType<typeof topOfBook> | null };
+    }
+    const idx = resolveUpDownIndices(outcomeLabels, marketJson);
+    if (!idx) return { up: null, down: null };
+    const upE = books[idx.up];
+    const downE = books[idx.down];
+    return {
+      up: upE && !upE.error ? topOfBook(upE.book) : null,
+      down: downE && !downE.error ? topOfBook(downE.book) : null,
+    };
+  }, [books, marketJson, outcomeLabels]);
 
   const loadMarket = useCallback(async (slug: string): Promise<LoadMarketResult> => {
     const clean = normalizeMarketLookupRef(slug);
@@ -1057,6 +1091,9 @@ function App() {
 
   // (intentionally no second clock interval)
 
+  const spotLenForRtds = spotSeriesBySlug[selectedSlug]?.length ?? 0;
+  const rtdsPollFast = parseUpdownSlug(selectedSlug) != null && spotLenForRtds < 2;
+
   useEffect(() => {
     const symFromSlug = (slug: string): string | null => {
       const m = slug.trim().toLowerCase().match(/^([a-z0-9]{2,10})-updown-(5m|15m)-(\d+)$/);
@@ -1112,12 +1149,22 @@ function App() {
       });
     };
     void tick();
-    const id = window.setInterval(() => void tick(), 2_000);
+    const bootTimers = [
+      window.setTimeout(() => {
+        if (!stopped) void tick();
+      }, 140),
+      window.setTimeout(() => {
+        if (!stopped) void tick();
+      }, 400),
+    ];
+    const intervalMs = rtdsPollFast ? 750 : 2_000;
+    const id = window.setInterval(() => void tick(), intervalMs);
     return () => {
       stopped = true;
       window.clearInterval(id);
+      for (const t of bootTimers) window.clearTimeout(t);
     };
-  }, [selectedSlug]);
+  }, [selectedSlug, ptbWatchSlugs, rtdsPollFast]);
 
   useEffect(() => {
     const slugs = [...new Set(ptbWatchSlugs.filter((s) => parseUpdownSlug(s) != null))];
@@ -1427,17 +1474,25 @@ function App() {
             <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
               <button
                 type="button"
-                onClick={() => setGlobalTradeOpenNonce((n) => n + 1)}
+                onClick={() => setTradePanelOpen(true)}
                 className="min-h-[34px] rounded-full border border-amber-500/35 bg-zinc-950/70 px-4 text-[12px] font-black tracking-wide text-amber-100 shadow-lg shadow-black/20 ring-1 ring-white/[0.04] transition-colors hover:bg-zinc-900/80"
                 title={
-                  !globalTradeReady
+                  !effectiveTradeReady
                     ? 'Open trade (market not ready yet)'
-                    : globalTradeEnabled
+                    : effectiveTradeEnabled
                       ? 'Open trade'
                       : 'Open trade (tokens not resolved yet)'
                 }
               >
                 Trade
+              </button>
+              <button
+                type="button"
+                onClick={() => setPositionsPanelOpen(true)}
+                className="min-h-[34px] rounded-full border border-cyan-600/35 bg-zinc-950/70 px-4 text-[12px] font-black tracking-wide text-cyan-100 shadow-lg shadow-black/20 ring-1 ring-white/[0.04] transition-colors hover:bg-zinc-900/80"
+                title="Global positions (paper) — X exit row, Shift+X close all"
+              >
+                Positions
               </button>
               <div className="rounded-full border border-zinc-700/40 bg-zinc-950/50 px-3 py-1.5 font-mono text-[11px] leading-snug text-zinc-400">
                 {apiHealth}
@@ -1586,7 +1641,15 @@ function App() {
               <div className="ml-auto flex items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => setGlobalTradeOpenNonce((n) => n + 1)}
+                  onClick={() => setPositionsPanelOpen(true)}
+                  className="min-h-[34px] rounded-xl border border-cyan-800/50 bg-cyan-950/20 px-3 text-[12px] font-black tracking-wide text-cyan-100 ring-1 ring-white/[0.04] transition-colors hover:bg-cyan-950/35"
+                  title="Global positions (paper)"
+                >
+                  Positions
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTradePanelOpen(true)}
                   className={`min-h-[34px] rounded-xl border px-3 text-[12px] font-black tracking-wide ring-1 ring-white/[0.04] transition-colors ${
                     'border-zinc-700/70 bg-black/20 text-zinc-200 hover:bg-black/30'
                   }`}
@@ -1607,6 +1670,7 @@ function App() {
               <MainTabButton id="book" label="Book" active={mainTab === 'book'} onSelect={setMainTab} />
               <MainTabButton id="flowzones" label="Flow" title="Flow Zones" active={mainTab === 'flowzones'} onSelect={setMainTab} />
               <MainTabButton id="signals" label="Signals" active={mainTab === 'signals'} onSelect={setMainTab} />
+              <MainTabButton id="tradehistory" label="History" title="Trade history (paper + live log)" active={mainTab === 'tradehistory'} onSelect={setMainTab} />
               <MainTabButton id="dualptb" label="Dual PTB" title="Reference PTB continuation tab" active={mainTab === 'dualptb'} onSelect={setMainTab} />
               <MainTabButton id="threeup" label="3-up" title="BTC/ETH/SOL spot vs PTB (simultaneous)" active={mainTab === 'threeup'} onSelect={setMainTab} />
               <MainTabButton id="command" label="Command" title="Multi-market command tiles + command center" active={mainTab === 'command'} onSelect={setMainTab} />
@@ -1618,77 +1682,6 @@ function App() {
               <MainTabButton id="assistant" label="Assistant" active={mainTab === 'assistant'} onSelect={setMainTab} />
               <MainTabButton id="raw" label="Raw" active={mainTab === 'raw'} onSelect={setMainTab} />
             </div>
-
-            <FloatingTradeDock
-              title="Trade"
-              enabled
-              hideLauncher
-              openNonce={globalTradeOpenNonce}
-              inline={<></>}
-              floating={
-                <div className="space-y-3">
-                  <TradeSessionTabsBar
-                    tabs={tradeSessionTabs}
-                    activeId={activeTradeSessionTabId}
-                    onSelect={onSelectTradeSessionTab}
-                    onAdd={onAddTradeSessionTab}
-                    onClose={onCloseTradeSessionTab}
-                  />
-                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-zinc-800/70 bg-black/20 px-3 py-2">
-                    <div className="min-w-0">
-                      <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Active market (session tab)</div>
-                      <div className="truncate text-[12px] font-semibold text-zinc-200">{effectiveTradeContext.question || effectiveTradeContext.slug || '—'}</div>
-                      {effectiveTradeContext.slug ? <div className="truncate font-mono text-[10px] text-zinc-600">{effectiveTradeContext.slug}</div> : null}
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setGlobalTradeLocked((v) => {
-                            const next = !v;
-                            if (next) setGlobalTradeContext(currentTradeContext);
-                            return next;
-                          });
-                        }}
-                        className={`min-h-[34px] rounded-xl border px-3 text-[11px] font-black tracking-wide transition-colors ${
-                          globalTradeLocked
-                            ? 'border-amber-500/50 bg-amber-500/10 text-amber-100 hover:bg-amber-500/15'
-                            : 'border-zinc-800/70 bg-black/15 text-zinc-200 hover:bg-black/25'
-                        }`}
-                        title={globalTradeLocked ? 'Unlock (follow current market)' : 'Lock (stay on this market)'}
-                      >
-                        {globalTradeLocked ? 'Locked' : 'Lock'}
-                      </button>
-                    </div>
-                  </div>
-
-                  {effectiveTradeEnabled ? (
-                    <SignalsTradePanel
-                      marketSlug={effectiveTradeContext.slug}
-                      marketQuestion={effectiveTradeContext.question}
-                      upLabel={effectiveTradeContext.upLabel}
-                      downLabel={effectiveTradeContext.downLabel}
-                      upToken={effectiveTradeContext.upToken}
-                      downToken={effectiveTradeContext.downToken}
-                      upMid={signalsProbMids.up.length ? (signalsProbMids.up[signalsProbMids.up.length - 1]!.v ?? null) : null}
-                      downMid={signalsProbMids.down.length ? (signalsProbMids.down[signalsProbMids.down.length - 1]!.v ?? null) : null}
-                      lane={globalTradeLane}
-                      onLaneChange={onGlobalTradeLaneChange}
-                      visualStyle="sidebar"
-                    />
-                  ) : !effectiveTradeReady ? (
-                    <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-4 text-sm text-zinc-500">
-                      Load a market (with books) to enable trading. Once a market is loaded, open this dock again.
-                    </div>
-                  ) : (
-                    <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-4 text-sm text-zinc-500">
-                      Trading UI is ready, but this market’s outcome tokens aren’t resolved yet. Load a 2-outcome market (or wait for books), and ensure your API has{' '}
-                      <code className="text-zinc-400">POLYMARKET_PRIVATE_KEY</code> set to place real orders.
-                    </div>
-                  )}
-                </div>
-              }
-            />
 
             {isMarketClosed(marketJson) ? (
               <div className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-800/25 bg-amber-950/15 px-3 py-2 text-xs text-amber-100/85">
@@ -1785,7 +1778,7 @@ function App() {
               </div>
             ) : null}
 
-            {tokenIds.length === 0 && mainTab !== 'watch' && mainTab !== 'momentum' ? (
+            {tokenIds.length === 0 && mainTab !== 'watch' && mainTab !== 'momentum' && mainTab !== 'tradehistory' ? (
               <div className="mt-4 text-sm leading-relaxed text-zinc-500">Select a market to load token ids and ladders.</div>
             ) : null}
 
@@ -1969,6 +1962,12 @@ function App() {
               </div>
             ) : null}
 
+            {mainTab === 'tradehistory' ? (
+              <div className="mt-5">
+                <TradeHistoryTab />
+              </div>
+            ) : null}
+
             {mainTab === 'multiscan' ? (
               <div className="mt-5">
                 <PtbMultiAssetGrid
@@ -2099,10 +2098,10 @@ function App() {
                   }}
                   onOpenTradeDock={({ slug, lane }) => {
                     if (slug) void loadMarket(slug);
-                    // Let the dock auto-bind to the currently loaded market unless user locks manually.
+                    // Let the panel auto-bind to the currently loaded market unless user locks manually.
                     setGlobalTradeLocked(false);
                     setGlobalTradeLane(lane);
-                    setGlobalTradeOpenNonce((n) => n + 1);
+                    setTradePanelOpen(true);
                   }}
                 />
               </div>
@@ -2215,6 +2214,13 @@ function App() {
                 </button>
                 <button
                   type="button"
+                  onClick={() => setMainTab('tradehistory')}
+                  className="rounded-xl border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
+                >
+                  History
+                </button>
+                <button
+                  type="button"
                   onClick={() => setMainTab('dualptb')}
                   className="rounded-xl border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
                 >
@@ -2252,6 +2258,115 @@ function App() {
             </div>
           </div>
         </div>
+
+        <TradeSlidePanel
+          open={tradePanelOpen}
+          onClose={() => setTradePanelOpen(false)}
+          title={effectiveTradeContext.question || effectiveTradeContext.slug || 'Market'}
+        >
+          <div className="space-y-3">
+            <TradeSessionTabsBar
+              tabs={tradeSessionTabs}
+              activeId={activeTradeSessionTabId}
+              onSelect={onSelectTradeSessionTab}
+              onAdd={onAddTradeSessionTab}
+              onClose={onCloseTradeSessionTab}
+            />
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-zinc-800/60 bg-gradient-to-br from-zinc-900/40 to-black/30 px-3 py-3 ring-1 ring-white/[0.04]">
+              <div className="min-w-0 flex-1">
+                <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-zinc-500">Current market</div>
+                <div className="mt-0.5 truncate text-[13px] font-semibold leading-snug text-zinc-100">
+                  {effectiveTradeContext.question || effectiveTradeContext.slug || '—'}
+                </div>
+                {effectiveTradeContext.slug ? (
+                  <div className="mt-1 truncate font-mono text-[10px] text-zinc-500">{effectiveTradeContext.slug}</div>
+                ) : null}
+                <p className="mt-1.5 text-[10px] leading-relaxed text-zinc-600">
+                  {globalTradeLocked
+                    ? 'Pinned: the trade panel stays on this market while you browse elsewhere in the app.'
+                    : 'Following the page: when you load another market, this panel updates too.'}
+                </p>
+              </div>
+              <div className="flex shrink-0 flex-col items-stretch gap-1.5 sm:items-end">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setGlobalTradeLocked((v) => {
+                      const next = !v;
+                      if (next) setGlobalTradeContext(currentTradeContext);
+                      return next;
+                    });
+                  }}
+                  className={`min-h-[40px] rounded-xl border px-3.5 text-[11px] font-semibold tracking-wide transition-colors ${
+                    globalTradeLocked
+                      ? 'border-amber-500/50 bg-amber-500/15 text-amber-50 hover:bg-amber-500/20'
+                      : 'border-zinc-600/60 bg-zinc-950/50 text-zinc-200 hover:border-zinc-500/60 hover:bg-zinc-900/60'
+                  }`}
+                  title={
+                    globalTradeLocked
+                      ? 'Unpin — panel will follow whichever market you load next'
+                      : 'Pin — keep trading this market even if you open another slug in the background'
+                  }
+                >
+                  {globalTradeLocked ? 'Pinned' : 'Pin market'}
+                </button>
+              </div>
+            </div>
+
+            {effectiveTradeEnabled ? (
+              <SignalsTradePanel
+                marketSlug={effectiveTradeContext.slug}
+                marketQuestion={effectiveTradeContext.question}
+                upLabel={effectiveTradeContext.upLabel}
+                downLabel={effectiveTradeContext.downLabel}
+                upToken={effectiveTradeContext.upToken}
+                downToken={effectiveTradeContext.downToken}
+                upMid={signalsProbMids.up.length ? (signalsProbMids.up[signalsProbMids.up.length - 1]!.v ?? null) : null}
+                downMid={signalsProbMids.down.length ? (signalsProbMids.down[signalsProbMids.down.length - 1]!.v ?? null) : null}
+                bookMidUp={tradePanelBookMids.up}
+                bookMidDown={tradePanelBookMids.down}
+                bookTouchUp={tradePanelBookTouch.up}
+                bookTouchDown={tradePanelBookTouch.down}
+                lane={globalTradeLane}
+                onLaneChange={onGlobalTradeLaneChange}
+                visualStyle="slide"
+              />
+            ) : !effectiveTradeReady ? (
+              <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/40 p-4 text-[13px] leading-relaxed text-zinc-400">
+                <p className="font-medium text-zinc-300">Almost there</p>
+                <ol className="mt-2 list-decimal space-y-1 pl-4 text-zinc-500">
+                  <li>Use the shortcuts or search to open a market.</li>
+                  <li>Wait until the order book finishes loading.</li>
+                  <li>Then use Trade again — the panel unlocks automatically.</li>
+                </ol>
+              </div>
+            ) : (
+              <div className="rounded-2xl border border-amber-900/25 bg-amber-950/10 p-4 text-[13px] leading-relaxed text-amber-100/85">
+                <p className="font-medium text-amber-100">Tokens not ready</p>
+                <p className="mt-2 text-amber-100/75">
+                  This market loaded, but we still need both outcome tokens (usually a two-sided Yes/No or Up/Down market). Try another slug, or wait for books to populate.
+                </p>
+                <p className="mt-2 text-[12px] text-amber-200/60">
+                  For <span className="font-medium text-amber-100/90">live</span> orders, your API needs{' '}
+                  <code className="rounded bg-black/30 px-1 py-0.5 font-mono text-[11px] text-amber-200/90">POLYMARKET_PRIVATE_KEY</code>{' '}
+                  configured — Paper mode still works for practice.
+                </p>
+              </div>
+            )}
+          </div>
+        </TradeSlidePanel>
+
+        <PositionsCommandPanel
+          open={positionsPanelOpen}
+          onClose={() => setPositionsPanelOpen(false)}
+          selectedSlug={selectedSlug}
+          booksFetchedAt={booksFetchedAt}
+          onNavigate={(slug, lane) => {
+            void loadMarket(slug);
+            setGlobalTradeLane(lane);
+            setMainTab('dualptb');
+          }}
+        />
       </div>
     </div>
   );

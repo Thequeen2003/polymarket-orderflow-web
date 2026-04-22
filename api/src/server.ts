@@ -3,7 +3,15 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import express from 'express';
-import { AssetType, COLLATERAL_TOKEN_DECIMALS, CONDITIONAL_TOKEN_DECIMALS, OrderType, Side } from '@polymarket/clob-client';
+import {
+  AssetType,
+  type ClobClient,
+  COLLATERAL_TOKEN_DECIMALS,
+  CONDITIONAL_TOKEN_DECIMALS,
+  OrderType,
+  Side,
+  type TradeParams,
+} from '@polymarket/clob-client';
 import { getTradingClient, getTradingConfigFromEnv } from './polymarketTrading.js';
 
 // Load env: monorepo root `.env` first, then `api/.env` (overrides) so keys work from either location.
@@ -386,8 +394,23 @@ function normalizeChainlinkTsMs(tsRaw: number): number {
   return tsRaw < 1e12 ? tsRaw * 1000 : tsRaw;
 }
 
+/** Normalize RTDS symbols: Chainlink uses `eth/usd`; Binance uses `ethusdt`. */
+function canonicalCryptoSpotSymbol(raw: string): string | null {
+  const s = String(raw ?? '').trim().toLowerCase();
+  if (!s) return null;
+  if (/^[a-z0-9]{2,12}\/usd$/.test(s)) return s;
+  const binanceToSlash: Record<string, string> = {
+    btcusdt: 'btc/usd',
+    ethusdt: 'eth/usd',
+    solusdt: 'sol/usd',
+    xrpusdt: 'xrp/usd',
+  };
+  return binanceToSlash[s] ?? null;
+}
+
 function recordRtdsTick(symbol: string, value: number, tsRaw: number, source: RtdsPrice['source']): void {
-  const sym = symbol.toLowerCase();
+  const sym = canonicalCryptoSpotSymbol(symbol);
+  if (!sym) return;
   const tsMs = normalizeChainlinkTsMs(tsRaw);
   rtdsCache.set(sym, {
     symbol: sym,
@@ -415,40 +438,79 @@ async function ensureRtdsWs(): Promise<void> {
     const ws = new WebSocket('wss://ws-live-data.polymarket.com');
     rtdsWs = ws;
     ws.onopen = () => {
-      // Subscribe to a small default set; additional symbols are subscribed on-demand by the /api/rtds/crypto endpoint.
-      const subs = ['btc/usd', 'eth/usd', 'sol/usd'].map((symbol) => ({
+      // Chainlink (slash symbols) + Binance (concat symbols) — both map into `btc/usd`, `eth/usd`, `sol/usd`.
+      const chainlinkSubs = ['btc/usd', 'eth/usd', 'sol/usd'].map((symbol) => ({
         topic: 'crypto_prices_chainlink',
         type: '*',
         filters: JSON.stringify({ symbol }),
       }));
-      ws.send(JSON.stringify({ action: 'subscribe', subscriptions: subs }));
+      // Filters must be JSON-shaped; comma lists like "btcusdt,ethusdt" reject the *entire* subscribe batch (no Chainlink).
+      const binanceSub = { topic: 'crypto_prices', type: 'update' };
+      ws.send(JSON.stringify({ action: 'subscribe', subscriptions: [...chainlinkSubs, binanceSub] }));
       resolve();
+    };
+    /** Official RTDS client uses lowercase `ping` every 5s; long intervals risk idle disconnects. */
+    const pingEveryMs = 5_000;
+    const pingId = setInterval(() => {
+      try {
+        if (ws.readyState === WebSocket.OPEN) ws.send('ping');
+      } catch {
+        /* ignore */
+      }
+    }, pingEveryMs);
+    const stopPing = () => {
+      try {
+        clearInterval(pingId);
+      } catch {
+        /* ignore */
+      }
     };
     ws.onmessage = (ev) => {
       try {
-        const msg = JSON.parse(String(ev.data)) as Record<string, unknown>;
-        const topic = String(msg.topic ?? '');
-        if (topic !== 'crypto_prices_chainlink' && topic !== 'crypto_prices') return;
-        const payload = (msg.payload ?? {}) as Record<string, unknown>;
-        const symbol = String(payload.symbol ?? '');
-        const value = Number(payload.value);
-        const ts = Number(payload.timestamp ?? msg.timestamp);
-        if (!symbol || !Number.isFinite(value)) return;
-        recordRtdsTick(
-          symbol,
-          value,
-          Number.isFinite(ts) ? ts : Date.now(),
-          topic === 'crypto_prices_chainlink' ? 'chainlink' : 'binance',
-        );
+        const parsed = JSON.parse(String(ev.data)) as unknown;
+        const batch = Array.isArray(parsed) ? parsed : [parsed];
+        for (const item of batch) {
+          const msg = item as Record<string, unknown>;
+          const topic = String(msg.topic ?? '');
+          if (topic !== 'crypto_prices_chainlink' && topic !== 'crypto_prices') continue;
+          const payload = (msg.payload ?? {}) as Record<string, unknown>;
+          const msgType = String(msg.type ?? '');
+          const symRaw = String(payload.symbol ?? '');
+
+          // Initial history: { topic, type: "subscribe", payload: { symbol, data: [{timestamp,value}, ...] } }
+          if (msgType === 'subscribe' && Array.isArray(payload.data) && symRaw) {
+            const src: RtdsPrice['source'] = symRaw.includes('/') ? 'chainlink' : 'binance';
+            for (const row of payload.data) {
+              if (!row || typeof row !== 'object') continue;
+              const ro = row as Record<string, unknown>;
+              const t = Number(ro.timestamp);
+              const val = Number(ro.value);
+              if (Number.isFinite(t) && Number.isFinite(val)) recordRtdsTick(symRaw, val, t, src);
+            }
+            continue;
+          }
+
+          const value = Number(payload.value);
+          const ts = Number(payload.timestamp ?? msg.timestamp);
+          if (!symRaw || !Number.isFinite(value)) continue;
+          recordRtdsTick(
+            symRaw,
+            value,
+            Number.isFinite(ts) ? ts : Date.now(),
+            topic === 'crypto_prices_chainlink' ? 'chainlink' : 'binance',
+          );
+        }
       } catch {
         /* ignore */
       }
     };
     ws.onerror = () => {
+      stopPing();
       // allow restart
       rtdsWsStarting = null;
     };
     ws.onclose = () => {
+      stopPing();
       rtdsWsStarting = null;
     };
   });
@@ -905,7 +967,14 @@ app.get('/api/rtds/crypto', async (req, res) => {
   } catch (e) {
     return json(res, 502, { ok: false, error: 'rtds_unavailable', details: String(e) });
   }
-  const v = rtdsCache.get(symbol);
+  let v = rtdsCache.get(symbol);
+  // First ticks can lag a few hundred ms after subscribe; short wait avoids empty charts on cold load.
+  if (!v && rtdsWs && rtdsWs.readyState === WebSocket.OPEN) {
+    for (let i = 0; i < 16 && !v; i++) {
+      await new Promise<void>((r) => setTimeout(r, 75));
+      v = rtdsCache.get(symbol);
+    }
+  }
   if (!v) return json(res, 404, { ok: false, error: 'no_price_yet', details: { symbol } });
   const history = rtdsHistory.get(symbol) ?? [];
   return json(res, 200, { ok: true, data: { ...v, history } });
@@ -1154,6 +1223,18 @@ function parseNumber(name: string, v: unknown): number | null {
   return n;
 }
 
+function roundPrice01Api(n: number): number {
+  return Math.round(n * 1_000_000) / 1_000_000;
+}
+
+function floorSizeShares4(n: number): number {
+  return Math.floor(n * 10_000 + 1e-12) / 10_000;
+}
+
+function roundSizeShares4(n: number): number {
+  return Math.round(n * 10_000) / 10_000;
+}
+
 function toHumanAmount(raw: unknown, decimals: number): string | null {
   const n = typeof raw === 'string' ? Number(raw) : typeof raw === 'number' ? raw : NaN;
   if (!Number.isFinite(n)) return null;
@@ -1161,14 +1242,156 @@ function toHumanAmount(raw: unknown, decimals: number): string | null {
   return String(n / denom);
 }
 
-function normalizeAmountMaybe(raw: unknown, decimals: number, kind: 'collateral' | 'conditional'): string | null {
+function normalizeAmountMaybe(raw: unknown, decimals: number, _kind: 'collateral' | 'conditional'): string | null {
   const n = typeof raw === 'string' ? Number(raw) : typeof raw === 'number' ? raw : NaN;
   if (!Number.isFinite(n)) return null;
-  // Some upstreams return base units (1e6) while others return human units already.
-  // Heuristic: if it's huge, treat as base units; otherwise treat as already-human.
-  const threshold = kind === 'collateral' ? 1e8 : 1e9; // ~100 USDC in base units; ~1000 shares in base units
-  if (n >= threshold) return toHumanAmount(n, decimals);
-  return String(n);
+  // CLOB balances are usually smallest-unit integers (e.g. 6dp → 12.94 shares as "12940000").
+  // Human values are typically decimals ("12.94") or small whole numbers ("5") and must not be divided.
+  const str = typeof raw === 'string' ? raw.trim() : '';
+  const intOk =
+    (typeof raw === 'string' && /^-?\d+$/.test(str) && !/[eE]/.test(str)) ||
+    (typeof raw === 'number' && Number.isInteger(n));
+  if (!intOk) {
+    return String(n);
+  }
+  const minRaw = 10 ** Math.max(0, decimals - 2);
+  if (Math.abs(n) < minRaw) {
+    return String(n);
+  }
+  return toHumanAmount(n, decimals) ?? String(n);
+}
+
+type ClobBookLevel = { price?: string; size?: string };
+
+function bestAskBestBidFromBook(book: unknown): { bestAsk: number | null; bestBid: number | null } {
+  const b = book as { asks?: ClobBookLevel[]; bids?: ClobBookLevel[] };
+  let bestAsk: number | null = null;
+  for (const a of b.asks ?? []) {
+    const p = Number(a.price);
+    if (Number.isFinite(p) && p > 0 && p < 1) {
+      if (bestAsk == null || p < bestAsk) bestAsk = p;
+    }
+  }
+  let bestBid: number | null = null;
+  for (const x of b.bids ?? []) {
+    const p = Number(x.price);
+    if (Number.isFinite(p) && p > 0 && p < 1) {
+      if (bestBid == null || p > bestBid) bestBid = p;
+    }
+  }
+  return { bestAsk, bestBid };
+}
+
+function extractOrderIdFromClobPayload(obj: unknown): string | null {
+  if (!obj || typeof obj !== 'object') return null;
+  const o = obj as Record<string, unknown>;
+  for (const k of ['orderID', 'orderId', 'order_id', 'id'] as const) {
+    const v = o[k];
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
+  return null;
+}
+
+function parseTickSizeOrDefault(tickStr: string): number {
+  const t = Number(tickStr);
+  return Number.isFinite(t) && t > 0 && t < 1 ? t : 0.01;
+}
+
+/** When SDK-walked depth fails the matcher, cross with an explicit limit just past the touch (tick-aligned). */
+function slipExplicitBuyPrice(bestAsk: number, tick: number): number {
+  const maxP = Math.min(0.99, 1 - tick);
+  const cushion = Math.max(tick * 22, 0.012, bestAsk * 0.025);
+  const target = Math.min(maxP, bestAsk + cushion);
+  let out = Math.ceil((target + 1e-12) / tick) * tick;
+  out = Math.min(maxP, Math.max(bestAsk, out));
+  // If rounding collapsed to the touch, step one tick up so the matcher sees a true cross.
+  if (out <= bestAsk + 1e-12 && out + tick <= maxP + 1e-12) out = Math.min(maxP, out + tick);
+  return out;
+}
+
+function slipExplicitSellPrice(bestBid: number, tick: number): number {
+  const minP = Math.max(0.01, tick);
+  const cushion = Math.max(tick * 22, 0.012, bestBid * 0.025);
+  const target = Math.max(minP, bestBid - cushion);
+  let out = Math.floor((target - 1e-12) / tick) * tick;
+  out = Math.max(minP, Math.min(bestBid, out));
+  if (out >= bestBid - 1e-12 && out - tick >= minP - 1e-12) out = Math.max(minP, out - tick);
+  return out;
+}
+
+function isLiquidityClassMarketError(msg: string): boolean {
+  return (
+    /no orders found/i.test(msg) ||
+    /no match/i.test(msg) ||
+    /FAK/i.test(msg) ||
+    /FOK/i.test(msg) ||
+    /fully filled/i.test(msg) ||
+    /killed/i.test(msg)
+  );
+}
+
+type FakMarketPayload = {
+  tokenID: string;
+  amount: number;
+  side: Side;
+  orderType: typeof OrderType.FAK;
+  price?: number;
+};
+
+/**
+ * Prefer an explicit tick-aligned cross price from the live book on every market order.
+ * Skips SDK-only `calculateMarketPrice` when possible — that path often disagrees with the matcher by a tick.
+ */
+async function attachBookCrossPricePrefer(client: ClobClient, base: FakMarketPayload): Promise<FakMarketPayload> {
+  if (base.price != null && Number.isFinite(base.price) && base.price > 0 && base.price < 1) return base;
+  try {
+    const [tickStr, book] = await Promise.all([client.getTickSize(base.tokenID), client.getOrderBook(base.tokenID)]);
+    const tick = parseTickSizeOrDefault(tickStr);
+    const { bestAsk, bestBid } = bestAskBestBidFromBook(book);
+    if (base.side === Side.BUY && bestAsk != null) {
+      return { ...base, price: slipExplicitBuyPrice(bestAsk, tick) };
+    }
+    if (base.side === Side.SELL && bestBid != null) {
+      return { ...base, price: slipExplicitSellPrice(bestBid, tick) };
+    }
+  } catch {
+    /* SDK will derive price inside createMarketOrder */
+  }
+  return base;
+}
+
+async function createAndPostMarketOrderWithBookSlippage(client: ClobClient, base: FakMarketPayload): Promise<unknown> {
+  try {
+    return await client.createAndPostMarketOrder(base, undefined, OrderType.FAK);
+  } catch (first) {
+    const msg = first instanceof Error ? first.message : String(first);
+    if (!isLiquidityClassMarketError(msg)) throw first;
+
+    const tickStr = await client.getTickSize(base.tokenID);
+    const tick = parseTickSizeOrDefault(tickStr);
+    const book = await client.getOrderBook(base.tokenID);
+    const { bestAsk, bestBid } = bestAskBestBidFromBook(book);
+
+    let slip: number | null = null;
+    if (base.side === Side.BUY) {
+      if (bestAsk == null) throw first;
+      slip = slipExplicitBuyPrice(bestAsk, tick);
+    } else {
+      if (bestBid == null) throw first;
+      slip = slipExplicitSellPrice(bestBid, tick);
+    }
+
+    const slipped = { ...base, price: slip, orderType: OrderType.FAK as const };
+    try {
+      return await client.createAndPostMarketOrder(slipped, undefined, OrderType.FAK);
+    } catch {
+      return await client.createAndPostMarketOrder(
+        { ...slipped, orderType: OrderType.FOK as const },
+        undefined,
+        OrderType.FOK,
+      );
+    }
+  }
 }
 
 /** CLOB balance + allowance for Max / Available (USDC or outcome shares). */
@@ -1214,7 +1437,35 @@ app.get('/api/trade/balance-allowance', async (req, res) => {
   }
 });
 
-/** Avg entry price (cost basis) for current user and token (0..1), computed from authenticated trade history. */
+function tradeMatchTimeMs(trade: Record<string, unknown>): number {
+  const raw = trade.match_time ?? trade.last_update ?? trade.timestamp;
+  if (typeof raw === 'string') {
+    const ms = Date.parse(raw);
+    if (Number.isFinite(ms)) return ms;
+  }
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+  return 0;
+}
+
+function tradeInvolvesAddresses(trade: Record<string, unknown>, addrs: Set<string>): boolean {
+  const owner = typeof trade.owner === 'string' ? trade.owner.toLowerCase() : '';
+  const makerRoot = typeof trade.maker_address === 'string' ? trade.maker_address.toLowerCase() : '';
+  if (owner && addrs.has(owner)) return true;
+  if (makerRoot && addrs.has(makerRoot)) return true;
+  const mos = trade.maker_orders;
+  if (Array.isArray(mos)) {
+    for (const mo of mos) {
+      if (!mo || typeof mo !== 'object') continue;
+      const m = mo as Record<string, unknown>;
+      const ma = typeof m.maker_address === 'string' ? m.maker_address.toLowerCase() : '';
+      const ow = typeof m.owner === 'string' ? m.owner.toLowerCase() : '';
+      if ((ma && addrs.has(ma)) || (ow && addrs.has(ow))) return true;
+    }
+  }
+  return false;
+}
+
+/** Avg entry price (cost basis) for current user and token (0..1), from CLOB `/data/trades` for this `asset_id`. */
 app.get('/api/trade/avg-entry', async (req, res) => {
   const tokenId = String(req.query.token_id ?? '').trim();
   if (!tokenId) return json(res, 400, { ok: false, error: 'missing_token_id' });
@@ -1229,32 +1480,40 @@ app.get('/api/trade/avg-entry', async (req, res) => {
   }
 
   try {
-    // Keep it light: fetch only the first page for this token. If you have very long history,
-    // this is an estimate (still useful for most active markets).
-    const trades = await ready.client.getTrades({ token_id: tokenId, limit: 500 } as never, true);
-
     const funder = ready.config.funderAddress.toLowerCase();
-    const items = (Array.isArray(trades) ? trades : []) as unknown[];
+    const signer = ready.config.signerAddress.toLowerCase();
+    const myAddrs = new Set([funder, signer].filter(Boolean));
 
-    // Moving average cost basis.
+    const params: TradeParams = { asset_id: tokenId };
+    const items: Record<string, unknown>[] = [];
+    let cursor: string | undefined = undefined;
+    for (let page = 0; page < 24; page++) {
+      const batch = await ready.client.getTradesPaginated(params, cursor);
+      for (const tr of batch.trades) items.push(tr as unknown as Record<string, unknown>);
+      const next = batch.next_cursor;
+      if (!next || next === 'LTE=' || batch.trades.length === 0) break;
+      cursor = next;
+    }
+
+    items.sort((a, b) => tradeMatchTimeMs(a) - tradeMatchTimeMs(b));
+
+    const anyAddrHit = items.some((t) => String(t.asset_id ?? '') === tokenId && tradeInvolvesAddresses(t, myAddrs));
+
     let pos = 0;
     let cost = 0;
-    for (const t of items.slice().reverse()) {
-      const trade = t as Record<string, unknown>;
-      const sideRaw = String(trade.side ?? trade.taker_side ?? trade.maker_side ?? '').toLowerCase();
-      const price = parseNumber('price', trade.price);
-      const size = parseNumber('size', trade.size ?? trade.amount ?? trade.quantity);
-      const maker = typeof trade.maker_address === 'string' ? trade.maker_address.toLowerCase() : '';
-      const taker = typeof trade.taker_address === 'string' ? trade.taker_address.toLowerCase() : '';
+    for (const trade of items) {
+      if (String(trade.asset_id ?? '') !== tokenId) continue;
+      if (anyAddrHit && !tradeInvolvesAddresses(trade, myAddrs)) continue;
 
-      // If addresses exist, only include the user's own participation.
-      const hasAddr = Boolean(maker || taker);
-      const involved = !hasAddr || maker === funder || taker === funder;
-      if (!involved) continue;
+      const price = parseNumber('price', trade.price);
+      const sizeRaw = trade.size ?? trade.amount ?? trade.quantity;
+      const sizeNorm = normalizeAmountMaybe(sizeRaw, CONDITIONAL_TOKEN_DECIMALS, 'conditional');
+      const size = parseNumber('size', sizeNorm ?? sizeRaw);
       if (price == null || size == null || price <= 0 || price >= 1 || size <= 0) continue;
 
-      const isBuy = sideRaw === 'buy' || sideRaw === 'b';
-      const isSell = sideRaw === 'sell' || sideRaw === 's';
+      const sideRaw = String(trade.side ?? '').toUpperCase();
+      const isBuy = sideRaw === 'BUY' || sideRaw === 'B';
+      const isSell = sideRaw === 'SELL' || sideRaw === 'S';
       if (!isBuy && !isSell) continue;
 
       if (isBuy) {
@@ -1269,8 +1528,9 @@ app.get('/api/trade/avg-entry', async (req, res) => {
       }
     }
 
-    const avgEntry = pos > 0 ? cost / pos : null;
-    return json(res, 200, { ok: true, data: { tokenId, avgEntry, shares: pos } });
+    const avgEntry = pos > 0 ? roundPrice01Api(cost / pos) : null;
+    const sharesOut = roundSizeShares4(pos);
+    return json(res, 200, { ok: true, data: { tokenId, avgEntry, shares: sharesOut } });
   } catch (error) {
     return json(res, 502, {
       ok: false,
@@ -1331,6 +1591,38 @@ app.post('/api/trade/market-order', async (req, res) => {
   if (side === 'buy' && amount > 10_000) return json(res, 400, { ok: false, error: 'bad_amount', details: { max_usdc: 10_000 } });
   if (side === 'sell' && amount > 2_000_000) return json(res, 400, { ok: false, error: 'bad_amount', details: { max_shares: 2_000_000 } });
 
+  /** Polymarket CLOB rejects marketable BUY below $1 (e.g. shares×mid = 0.9988). */
+  const MIN_MARKET_BUY_USDC = 1;
+  let orderAmount = amount;
+  if (side === 'buy' && amount < MIN_MARKET_BUY_USDC - 1e-9) {
+    const bumped = Math.ceil(amount * 100 - 1e-9) / 100;
+    if (bumped < MIN_MARKET_BUY_USDC - 1e-9) {
+      return json(res, 400, {
+        ok: false,
+        error: 'bad_amount',
+        details: {
+          message: `Market buy notional must be at least $${MIN_MARKET_BUY_USDC} USDC.`,
+          min_usdc: MIN_MARKET_BUY_USDC,
+        },
+      });
+    }
+    orderAmount = bumped;
+  }
+  if (side === 'buy') {
+    orderAmount = Number(orderAmount.toFixed(2));
+  }
+  // CLOB share sizes are effectively 4dp; rounding up can exceed balance and reject sells.
+  if (side === 'sell') {
+    orderAmount = floorSizeShares4(amount);
+    if (orderAmount < 1e-4) {
+      return json(res, 400, {
+        ok: false,
+        error: 'bad_amount',
+        details: { hint: 'Sell size is too small after rounding to 4 decimal shares.' },
+      });
+    }
+  }
+
   const ready = await getTradingClient();
   if (!ready.ok) {
     return json(res, ready.error === 'trading_auth_failed' ? 502 : 503, {
@@ -1349,46 +1641,55 @@ app.post('/api/trade/market-order', async (req, res) => {
     }
 
     const sideEnum = side === 'buy' ? Side.BUY : Side.SELL;
-    const baseOrder = {
+    const baseOrder: FakMarketPayload = {
       tokenID: token,
-      amount,
+      amount: orderAmount,
       side: sideEnum,
       /**
        * Must match the execution order type passed to `createAndPostMarketOrder` — otherwise
        * `calculateMarketPrice` defaults to FOK-style pricing while the matcher runs FAK, which
        * can yield “no orders found to match with FAK order”.
        */
-      orderType: OrderType.FAK as const,
+      orderType: OrderType.FAK,
     };
 
+    const t0 = Date.now();
     let parsed: unknown;
+    let submittedCrossPrice: number | null = null;
     try {
-      parsed = await ready.client.createAndPostMarketOrder(baseOrder, undefined, OrderType.FAK);
-    } catch (first) {
-      const msg = first instanceof Error ? first.message : String(first);
-      // Avoid FOK fallback: it can fail with "couldn't be fully filled" when the book is thin/moving,
-      // which is worse UX than simply surfacing the original FAK failure with a liquidity hint.
-      const liquidityHint =
-        /no orders found/i.test(msg) ||
-        /no match/i.test(msg) ||
-        /FAK/i.test(msg) ||
-        /FOK/i.test(msg) ||
-        /fully filled/i.test(msg) ||
-        /killed/i.test(msg);
-      if (liquidityHint) {
+      const priced = await attachBookCrossPricePrefer(ready.client, baseOrder);
+      submittedCrossPrice =
+        priced.price != null && Number.isFinite(priced.price) && priced.price > 0 && priced.price < 1
+          ? priced.price
+          : null;
+      parsed = await createAndPostMarketOrderWithBookSlippage(ready.client, priced);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (isLiquidityClassMarketError(msg)) {
         return json(res, 502, {
           ok: false,
           error: 'trade_api_failed',
           details: {
             message: msg,
-            hint: 'Not enough liquidity to fill this as a market order right now. Try a smaller size, switch to Limit, or retry in a few seconds.',
+            hint:
+              'Could not match a market order after a book-based retry (FAK then FOK at a wider limit). The book may be empty or moving — try a smaller size, wait a few seconds, or use a Limit order.',
           },
         });
       }
-      throw first;
+      throw err;
     }
 
-    return json(res, 200, { ok: true, data: parsed });
+    return json(res, 200, {
+      ok: true,
+      data: {
+        result: parsed,
+        execution: {
+          submitted_price_01: submittedCrossPrice,
+          order_id: extractOrderIdFromClobPayload(parsed),
+          round_trip_ms: Date.now() - t0,
+        },
+      },
+    });
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     const hint =
@@ -1408,13 +1709,30 @@ app.post('/api/trade/create-order', async (req, res) => {
   const body = req.body as { token?: unknown; price?: unknown; size?: unknown; side?: unknown; signatureType?: unknown };
   const token = typeof body.token === 'string' ? body.token.trim() : '';
   const side = typeof body.side === 'string' ? body.side.trim().toLowerCase() : 'buy';
-  const price = parseNumber('price', body.price);
-  const size = parseNumber('size', body.size);
+  const priceRaw = parseNumber('price', body.price);
+  const sizeRaw = parseNumber('size', body.size);
 
   if (!token) return json(res, 400, { ok: false, error: 'missing_token' });
   if (side !== 'buy' && side !== 'sell') return json(res, 400, { ok: false, error: 'bad_side' });
-  if (price == null || price <= 0 || price >= 1) return json(res, 400, { ok: false, error: 'bad_price' });
-  if (size == null || size <= 0 || size > 2_000_000) return json(res, 400, { ok: false, error: 'bad_size' });
+  if (priceRaw == null || priceRaw <= 0 || priceRaw >= 1) return json(res, 400, { ok: false, error: 'bad_price' });
+  if (sizeRaw == null || sizeRaw <= 0 || sizeRaw > 2_000_000) return json(res, 400, { ok: false, error: 'bad_size' });
+
+  const price = roundPrice01Api(priceRaw);
+  if (price <= 0 || price >= 1) {
+    return json(res, 400, {
+      ok: false,
+      error: 'bad_price',
+      details: { hint: 'Price rounds to an invalid value for this market tick size.' },
+    });
+  }
+  const size = floorSizeShares4(sizeRaw);
+  if (size < 1e-4) {
+    return json(res, 400, {
+      ok: false,
+      error: 'bad_size',
+      details: { hint: 'Order size rounds to zero at 4 decimal shares — increase size slightly.' },
+    });
+  }
 
   const ready = await getTradingClient();
   if (!ready.ok) {
@@ -1425,6 +1743,7 @@ app.post('/api/trade/create-order', async (req, res) => {
     });
   }
 
+  const t0 = Date.now();
   try {
     if (side === 'sell') {
       await ready.client.updateBalanceAllowance({ asset_type: AssetType.CONDITIONAL, token_id: token });
@@ -1442,7 +1761,19 @@ app.post('/api/trade/create-order', async (req, res) => {
       undefined,
       OrderType.GTC,
     );
-    return json(res, 200, { ok: true, data: parsed });
+    const orderId = extractOrderIdFromClobPayload(parsed);
+    return json(res, 200, {
+      ok: true,
+      data: {
+        result: parsed,
+        execution: {
+          submitted_price_01: price,
+          submitted_size_shares: size,
+          order_id: orderId,
+          round_trip_ms: Date.now() - t0,
+        },
+      },
+    });
   } catch (error) {
     return json(res, 502, {
       ok: false,
@@ -1450,6 +1781,108 @@ app.post('/api/trade/create-order', async (req, res) => {
       details: { message: error instanceof Error ? error.message : String(error) },
     });
   }
+});
+
+/** Fetch a single order by id (for fill / no-fill reconciliation). */
+app.get('/api/trade/order', async (req, res) => {
+  const orderId = String(req.query.order_id ?? '').trim();
+  if (!orderId) return json(res, 400, { ok: false, error: 'missing_order_id' });
+
+  const ready = await getTradingClient();
+  if (!ready.ok) {
+    return json(res, ready.error === 'trading_auth_failed' ? 502 : 503, {
+      ok: false,
+      error: ready.error,
+      details: { hint: ready.hint, reason: ready.details },
+    });
+  }
+
+  try {
+    const data = await ready.client.getOrder(orderId);
+    return json(res, 200, { ok: true, data });
+  } catch (error) {
+    return json(res, 502, {
+      ok: false,
+      error: 'get_order_failed',
+      details: { message: error instanceof Error ? error.message : String(error) },
+    });
+  }
+});
+
+/** Cancel one resting order by CLOB order id. */
+app.post('/api/trade/cancel-order', async (req, res) => {
+  const body = req.body as { order_id?: unknown; orderID?: unknown };
+  const orderId =
+    (typeof body.order_id === 'string' && body.order_id.trim()) ||
+    (typeof body.orderID === 'string' && body.orderID.trim()) ||
+    '';
+  if (!orderId) return json(res, 400, { ok: false, error: 'missing_order_id' });
+
+  const ready = await getTradingClient();
+  if (!ready.ok) {
+    return json(res, ready.error === 'trading_auth_failed' ? 502 : 503, {
+      ok: false,
+      error: ready.error,
+      details: { hint: ready.hint, reason: ready.details },
+    });
+  }
+
+  try {
+    await ready.client.cancelOrder({ orderID: orderId } as { orderID: string });
+    return json(res, 200, { ok: true, data: { cancelled: true, order_id: orderId } });
+  } catch (error) {
+    return json(res, 502, {
+      ok: false,
+      error: 'cancel_order_failed',
+      details: { message: error instanceof Error ? error.message : String(error) },
+    });
+  }
+});
+
+/**
+ * Cancel all open orders for the authenticated trader (kill switch).
+ * Requires `{ "confirm": true }` in the JSON body to avoid accidental taps.
+ */
+app.post('/api/trade/cancel-all', async (req, res) => {
+  const body = req.body as { confirm?: unknown };
+  if (body.confirm !== true) {
+    return json(res, 400, {
+      ok: false,
+      error: 'confirm_required',
+      details: { hint: 'Send JSON body { "confirm": true } to cancel every open order.' },
+    });
+  }
+
+  const ready = await getTradingClient();
+  if (!ready.ok) {
+    return json(res, ready.error === 'trading_auth_failed' ? 502 : 503, {
+      ok: false,
+      error: ready.error,
+      details: { hint: ready.hint, reason: ready.details },
+    });
+  }
+
+  try {
+    const data = await ready.client.cancelAll();
+    return json(res, 200, { ok: true, data });
+  } catch (error) {
+    return json(res, 502, {
+      ok: false,
+      error: 'cancel_all_failed',
+      details: { message: error instanceof Error ? error.message : String(error) },
+    });
+  }
+});
+
+/** Last-resort JSON errors (uncaught async throws, etc.) so the web client never sees HTML on 500. */
+app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  console.error('[api] unhandled_error', err);
+  if (res.headersSent) return;
+  json(res, 500, {
+    ok: false,
+    error: 'internal_error',
+    details: { message: err instanceof Error ? err.message : String(err) },
+  });
 });
 
 const port = Number(process.env.PORT ?? 8787);

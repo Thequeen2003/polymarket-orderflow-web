@@ -26,6 +26,15 @@ function toPath(points: { x: number; y: number }[]): string {
   return d;
 }
 
+function sparklinePath(pts: { x: number; y: number }[], pad: number, width: number): string {
+  if (pts.length === 0) return '';
+  if (pts.length >= 2) return toPath(pts);
+  const p = pts[0]!;
+  const span = Math.max(16, (width - pad * 2) * 0.14);
+  const x0 = Math.max(pad + 1, p.x - span);
+  return `M ${x0.toFixed(2)} ${p.y.toFixed(2)} L ${p.x.toFixed(2)} ${p.y.toFixed(2)}`;
+}
+
 function fmtPtbUsd(n: number): string {
   return `$${n.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
 }
@@ -144,7 +153,9 @@ export function OrderFlowChart({
         <text x={pad + 8} y={topY0 + 14} className="fill-zinc-500" fontSize="10" fontFamily="ui-monospace, monospace">
           mid (price momentum)
         </text>
-        {midPts.length > 1 ? <path d={toPath(midPts)} className="stroke-indigo-300 fill-none" strokeWidth="2.2" /> : null}
+        {midPts.length > 0 ? (
+          <path d={sparklinePath(midPts, pad, width)} className="stroke-indigo-300 fill-none" strokeWidth="2.2" />
+        ) : null}
         {midPts.length > 0 ? (
           <circle cx={midPts[midPts.length - 1]!.x} cy={midPts[midPts.length - 1]!.y} r="3.5" className="fill-indigo-200" />
         ) : null}

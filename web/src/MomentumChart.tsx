@@ -28,6 +28,16 @@ function toPath(points: { x: number; y: number }[]): string {
   return d;
 }
 
+/** One book poll → one mid point; draw a short segment so the sparkline is visible before the second poll. */
+function sparklinePath(pts: { x: number; y: number }[], pad: number, width: number): string {
+  if (pts.length === 0) return '';
+  if (pts.length >= 2) return toPath(pts);
+  const p = pts[0]!;
+  const span = Math.max(16, (width - pad * 2) * 0.14);
+  const x0 = Math.max(pad + 1, p.x - span);
+  return `M ${x0.toFixed(2)} ${p.y.toFixed(2)} L ${p.x.toFixed(2)} ${p.y.toFixed(2)}`;
+}
+
 function fmtPtbUsd(n: number): string {
   return `$${n.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
 }
@@ -164,8 +174,12 @@ export function MomentumChart({
           />
         ) : null}
 
-        {aPts.length > 1 ? <path d={toPath(aPts)} className={`${toneClass(aTone)} fill-none`} strokeWidth="2.2" /> : null}
-        {bPts.length > 1 ? <path d={toPath(bPts)} className={`${toneClass(bTone)} fill-none`} strokeWidth="2.2" /> : null}
+        {aPts.length > 0 ? (
+          <path d={sparklinePath(aPts, pad, width)} className={`${toneClass(aTone)} fill-none`} strokeWidth="2.2" />
+        ) : null}
+        {bPts.length > 0 ? (
+          <path d={sparklinePath(bPts, pad, width)} className={`${toneClass(bTone)} fill-none`} strokeWidth="2.2" />
+        ) : null}
 
         {aPts.length > 0 ? (
           <circle cx={aPts[aPts.length - 1]!.x} cy={aPts[aPts.length - 1]!.y} r="3.5" className={dotClass(aTone)} />
