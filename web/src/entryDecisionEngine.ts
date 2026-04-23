@@ -314,6 +314,42 @@ export function evaluateTick(input: TickEvalInput): AlertEvent[] {
     }
   }
 
+  const inEntryBand =
+    mid != null &&
+    ((entryLo != null && entryHi != null && entryHi >= entryLo && mid >= entryLo && mid <= entryHi) ||
+      (entry != null && Math.abs(mid - entry) < 0.012));
+  if (prefs.momentum_catch && inEntryBand && mid != null && slope != null) {
+    if (slope >= slopeTh) {
+      const spreadOk = spread == null || spread <= 0.055;
+      if (spreadOk) {
+        const targetHint = target != null ? ` Target ~${(target * 100).toFixed(0)}¢.` : '';
+        out.push(
+          ev(
+            slug,
+            'momentum_catch',
+            `CATCH: in buy zone with momentum (mid ${(mid * 100).toFixed(0)}¢, slope +${slope.toFixed(4)}/s).${targetHint}`,
+            {
+              severity: conf >= 58 ? 'critical' : 'warn',
+              confidenceScore: Math.max(conf, 58),
+              flags,
+              drivers: [
+                ...drivers,
+                {
+                  key: 'catch',
+                  label: 'CATCH',
+                  value: 'Entry band + slope ≥ threshold',
+                },
+                ...(target != null
+                  ? [{ key: 'target', label: 'Planned sell', value: (target * 100).toFixed(0) + '¢', raw: target } as const]
+                  : []),
+              ],
+            },
+          ),
+        );
+      }
+    }
+  }
+
   if (prefs.weak_follow && snaps.length >= 8) {
     const recent = snaps.slice(-8);
     const imb = recent.map((s) => s.imbalance).filter((x): x is number => x != null);
@@ -484,6 +520,7 @@ export function buildUpScalpVerdict(params: {
 }): ScalpVerdict {
   const { net4c, settings, mid, slope, snap, wall, asks, recentAlertKinds } = params;
   const weakFollow = recentAlertKinds.includes('weak_follow');
+  const catchWindow = recentAlertKinds.includes('momentum_catch');
   const asksEaten = recentAlertKinds.includes('asks_eaten');
   const bidWallAlert = recentAlertKinds.includes('bid_wall');
   const askWallAlert = recentAlertKinds.includes('ask_wall');
@@ -531,6 +568,14 @@ export function buildUpScalpVerdict(params: {
   } else if (weakFollow) {
     momStatus = 'fail';
     momDetail = 'Weak follow-through flagged — bullish pressure not translating into mid.';
+  } else if (
+    catchWindow &&
+    slope != null &&
+    slope >= settings.minMomentum * 0.92 &&
+    !weakFollow
+  ) {
+    momStatus = 'pass';
+    momDetail = `CATCH — price in your entry band with momentum (slope +${slope.toFixed(5)}/s).`;
   } else if (slope == null || slope < settings.minMomentum) {
     momStatus = slope != null && slope > 0 ? 'warn' : 'fail';
     momDetail =

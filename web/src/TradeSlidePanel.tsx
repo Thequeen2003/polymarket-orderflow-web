@@ -24,7 +24,7 @@ export function TradeSlidePanel(props: TradeSlidePanelProps): ReactElement {
 
   return (
     <div
-      className={`fixed inset-y-0 right-0 z-[135] flex w-[min(380px,100vw)] flex-col border-l border-zinc-700/80 bg-zinc-950 shadow-[-12px_0_40px_rgba(0,0,0,0.45)] transition-transform duration-200 ease-out ${
+      className={`fixed inset-y-0 right-0 z-[135] flex w-[min(360px,100vw)] flex-col border-l border-zinc-700/80 bg-zinc-950 shadow-[-12px_0_40px_rgba(0,0,0,0.45)] transition-transform duration-200 ease-out ${
         open ? 'translate-x-0' : 'translate-x-full pointer-events-none'
       }`}
       aria-hidden={!open}
@@ -43,7 +43,7 @@ export function TradeSlidePanel(props: TradeSlidePanelProps): ReactElement {
           Close
         </button>
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-y-contain px-3 py-3">{children}</div>
+      <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-y-contain px-2.5 py-2.5">{children}</div>
     </div>
   );
 }

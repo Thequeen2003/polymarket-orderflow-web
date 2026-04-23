@@ -192,6 +192,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const [action, setAction] = useState<'buy' | 'sell'>('buy');
   const [laneState, setLaneState] = useState<'up' | 'down'>(controlledLane ?? 'up');
   const [execMode, setExecMode] = useState<'touch' | 'market' | 'limit'>('touch');
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [unit, setUnit] = useState<'dollars' | 'shares'>('dollars');
   const [accountMode, setAccountMode] = useState<'paper' | 'live'>('paper');
   const [paperAccount, setPaperAccount] = useState(() => loadPaperAccount());
@@ -226,9 +227,14 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const [avgEntryDown, setAvgEntryDown] = useState<number | null>(null);
   const [flashToast, setFlashToast] = useState<string | null>(null);
   const flashTimerRef = useRef<number | null>(null);
+  const toastIdRef = useRef(0);
+  const toastTimersRef = useRef<Map<number, number>>(new Map());
+  const [toasts, setToasts] = useState<Array<{ id: number; kind: 'ok' | 'err' | 'info'; message: string }>>([]);
   const [lastExecLatencyMs, setLastExecLatencyMs] = useState<number | null>(null);
   const liveSubmitGenRef = useRef(0);
   const submitLockRef = useRef(false);
+  const [killArmed, setKillArmed] = useState(false);
+  const killArmTimerRef = useRef<number | null>(null);
 
   const tradeHistoryMarketMeta = useMemo(
     () => ({
@@ -321,6 +327,10 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   }, [isSlide]);
 
   useEffect(() => {
+    if (isSlide) setShowAdvanced(false);
+  }, [isSlide]);
+
+  useEffect(() => {
     const onSync = () => {
       setPaperAccount(loadPaperAccount());
       setHistoryRows(loadTradeHistory());
@@ -354,17 +364,52 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     }, 3800);
   }, []);
 
-  useEffect(() => {
-    if (!isSlide || !okMsg) return;
-    pushFlash(okMsg);
-    playTradeFill();
-  }, [okMsg, isSlide, pushFlash]);
+  const dismissToast = useCallback((id: number) => {
+    setToasts((xs) => xs.filter((t) => t.id !== id));
+    const t = toastTimersRef.current.get(id);
+    if (t != null) window.clearTimeout(t);
+    toastTimersRef.current.delete(id);
+  }, []);
+
+  const pushToast = useCallback(
+    (kind: 'ok' | 'err' | 'info', message: string, ttlMs = 5200) => {
+      const id = (toastIdRef.current += 1);
+      setToasts((xs) => [...xs.slice(-2), { id, kind, message }]);
+      const timer = window.setTimeout(() => dismissToast(id), ttlMs);
+      toastTimersRef.current.set(id, timer);
+    },
+    [dismissToast],
+  );
 
   useEffect(() => {
-    if (!isSlide || !err) return;
-    pushFlash(err);
+    if (!okMsg) return;
+    if (isSlide) pushFlash(okMsg);
+    pushToast('ok', okMsg);
+    playTradeFill();
+    if (!isSlide) {
+      const t = window.setTimeout(() => setOkMsg(null), 8000);
+      return () => window.clearTimeout(t);
+    }
+  }, [okMsg, isSlide, pushFlash, pushToast]);
+
+  useEffect(() => {
+    if (!err) return;
+    if (isSlide) pushFlash(err);
+    pushToast('err', err, 7200);
     playTradeError();
-  }, [err, isSlide, pushFlash]);
+    if (!isSlide) {
+      const t = window.setTimeout(() => setErr(null), 12000);
+      return () => window.clearTimeout(t);
+    }
+  }, [err, isSlide, pushFlash, pushToast]);
+
+  useEffect(() => {
+    return () => {
+      if (killArmTimerRef.current != null) window.clearTimeout(killArmTimerRef.current);
+      for (const t of toastTimersRef.current.values()) window.clearTimeout(t);
+      toastTimersRef.current.clear();
+    };
+  }, []);
 
   const positionShares = accountMode === 'paper' ? paperPos.shares : livePositionShares;
   const avgEntry = accountMode === 'paper' ? paperPos.avgCost01 : liveAvgEntry;
@@ -817,7 +862,6 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     setSubmitAbort(null);
   };
 
-  const dismissOk = () => setOkMsg(null);
   const isSidebarOnly = visualStyle === 'sidebar';
 
   // Paper mode: auto-fill resting orders when mid crosses.
@@ -906,7 +950,17 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                 className="rounded-full border border-rose-900/50 bg-rose-950/25 px-2 py-0.5 font-semibold text-rose-100/90 hover:bg-rose-950/40 disabled:opacity-30"
                 title="POST /api/trade/cancel-all — cancels every open order for this API wallet on Polymarket."
                 onClick={async () => {
-                  if (!window.confirm('Cancel ALL open orders on Polymarket for this API key?')) return;
+                  if (!killArmed) {
+                    setKillArmed(true);
+                    if (killArmTimerRef.current != null) window.clearTimeout(killArmTimerRef.current);
+                    killArmTimerRef.current = window.setTimeout(() => {
+                      killArmTimerRef.current = null;
+                      setKillArmed(false);
+                    }, 3600);
+                    pushToast('info', 'Click again to confirm: cancel ALL open orders (3.6s).', 3600);
+                    return;
+                  }
+                  setKillArmed(false);
                   setErr(null);
                   setOkMsg(null);
                   const r = await tradeCancelAllOrders();
@@ -914,7 +968,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   else setOkMsg('Cancel-all sent. Verify on Polymarket Open Orders.');
                 }}
               >
-                Kill open orders
+                {killArmed ? 'Confirm kill' : 'Kill open orders'}
               </button>
             </div>
           ) : null}
@@ -1206,36 +1260,48 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       {action === 'buy' ? (
         <>
           {!isSlide ? (
-            <div className="mt-6 space-y-2">
-              <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">How to execute</div>
-              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                <TradeSegmentedControl
-                  value={execMode}
-                  onChange={(v) => {
-                    setExecMode(v as 'touch' | 'market' | 'limit');
-                    setErr(null);
-                    setOkMsg(null);
-                    if (v === 'touch' && touchLimitCents) setLimitPriceCents(touchLimitCents);
-                    else if (v === 'limit' && defaultLimitCents) setLimitPriceCents(defaultLimitCents);
-                  }}
-                  options={[
-                    {
-                      value: 'touch',
-                      label: 'Quick',
-                      title: 'Places a limit very close to the current price — best for fast clicks',
-                    },
-                    { value: 'market', label: 'Market', title: 'Fill immediately at the best prices in the book right now' },
-                    { value: 'limit', label: 'Limit', title: 'You set the price; the order waits until the market comes to you' },
-                  ]}
-                />
-                <p className="max-w-md text-[11px] leading-relaxed text-zinc-500">
-                  {execMode === 'touch'
-                    ? 'Quick: a tight limit around the mid — little slippage, good when you want speed.'
-                    : execMode === 'market'
-                      ? 'Market: trade now; final price depends on book depth.'
-                      : 'Limit: your price, your control — may take time to fill.'}
-                </p>
+            <div className="mt-6">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">
+                  Execution ·{' '}
+                  <span className="text-zinc-300">
+                    {execMode === 'touch' ? 'Quick' : execMode === 'market' ? 'Market' : 'Limit'}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowAdvanced((v) => !v)}
+                  className="min-h-[36px] rounded-lg border border-zinc-700/60 bg-black/20 px-3 py-1.5 text-[11px] font-semibold text-zinc-200 hover:bg-black/30"
+                >
+                  {showAdvanced ? 'Hide advanced' : 'Advanced'}
+                </button>
               </div>
+              {showAdvanced ? (
+                <div className="mt-2 space-y-2 rounded-xl border border-zinc-800/60 bg-zinc-950/30 px-3 py-3">
+                  <TradeSegmentedControl
+                    value={execMode}
+                    onChange={(v) => {
+                      setExecMode(v as 'touch' | 'market' | 'limit');
+                      setErr(null);
+                      setOkMsg(null);
+                      if (v === 'touch' && touchLimitCents) setLimitPriceCents(touchLimitCents);
+                      else if (v === 'limit' && defaultLimitCents) setLimitPriceCents(defaultLimitCents);
+                    }}
+                    options={[
+                      { value: 'touch', label: 'Quick', title: 'Places a limit very close to the current price — best for fast clicks' },
+                      { value: 'market', label: 'Market', title: 'Fill immediately at the best prices in the book right now' },
+                      { value: 'limit', label: 'Limit', title: 'You set the price; the order waits until the market comes to you' },
+                    ]}
+                  />
+                  <p className="text-[11px] leading-relaxed text-zinc-500">
+                    {execMode === 'touch'
+                      ? 'Quick: tight limit around the mid — low fuss, good default.'
+                      : execMode === 'market'
+                        ? 'Market: trade now; final price depends on book depth.'
+                        : 'Limit: your price; may take time to fill.'}
+                  </p>
+                </div>
+              ) : null}
             </div>
           ) : (
             <details className="mt-4 rounded-xl border border-zinc-800/60 bg-zinc-950/30">
@@ -1262,6 +1328,12 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
             </details>
           )}
 
+          {isSlide || showAdvanced ? (
+          <details className="mt-4 rounded-xl border border-zinc-800/60 bg-zinc-950/30">
+            <summary className="cursor-pointer px-3 py-2 text-[11px] font-semibold text-zinc-400 hover:text-zinc-300">
+              Advanced entry tools · order book + passive ladder
+            </summary>
+            <div className="border-t border-zinc-800/50 px-3 py-3">
           <div className="mt-4 space-y-2">
             <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Entry mode</div>
             <TradeSegmentedControl
@@ -1670,10 +1742,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                     );
                   })}
                 </div>
-                </div>
+              </div>
               </details>
-
-            </div>
             {buyEntryMode === 'passive' ? (
               <div className="rounded-xl border border-zinc-800/70 bg-zinc-950/25 p-3">
                 <div className="grid gap-2 sm:grid-cols-4">
@@ -1815,6 +1885,10 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
               </div>
             ) : null}
           </div>
+            </div>
+          </div>
+        </details>
+          ) : null}
 
           <div className="mt-2 flex flex-wrap items-end justify-between gap-2 text-xs text-zinc-400">
             <span className="font-semibold text-zinc-300">How much</span>
@@ -2929,7 +3003,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                 busySubmit ||
                 positionShares == null ||
                 positionShares <= 0 ||
-                (execMode !== 'market' && (limit01 == null || !Number.isFinite(limit01)))
+                (execMode === 'limit' && (limit01 == null || !Number.isFinite(limit01))) ||
+                (execMode === 'touch' && executableQuote01 == null && (mid == null || !(mid > 0)))
               }
               aria-busy={busySubmit}
               className={`mt-4 min-h-[48px] w-full rounded-xl border-2 border-rose-600/50 bg-transparent px-4 py-3 text-sm font-bold text-rose-200 hover:bg-rose-950/35 disabled:cursor-not-allowed disabled:opacity-40 ${
@@ -2990,7 +3065,11 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   if (execMode === 'market') {
                     await runMarketSell(positionShares);
                   } else {
-                    const price = limit01 ?? NaN;
+                    const price =
+                      execMode === 'touch'
+                        ? // Quick sell = aggressive limit at executable reference (best bid; falls back to mid)
+                          (executableQuote01 ?? mid ?? NaN)
+                        : (limit01 ?? NaN);
                     const sizeLive = floorShares4(positionShares);
                     if (sizeLive < 1e-4) {
                       setErr('Sell size is too small after rounding to 4 decimal shares.');
@@ -3086,28 +3165,30 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         </>
       )}
 
-      {err ? (
-        <div role="alert" className="mt-4 rounded-lg border border-rose-800/35 bg-rose-950/15 px-3 py-2.5 text-[11px] text-rose-100">
-          <span className="mr-1.5 font-bold">Error.</span>
-          {err}
-        </div>
-      ) : null}
-      {okMsg ? (
-        <div
-          className="mt-4 flex items-start justify-between gap-2 rounded-lg border border-emerald-800/30 bg-emerald-950/15 px-3 py-2.5 text-[11px] text-emerald-100"
-          aria-live="polite"
-        >
-          <span>
-            <span className="font-bold text-emerald-200">Done.</span> {okMsg}
-          </span>
-          <button
-            type="button"
-            onClick={dismissOk}
-            className="shrink-0 rounded px-1.5 text-zinc-500 hover:bg-emerald-950/40 hover:text-zinc-300"
-            aria-label="Dismiss success message"
-          >
-            ×
-          </button>
+      {toasts.length ? (
+        <div className={`mt-4 space-y-2 ${isSlide ? 'hidden' : ''}`} aria-live="polite">
+          {toasts.map((t) => (
+            <div
+              key={t.id}
+              className={`flex items-start justify-between gap-2 rounded-xl border px-3 py-2.5 text-[11px] leading-snug ${
+                t.kind === 'err'
+                  ? 'border-rose-800/35 bg-rose-950/15 text-rose-100'
+                  : t.kind === 'ok'
+                    ? 'border-emerald-800/30 bg-emerald-950/15 text-emerald-100'
+                    : 'border-zinc-800/60 bg-black/25 text-zinc-200'
+              }`}
+            >
+              <span className="min-w-0 flex-1 break-words">{t.message}</span>
+              <button
+                type="button"
+                onClick={() => dismissToast(t.id)}
+                className="shrink-0 rounded px-1.5 text-zinc-500 hover:bg-black/20 hover:text-zinc-300"
+                aria-label="Dismiss notification"
+              >
+                ×
+              </button>
+            </div>
+          ))}
         </div>
       ) : null}
 

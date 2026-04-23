@@ -7,7 +7,7 @@ import type { SpotPoint } from './SpotLevelChart';
 import { underlyingChartTitle } from './underlyingChartTitle';
 import { resolveUpDownIndices } from './upDown';
 import { anchorPriceScale, buildSpotCandles } from './spotVsPtb';
-import { computePtbChartDerivatives } from './ptbChartDerivatives';
+import { computePtbChartDerivatives, type PtbChartDerivatives } from './ptbChartDerivatives';
 import type { BookSnapshot } from './orderflowMetrics';
 
 function fmtUsd(n: number | null, maxFrac = 2): string {
@@ -36,6 +36,59 @@ function candleBucketCount(ptsLen: number): number {
   if (ptsLen < 4) return Math.max(2, ptsLen - 1);
   const n = Math.floor(ptsLen * 0.38);
   return Math.min(64, Math.max(16, n));
+}
+
+/** Separates venue facts from modeled / crowd signals so the UI reads less like fortune-telling. */
+function buildGuessworkReadout(params: {
+  ptb: number | null;
+  spotLast: number | null;
+  derived: PtbChartDerivatives | null;
+  endsInMs: number | null;
+  activeLane: 'up' | 'down';
+  laneLabel: string;
+  upLabel: string;
+  downLabel: string;
+  upMid: number | null;
+  downMid: number | null;
+}): { facts: string[]; models: string[]; play: string } | null {
+  const { ptb, spotLast, derived, endsInMs, activeLane, laneLabel, upLabel, downLabel, upMid, downMid } = params;
+  if (ptb == null || !Number.isFinite(ptb) || spotLast == null || !Number.isFinite(spotLast)) return null;
+  const side = spotLast >= ptb ? 'above' : 'below';
+  const facts: string[] = [
+    `PTB (venue line): ${fmtUsd(ptb)}`,
+    `Last underlying spot: ${fmtUsd(spotLast)} — ${side} PTB`,
+  ];
+  if (endsInMs != null && Number.isFinite(endsInMs)) {
+    facts.push(`Time to round end (venue clock): ${fmtTimeRemaining(endsInMs)}`);
+  }
+  if (derived) {
+    facts.push(
+      `Engine: spot ${derived.position} vs band · control ${derived.controlSignal.replaceAll('_', ' ')} · slope ${derived.slopeUsdPerMin >= 0 ? '+' : ''}${derived.slopeUsdPerMin.toFixed(3)} $/min (${derived.slopeSampleCount} samples)`,
+    );
+  }
+  const models: string[] = [
+    'Settlement % and “cross soon” on the chart are a small normal model (drift + tick vol + chop penalty) — not the market oracle.',
+    `You are viewing the ${laneLabel} lane (${activeLane.toUpperCase()}). It does not replace checking bid/ask for your actual fill.`,
+  ];
+  if (upMid != null && downMid != null && Number.isFinite(upMid) && Number.isFinite(downMid)) {
+    models.push(
+      `Implied mids: ${upLabel} ${(upMid * 100).toFixed(0)}¢ · ${downLabel} ${(downMid * 100).toFixed(0)}¢ — mid of the book, not guaranteed execution.`,
+    );
+  }
+  let play =
+    'Mechanical habit: if control is NO EDGE or structure is chop, assume you are missing information — default to smaller size or wait for a clean break/hold.';
+  if (!derived) {
+    play = 'Need a few more spot ticks before the engine labels control — avoid sizing on the chart alone.';
+  } else if (derived.controlSignal === 'NO_EDGE' || derived.structureEvent === 'chop' || derived.reaction.kind === 'choppy_at_line') {
+    play =
+      'Tape says chop / no edge — feeling like you are guessing is correct. Prefer: wait, tighten risk, or trade only with hard limits you would accept if wrong.';
+  } else if (derived.controlSignal === 'UP_CONTROL' || derived.controlSignal === 'DOWN_CONTROL') {
+    const t = endsInMs != null && Number.isFinite(endsInMs) ? fmtTimeRemaining(endsInMs) : '—';
+    play = `Tape leans ${derived.controlSignal.replaceAll('_', ' ')} — use it as context, then decide only from prices you can actually hit on the CLOB and time left (${t}).`;
+  } else if (derived.controlSignal === 'REJECTION' || derived.controlSignal === 'TRANSITION') {
+    play = 'Rotation or rejection in play — treat probabilities as extra context, not conviction; confirm with book flow and invalidation levels.';
+  }
+  return { facts, models, play };
 }
 
 export function UnifiedPtbView(props: {
@@ -86,7 +139,7 @@ export function UnifiedPtbView(props: {
   const upMid = probUp.length ? (probUp[probUp.length - 1]!.v ?? null) : null;
   const downMid = probDown.length ? (probDown[probDown.length - 1]!.v ?? null) : null;
 
-  const derived = useMemo(() => {
+  const derivedBase = useMemo(() => {
     const ptb = priceToBeat;
     if (ptb == null || !Number.isFinite(ptb) || spot.length < 2) return null;
     const pts = spot
@@ -99,9 +152,29 @@ export function UnifiedPtbView(props: {
   }, [priceToBeat, spot]);
 
   const activeLane = useMemo<'up' | 'down'>(() => {
-    if (!derived) return 'up';
-    return derived.distanceUsd >= 0 ? 'up' : 'down';
-  }, [derived]);
+    if (!derivedBase) return 'up';
+    return derivedBase.distanceUsd >= 0 ? 'up' : 'down';
+  }, [derivedBase]);
+
+  /** Outcome-token book-flow series for the same lane as Spot vs PTB (UP/DOWN). */
+  const bookFlowForChart = useMemo(() => {
+    if (!flowSeriesForSlug || !idx || !books || books.length < 2) return null;
+    const token = activeLane === 'up' ? books[idx.up]?.token : books[idx.down]?.token;
+    if (!token) return null;
+    return flowSeriesForSlug[token] ?? null;
+  }, [flowSeriesForSlug, idx, activeLane, books]);
+
+  const derived = useMemo(() => {
+    const ptb = priceToBeat;
+    if (ptb == null || !Number.isFinite(ptb) || spot.length < 2) return null;
+    const pts = spot
+      .filter((p) => Number.isFinite(p.t) && Number.isFinite(p.v))
+      .slice(-320)
+      .map((p) => ({ t: p.t, v: p.v }));
+    if (pts.length < 2) return null;
+    const candles = buildSpotCandles(pts, candleBucketCount(pts.length));
+    return computePtbChartDerivatives({ pts, candles, ptb, bookFlow: bookFlowForChart ?? undefined });
+  }, [priceToBeat, spot, bookFlowForChart]);
 
   const spotLast = spot.length ? spot[spot.length - 1]!.v : null;
   const distUsd = derived?.distanceUsd ?? null;
@@ -119,6 +192,24 @@ export function UnifiedPtbView(props: {
     });
     return plotMax - plotMin;
   }, [priceToBeat, spot]);
+
+  const laneLabel = activeLane === 'up' ? upLabel : downLabel;
+  const guessworkReadout = useMemo(
+    () =>
+      buildGuessworkReadout({
+        ptb: priceToBeat,
+        spotLast,
+        derived,
+        endsInMs,
+        activeLane,
+        laneLabel,
+        upLabel,
+        downLabel,
+        upMid,
+        downMid,
+      }),
+    [priceToBeat, spotLast, derived, endsInMs, activeLane, laneLabel, upLabel, downLabel, upMid, downMid],
+  );
 
   return (
     <div className="space-y-4">
@@ -147,6 +238,37 @@ export function UnifiedPtbView(props: {
           </div>
         ) : null}
 
+        {guessworkReadout ? (
+          <div className="rounded-2xl border border-sky-900/45 bg-sky-950/20 px-4 py-3 ring-1 ring-sky-500/10">
+            <div className="text-[11px] font-bold uppercase tracking-[0.14em] text-sky-200/90">Know vs guess</div>
+            <p className="mt-1.5 text-[11px] leading-snug text-sky-100/70">
+              Use the bullets on the left as <span className="font-semibold text-sky-50">facts</span>; the right column is{' '}
+              <span className="font-semibold text-sky-100/90">models + crowd</span> — useful, not prophetic.
+            </p>
+            <div className="mt-3 grid gap-3 sm:grid-cols-2">
+              <div>
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-emerald-200/80">Observable</div>
+                <ul className="mt-1.5 list-inside list-disc space-y-1 text-[11px] leading-snug text-zinc-200/95">
+                  {guessworkReadout.facts.map((line, i) => (
+                    <li key={i}>{line}</li>
+                  ))}
+                </ul>
+              </div>
+              <div>
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-amber-200/80">Still uncertain</div>
+                <ul className="mt-1.5 list-inside list-disc space-y-1 text-[11px] leading-snug text-zinc-300/95">
+                  {guessworkReadout.models.map((line, i) => (
+                    <li key={i}>{line}</li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+            <div className="mt-3 rounded-xl border border-sky-800/40 bg-black/25 px-3 py-2 text-[11px] leading-relaxed text-sky-50/95">
+              <span className="font-semibold text-sky-200">How to use this:</span> {guessworkReadout.play}
+            </div>
+          </div>
+        ) : null}
+
         <PtbOpportunityModeChart
           mode={activeLane}
           spot={spot}
@@ -156,6 +278,9 @@ export function UnifiedPtbView(props: {
           chartTitle={underlyingChartTitle(market)}
           upLabel={upLabel}
           downLabel={downLabel}
+          lastProbUp={upMid}
+          lastProbDown={downMid}
+          bookFlow={bookFlowForChart}
         />
 
           <div className="grid gap-4 xl:grid-cols-2">

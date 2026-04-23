@@ -31,13 +31,7 @@ export function TradeSessionTabsBar(props: Props): ReactElement {
   const { tabs, activeId, onSelect, onAdd, onClose } = props;
 
   return (
-    <div className="rounded-2xl border border-zinc-800/60 bg-gradient-to-b from-zinc-900/35 to-black/25 p-3 ring-1 ring-white/[0.03]">
-      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-        <div>
-          <div className="text-[11px] font-semibold text-zinc-300">Markets in this window</div>
-          <div className="text-[10px] text-zinc-500">Tap a tab to switch — one live order book at a time.</div>
-        </div>
-      </div>
+    <div className="rounded-xl border border-zinc-800/60 bg-black/15 p-2.5 ring-1 ring-white/[0.02]">
       <div className="flex flex-wrap items-center gap-2">
         {tabs.map((t) => {
           const isActive = t.id === activeId;
@@ -84,17 +78,6 @@ export function TradeSessionTabsBar(props: Props): ReactElement {
           New tab
         </button>
       </div>
-      <details className="mt-2.5 rounded-lg border border-zinc-800/40 bg-black/15 px-2 py-1.5 text-[10px] text-zinc-500">
-        <summary className="cursor-pointer select-none font-medium text-zinc-500 hover:text-zinc-400 [&::-webkit-details-marker]:hidden">
-          <span className="mr-1 text-zinc-600" aria-hidden>
-            ℹ
-          </span>
-          Need two books at once?
-        </summary>
-        <p className="mt-1.5 pl-4 leading-relaxed text-zinc-500">
-          Open this app in a second browser window and keep a different tab active in each — each window has its own loaded market.
-        </p>
-      </details>
     </div>
   );
 }

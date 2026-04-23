@@ -682,8 +682,21 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
         tryTs.push(base + i * stepSec);
       }
     }
+    if (stepSec === 900) {
+      for (const o of [300, -300, 600, -600, 1500, -1500, 30 * 60, -30 * 60, 15 * 60, -15 * 60, 5 * 60, -5 * 60]) {
+        for (const t0 of [base, base - 900, base + 900, base - 2 * 900, base + 2 * 900]) {
+          tryTs.push(t0 + o);
+        }
+      }
+    }
+    const tryTsOrdered = Array.from(new Set(tryTs)).sort((a, c) => {
+      const da = Math.abs(a - b.now);
+      const dc = Math.abs(c - b.now);
+      if (da !== dc) return da - dc;
+      return a - c;
+    });
     // First try the deterministic slug rather than Gamma search (which can lag).
-    for (const ts of tryTs) {
+    for (const ts of tryTsOrdered) {
       const slug = `${asset}-updown-${interval}-${ts}`;
       try {
         const m = (await gammaMarketBySlugOrId(slug)) as Record<string, unknown>;
@@ -1804,6 +1817,44 @@ app.get('/api/trade/order', async (req, res) => {
     return json(res, 502, {
       ok: false,
       error: 'get_order_failed',
+      details: { message: error instanceof Error ? error.message : String(error) },
+    });
+  }
+});
+
+/** List open orders (resting) for the authenticated trader. Optional `token_id` filters one market/outcome. */
+app.get('/api/trade/open-orders', async (req, res) => {
+  const tokenId = String(req.query.token_id ?? '').trim();
+
+  const ready = await getTradingClient();
+  if (!ready.ok) {
+    return json(res, ready.error === 'trading_auth_failed' ? 502 : 503, {
+      ok: false,
+      error: ready.error,
+      details: { hint: ready.hint, reason: ready.details },
+    });
+  }
+
+  try {
+    const params = tokenId ? ({ token_id: tokenId } as Record<string, unknown>) : ({} as Record<string, unknown>);
+    const items: unknown[] = [];
+    let cursor: string | undefined = undefined;
+    for (let page = 0; page < 10; page++) {
+      const batch = await ready.client.getOpenOrders(params as never, false, cursor);
+      const next = (batch as { next_cursor?: unknown }).next_cursor;
+      const data = (batch as { data?: unknown }).data;
+      if (Array.isArray(data)) {
+        for (const o of data) items.push(o);
+      }
+      const nextStr = typeof next === 'string' ? next : '';
+      if (!nextStr || nextStr === 'LTE=' || (Array.isArray(data) && data.length === 0)) break;
+      cursor = nextStr;
+    }
+    return json(res, 200, { ok: true, data: { token_id: tokenId || null, orders: items } });
+  } catch (error) {
+    return json(res, 502, {
+      ok: false,
+      error: 'open_orders_failed',
       details: { message: error instanceof Error ? error.message : String(error) },
     });
   }

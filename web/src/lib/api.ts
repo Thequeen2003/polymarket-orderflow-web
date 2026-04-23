@@ -9,8 +9,24 @@ type JsonOpts = {
 /** When set (e.g. `http://127.0.0.1:8787`), all `/api/...` calls go there — needed for `vite preview` or web-only dev without the Vite proxy. */
 function apiBase(): string {
   const raw = import.meta.env.VITE_API_BASE;
-  if (typeof raw !== 'string') return '';
-  return raw.trim().replace(/\/+$/, '');
+  if (typeof raw === 'string') {
+    const v = raw.trim().replace(/\/+$/, '');
+    if (v) return v;
+  }
+  // Vite dev uses the proxy (same-origin `/api/*`) to avoid CORS; preview/static hosting does not.
+  // When running a production build on localhost, default to the local API port so fetch works without extra env setup.
+  try {
+    const loc = window.location;
+    const isLocalhost =
+      loc.hostname === 'localhost' ||
+      loc.hostname === '127.0.0.1' ||
+      loc.hostname === '0.0.0.0' ||
+      loc.hostname === '::1';
+    if (isLocalhost && import.meta.env.PROD) return 'http://127.0.0.1:8787';
+  } catch {
+    /* ignore */
+  }
+  return '';
 }
 
 function apiUrl(path: string): string {
@@ -59,7 +75,8 @@ function interpretParsedJson<T>(res: Response, parsed: unknown): ApiOk<T> | ApiE
 export async function postJson<T>(path: string, body: unknown): Promise<ApiOk<T> | ApiErr> {
   let text = '';
   try {
-    const res = await fetch(apiUrl(path), {
+    const url = apiUrl(path);
+    const res = await fetch(url, {
       method: 'POST',
       headers: { accept: 'application/json', 'content-type': 'application/json' },
       body: JSON.stringify(body),
@@ -69,7 +86,33 @@ export async function postJson<T>(path: string, body: unknown): Promise<ApiOk<T>
     if (!parsedWrap.ok) return apiErrFromNonJsonResponse(res, text);
     return interpretParsedJson<T>(res, parsedWrap.value);
   } catch (e) {
-    return { ok: false, error: 'fetch_failed', details: String(e) };
+    const url = apiUrl(path);
+    let mixedContent = false;
+    try {
+      mixedContent = window.location.protocol === 'https:' && url.startsWith('http://');
+    } catch {
+      mixedContent = false;
+    }
+    return {
+      ok: false,
+      error: 'fetch_failed',
+      details: {
+        message: e instanceof Error ? e.message : String(e),
+        name: e instanceof Error ? e.name : typeof e,
+        url,
+        apiBase: apiBase() || null,
+        origin: (() => {
+          try {
+            return window.location.origin;
+          } catch {
+            return null;
+          }
+        })(),
+        hint: mixedContent
+          ? 'This looks like mixed-content (HTTPS page trying to call an HTTP API). Use an HTTPS API URL or serve the web app over HTTP for local dev.'
+          : 'If you are on `npm run dev -w web`, make sure the API is running on :8787 (root `npm run dev` starts both). If you are on `vite preview`, set `VITE_API_BASE=http://127.0.0.1:8787` (or let preview default handle localhost).',
+      },
+    };
   }
 }
 
@@ -88,7 +131,8 @@ async function getJson<T>(path: string, opts?: JsonOpts): Promise<ApiOk<T> | Api
         }, timeoutMs)
       : null;
   try {
-    const res = await fetch(apiUrl(path), {
+    const url = apiUrl(path);
+    const res = await fetch(url, {
       headers: { accept: 'application/json' },
       signal: opts?.signal ?? controller?.signal,
     });
@@ -97,7 +141,34 @@ async function getJson<T>(path: string, opts?: JsonOpts): Promise<ApiOk<T> | Api
     if (!parsedWrap.ok) return apiErrFromNonJsonResponse(res, text);
     return interpretParsedJson<T>(res, parsedWrap.value);
   } catch (e) {
-    return { ok: false, error: 'fetch_failed', details: String(e) };
+    const url = apiUrl(path);
+    let mixedContent = false;
+    try {
+      mixedContent = window.location.protocol === 'https:' && url.startsWith('http://');
+    } catch {
+      mixedContent = false;
+    }
+    return {
+      ok: false,
+      error: 'fetch_failed',
+      details: {
+        message: e instanceof Error ? e.message : String(e),
+        name: e instanceof Error ? e.name : typeof e,
+        url,
+        apiBase: apiBase() || null,
+        origin: (() => {
+          try {
+            return window.location.origin;
+          } catch {
+            return null;
+          }
+        })(),
+        timeoutMs: timeoutMs ?? null,
+        hint: mixedContent
+          ? 'This looks like mixed-content (HTTPS page trying to call an HTTP API). Use an HTTPS API URL or serve the web app over HTTP for local dev.'
+          : 'If the web app is not running via the Vite dev server proxy, set `VITE_API_BASE` to your API URL (e.g. http://127.0.0.1:8787) and ensure the API is running.',
+      },
+    };
   } finally {
     if (t != null) window.clearTimeout(t);
   }
@@ -118,7 +189,8 @@ export async function postJsonWithOpts<T>(path: string, body: unknown, opts?: Js
         }, timeoutMs)
       : null;
   try {
-    const res = await fetch(apiUrl(path), {
+    const url = apiUrl(path);
+    const res = await fetch(url, {
       method: 'POST',
       headers: { accept: 'application/json', 'content-type': 'application/json' },
       body: JSON.stringify(body),
@@ -129,7 +201,34 @@ export async function postJsonWithOpts<T>(path: string, body: unknown, opts?: Js
     if (!parsedWrap.ok) return apiErrFromNonJsonResponse(res, text);
     return interpretParsedJson<T>(res, parsedWrap.value);
   } catch (e) {
-    return { ok: false, error: 'fetch_failed', details: String(e) };
+    const url = apiUrl(path);
+    let mixedContent = false;
+    try {
+      mixedContent = window.location.protocol === 'https:' && url.startsWith('http://');
+    } catch {
+      mixedContent = false;
+    }
+    return {
+      ok: false,
+      error: 'fetch_failed',
+      details: {
+        message: e instanceof Error ? e.message : String(e),
+        name: e instanceof Error ? e.name : typeof e,
+        url,
+        apiBase: apiBase() || null,
+        origin: (() => {
+          try {
+            return window.location.origin;
+          } catch {
+            return null;
+          }
+        })(),
+        timeoutMs: timeoutMs ?? null,
+        hint: mixedContent
+          ? 'This looks like mixed-content (HTTPS page trying to call an HTTP API). Use an HTTPS API URL or serve the web app over HTTP for local dev.'
+          : 'If you are using `vite preview`, set `VITE_API_BASE=http://127.0.0.1:8787` (localhost preview also defaults there now). Otherwise, ensure the dev proxy is active or the API is reachable.',
+      },
+    };
   } finally {
     if (t != null) window.clearTimeout(t);
   }
@@ -298,6 +397,13 @@ export function tradeAvgEntry(tokenId: string) {
 
 export function tradeGetOrder(orderId: string, opts?: JsonOpts) {
   return getJson<unknown>(`/api/trade/order?order_id=${encodeURIComponent(orderId)}`, opts);
+}
+
+export function tradeOpenOrders(params?: { tokenId?: string }) {
+  const q = new URLSearchParams();
+  if (params?.tokenId) q.set('token_id', params.tokenId);
+  const suffix = q.toString();
+  return getJson<{ token_id: string | null; orders: unknown[] }>(`/api/trade/open-orders${suffix ? `?${suffix}` : ''}`);
 }
 
 export function tradeCancelOrder(orderId: string) {

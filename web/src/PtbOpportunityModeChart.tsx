@@ -1,6 +1,8 @@
-import { memo, useId, useMemo, useState, type ReactElement } from 'react';
+import { memo, useEffect, useId, useMemo, useRef, useState, type ReactElement } from 'react';
 import type { SpotPoint } from './SpotLevelChart';
+import type { BookSnapshot } from './orderflowMetrics';
 import { computePtbChartDerivatives, type PtbControlSignal } from './ptbChartDerivatives';
+import { computePtbSettlementCrossProjections } from './ptbProjection';
 import { PTB_REACTION_DIMENSIONS, PTB_REACTION_ONE_LINER } from './ptbReactionFramework';
 import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
 import { buildSpotCandles, candleStraddlesPtb, ptbTouchEpsilonUsd } from './spotVsPtb';
@@ -141,14 +143,41 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
   lastUpdateMs: number | null;
   /** Milliseconds until market / round end (from parent); drives “Time remaining”. */
   endsInMs?: number | null;
+  /** Last implied mid (0–1) for settlement/cross model confirmation. */
+  lastProbUp?: number | null;
+  lastProbDown?: number | null;
+  /** Book flow snapshots for the active UP/DOWN outcome token. */
+  bookFlow?: BookSnapshot[] | null;
   chartTitle?: string;
   upLabel?: string;
   downLabel?: string;
 }): ReactElement {
-  const { mode, spot, priceToBeat, lastUpdateMs, endsInMs = null, chartTitle = 'Spot (USD)', upLabel = 'UP', downLabel = 'DOWN' } = props;
+  const {
+    mode,
+    spot,
+    priceToBeat,
+    lastUpdateMs,
+    endsInMs = null,
+    lastProbUp = null,
+    lastProbDown = null,
+    bookFlow = null,
+    chartTitle = 'Spot (USD)',
+    upLabel = 'UP',
+    downLabel = 'DOWN',
+  } = props;
   const gradId = useId().replace(/:/g, '');
   const [displayMode, setDisplayMode] = useState<'line' | 'ohlc'>('line');
-  const [zoomWindow, setZoomWindow] = useState<60 | 120 | 300>(300);
+  const [zoomWindow, setZoomWindow] = useState<60 | 120 | 300 | 900>(300);
+  const didAuto15mZoom = useRef(false);
+  useEffect(() => {
+    if (didAuto15mZoom.current) return;
+    if (endsInMs == null || !Number.isFinite(endsInMs)) return;
+    // Longer windows (e.g. 15m up/down) — default to a 15m strip once we know time remaining.
+    if (endsInMs > 7 * 60_000) {
+      setZoomWindow(900);
+      didAuto15mZoom.current = true;
+    }
+  }, [endsInMs]);
 
   const pts = useMemo(() => {
     const all = spot.filter((p) => isFiniteNumber(p.t) && isFiniteNumber(p.v));
@@ -212,8 +241,32 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
 
   const derivedStrip = useMemo(() => {
     if (!model || priceToBeat == null || !Number.isFinite(priceToBeat)) return null;
-    return computePtbChartDerivatives({ pts, candles: model.candles, ptb: priceToBeat });
-  }, [model, priceToBeat, pts]);
+    return computePtbChartDerivatives({ pts, candles: model.candles, ptb: priceToBeat, bookFlow: bookFlow ?? undefined });
+  }, [model, priceToBeat, pts, bookFlow]);
+
+  const settlementCross = useMemo(() => {
+    if (!model || !derivedStrip || priceToBeat == null || !Number.isFinite(priceToBeat)) return null;
+    const Tsec =
+      endsInMs != null && Number.isFinite(endsInMs) && endsInMs > 0
+        ? Math.max(1, endsInMs / 1000)
+        : Math.max(30, (model.tMax - model.tMin) / 1000);
+    return computePtbSettlementCrossProjections({
+      pts,
+      candles: model.candles,
+      ptb: priceToBeat,
+      s0: model.last,
+      Tsec,
+      slopeUsdPerSec: derivedStrip.slopeUsdPerSec,
+      slopeSampleCount: derivedStrip.slopeSampleCount,
+      controlSignal: derivedStrip.controlSignal,
+      structureEvent: derivedStrip.structureEvent,
+      structureEventLabel: derivedStrip.structureEventLabel,
+      reactionKind: derivedStrip.reaction.kind,
+      lastProbUp,
+      lastProbDown,
+      bookFlow: bookFlow ?? undefined,
+    });
+  }, [model, derivedStrip, priceToBeat, pts, endsInMs, lastProbUp, lastProbDown, bookFlow]);
 
   /** Key price levels — swing highs/lows from candles for S/R. */
   const priceLevels = useMemo(() => {
@@ -953,8 +1006,8 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
                 OHLC
               </button>
             </div>
-            <div className="inline-flex rounded-2xl border border-zinc-800/80 bg-black/25 p-1 shadow-inner shadow-black/30">
-              {([60, 120, 300] as const).map((sec) => (
+            <div className="inline-flex flex-wrap rounded-2xl border border-zinc-800/80 bg-black/25 p-1 shadow-inner shadow-black/30">
+              {([60, 120, 300, 900] as const).map((sec) => (
                 <button
                   key={sec}
                   type="button"
@@ -963,7 +1016,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
                     zoomWindow === sec ? 'bg-indigo-600 text-white' : 'text-zinc-400 hover:text-zinc-200'
                   }`}
                 >
-                  {sec < 120 ? '1m' : sec < 300 ? '2m' : '5m'}
+                  {sec < 120 ? '1m' : sec < 300 ? '2m' : sec < 900 ? '5m' : '15m'}
                 </button>
               ))}
             </div>
@@ -1444,6 +1497,65 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             <div className="mt-1 text-[10px] font-semibold text-inherit/85">{playbook.tp}</div>
           </div>
         </div>
+
+        {settlementCross ? (
+          <div className="mt-3 grid gap-2 sm:grid-cols-2">
+            <div
+              className="rounded-xl border border-violet-600/40 bg-violet-950/25 px-3 py-2"
+              title={
+                `${settlementCross.blurb}\n` +
+                `50% band ${fmtUsd(settlementCross.band50Low)} – ${fmtUsd(settlementCross.band50High)} · ` +
+                `80% ${fmtUsd(settlementCross.band80Low)} – ${fmtUsd(settlementCross.band80High)}`
+              }
+            >
+              <div className="text-[9px] font-extrabold uppercase tracking-[0.18em] text-violet-200/85">Settlement (vs PTB @ end)</div>
+              <div className="mt-1 font-mono text-sm font-semibold tabular-nums text-violet-100">
+                Above {Math.round(settlementCross.pAboveAtEnd * 100)}% · Below {Math.round(settlementCross.pBelowAtEnd * 100)}%
+              </div>
+              <div className="mt-0.5 text-[10px] text-violet-200/70">
+                Confidence:{' '}
+                <span className="font-bold uppercase text-violet-100">{settlementCross.confidence}</span>
+                {' · '}
+                E[close] {fmtUsd(settlementCross.expectedEndPrice)}
+              </div>
+            </div>
+            <div
+              className="rounded-xl border border-cyan-600/40 bg-cyan-950/20 px-3 py-2"
+              title={
+                `P(cross PTB within window): 30s ${Math.round(settlementCross.pCrossIn30s * 100)}%, ` +
+                `60s ${Math.round(settlementCross.pCrossIn60s * 100)}%, 120s ${Math.round(settlementCross.pCrossIn120s * 100)}%. ` +
+                (settlementCross.tCrossMedianSec != null
+                  ? `Rough median time to line (drift toward line): ${settlementCross.tCrossMedianSec < 60 ? `${settlementCross.tCrossMedianSec.toFixed(0)}s` : `${(settlementCross.tCrossMedianSec / 60).toFixed(1)}m`}.`
+                  : 'Median time to line: n/a (drift not toward PTB).') +
+                `\n${settlementCross.blurb}`
+              }
+            >
+              <div className="text-[9px] font-extrabold uppercase tracking-[0.18em] text-cyan-200/85">Cross soon</div>
+              <div className="mt-1 font-mono text-sm font-semibold tabular-nums text-cyan-100">
+                60s: {Math.round(settlementCross.pCrossIn60s * 100)}%
+                <span className="text-cyan-200/50"> · 30s {Math.round(settlementCross.pCrossIn30s * 100)}%</span>
+                <span className="text-cyan-200/50"> · 120s {Math.round(settlementCross.pCrossIn120s * 100)}%</span>
+              </div>
+              <div className="mt-0.5 text-[10px] text-cyan-200/70">
+                {settlementCross.confidence === 'low' || derivedStrip?.controlSignal === 'NO_EDGE' || derivedStrip?.structureEvent === 'chop' ? (
+                  <span>Low conf. in chop / near band — use for timing only.</span>
+                ) : (
+                  <span>Barrier MC from drift + tick vol; hover for 30/120s + bands.</span>
+                )}
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        {derivedStrip?.structureEvent === 'chop' || derivedStrip?.reaction?.kind === 'choppy_at_line' ? (
+          <div
+            className="mt-2 rounded-lg border border-amber-600/50 bg-amber-950/25 px-3 py-2 text-[10px] leading-snug text-amber-100/95"
+            title="Repeated crosses / negotiation at PTB — favor risk management: tighten, wait for a clean test."
+          >
+            <span className="font-bold text-amber-200">Chop / NO EDGE</span> — action is noisy; settlement & cross readouts are down-weighted. Prefer mechanical invalidations over forcing sells into the band.
+          </div>
+        ) : null}
+
         <div className="mt-3 flex flex-wrap gap-2 text-[10px] text-zinc-400">
           <span
             className="rounded border border-zinc-600/70 bg-zinc-950/80 px-2 py-1 font-mono text-zinc-200"

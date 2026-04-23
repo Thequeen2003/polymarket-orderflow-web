@@ -25,6 +25,7 @@ import type {
   AlertKind,
   AlertCooldowns,
   AlertPrefs,
+  TradePlan,
   UpScalpSettings,
   WatchlistEntry,
 } from './momentumAlertsTypes';
@@ -33,6 +34,7 @@ import {
   defaultAlertPrefs,
   defaultTradePlan,
   defaultUpScalpSettings,
+  tradePlan65To70,
 } from './momentumAlertsTypes';
 
 const LS_WL = 'pm-momentum-watchlist-v1';
@@ -42,6 +44,8 @@ const LS_FOCUS = 'pm-momentum-focus-slug-v1';
 const LS_COOLDOWNS = 'pm-momentum-alert-cooldowns-v1';
 const LS_FEED_FILTERS = 'pm-momentum-alert-feed-filters-v1';
 const LS_PLAYBOOK_VIEW = 'pm-playbook-view-v1';
+const LS_TRADE_PLAN = 'pm-momentum-trade-plan-v2';
+const LS_CATCH_NOTIFY = 'pm-momentum-catch-notify-v1';
 
 function isOk<T>(x: unknown): x is { ok: true; data: T } {
   return typeof x === 'object' && x !== null && (x as { ok?: boolean }).ok === true && 'data' in (x as object);
@@ -140,6 +144,7 @@ const ALERT_LABELS: Record<AlertKind, string> = {
   spoof_suspect: 'Spoof?',
   near_entry: 'Near entry',
   near_target: 'Near target',
+  momentum_catch: 'CATCH (zone + momo)',
   weak_follow: 'Weak follow',
   do_not_enter_signal: 'Do not enter',
   context: 'Context',
@@ -162,6 +167,10 @@ export function MomentumAlertsTab(props: {
   const [minConfidence, setMinConfidence] = useState<number>(55);
   const [hideLowConfidence, setHideLowConfidence] = useState<boolean>(false);
   const [playbookView, setPlaybookView] = useState<'kind' | 'confidence' | 'spread'>(() => 'kind');
+  const [tradePlan, setTradePlan] = useState<TradePlan>(() => defaultTradePlan());
+  const [catchDesktopNotify, setCatchDesktopNotify] = useState<boolean>(false);
+  const tradePlanRef = useRef<TradePlan>(tradePlan);
+  const catchNotifyRef = useRef(catchDesktopNotify);
 
   const [midsBySlug, setMidsBySlug] = useState<Record<string, SeriesPoint[]>>({});
   const [snapsBySlug, setSnapsBySlug] = useState<Record<string, BookSnapshot[]>>({});
@@ -187,6 +196,12 @@ export function MomentumAlertsTab(props: {
   useEffect(() => {
     scalpSettingsRef.current = scalpSettings;
   }, [scalpSettings]);
+  useEffect(() => {
+    tradePlanRef.current = tradePlan;
+  }, [tradePlan]);
+  useEffect(() => {
+    catchNotifyRef.current = catchDesktopNotify;
+  }, [catchDesktopNotify]);
 
   const scheduleReadyOutcomes = useCallback((sampleId: string, slug: string) => {
     const run = (slot: 'outcome30s' | 'outcome2m') => {
@@ -226,6 +241,10 @@ export function MomentumAlertsTab(props: {
       if (f) setFocusSlug(f);
       const pv = localStorage.getItem(LS_PLAYBOOK_VIEW);
       if (pv === 'kind' || pv === 'confidence' || pv === 'spread') setPlaybookView(pv);
+      const tp = localStorage.getItem(LS_TRADE_PLAN);
+      if (tp) setTradePlan({ ...defaultTradePlan(), ...JSON.parse(tp) });
+      const cn = localStorage.getItem(LS_CATCH_NOTIFY);
+      if (cn === '1') setCatchDesktopNotify(true);
     } catch {
       /* ignore */
     }
@@ -253,6 +272,20 @@ export function MomentumAlertsTab(props: {
   useEffect(() => {
     localStorage.setItem(LS_PLAYBOOK_VIEW, playbookView);
   }, [playbookView]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_TRADE_PLAN, JSON.stringify(tradePlan));
+    } catch {
+      /* ignore */
+    }
+  }, [tradePlan]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_CATCH_NOTIFY, catchDesktopNotify ? '1' : '0');
+    } catch {
+      /* ignore */
+    }
+  }, [catchDesktopNotify]);
   useEffect(() => {
     if (focusSlug) localStorage.setItem(LS_FOCUS, focusSlug);
   }, [focusSlug]);
@@ -334,7 +367,7 @@ export function MomentumAlertsTab(props: {
         prevBestBid: pb?.bid ?? null,
         prevBestAsk: pb?.ask ?? null,
         prevSlope: ps,
-        plan: { ...defaultTradePlan(), momentumThreshold: String(scalp.minMomentum) },
+        plan: { ...tradePlanRef.current, momentumThreshold: String(scalp.minMomentum) },
         prefs,
         momentumThreshold: th,
       });
@@ -360,7 +393,24 @@ export function MomentumAlertsTab(props: {
         lastFireRef.current[k] = now;
         return true;
       });
-      if (cooled.length > 0) {
+        if (cooled.length > 0) {
+        for (const ev of cooled) {
+          if (
+            ev.kind === 'momentum_catch' &&
+            catchNotifyRef.current &&
+            typeof Notification !== 'undefined' &&
+            Notification.permission === 'granted'
+          ) {
+            try {
+              new Notification('Bullpen · CATCH', {
+                body: `${ev.message}`,
+                tag: `catch-${ev.slug}`,
+              });
+            } catch {
+              /* ignore */
+            }
+          }
+        }
         // Record playbook samples for each fired event (local only).
         const nowCool = Date.now();
         const recentKinds = (slug: string, kinds: AlertKind[]) => {
@@ -512,6 +562,7 @@ export function MomentumAlertsTab(props: {
 
   const scalpFeedRank = useCallback((k: AlertKind): number => {
     const scores: Partial<Record<AlertKind, number>> = {
+      momentum_catch: 6,
       momentum_start: 4,
       asks_eaten: 4,
       bid_wall: 3,
@@ -807,6 +858,80 @@ export function MomentumAlertsTab(props: {
                   className="mt-0.5 w-full rounded-lg border border-zinc-700/50 bg-zinc-950/50 px-2 py-1.5 font-mono text-xs text-zinc-200"
                 />
               </label>
+            </div>
+            <div className="mt-3 rounded-xl border border-amber-900/40 bg-amber-950/15 p-3">
+              <div className="text-[10px] font-bold uppercase tracking-wide text-amber-200/80">Momentum catch (entry → target)</div>
+              <p className="mt-1 text-[10px] leading-snug text-amber-100/60">
+                Set your buy band and take-profit. When mid is <span className="text-amber-100">in the band</span> and tape slope is above your
+                min momentum, you get a <span className="font-semibold text-amber-50">CATCH</span> alert (top of feed). Use decimals:{' '}
+                <span className="font-mono">0.65</span> = 65¢.
+              </p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTradePlan(tradePlan65To70());
+                    setScalpSettings((s) => ({ ...s, minMomentum: 0.012, targetNetCents: 5 }));
+                  }}
+                  className="rounded-lg border border-amber-600/50 bg-amber-950/40 px-2.5 py-1.5 text-[10px] font-bold text-amber-50 hover:bg-amber-950/60"
+                >
+                  Preset: 64–66¢ entry → 70¢ TP
+                </button>
+                <label className="flex cursor-pointer items-center gap-2 text-[10px] text-amber-100/80">
+                  <input
+                    type="checkbox"
+                    checked={catchDesktopNotify}
+                    onChange={async (e) => {
+                      const on = e.target.checked;
+                      if (on && typeof Notification !== 'undefined' && Notification.permission === 'default') {
+                        const p = await Notification.requestPermission();
+                        setCatchDesktopNotify(p === 'granted');
+                        return;
+                      }
+                      setCatchDesktopNotify(on && (typeof Notification === 'undefined' || Notification.permission === 'granted'));
+                    }}
+                  />
+                  Desktop notify on CATCH
+                </label>
+              </div>
+              <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                <label className="block text-[10px] text-zinc-500">
+                  Planned entry (mid)
+                  <input
+                    value={tradePlan.plannedEntry}
+                    onChange={(e) => setTradePlan((p) => ({ ...p, plannedEntry: e.target.value }))}
+                    placeholder="0.65"
+                    className="mt-0.5 w-full rounded-lg border border-zinc-700/50 bg-zinc-950/50 px-2 py-1.5 font-mono text-xs text-zinc-200"
+                  />
+                </label>
+                <label className="block text-[10px] text-zinc-500">
+                  Take-profit (mid)
+                  <input
+                    value={tradePlan.targetSell}
+                    onChange={(e) => setTradePlan((p) => ({ ...p, targetSell: e.target.value }))}
+                    placeholder="0.70"
+                    className="mt-0.5 w-full rounded-lg border border-zinc-700/50 bg-zinc-950/50 px-2 py-1.5 font-mono text-xs text-zinc-200"
+                  />
+                </label>
+                <label className="block text-[10px] text-zinc-500">
+                  Entry band low
+                  <input
+                    value={tradePlan.entryRangeLow}
+                    onChange={(e) => setTradePlan((p) => ({ ...p, entryRangeLow: e.target.value }))}
+                    placeholder="0.64"
+                    className="mt-0.5 w-full rounded-lg border border-zinc-700/50 bg-zinc-950/50 px-2 py-1.5 font-mono text-xs text-zinc-200"
+                  />
+                </label>
+                <label className="block text-[10px] text-zinc-500">
+                  Entry band high
+                  <input
+                    value={tradePlan.entryRangeHigh}
+                    onChange={(e) => setTradePlan((p) => ({ ...p, entryRangeHigh: e.target.value }))}
+                    placeholder="0.66"
+                    className="mt-0.5 w-full rounded-lg border border-zinc-700/50 bg-zinc-950/50 px-2 py-1.5 font-mono text-xs text-zinc-200"
+                  />
+                </label>
+              </div>
             </div>
             <label className="mt-2 block text-[10px] text-zinc-500">
               Verdict focus market

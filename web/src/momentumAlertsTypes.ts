@@ -31,6 +31,20 @@ export const defaultTradePlan = (): TradePlan => ({
   momentumThreshold: '0.015',
 });
 
+/** One-click: ~65¢ entry band → ~70¢ target (momentum rip). Mids are 0–1. */
+export function tradePlan65To70(): TradePlan {
+  return {
+    ...defaultTradePlan(),
+    plannedEntry: '0.65',
+    entryRangeLow: '0.64',
+    entryRangeHigh: '0.66',
+    targetSell: '0.70',
+    riskLevel: 'med',
+    doNotEnter: 'Very wide spread, giant ask wall, or weak follow-through on tape',
+    momentumThreshold: '0.012',
+  };
+}
+
 export type AlertKind =
   | 'momentum_start'
   | 'momentum_slow'
@@ -41,6 +55,8 @@ export type AlertKind =
   | 'spoof_suspect'
   | 'near_entry'
   | 'near_target'
+  /** In planned entry band + positive momentum (rip starter). */
+  | 'momentum_catch'
   | 'weak_follow'
   | 'do_not_enter_signal'
   | 'context';
@@ -57,6 +73,7 @@ export const defaultAlertPrefs = (): AlertPrefs => ({
   spoof_suspect: true,
   near_entry: true,
   near_target: true,
+  momentum_catch: true,
   weak_follow: true,
   do_not_enter_signal: true,
   context: true,
@@ -75,6 +92,7 @@ export const defaultAlertCooldowns = (): AlertCooldowns => ({
   spoof_suspect: 60_000,
   near_entry: 60_000,
   near_target: 60_000,
+  momentum_catch: 32_000,
   weak_follow: 60_000,
   do_not_enter_signal: 60_000,
   context: 45_000,

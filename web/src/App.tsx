@@ -35,6 +35,7 @@ import { TradeHistoryTab } from './TradeHistoryTab';
 import { shortTradeTabLabel, TradeSessionTabsBar, type TradeSessionTab } from './TradeSessionTabsBar';
 import { PtbMultiAssetGrid, type PtbMultiAssetRow } from './PtbMultiAssetGrid';
 import { UnifiedPtbView } from './UnifiedPtbView';
+import { TrackingTab } from './TrackingTab';
 import { PtbThreeUp } from './PtbThreeUp';
 import { MultiMarketCommandView, type MarketKey, type MultiMarketRow } from './MultiMarketCommandView';
 import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
@@ -67,6 +68,7 @@ function apiReachabilityHint(err: ApiErr): string {
 
 const PTB_WATCH_SLUGS_KEY = 'ptbWatchSlugs.v1';
 const PTB_WATCH_RECENT_KEY = 'ptbWatchRecentSlugs.v1';
+const PTB_THREE_UP_INTERVAL_KEY = 'ptbThreeUpInterval.v1';
 
 function readStringArray(key: string, max: number): string[] {
   try {
@@ -532,6 +534,7 @@ type MainTab =
   | 'book'
   | 'flowzones'
   | 'signals'
+  | 'tracking'
   | 'tradehistory'
   | 'dualptb'
   | 'threeup'
@@ -552,6 +555,8 @@ function mainTabTitle(tab: MainTab): string {
       return 'Flow Zones';
     case 'signals':
       return 'Signals';
+    case 'tracking':
+      return 'Tracking';
     case 'tradehistory':
       return 'Trade history';
     case 'dualptb':
@@ -623,7 +628,16 @@ function App() {
   const [shortcutBusy, setShortcutBusy] = useState<{ asset: UpdownShortcutAsset; interval: UpdownInterval } | null>(null);
   const [lastShortcut, setLastShortcut] = useState<{ asset: UpdownShortcutAsset; interval: UpdownInterval } | null>(null);
   const [mainTab, setMainTab] = useState<MainTab>('dualptb');
-  const [threeUpInterval, setThreeUpInterval] = useState<UpdownInterval>('5m');
+  const [threeUpInterval, setThreeUpInterval] = useState<UpdownInterval>(() => {
+    if (typeof window === 'undefined') return '5m';
+    try {
+      const s = localStorage.getItem(PTB_THREE_UP_INTERVAL_KEY);
+      if (s === '5m' || s === '15m') return s;
+    } catch {
+      /* ignore */
+    }
+    return '5m';
+  });
   const [_threeUpSlugs, setThreeUpSlugs] = useState<Record<string, string>>({});
   const [threeUpMeta, setThreeUpMeta] = useState<Record<string, { ptb: number | null; endsInMs: number | null }>>({});
   const [commandSelected, setCommandSelected] = useState<MarketKey>('btc');
@@ -1027,6 +1041,14 @@ function App() {
   }, []);
 
   useEffect(() => {
+    try {
+      localStorage.setItem(PTB_THREE_UP_INTERVAL_KEY, threeUpInterval);
+    } catch {
+      /* ignore */
+    }
+  }, [threeUpInterval]);
+
+  useEffect(() => {
     writeStringArray(PTB_WATCH_SLUGS_KEY, ptbWatchSlugs);
   }, [ptbWatchSlugs]);
 
@@ -1041,8 +1063,11 @@ function App() {
         const a = assets[i]!;
         const r = res[i]!;
         if (!isOk(r)) continue;
-        const prior = nextUpdownSlug(r.data.slug, -1) ?? r.data.slug;
-        nextSlugs[a] = prior;
+        const cur = r.data.slug;
+        // 5m: prior window — PTB is previous bucket open; smoother right after a roll. 15m: use the live window
+        // (prior is a full 15m back and is often the wrong/closed book for the round you are trading).
+        const slug = threeUpInterval === '15m' ? cur : (nextUpdownSlug(cur, -1) ?? cur);
+        nextSlugs[a] = slug;
       }
       setThreeUpSlugs(nextSlugs);
 
@@ -1407,9 +1432,10 @@ function App() {
       } else {
         setMarketsError(null);
       }
-      // Default to the prior round (more stable: PTB is the previous bucket's open and you avoid the just-rolled window).
-      const prior = nextUpdownSlug(res.data.slug, -1) ?? res.data.slug;
-      await loadMarket(prior);
+      // 5m: open prior round (PTB = previous window open, less noisy at the roll). 15m: open the live window from the API.
+      const slugToOpen =
+        interval === '15m' ? res.data.slug : (nextUpdownSlug(res.data.slug, -1) ?? res.data.slug);
+      await loadMarket(slugToOpen);
     } finally {
       setShortcutBusy(null);
     }
@@ -1463,7 +1489,9 @@ function App() {
 
   return (
     <div className="min-h-full bg-zinc-950 bg-[radial-gradient(100%_60%_at_50%_-10%,rgba(99,102,241,0.08),transparent_52%),linear-gradient(180deg,#0b0b0f_0%,#09090b_45%,#060608_100%)] font-sans text-zinc-200 antialiased">
-      <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
+      <div
+        className={`mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8 ${tradePanelOpen ? '2xl:pr-[400px]' : ''}`}
+      >
         <header className="rounded-2xl border border-zinc-800/50 bg-zinc-900/20 px-5 py-5 shadow-lg shadow-black/20 ring-1 ring-white/[0.03] backdrop-blur-sm sm:px-6">
           <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
             <div>
@@ -1670,6 +1698,7 @@ function App() {
               <MainTabButton id="book" label="Book" active={mainTab === 'book'} onSelect={setMainTab} />
               <MainTabButton id="flowzones" label="Flow" title="Flow Zones" active={mainTab === 'flowzones'} onSelect={setMainTab} />
               <MainTabButton id="signals" label="Signals" active={mainTab === 'signals'} onSelect={setMainTab} />
+              <MainTabButton id="tracking" label="Tracking" title="Positions + open orders + cash" active={mainTab === 'tracking'} onSelect={setMainTab} />
               <MainTabButton id="tradehistory" label="History" title="Trade history (paper + live log)" active={mainTab === 'tradehistory'} onSelect={setMainTab} />
               <MainTabButton id="dualptb" label="Dual PTB" title="Reference PTB continuation tab" active={mainTab === 'dualptb'} onSelect={setMainTab} />
               <MainTabButton id="threeup" label="3-up" title="BTC/ETH/SOL spot vs PTB (simultaneous)" active={mainTab === 'threeup'} onSelect={setMainTab} />
@@ -1960,6 +1989,10 @@ function App() {
                   Book tab: order flow, ladders, and above/below context. Assistant tab: chat + digest.
                 </p>
               </div>
+            ) : null}
+
+            {mainTab === 'tracking' ? (
+              <TrackingTab upToken={effectiveTradeContext.upToken} downToken={effectiveTradeContext.downToken} />
             ) : null}
 
             {mainTab === 'tradehistory' ? (
@@ -2264,30 +2297,22 @@ function App() {
           onClose={() => setTradePanelOpen(false)}
           title={effectiveTradeContext.question || effectiveTradeContext.slug || 'Market'}
         >
-          <div className="space-y-3">
-            <TradeSessionTabsBar
-              tabs={tradeSessionTabs}
-              activeId={activeTradeSessionTabId}
-              onSelect={onSelectTradeSessionTab}
-              onAdd={onAddTradeSessionTab}
-              onClose={onCloseTradeSessionTab}
-            />
-            <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-zinc-800/60 bg-gradient-to-br from-zinc-900/40 to-black/30 px-3 py-3 ring-1 ring-white/[0.04]">
-              <div className="min-w-0 flex-1">
-                <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-zinc-500">Current market</div>
-                <div className="mt-0.5 truncate text-[13px] font-semibold leading-snug text-zinc-100">
-                  {effectiveTradeContext.question || effectiveTradeContext.slug || '—'}
-                </div>
-                {effectiveTradeContext.slug ? (
-                  <div className="mt-1 truncate font-mono text-[10px] text-zinc-500">{effectiveTradeContext.slug}</div>
-                ) : null}
-                <p className="mt-1.5 text-[10px] leading-relaxed text-zinc-600">
-                  {globalTradeLocked
-                    ? 'Pinned: the trade panel stays on this market while you browse elsewhere in the app.'
-                    : 'Following the page: when you load another market, this panel updates too.'}
-                </p>
-              </div>
-              <div className="flex shrink-0 flex-col items-stretch gap-1.5 sm:items-end">
+          <div className="space-y-2">
+            <details className="rounded-2xl border border-zinc-800/60 bg-zinc-950/30" open={false}>
+              <summary className="cursor-pointer select-none px-3 py-2.5 text-[11px] font-semibold text-zinc-400 hover:text-zinc-200 [&::-webkit-details-marker]:hidden">
+                <span className="mr-1 text-zinc-600" aria-hidden>
+                  ▸
+                </span>
+                Markets · pin
+              </summary>
+              <div className="border-t border-zinc-800/50 px-3 py-3 space-y-2">
+                <TradeSessionTabsBar
+                  tabs={tradeSessionTabs}
+                  activeId={activeTradeSessionTabId}
+                  onSelect={onSelectTradeSessionTab}
+                  onAdd={onAddTradeSessionTab}
+                  onClose={onCloseTradeSessionTab}
+                />
                 <button
                   type="button"
                   onClick={() => {
@@ -2297,7 +2322,7 @@ function App() {
                       return next;
                     });
                   }}
-                  className={`min-h-[40px] rounded-xl border px-3.5 text-[11px] font-semibold tracking-wide transition-colors ${
+                  className={`min-h-[40px] w-full rounded-xl border px-3.5 text-[11px] font-semibold tracking-wide transition-colors ${
                     globalTradeLocked
                       ? 'border-amber-500/50 bg-amber-500/15 text-amber-50 hover:bg-amber-500/20'
                       : 'border-zinc-600/60 bg-zinc-950/50 text-zinc-200 hover:border-zinc-500/60 hover:bg-zinc-900/60'
@@ -2308,10 +2333,10 @@ function App() {
                       : 'Pin — keep trading this market even if you open another slug in the background'
                   }
                 >
-                  {globalTradeLocked ? 'Pinned' : 'Pin market'}
+                  {globalTradeLocked ? 'Pinned (click to unpin)' : 'Pin current market'}
                 </button>
               </div>
-            </div>
+            </details>
 
             {effectiveTradeEnabled ? (
               <SignalsTradePanel
