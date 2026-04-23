@@ -618,11 +618,18 @@ export function MomentumAlertsTab(props: {
   return (
     <div className="mt-5 space-y-5">
       <div className="rounded-2xl border border-zinc-800/50 bg-zinc-950/35 p-4 ring-1 ring-white/[0.02]">
-        <div className="text-[13px] font-semibold text-zinc-100">Momentum + Alerts</div>
+        <div className="text-[13px] font-semibold text-zinc-100">+4¢ scalp finder</div>
         <p className="mt-1 text-xs leading-relaxed text-zinc-500">
-          Watch live mids and bullish 4¢ scalp-style signals. Tune execution gates on the right; the card above the feed scores READY /
-          WAIT / AVOID using net+4¢ feasibility first, then tape. Not financial advice.
+          <span className="font-semibold text-zinc-300">Where READY comes from:</span> the green verdict runs a <span className="font-mono text-zinc-300">net +N¢</span> path
+          at your ref share size (see settings) — if the book cannot support that net after spread/slip, you get AVOID even when mid is
+          moving. Tune gates on the right; the alert feed is secondary.
         </p>
+        <ol className="mt-2 list-inside list-decimal space-y-0.5 text-[11px] leading-snug text-zinc-400">
+          <li>Add your market slug under Tracked markets (or Track current from Book).</li>
+          <li>Pick Verdict focus market — the big READY / WAIT / AVOID card follows that slug.</li>
+          <li>When READY fires, cross-check the ladder; use Momentum catch block if you want entry-band + tape alerts.</li>
+        </ol>
+        <p className="mt-2 text-[10px] text-zinc-600">Not financial advice.</p>
       </div>
 
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">

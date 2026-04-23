@@ -570,7 +570,7 @@ function mainTabTitle(tab: MainTab): string {
     case 'multiscan':
       return 'Multi scan';
     case 'momentum':
-      return 'Momentum';
+      return '+4¢ scalps';
     case 'watch':
       return 'Watch';
     case 'workspace':
@@ -1705,7 +1705,13 @@ function App() {
               <MainTabButton id="command" label="Command" title="Multi-market command tiles + command center" active={mainTab === 'command'} onSelect={setMainTab} />
               <MainTabButton id="unified" label="Unified" title="Unified PTB view (chart + panel)" active={mainTab === 'unified'} onSelect={setMainTab} />
               <MainTabButton id="multiscan" label="Multi" title="Multi-asset PTB scan" active={mainTab === 'multiscan'} onSelect={setMainTab} />
-              <MainTabButton id="momentum" label="Momentum" title="Momentum + Alerts" active={mainTab === 'momentum'} onSelect={setMainTab} />
+              <MainTabButton
+                id="momentum"
+                label="+4¢"
+                title="Scalps: net +4¢ long scanner, READY/WAIT/AVOID, momentum & CATCH alerts — add slugs below"
+                active={mainTab === 'momentum'}
+                onSelect={setMainTab}
+              />
               <MainTabButton id="watch" label="Watch" title="PTB Watch" active={mainTab === 'watch'} onSelect={setMainTab} />
               <MainTabButton id="workspace" label="Workspace" title="Drag + resize board" active={mainTab === 'workspace'} onSelect={setMainTab} />
               <MainTabButton id="assistant" label="Assistant" active={mainTab === 'assistant'} onSelect={setMainTab} />
@@ -1819,7 +1825,17 @@ function App() {
               <div className="mt-5">
                 <div className="mb-4 rounded-2xl border border-zinc-800/40 bg-zinc-900/20 p-3 ring-1 ring-white/[0.02]">
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Momentum</div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Outcome mids</div>
+                      <button
+                        type="button"
+                        onClick={() => setMainTab('momentum')}
+                        className="rounded-md border border-amber-800/50 bg-amber-950/30 px-2 py-0.5 text-[10px] font-semibold text-amber-100 hover:bg-amber-950/50"
+                        title="Net +4¢ scalp scanner, READY/WAIT verdict, alerts"
+                      >
+                        +4¢ scalps →
+                      </button>
+                    </div>
                     <div className="flex flex-wrap gap-2">
                       <TradeSegmentedControl
                         value={flowMode}
@@ -2264,7 +2280,7 @@ function App() {
                   onClick={() => setMainTab('momentum')}
                   className="rounded-xl border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
                 >
-                  Momentum + Alerts
+                  +4¢ scalps
                 </button>
                 <button
                   type="button"
