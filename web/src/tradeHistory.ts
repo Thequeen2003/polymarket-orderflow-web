@@ -252,6 +252,15 @@ export function updateTradeHistoryRow(
   return next;
 }
 
+export function deleteTradeHistoryRow(id: string): TradeHistoryRow[] {
+  const rid = String(id ?? '').trim();
+  if (!rid) return loadTradeHistory();
+  const rows = loadTradeHistory();
+  const next = rows.filter((r) => r.id !== rid);
+  if (next.length !== rows.length) saveTradeHistory(next);
+  return next;
+}
+
 function csvEscape(s: string): string {
   if (/[,"\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
   return s;

@@ -38,7 +38,9 @@ import { UnifiedPtbView } from './UnifiedPtbView';
 import { TrackingTab } from './TrackingTab';
 import { PtbThreeUp } from './PtbThreeUp';
 import { MultiMarketCommandView, type MarketKey, type MultiMarketRow } from './MultiMarketCommandView';
+import { SmartMoneyPaperPanel } from './SmartMoneyPaperPanel';
 import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
+import { PolySimulatorTradePanel } from './PolySimulatorTradePanel';
 import type { SpotPoint } from './SpotLevelChart';
 import {
   bookIntelForAssistant,
@@ -49,6 +51,7 @@ import {
 } from './bookIntel';
 import { outcomeEntryExitHints } from './chartReadouts';
 import { buildRollingContext, rollingContextText } from './contextSummary';
+import { nextUpdownSlug, parseUpdownSlug } from './sixPackUpdownSlugs';
 
 function pretty(value: unknown) {
   return JSON.stringify(value, null, 2);
@@ -244,30 +247,8 @@ function mergeSpotHistory(
   return [...prev, { t: serverTs, v: data.value }].slice(-600);
 }
 
-function parseUpdownSlug(slug: string): {
-  asset: string;
-  ts: number;
-  interval: UpdownInterval;
-  stepSec: number;
-} | null {
-  const m = slug.trim().toLowerCase().match(/^([a-z0-9]{2,10})-updown-(5m|15m)-(\d+)$/);
-  if (!m) return null;
-  const asset = m[1]!;
-  const interval = m[2] as UpdownInterval;
-  const ts = Number(m[3]);
-  if (!Number.isFinite(ts) || ts <= 0) return null;
-  const stepSec = interval === '15m' ? 900 : 300;
-  return { asset, ts, interval, stepSec };
-}
-
 function isShortcutAsset(asset: string): asset is UpdownShortcutAsset {
   return asset === 'btc' || asset === 'eth' || asset === 'sol';
-}
-
-function nextUpdownSlug(slug: string, dir: -1 | 1): string | null {
-  const p = parseUpdownSlug(slug);
-  if (!p) return null;
-  return `${p.asset}-updown-${p.interval}-${p.ts + dir * p.stepSec}`;
 }
 
 function buildAssistantContext(
@@ -668,6 +649,7 @@ function App() {
   const [tradePanelOpen, setTradePanelOpen] = useState(false);
   const [positionsPanelOpen, setPositionsPanelOpen] = useState(false);
   const [globalTradeLocked, setGlobalTradeLocked] = useState(false);
+  const [updownPickerOpen, setUpdownPickerOpen] = useState(false);
   /** Multiple trade tabs in the slide panel; switching re-loads that slug (one CLOB at a time). */
   const [tradeSessionTabs, setTradeSessionTabs] = useState<TradeSessionTab[]>([]);
   const [activeTradeSessionTabId, setActiveTradeSessionTabId] = useState<string | null>(null);
@@ -740,11 +722,22 @@ function App() {
     const tokU = books[idx.up]?.token;
     const tokD = books[idx.down]?.token;
     const m = chartSeriesBySlug[selectedSlug] ?? {};
-    const clean = (arr: SeriesPoint[]): SpotPoint[] =>
-      arr
-        .filter((p) => typeof p.v === 'number' && Number.isFinite(p.v as number))
-        .map((p) => ({ t: p.t, v: p.v as number }))
-        .slice(-220);
+    const parsed = parseUpdownSlug(selectedSlug);
+    const stepSec = parsed?.stepSec ?? 300;
+    const clean = (arr: SeriesPoint[]): SpotPoint[] => {
+      const pts = arr
+        .filter((p) => typeof p.v === 'number' && Number.isFinite(p.v as number) && Number.isFinite(p.t as number))
+        .map((p) => ({ t: p.t, v: p.v as number }));
+      if (pts.length < 2) return pts;
+      const tMax = pts[pts.length - 1]!.t;
+      // Series timestamps may be either epoch ms or epoch seconds depending on the source.
+      const isEpochMs = tMax > 50_000_000_000; // ~year 1971 in ms; safely above any "seconds" epoch.
+      const windowT = isEpochMs ? stepSec * 1000 : stepSec;
+      const tMinKeep = tMax - windowT;
+      // Time-window slice so BTC 5m never renders as longer windows.
+      const sliced = pts.filter((p) => p.t >= tMinKeep).slice(-480);
+      return sliced.length >= 2 ? sliced : pts.slice(-220);
+    };
     return {
       up: tokU ? clean(m[tokU] ?? []) : [],
       down: tokD ? clean(m[tokD] ?? []) : [],
@@ -1267,6 +1260,24 @@ function App() {
   }, [ptbWatchSlugs, spotBySymbol, watchMetaBySlug, selectedSlug, ssrPriceToBeat, marketEndsInMs]);
 
   const updownParsed = useMemo(() => parseUpdownSlug(selectedSlug), [selectedSlug]);
+  const updownPickerItems = useMemo(() => {
+    const p = updownParsed;
+    if (!p) return [];
+    const step = p.stepSec;
+    // Snap to exact 5m/15m boundary. (ts is epoch seconds.)
+    const snapped = Math.floor(p.ts / step) * step;
+    const items: { slug: string; label: string; ts: number }[] = [];
+    // Show the last ~2 hours of windows (24×5m = 2h; 12×15m = 3h).
+    const count = p.interval === '15m' ? 12 : 24;
+    for (let i = 0; i < count; i++) {
+      const ts = snapped - i * step;
+      const slug = `${p.asset}-updown-${p.interval}-${ts}`;
+      const d = new Date(ts * 1000);
+      const hh = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+      items.push({ slug, label: hh, ts });
+    }
+    return items;
+  }, [updownParsed]);
   const [updownLiveSlugFromApi, setUpdownLiveSlugFromApi] = useState<string | null>(null);
 
   // For Up/Down markets, use the API's notion of "live" (bucket) rather than the browser clock.
@@ -1813,6 +1824,48 @@ function App() {
               </div>
             ) : null}
 
+            {updownParsed ? (
+              <div className="mt-3 rounded-xl border border-zinc-800/60 bg-zinc-950/35 px-3 py-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-[11px] font-semibold text-zinc-300">
+                    5-minute markers
+                    <span className="ml-2 font-mono text-zinc-500">({updownParsed.asset.toUpperCase()} {updownParsed.interval})</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setUpdownPickerOpen((v) => !v)}
+                    className="rounded-lg border border-zinc-700/60 bg-black/20 px-2.5 py-1.5 text-[11px] font-bold text-zinc-200 hover:bg-black/30"
+                    title="Jump to an exact 5m/15m window boundary"
+                  >
+                    {updownPickerOpen ? 'Hide' : 'Choose window'}
+                  </button>
+                </div>
+
+                {updownPickerOpen ? (
+                  <div className="mt-2 grid grid-cols-4 gap-2 sm:grid-cols-6">
+                    {updownPickerItems.map((it) => (
+                      <button
+                        key={it.slug}
+                        type="button"
+                        onClick={() => {
+                          setUpdownPickerOpen(false);
+                          void loadMarket(it.slug);
+                        }}
+                        className={`rounded-lg border px-2 py-2 text-[11px] font-semibold transition-colors ${
+                          it.slug === selectedSlug
+                            ? 'border-emerald-600/60 bg-emerald-950/25 text-emerald-100'
+                            : 'border-zinc-800/70 bg-black/15 text-zinc-300 hover:bg-black/25'
+                        }`}
+                        title={it.slug}
+                      >
+                        {it.label}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+
             {tokenIds.length === 0 && mainTab !== 'watch' && mainTab !== 'momentum' && mainTab !== 'tradehistory' ? (
               <div className="mt-4 text-sm leading-relaxed text-zinc-500">Select a market to load token ids and ladders.</div>
             ) : null}
@@ -1839,7 +1892,7 @@ function App() {
                     <div className="flex flex-wrap gap-2">
                       <TradeSegmentedControl
                         value={flowMode}
-                        onChange={setFlowMode}
+                        onChange={(v) => setFlowMode(v as 'price' | 'flow')}
                         options={[
                           { value: 'price', label: 'Price' },
                           { value: 'flow', label: 'Order flow' },
@@ -2084,7 +2137,8 @@ function App() {
             ) : null}
 
             {mainTab === 'command' ? (
-              <div className="mt-5">
+              <div className="mt-5 space-y-3">
+                <SmartMoneyPaperPanel />
                 <MultiMarketCommandView
                   intervalLabel={threeUpInterval}
                   rows={
@@ -2172,6 +2226,62 @@ function App() {
                   booksFetchedAt={booksFetchedAt}
                   endsInMs={marketEndsInMs}
                   spotStreamEligible={updownParsed != null}
+                  uiVariant={updownParsed != null ? 'polymarket' : 'default'}
+                  rightPanel={
+                    effectiveTradeEnabled ? (
+                      updownParsed != null ? (
+                        <PolySimulatorTradePanel
+                          upLabel={effectiveTradeContext.upLabel}
+                          downLabel={effectiveTradeContext.downLabel}
+                          upMid={signalsProbMids.up.length ? (signalsProbMids.up[signalsProbMids.up.length - 1]!.v ?? null) : null}
+                          downMid={signalsProbMids.down.length ? (signalsProbMids.down[signalsProbMids.down.length - 1]!.v ?? null) : null}
+                        />
+                      ) : (
+                        <div className="rounded-[28px] border border-zinc-800/70 bg-[#0d1219] p-4 shadow-[0_18px_60px_rgba(0,0,0,0.25)] ring-1 ring-white/[0.03]">
+                          <div className="flex items-center justify-between gap-3 border-b border-zinc-800/50 pb-3">
+                            <div className="min-w-0">
+                              <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Trade</div>
+                              <div className="truncate text-[13px] font-semibold text-zinc-100">
+                                {effectiveTradeContext.question || effectiveTradeContext.slug || 'Market'}
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setTradePanelOpen(true);
+                              }}
+                              className="shrink-0 rounded-xl border border-zinc-700/60 bg-black/20 px-3 py-1.5 text-[11px] font-semibold text-zinc-200 hover:bg-black/30"
+                              title="Open full trade dock"
+                            >
+                              Dock
+                            </button>
+                          </div>
+
+                          <div className="mt-3">
+                            <SignalsTradePanel
+                              marketSlug={effectiveTradeContext.slug}
+                              marketQuestion={effectiveTradeContext.question}
+                              upLabel={effectiveTradeContext.upLabel}
+                              downLabel={effectiveTradeContext.downLabel}
+                              upToken={effectiveTradeContext.upToken}
+                              downToken={effectiveTradeContext.downToken}
+                              upMid={signalsProbMids.up.length ? (signalsProbMids.up[signalsProbMids.up.length - 1]!.v ?? null) : null}
+                              downMid={signalsProbMids.down.length ? (signalsProbMids.down[signalsProbMids.down.length - 1]!.v ?? null) : null}
+                              bookMidUp={tradePanelBookMids.up}
+                              bookMidDown={tradePanelBookMids.down}
+                              bookTouchUp={tradePanelBookTouch.up}
+                              bookTouchDown={tradePanelBookTouch.down}
+                              bookUp={books && globalUpDown ? books[globalUpDown.up]?.book ?? null : null}
+                              bookDown={books && globalUpDown ? books[globalUpDown.down]?.book ?? null : null}
+                              lane={globalTradeLane}
+                              onLaneChange={onGlobalTradeLaneChange}
+                              visualStyle="sidebar"
+                            />
+                          </div>
+                        </div>
+                      )
+                    ) : null
+                  }
                 />
               </div>
             ) : null}

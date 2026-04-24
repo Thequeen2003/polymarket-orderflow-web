@@ -8,10 +8,21 @@ import {
   tradeCreateOrderWithOpts,
   tradeGetOrder,
   tradeMarketOrderWithOpts,
+  tradeOpenOrders,
   tradeUpdateBalanceAllowance,
 } from './lib/api';
 import { TradeSegmentedControl } from './tradeUi';
-import { addPaperOrder, getPaperPosition, loadPaperAccount, markToMarket, matchPaperOrders, paperTrade, resetPaperAccount } from './paperTrading';
+import {
+  addPaperOrder,
+  cancelPaperOrder,
+  getPaperPosition,
+  loadPaperAccount,
+  loadPaperOrders,
+  markToMarket,
+  matchPaperOrders,
+  paperTrade,
+  resetPaperAccount,
+} from './paperTrading';
 import { pickBookLevels } from './bookLevels';
 import {
   appendTradeHistory,
@@ -74,6 +85,68 @@ function fmtUsdCents(v: number | null): string {
   const dollars = v / 100;
   const sign = dollars < 0 ? '-' : '';
   return `${sign}$${Math.abs(dollars).toFixed(2)}`;
+}
+
+function asNum(x: unknown): number | null {
+  const n = typeof x === 'number' ? x : typeof x === 'string' ? Number(x) : NaN;
+  return Number.isFinite(n) ? n : null;
+}
+
+function asStr(x: unknown): string | null {
+  return typeof x === 'string' && x.trim() ? x : null;
+}
+
+function orderIdFromRow(o: unknown): string | null {
+  if (!o || typeof o !== 'object') return null;
+  const r = o as Record<string, unknown>;
+  return asStr(r.orderID ?? r.orderId ?? r.id ?? r.order_id);
+}
+
+function orderSideFromRow(o: unknown): 'buy' | 'sell' | null {
+  if (!o || typeof o !== 'object') return null;
+  const r = o as Record<string, unknown>;
+  const s = String(r.side ?? '').toLowerCase();
+  return s === 'buy' || s === 'sell' ? (s as 'buy' | 'sell') : null;
+}
+
+function orderPrice01FromRow(o: unknown): number | null {
+  if (!o || typeof o !== 'object') return null;
+  const r = o as Record<string, unknown>;
+  return asNum(r.price ?? r.price01);
+}
+
+function orderSizeFromRow(o: unknown): number | null {
+  if (!o || typeof o !== 'object') return null;
+  const r = o as Record<string, unknown>;
+  return asNum(r.size ?? r.original_size ?? r.originalSize);
+}
+
+function orderRemainingFromRow(o: unknown): number | null {
+  if (!o || typeof o !== 'object') return null;
+  const r = o as Record<string, unknown>;
+  const rem = asNum(r.remaining ?? r.sizeRemaining);
+  if (rem != null) return rem;
+  const size = orderSizeFromRow(o);
+  const matched = asNum(r.size_matched ?? r.sizeMatched);
+  if (size != null && matched != null) return Math.max(0, size - matched);
+  return null;
+}
+
+function orderCreatedAtFromRow(o: unknown): string | null {
+  if (!o || typeof o !== 'object') return null;
+  const r = o as Record<string, unknown>;
+  return asStr(r.createdAt ?? r.created_at ?? r.timestamp);
+}
+
+function fmtWhen(v: string | number | null | undefined): string {
+  if (v == null) return '—';
+  const ms = typeof v === 'number' ? v : Date.parse(v);
+  if (!Number.isFinite(ms)) {
+    const s = String(v);
+    return s.length > 28 ? `${s.slice(0, 28)}…` : s;
+  }
+  const d = new Date(ms);
+  return d.toLocaleString(undefined, { year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 }
 
 const SHARES_FMT = new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 });
@@ -197,6 +270,9 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const [accountMode, setAccountMode] = useState<'paper' | 'live'>('paper');
   const [paperAccount, setPaperAccount] = useState(() => loadPaperAccount());
   const [historyRows, setHistoryRows] = useState<TradeHistoryRow[]>(() => loadTradeHistory());
+  const [openOrders, setOpenOrders] = useState<unknown[]>([]);
+  const [openOrdersLoading, setOpenOrdersLoading] = useState(false);
+  const [openOrdersErr, setOpenOrdersErr] = useState<string | null>(null);
 
   const [amount, setAmount] = useState('10');
   const [sellQty, setSellQty] = useState('');
@@ -218,6 +294,40 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const [submitAbort, setSubmitAbort] = useState<AbortController | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [okMsg, setOkMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    const onPrefill = (ev: Event) => {
+      const ce = ev as CustomEvent<{
+        lane?: 'up' | 'down';
+        tone?: 'ask' | 'bid';
+        price01?: number;
+        priceCents?: number;
+      }>;
+      const d = ce.detail;
+      if (!d) return;
+
+      if (d.lane && onLaneChange) onLaneChange(d.lane);
+      if (d.tone === 'ask') setAction('buy');
+      if (d.tone === 'bid') setAction('sell');
+      setExecMode('limit');
+
+      const cents =
+        d.priceCents != null && Number.isFinite(d.priceCents)
+          ? d.priceCents
+          : d.price01 != null && Number.isFinite(d.price01)
+            ? Math.round(d.price01 * 1000) / 10
+            : null;
+      if (cents != null) setLimitPriceCents(String(cents));
+
+      // Nudge the user toward the fast path.
+      setShowAdvanced(false);
+      setErr(null);
+      setOkMsg(null);
+    };
+
+    window.addEventListener('bpx-trade-prefill', onPrefill as EventListener);
+    return () => window.removeEventListener('bpx-trade-prefill', onPrefill as EventListener);
+  }, [onLaneChange]);
   const [availUsdc, setAvailUsdc] = useState<number | null>(null);
   const [balUp, setBalUp] = useState<number | null>(null);
   const [balDown, setBalDown] = useState<number | null>(null);
@@ -264,6 +374,22 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const paperUpPos = useMemo(() => getPaperPosition(paperAccount, upToken), [paperAccount, upToken]);
   const paperDownPos = useMemo(() => getPaperPosition(paperAccount, downToken), [paperAccount, downToken]);
   const paperMtm = useMemo(() => markToMarket({ account: paperAccount, tokenId: token, mid01: mid }), [paperAccount, token, mid]);
+
+  const paperRestingForToken = useMemo(() => {
+    if (!token) return [];
+    return loadPaperOrders()
+      .filter((o) => o.tokenId === token)
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .slice(0, 5);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, paperAccount.updatedAt, historyRows.length]);
+
+  const recentFillsForToken = useMemo(() => {
+    if (!token) return [];
+    return historyRows
+      .filter((r) => r.token === token && r.status === 'filled')
+      .slice(0, 5);
+  }, [historyRows, token]);
 
   const midUpChart = upMid != null && Number.isFinite(upMid) && upMid > 0 ? upMid : null;
   const midDownChart = downMid != null && Number.isFinite(downMid) && downMid > 0 ? downMid : null;
@@ -487,6 +613,45 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     refreshAvgEntry();
   }, [refreshAvgEntry]);
 
+  const refreshOpenOrders = useCallback(async () => {
+    if (accountMode !== 'live') return;
+    if (!token) return;
+    setOpenOrdersErr(null);
+    setOpenOrdersLoading(true);
+    try {
+      const r = await tradeOpenOrders({ tokenId: token });
+      if (!isOk(r)) {
+        const e = r as ApiErr;
+        setOpenOrdersErr(`${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`);
+        setOpenOrders([]);
+      } else {
+        const orders = (r.data as { orders?: unknown }).orders;
+        setOpenOrders(Array.isArray(orders) ? orders : []);
+      }
+    } catch (e) {
+      setOpenOrdersErr(`open_orders_failed · ${String(e)}`);
+      setOpenOrders([]);
+    } finally {
+      setOpenOrdersLoading(false);
+    }
+  }, [accountMode, token]);
+
+  useEffect(() => {
+    if (accountMode !== 'live') return;
+    if (!token) return;
+    let cancelled = false;
+    void (async () => {
+      if (!cancelled) await refreshOpenOrders();
+    })();
+    const t = window.setInterval(() => {
+      if (!cancelled) void refreshOpenOrders();
+    }, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, [accountMode, refreshOpenOrders, token]);
+
   const chooseAction = useCallback((a: 'buy' | 'sell') => {
     setAction(a);
     setErr(null);
@@ -684,12 +849,25 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const limit01 =
     Number.isFinite(limitCents) && limitCents > 0 ? Math.min(0.99, Math.max(0.01, limitCents / 100)) : null;
 
+  const mid01 = mid != null && Number.isFinite(mid) ? mid : null;
+  const midIsExtremeLow = mid01 != null && mid01 <= 0.01;
+  const midIsExtremeHigh = mid01 != null && mid01 >= 0.99;
+  const outcomeLocked = midIsExtremeLow || midIsExtremeHigh;
+
   const amtNum = Number(amount);
   const amtOk = Number.isFinite(amtNum) && amtNum > 0;
+  // Do not preview using 0¢ / 100¢ — it produces “infinite shares” and fake profit.
+  const previewPrice01 = mid01 != null && mid01 > 0.01 && mid01 < 0.99 ? mid01 : null;
   const estShares =
-    mid != null && amtOk ? (unit === 'dollars' ? amtNum / Math.max(1e-9, mid) : amtNum) : null;
+    previewPrice01 != null && amtOk ? (unit === 'dollars' ? amtNum / previewPrice01 : amtNum) : null;
   const estCost =
-    mid != null && estShares != null ? (unit === 'dollars' ? amtNum : estShares * mid) : unit === 'dollars' && amtOk ? amtNum : null;
+    previewPrice01 != null && estShares != null
+      ? unit === 'dollars'
+        ? amtNum
+        : estShares * previewPrice01
+      : unit === 'dollars' && amtOk
+        ? amtNum
+        : null;
   const payout = estShares != null ? estShares : null;
   const profit = estCost != null && payout != null ? payout - estCost : null;
 
@@ -905,9 +1083,33 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       {/* Header */}
       <div className="flex flex-col gap-4">
         <div className="min-w-0">
-          <h1 className="text-lg font-semibold tracking-tight text-zinc-100">
-            {isSlide ? 'Order' : isSidebarOnly ? 'Trade desk' : 'Trade'}
-          </h1>
+          <div className="flex items-start justify-between gap-3">
+            <h1 className="text-lg font-semibold tracking-tight text-zinc-100">
+              {isSlide ? 'Trade' : 'TRADE'}
+            </h1>
+            {isSlide ? (
+              <div className="flex shrink-0 items-center gap-1 rounded-xl border border-zinc-800/60 bg-black/20 p-1">
+                <button
+                  type="button"
+                  onClick={() => chooseAction('buy')}
+                  className={`min-h-[36px] rounded-lg px-3 text-[12px] font-bold transition-colors ${
+                    action === 'buy' ? 'bg-zinc-800 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  BUY
+                </button>
+                <button
+                  type="button"
+                  onClick={() => chooseAction('sell')}
+                  className={`min-h-[36px] rounded-lg px-3 text-[12px] font-bold transition-colors ${
+                    action === 'sell' ? 'bg-rose-500 text-black' : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  SELL
+                </button>
+              </div>
+            ) : null}
+          </div>
           {!isSlide ? (
             <p className="mt-1 text-[12px] leading-relaxed text-zinc-500">
               {isSidebarOnly
@@ -1010,7 +1212,106 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
             ) : null}
           </div>
         </div>
-        <div className="grid grid-cols-2 gap-2">
+
+        {accountMode === 'live' ? (
+          <details className="rounded-xl border border-zinc-800/60 bg-zinc-950/35">
+            <summary className="cursor-pointer select-none px-3 py-2 text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500 hover:text-zinc-400">
+              Open orders{' '}
+              <span className="font-mono text-zinc-600">
+                ({openOrdersLoading ? '…' : openOrders.length})
+              </span>
+            </summary>
+            <div className="border-t border-zinc-800/50 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-[11px] text-zinc-500">
+                  Showing resting orders for this outcome token.
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void refreshOpenOrders()}
+                    disabled={openOrdersLoading}
+                    className="rounded-lg border border-zinc-800/70 bg-black/20 px-2.5 py-1.5 text-[10px] font-bold text-zinc-300 hover:bg-black/30 disabled:opacity-40"
+                  >
+                    Refresh
+                  </button>
+                </div>
+              </div>
+
+              {openOrdersErr ? (
+                <div className="mt-2 rounded-lg border border-rose-800/35 bg-rose-950/15 px-3 py-2 text-[11px] text-rose-100">
+                  {openOrdersErr}
+                </div>
+              ) : null}
+
+              {openOrders.length ? (
+                <div className="mt-3 max-h-[260px] overflow-auto rounded-xl border border-zinc-800/60 bg-black/15">
+                  <table className="w-full border-collapse text-left text-[11px]">
+                    <thead className="sticky top-0 bg-zinc-950/80 backdrop-blur">
+                      <tr className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
+                        <th className="px-2 py-2">Side</th>
+                        <th className="px-2 py-2">Price</th>
+                        <th className="px-2 py-2 text-right">Remaining</th>
+                        <th className="px-2 py-2 text-right">Size</th>
+                        <th className="px-2 py-2">Created</th>
+                        <th className="px-2 py-2 text-right">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody className="align-top">
+                      {openOrders.slice(0, 80).map((o) => {
+                        const id = orderIdFromRow(o);
+                        const side = orderSideFromRow(o);
+                        const px = orderPrice01FromRow(o);
+                        const rem = orderRemainingFromRow(o);
+                        const size = orderSizeFromRow(o);
+                        const created = orderCreatedAtFromRow(o);
+                        return (
+                          <tr key={id ?? JSON.stringify(o).slice(0, 32)} className="border-t border-zinc-900/70">
+                            <td className="px-2 py-2">
+                              <span className={`font-bold ${side === 'buy' ? 'text-emerald-200' : side === 'sell' ? 'text-rose-200' : 'text-zinc-400'}`}>
+                                {side ?? '—'}
+                              </span>
+                            </td>
+                            <td className="px-2 py-2 font-mono text-zinc-300">{px == null ? '—' : `${(px * 100).toFixed(1)}¢`}</td>
+                            <td className="px-2 py-2 text-right font-mono text-zinc-300">{rem == null ? '—' : rem.toFixed(2)}</td>
+                            <td className="px-2 py-2 text-right font-mono text-zinc-500">{size == null ? '—' : size.toFixed(2)}</td>
+                            <td className="px-2 py-2 font-mono text-[10px] text-zinc-500">{created ?? '—'}</td>
+                            <td className="px-2 py-2 text-right">
+                              <button
+                                type="button"
+                                disabled={!id || openOrdersLoading}
+                                onClick={async () => {
+                                  if (!id) return;
+                                  const r = await tradeCancelOrder(id);
+                                  if (!isOk(r)) {
+                                    const e = r as ApiErr;
+                                    setOpenOrdersErr(`${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`);
+                                  } else {
+                                    setOkMsg('Cancel sent.');
+                                    void refreshOpenOrders();
+                                  }
+                                }}
+                                className="rounded-lg border border-zinc-800/70 bg-black/20 px-2 py-1 text-[10px] font-bold text-zinc-300 hover:bg-black/30 disabled:opacity-40"
+                              >
+                                Cancel
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <div className="mt-3 rounded-xl border border-zinc-800/60 bg-black/15 px-3 py-2 text-[11px] text-zinc-500">
+                  No open orders for this token.
+                </div>
+              )}
+            </div>
+          </details>
+        ) : null}
+
+        {!isSlide ? <div className="grid grid-cols-2 gap-2">
           <button
             type="button"
             onClick={() => chooseAction('buy')}
@@ -1033,7 +1334,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
           >
             Sell
           </button>
-        </div>
+        </div> : null}
       </div>
 
       {accountMode === 'live' ? (
@@ -1192,20 +1493,20 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       ) : null}
 
       {/* Outcome */}
-      <div className="mt-6">
-        <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Pick a side</div>
+      <div className={isSlide ? 'mt-4' : 'mt-6'}>
+        <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Outcome select</div>
         {!isSlide ? (
           <p className="mt-1 text-[11px] text-zinc-600">Tap the outcome you want to trade — mid price updates as the book moves.</p>
         ) : (
           <p className="mt-1 text-[11px] text-zinc-600">Large prices — tap side, size, then Enter.</p>
         )}
-        <div className="mt-2 grid gap-2 sm:grid-cols-2">
+        <div className="mt-2 grid grid-cols-2 gap-2">
           <button
             type="button"
             onClick={() => chooseLane('up')}
             className={`rounded-xl border text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/40 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950 ${
-              isSlide ? 'px-3 py-5' : 'px-4 py-3.5'
-            } ${
+              isSlide ? 'min-h-[86px] px-3 py-3.5' : 'px-4 py-3.5'
+            } flex flex-col justify-between ${
               lane === 'up'
                 ? 'border-emerald-500/80 bg-emerald-950/35 ring-2 ring-emerald-500/30'
                 : 'border-zinc-800/70 bg-black/20 hover:bg-black/30'
@@ -1231,8 +1532,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
             type="button"
             onClick={() => chooseLane('down')}
             className={`rounded-xl border text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500/40 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950 ${
-              isSlide ? 'px-3 py-5' : 'px-4 py-3.5'
-            } ${
+              isSlide ? 'min-h-[86px] px-3 py-3.5' : 'px-4 py-3.5'
+            } flex flex-col justify-between ${
               lane === 'down'
                 ? 'border-rose-500/75 bg-rose-950/25 ring-2 ring-rose-500/25'
                 : 'border-zinc-800/70 bg-black/20 hover:bg-black/30'
@@ -1262,12 +1563,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
           {!isSlide ? (
             <div className="mt-6">
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">
-                  Execution ·{' '}
-                  <span className="text-zinc-300">
-                    {execMode === 'touch' ? 'Quick' : execMode === 'market' ? 'Market' : 'Limit'}
-                  </span>
-                </div>
+                <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Order type</div>
                 <button
                   type="button"
                   onClick={() => setShowAdvanced((v) => !v)}
@@ -1276,6 +1572,24 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   {showAdvanced ? 'Hide advanced' : 'Advanced'}
                 </button>
               </div>
+              {!showAdvanced ? (
+                <div className="mt-2 rounded-xl border border-zinc-800/60 bg-zinc-950/30 px-3 py-3">
+                  <TradeSegmentedControl
+                    value={execMode === 'market' ? 'market' : 'limit'}
+                    onChange={(v) => {
+                      const next = v === 'market' ? 'market' : 'touch';
+                      setExecMode(next);
+                      setErr(null);
+                      setOkMsg(null);
+                      if (next === 'touch' && touchLimitCents) setLimitPriceCents(touchLimitCents);
+                    }}
+                    options={[
+                      { value: 'market', label: 'Market', title: 'Fill immediately at the best prices in the book right now' },
+                      { value: 'limit', label: 'Limit', title: 'Smart limit near mid (default)' },
+                    ]}
+                  />
+                </div>
+              ) : null}
               {showAdvanced ? (
                 <div className="mt-2 space-y-2 rounded-xl border border-zinc-800/60 bg-zinc-950/30 px-3 py-3">
                   <TradeSegmentedControl
@@ -1304,37 +1618,35 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
               ) : null}
             </div>
           ) : (
-            <details className="mt-4 rounded-xl border border-zinc-800/60 bg-zinc-950/30">
-              <summary className="cursor-pointer px-3 py-2 text-[11px] font-semibold text-zinc-400 hover:text-zinc-300">
-                Advanced · market or custom limit
-              </summary>
-              <div className="border-t border-zinc-800/50 px-3 py-3">
+            <div className="mt-4">
+              <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Order type</div>
+              <div className="mt-2 rounded-xl border border-zinc-800/60 bg-zinc-950/30 px-3 py-3">
                 <TradeSegmentedControl
-                  value={execMode}
+                  value={execMode === 'market' ? 'market' : 'limit'}
                   onChange={(v) => {
-                    setExecMode(v as 'touch' | 'market' | 'limit');
+                    const next = v === 'market' ? 'market' : 'touch';
+                    setExecMode(next);
                     setErr(null);
                     setOkMsg(null);
-                    if (v === 'touch' && touchLimitCents) setLimitPriceCents(touchLimitCents);
-                    else if (v === 'limit' && defaultLimitCents) setLimitPriceCents(defaultLimitCents);
+                    if (next === 'touch' && touchLimitCents) setLimitPriceCents(touchLimitCents);
                   }}
                   options={[
-                    { value: 'touch', label: 'Smart limit', title: 'Tight limit near mid (default)' },
-                    { value: 'market', label: 'Market', title: 'Fill at best available now' },
-                    { value: 'limit', label: 'Limit', title: 'Your price' },
+                    { value: 'market', label: 'Market', title: 'Fill immediately at the best prices in the book right now' },
+                    { value: 'limit', label: 'Limit', title: 'Smart limit near mid (default)' },
                   ]}
+                  className="w-full"
+                  size="md"
                 />
               </div>
-            </details>
+            </div>
           )}
 
-          {isSlide || showAdvanced ? (
-          <details className="mt-4 rounded-xl border border-zinc-800/60 bg-zinc-950/30">
-            <summary className="cursor-pointer px-3 py-2 text-[11px] font-semibold text-zinc-400 hover:text-zinc-300">
-              Advanced entry tools · order book + passive ladder
-            </summary>
-            <div className="border-t border-zinc-800/50 px-3 py-3">
-          <div className="mt-4 space-y-2">
+          {!isSlide && showAdvanced ? (
+            <details className="mt-4 rounded-xl border border-zinc-800/60 bg-zinc-950/30">
+              <summary className="cursor-pointer px-3 py-2 text-[11px] font-semibold text-zinc-400 hover:text-zinc-300">
+                Advanced entry tools · order book + passive ladder
+              </summary>
+              <div className="border-t border-zinc-800/50 px-3 py-3">
             <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Entry mode</div>
             <TradeSegmentedControl
               value={buyEntryMode}
@@ -1884,14 +2196,13 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                 </div>
               </div>
             ) : null}
-          </div>
+              </div>
             </div>
-          </div>
-        </details>
+            </details>
           ) : null}
 
           <div className="mt-2 flex flex-wrap items-end justify-between gap-2 text-xs text-zinc-400">
-            <span className="font-semibold text-zinc-300">How much</span>
+            <span className="font-semibold text-zinc-300">Amount</span>
             <span className="font-mono text-zinc-500" title="USDC available for buys">
               {accountMode === 'paper'
                 ? `Cash ${fmtUsdCents(paperAccount.cashUsdCents)}`
@@ -1979,10 +2290,15 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                 busySubmit ||
                 busyRefresh ||
                 (accountMode === 'paper' ? paperAccount.cashUsdCents <= 0 : !availUsdc) ||
+                outcomeLocked ||
                 (unit === 'shares' && (mid == null || mid <= 0))
               }
               aria-busy={busySubmit || busyRefresh}
-              title={maxBuyDisabledReason}
+              title={
+                outcomeLocked
+                  ? `Disabled: market looks locked at ${midIsExtremeLow ? '0¢' : midIsExtremeHigh ? '100¢' : '—'}`
+                  : maxBuyDisabledReason
+              }
               className="min-h-[40px] rounded-lg border border-zinc-600/80 bg-zinc-900/60 px-4 py-2 text-xs font-semibold text-zinc-100 hover:bg-zinc-800/80 disabled:cursor-not-allowed disabled:opacity-40"
             >
               Max
@@ -2014,10 +2330,18 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
           ) : null}
 
           <div className="mt-4 rounded-xl border border-zinc-800/70 bg-black/20 p-3 text-sm text-zinc-300">
-            <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Order summary</div>
+            <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Estimation preview</div>
+            {outcomeLocked ? (
+              <p className="mt-2 rounded-lg border border-amber-800/30 bg-amber-950/15 px-2 py-1.5 text-[11px] leading-relaxed text-amber-100/90">
+                Locked price detected ({midIsExtremeLow ? '≈0¢' : midIsExtremeHigh ? '≈100¢' : 'extreme'}). Preview + buying are disabled to avoid
+                invalid “infinite shares” math.
+              </p>
+            ) : null}
             <div className="mt-2 flex items-center justify-between">
               <div className="text-zinc-500">Price / share</div>
-              <div className="font-mono tabular-nums">{fmtCents(mid)}</div>
+              <div className="font-mono tabular-nums">
+                {outcomeLocked ? (midIsExtremeLow ? '0.0¢ (locked)' : midIsExtremeHigh ? '100.0¢ (locked)' : fmtCents(mid)) : fmtCents(mid)}
+              </div>
             </div>
             <div className="mt-2 flex items-center justify-between">
               <div className="text-zinc-500">Est. shares</div>
@@ -2112,14 +2436,17 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
             type="button"
             disabled={
               busySubmit ||
+              outcomeLocked ||
               !amtOk ||
               (execMode !== 'market' && (limit01 == null || !Number.isFinite(limit01))) ||
               (liveMarketBuyUsdc != null && !liveMarketBuyUsdc.ok)
             }
             aria-busy={busySubmit}
-            className={`mt-4 min-h-[52px] w-full rounded-xl bg-emerald-400 px-4 py-3 text-sm font-bold text-black shadow-lg shadow-emerald-950/30 hover:bg-emerald-300 disabled:cursor-not-allowed disabled:opacity-40 ${
-              isSlide ? 'inline-flex items-center justify-center gap-2' : ''
-            }`}
+            className={`mt-4 w-full rounded-xl px-4 py-3 text-sm font-black text-black disabled:cursor-not-allowed disabled:opacity-40 ${
+              isSlide
+                ? 'min-h-[48px] bg-emerald-400/70 shadow-none hover:bg-emerald-300/80'
+                : 'min-h-[52px] bg-emerald-400 shadow-lg shadow-emerald-950/30 hover:bg-emerald-300'
+            } ${isSlide ? 'inline-flex items-center justify-center gap-2' : ''}`}
             onClick={async () => {
               if (submitLockRef.current) return;
               submitLockRef.current = true;
@@ -2128,6 +2455,10 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
               setOkMsg(null);
               setBusySubmit(true);
               try {
+                if (outcomeLocked) {
+                  setErr(`Trade disabled: price looks locked at ${midIsExtremeLow ? '0¢' : midIsExtremeHigh ? '100¢' : 'an extreme'} right now.`);
+                  return;
+                }
                 if (accountMode === 'paper') {
                   const px = execMode === 'market' ? mid : limit01;
                   const shares = unit === 'shares' ? amtNum : px != null && px > 0 ? amtNum / px : NaN;
@@ -2386,14 +2717,38 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                 ) : null}
                 {isSlide ? 'SENDING…' : 'Submitting…'}
               </>
+            ) : action === 'buy' ? (
+              `Buy ${label}`
             ) : (
-              `Enter · Buy ${label}`
+              `Sell ${label}`
             )}
           </button>
         </>
       ) : (
         <>
-          {!isSlide ? (
+          {isSlide ? (
+            <div className="mt-4">
+              <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Order type</div>
+              <div className="mt-2 rounded-xl border border-zinc-800/60 bg-zinc-950/30 px-3 py-3">
+                <TradeSegmentedControl
+                  value={execMode === 'market' ? 'market' : 'limit'}
+                  onChange={(v) => {
+                    const next = v === 'market' ? 'market' : 'touch';
+                    setExecMode(next);
+                    setErr(null);
+                    setOkMsg(null);
+                    if (next === 'touch' && touchLimitCents) setLimitPriceCents(touchLimitCents);
+                  }}
+                  options={[
+                    { value: 'market', label: 'Market', title: 'Sell now at the best bids available' },
+                    { value: 'limit', label: 'Limit', title: 'Smart limit near mid (default)' },
+                  ]}
+                  className="w-full"
+                  size="md"
+                />
+              </div>
+            </div>
+          ) : (
             <div className="mt-6 space-y-2">
               <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">How to execute</div>
               <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -2425,32 +2780,10 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                 </p>
               </div>
             </div>
-          ) : (
-            <details className="mt-4 rounded-xl border border-zinc-800/60 bg-zinc-950/30">
-              <summary className="cursor-pointer px-3 py-2 text-[11px] font-semibold text-zinc-400 hover:text-zinc-300">
-                Advanced · market or custom limit
-              </summary>
-              <div className="border-t border-zinc-800/50 px-3 py-3">
-                <TradeSegmentedControl
-                  value={execMode}
-                  onChange={(v) => {
-                    setExecMode(v as 'touch' | 'market' | 'limit');
-                    setErr(null);
-                    setOkMsg(null);
-                    if (v === 'touch' && touchLimitCents) setLimitPriceCents(touchLimitCents);
-                    else if (v === 'limit' && defaultLimitCents) setLimitPriceCents(defaultLimitCents);
-                  }}
-                  options={[
-                    { value: 'touch', label: 'Smart limit', title: 'Tight limit near mid (default)' },
-                    { value: 'market', label: 'Market', title: 'Sell at best bids now' },
-                    { value: 'limit', label: 'Limit', title: 'Your minimum price' },
-                  ]}
-                />
-              </div>
-            </details>
           )}
 
-          <div className="mt-4 rounded-xl border border-zinc-800/60 bg-black/20 p-3">
+          {!isSlide ? (
+            <div className="mt-4 rounded-xl border border-zinc-800/60 bg-black/20 p-3">
             <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">1-click sell</div>
             <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-zinc-500">
               <span className="rounded-lg border border-zinc-800/60 bg-black/20 px-2 py-1 font-mono">
@@ -2604,7 +2937,12 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                         void tradeCancelOrder(oid);
                       }, cancelMs);
                     }
-                    setOkMsg(`Sell best bid sent ${sharesReq.toFixed(2)} ${label} @ ${(bestBid * 100).toFixed(1)}¢`);
+                    void refreshOpenOrders();
+                    setOkMsg(
+                      `Sell best bid sent ${sharesReq.toFixed(2)} ${label} @ ${(bestBid * 100).toFixed(1)}¢${
+                        oid ? '' : ' (no order id returned; check Open Orders)'
+                      }`,
+                    );
                   } finally {
                     setBusySubmit(false);
                     submitLockRef.current = false;
@@ -2693,7 +3031,12 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                         orderId: oid ?? null,
                       }),
                     );
-                    setOkMsg(`Ask placed: sell ${sharesReq.toFixed(2)} ${label} @ ${(px01 * 100).toFixed(1)}¢ (waiting)`);
+                    void refreshOpenOrders();
+                    setOkMsg(
+                      `Ask placed: sell ${sharesReq.toFixed(2)} ${label} @ ${(px01 * 100).toFixed(1)}¢ (waiting)${
+                        oid ? '' : ' (no order id returned; check Open Orders)'
+                      }`,
+                    );
                   } finally {
                     setBusySubmit(false);
                     submitLockRef.current = false;
@@ -2704,6 +3047,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
               </button>
             </div>
           </div>
+          ) : null}
 
           <div className="mt-4 rounded-xl border border-zinc-800/70 bg-black/20 p-4">
             <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Your position</div>
@@ -2780,9 +3124,16 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
             ) : null}
 
             <div className="mt-4">
-              <label htmlFor={idSellQty} className="text-xs font-semibold text-zinc-400">
-                Sell quantity (shares)
-              </label>
+              <div className="flex items-end justify-between gap-2">
+                <label htmlFor={idSellQty} className="text-xs font-semibold text-zinc-400">
+                  {isSlide ? 'Sell Amount' : 'Sell quantity (shares)'}
+                </label>
+                {isSlide ? (
+                  <span className="text-[11px] font-mono text-emerald-300/90">
+                    Available: {positionShares != null ? `${fmtShares(positionShares, 'full')} shares` : '—'}
+                  </span>
+                ) : null}
+              </div>
               <div className="mt-1 flex flex-col gap-2 sm:flex-row sm:items-stretch">
                 <div className="min-w-0 flex-1 rounded-xl border border-zinc-800/70 bg-black/30 px-3 py-2 focus-within:border-zinc-600/70">
                   <input
@@ -2827,41 +3178,93 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                       setBusySubmit(true);
                       try {
                         if (accountMode === 'paper') {
-                          const px = execMode === 'market' ? mid : limit01;
-                          const r = paperTrade({ account: paperAccount, tokenId: token, side: 'sell', shares: sellSharesClamped, price01: px });
-                          if (!r.ok) {
-                            setErr(r.error);
-                            setHistoryRows(
-                              appendTradeHistory({ ...tradeHistoryMarketMeta,
-                                mode: 'paper',
-                                exec: execMode,
-                                side: 'sell',
-                                token,
-                                label,
-                                price01: px ?? null,
-                                shares: sellSharesClamped,
-                                usdCents: null,
-                                status: 'error',
-                                error: r.error,
-                              }),
-                            );
+                          if (execMode === 'market') {
+                            const px = mid;
+                            const r = paperTrade({ account: paperAccount, tokenId: token, side: 'sell', shares: sellSharesClamped, price01: px });
+                            if (!r.ok) {
+                              setErr(r.error);
+                              setHistoryRows(
+                                appendTradeHistory({ ...tradeHistoryMarketMeta,
+                                  mode: 'paper',
+                                  exec: execMode,
+                                  side: 'sell',
+                                  token,
+                                  label,
+                                  price01: px ?? null,
+                                  shares: sellSharesClamped,
+                                  usdCents: null,
+                                  status: 'error',
+                                  error: r.error,
+                                }),
+                              );
+                            } else {
+                              setPaperAccount(r.account);
+                              setOkMsg(`Paper sold ${sellSharesClamped.toFixed(2)} sh of ${label} @ ${(px! * 100).toFixed(1)}¢`);
+                              setHistoryRows(
+                                appendTradeHistory({ ...tradeHistoryMarketMeta,
+                                  mode: 'paper',
+                                  exec: execMode,
+                                  side: 'sell',
+                                  token,
+                                  label,
+                                  price01: r.fill.price01,
+                                  shares: r.fill.shares,
+                                  usdCents: Math.abs(r.fill.usdCents),
+                                  status: 'filled',
+                                }),
+                              );
+                              setSellQty('');
+                            }
+                            return;
+                          }
+
+                          // Limit/touch in paper mode: rest if not marketable, auto-fill later when mid crosses.
+                          if (mid == null || limit01 == null) {
+                            setErr('Need a valid mid and limit price.');
+                            return;
+                          }
+                          const limit = limit01;
+                          const marketable = mid >= limit;
+                          if (marketable) {
+                            const r = paperTrade({ account: paperAccount, tokenId: token, side: 'sell', shares: sellSharesClamped, price01: Math.max(mid, limit) });
+                            if (!r.ok) setErr(r.error);
+                            else {
+                              setPaperAccount(r.account);
+                              setOkMsg(`Paper filled sell ${sellSharesClamped.toFixed(2)} sh of ${label}`);
+                              setHistoryRows(
+                                appendTradeHistory({ ...tradeHistoryMarketMeta,
+                                  mode: 'paper',
+                                  exec: execMode,
+                                  side: 'sell',
+                                  token,
+                                  label,
+                                  price01: r.fill.price01,
+                                  shares: r.fill.shares,
+                                  usdCents: Math.abs(r.fill.usdCents),
+                                  status: 'filled',
+                                }),
+                              );
+                              setSellQty('');
+                            }
                           } else {
-                            setPaperAccount(r.account);
-                            setOkMsg(`Paper sold ${sellSharesClamped.toFixed(2)} sh of ${label} @ ${(px! * 100).toFixed(1)}¢`);
+                            const o = addPaperOrder({ tokenId: token, side: 'sell', limit01: limit, shares: sellSharesClamped });
+                            setOkMsg(`Paper order resting: sell ${sellSharesClamped.toFixed(2)} sh ≥ ${(limit * 100).toFixed(1)}¢`);
                             setHistoryRows(
-                              appendTradeHistory({ ...tradeHistoryMarketMeta,
+                              appendTradeHistory({
+                                ...tradeHistoryMarketMeta,
+                                id: o.id,
+                                ts: o.createdAt,
                                 mode: 'paper',
-                                exec: execMode,
+                                exec: 'limit',
                                 side: 'sell',
                                 token,
                                 label,
-                                price01: r.fill.price01,
-                                shares: r.fill.shares,
-                                usdCents: Math.abs(r.fill.usdCents),
-                                status: 'filled',
+                                price01: limit,
+                                shares: sellSharesClamped,
+                                usdCents: Math.abs(Math.round(limit * sellSharesClamped * 100)),
+                                status: 'sent',
                               }),
                             );
-                            setSellQty('');
                           }
                           return;
                         }
@@ -2960,8 +3363,10 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                         ) : null}
                         {isSlide ? 'SENDING…' : '…'}
                       </>
-                    ) : (
+                    ) : isSlide ? (
                       `Sell ${label}`
+                    ) : (
+                      'Execute Trade'
                     )}
                   </button>
                 </div>
@@ -3158,7 +3563,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   {isSlide ? 'SENDING…' : 'Submitting…'}
                 </>
               ) : (
-                `Enter · Sell all (${fmtShares(positionShares, 'compact')} sh)`
+                'Execute Trade'
               )}
             </button>
           </div>
@@ -3166,7 +3571,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       )}
 
       {toasts.length ? (
-        <div className={`mt-4 space-y-2 ${isSlide ? 'hidden' : ''}`} aria-live="polite">
+        <div className="mt-4 space-y-2" aria-live="polite">
           {toasts.map((t) => (
             <div
               key={t.id}
@@ -3192,11 +3597,335 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         </div>
       ) : null}
 
-      <p className="mt-4 rounded-xl border border-zinc-800/60 bg-black/20 px-3 py-2.5 text-[11px] leading-relaxed text-zinc-500">
-        <span className="font-semibold text-zinc-400">Trade history</span> lives in the main{' '}
-        <span className="font-medium text-zinc-300">History</span> tab (filters, export CSV, clear). Local log:{' '}
-        <span className="font-mono text-zinc-400">{historyRows.length}</span> rows.
-      </p>
+      {/* Polymarket-style cards */}
+      <div className="mt-4 space-y-3">
+        {/* Your Orders */}
+        <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/35">
+          <div className="flex items-center justify-between gap-2 px-4 py-3">
+            <div className="text-[14px] font-semibold text-zinc-100">Your Orders</div>
+            <div className="flex items-center gap-2 text-[11px] font-semibold text-zinc-500">
+              <span className="rounded-full border border-zinc-800/70 bg-black/20 px-2 py-0.5 text-[10px] font-semibold text-zinc-400">
+                {accountMode === 'live' ? 'Live' : 'Paper'}
+              </span>
+              <span className="font-mono text-zinc-400">
+                {accountMode === 'live' ? openOrders.length : paperRestingForToken.length} open
+              </span>
+            </div>
+          </div>
+          <details className="border-t border-zinc-800/50" open>
+            <summary className="flex cursor-pointer select-none items-center justify-between gap-3 px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500 hover:text-zinc-400">
+              <span>Open orders</span>
+              <span className="rounded-full border border-zinc-800/70 bg-black/20 px-2 py-0.5 font-mono text-[10px] text-zinc-400">
+                {accountMode === 'live' ? openOrders.length : paperRestingForToken.length}
+              </span>
+            </summary>
+            <div className="px-4 pb-4">
+              {accountMode === 'live' ? (
+                openOrders.length ? (
+                  <div className="space-y-2">
+                    {openOrders.slice(0, 5).map((o) => {
+                      const id = orderIdFromRow(o);
+                      const side = orderSideFromRow(o);
+                      const px = orderPrice01FromRow(o);
+                      const rem = orderRemainingFromRow(o) ?? orderSizeFromRow(o);
+                      const when = orderCreatedAtFromRow(o);
+                      const notionalCents =
+                        rem != null && px != null ? Math.abs(Math.round(rem * px * 100)) : null;
+                      return (
+                        <div
+                          key={id ?? JSON.stringify(o).slice(0, 32)}
+                          className="rounded-xl border border-zinc-800/60 bg-black/15 px-3 py-2"
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="text-[11px] font-bold text-zinc-100">
+                                <span className={side === 'buy' ? 'text-emerald-200' : side === 'sell' ? 'text-rose-200' : 'text-zinc-300'}>
+                                  {(side ?? '—').toUpperCase()}
+                                </span>{' '}
+                                {label}
+                              </div>
+                              <div className="mt-0.5 font-mono text-[11px] text-zinc-400">
+                                {fmtShares(rem, 'full')} shares @ {px == null ? '—' : `${(px * 100).toFixed(1)}¢`}
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              disabled={!id}
+                              onClick={async () => {
+                                if (!id) return;
+                                const r = await tradeCancelOrder(id);
+                                if (!isOk(r)) {
+                                  const e = r as ApiErr;
+                                  pushToast('err', `${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`);
+                                } else {
+                                  pushToast('ok', 'Cancel sent.');
+                                  void refreshOpenOrders();
+                                }
+                              }}
+                              className="rounded-lg border border-zinc-800/70 bg-black/20 px-2.5 py-1.5 text-[10px] font-bold text-zinc-300 hover:bg-black/30 disabled:opacity-40"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                          <div className="mt-1.5 flex items-center justify-between gap-3 text-[10px] text-zinc-500">
+                            <div className="font-mono">{fmtWhen(when)}</div>
+                            <div className="font-mono text-zinc-300">{notionalCents == null ? '—' : fmtUsdCents(notionalCents)}</div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="rounded-xl border border-zinc-800/60 bg-black/15 px-3 py-2 text-[11px] text-zinc-500">None</div>
+                )
+              ) : paperRestingForToken.length ? (
+                <div className="space-y-2">
+                  {paperRestingForToken.slice(0, 5).map((o) => {
+                    const notionalCents = Math.abs(Math.round(o.shares * o.limit01 * 100));
+                    return (
+                      <div key={o.id} className="rounded-xl border border-zinc-800/60 bg-black/15 px-3 py-2">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="text-[11px] font-bold text-zinc-100">
+                              <span className={o.side === 'buy' ? 'text-emerald-200' : 'text-rose-200'}>{o.side.toUpperCase()}</span> {label}
+                            </div>
+                            <div className="mt-0.5 font-mono text-[11px] text-zinc-400">
+                              {fmtShares(o.shares, 'full')} shares @ {(o.limit01 * 100).toFixed(1)}¢
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              cancelPaperOrder(o.id);
+                              // force re-render (orders live in localStorage)
+                              setPaperAccount((a) => ({ ...a, updatedAt: Date.now() }));
+                              pushToast('ok', 'Paper order canceled.');
+                            }}
+                            className="rounded-lg border border-zinc-800/70 bg-black/20 px-2.5 py-1.5 text-[10px] font-bold text-zinc-300 hover:bg-black/30"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                        <div className="mt-1.5 flex items-center justify-between gap-3 text-[10px] text-zinc-500">
+                          <div className="font-mono">{fmtWhen(o.createdAt)}</div>
+                          <div className="font-mono text-zinc-300">{fmtUsdCents(notionalCents)}</div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="rounded-xl border border-zinc-800/60 bg-black/15 px-3 py-2 text-[11px] text-zinc-500">None</div>
+              )}
+            </div>
+          </details>
+
+          <div className="border-t border-zinc-800/50 px-4 py-3">
+            <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Recent fills</div>
+            {recentFillsForToken.length ? (
+              <div className="mt-2 space-y-2">
+                {recentFillsForToken.slice(0, 8).map((r) => (
+                  <div key={r.id} className="rounded-xl border border-zinc-800/60 bg-black/15 px-3 py-2">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-[11px] font-bold text-zinc-100">
+                          <span className={r.side === 'buy' ? 'text-emerald-200' : 'text-rose-200'}>{r.side.toUpperCase()}</span> {label}{' '}
+                          <span className="ml-2 rounded-full border border-emerald-800/30 bg-emerald-950/15 px-2 py-0.5 text-[9px] font-bold text-emerald-200/90">
+                            FILLED
+                          </span>
+                        </div>
+                        <div className="mt-0.5 font-mono text-[11px] text-zinc-400">
+                          {fmtShares(r.shares ?? null, 'full')} @ {r.price01 == null ? '—' : `${(r.price01 * 100).toFixed(1)}¢`}
+                        </div>
+                      </div>
+                      <div className="font-mono text-[11px] text-zinc-300">{r.usdCents == null ? '—' : fmtUsdCents(Math.abs(r.usdCents))}</div>
+                    </div>
+                    <div className="mt-1.5 font-mono text-[10px] text-zinc-500">{fmtWhen((r as any).ts ?? (r as any).createdAt ?? (r as any).timestamp)}</div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="mt-2 rounded-xl border border-zinc-800/60 bg-black/15 px-3 py-2 text-[11px] text-zinc-500">No fills yet.</div>
+            )}
+          </div>
+        </div>
+
+        {/* Your Positions */}
+        {(() => {
+          const upSh =
+            accountMode === 'paper'
+              ? paperUpPos.shares
+              : balUp != null
+                ? balUp
+                : null;
+          const downSh =
+            accountMode === 'paper'
+              ? paperDownPos.shares
+              : balDown != null
+                ? balDown
+                : null;
+          const upAvg = accountMode === 'paper' ? paperUpPos.avgCost01 : avgEntryUp;
+          const downAvg = accountMode === 'paper' ? paperDownPos.avgCost01 : avgEntryDown;
+          const upPx = midUpEff;
+          const downPx = midDownEff;
+
+          const upVal = upSh != null && upPx != null ? Math.round(upSh * upPx * 100) : null;
+          const downVal = downSh != null && downPx != null ? Math.round(downSh * downPx * 100) : null;
+          const upCost = upSh != null && upAvg != null ? Math.round(upSh * upAvg * 100) : null;
+          const downCost = downSh != null && downAvg != null ? Math.round(downSh * downAvg * 100) : null;
+          const upPnl = upVal != null && upCost != null ? upVal - upCost : null;
+          const downPnl = downVal != null && downCost != null ? downVal - downCost : null;
+          const pnlTotal =
+            upPnl != null || downPnl != null ? (upPnl ?? 0) + (downPnl ?? 0) : null;
+
+          const tabLane = lane === 'down' ? 'down' : 'up';
+          const selSh = tabLane === 'up' ? upSh : downSh;
+          const selAvg = tabLane === 'up' ? upAvg : downAvg;
+          const selPx = tabLane === 'up' ? upPx : downPx;
+          const selVal = selSh != null && selPx != null ? Math.round(selSh * selPx * 100) : null;
+          const selMax = selSh != null && selSh > 0 ? selSh : 0;
+
+          const pnlBadge = (p: number | null) => {
+            if (p == null) return '—';
+            const cls = p > 0 ? 'text-emerald-200' : p < 0 ? 'text-rose-200' : 'text-zinc-300';
+            return <span className={cls}>{fmtUsdCents(p)}</span>;
+          };
+
+          return (
+            <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/35">
+              <div className="flex items-center justify-between gap-2 px-4 py-3">
+                <div className="text-[14px] font-semibold text-zinc-100">Your Positions</div>
+                <div className="text-[11px] font-semibold text-zinc-500">
+                  P&amp;L: {pnlTotal == null ? '—' : pnlBadge(pnlTotal)}
+                </div>
+              </div>
+              <div className="border-t border-zinc-800/50 px-4 py-3">
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => chooseLane('up')}
+                    className={`rounded-xl border px-3 py-2 text-left transition-colors ${
+                      tabLane === 'up' ? 'border-emerald-500/70 bg-emerald-950/25 ring-2 ring-emerald-500/20' : 'border-zinc-800/60 bg-black/15 hover:bg-black/20'
+                    }`}
+                  >
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">{upLabel}</div>
+                    <div className="mt-0.5 flex items-center justify-between gap-2">
+                      <div className="font-mono text-[12px] font-bold text-zinc-100">{upSh == null ? '—' : upSh.toFixed(2)} sh</div>
+                      <div className="text-[11px] font-semibold">{pnlBadge(upPnl)}</div>
+                    </div>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => chooseLane('down')}
+                    className={`rounded-xl border px-3 py-2 text-left transition-colors ${
+                      tabLane === 'down' ? 'border-rose-500/70 bg-rose-950/20 ring-2 ring-rose-500/20' : 'border-zinc-800/60 bg-black/15 hover:bg-black/20'
+                    }`}
+                  >
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">{downLabel}</div>
+                    <div className="mt-0.5 flex items-center justify-between gap-2">
+                      <div className="font-mono text-[12px] font-bold text-zinc-100">{downSh == null ? '—' : downSh.toFixed(2)} sh</div>
+                      <div className="text-[11px] font-semibold">{pnlBadge(downPnl)}</div>
+                    </div>
+                  </button>
+                </div>
+
+                <div className="mt-3 grid grid-cols-2 gap-2">
+                  <div className="rounded-xl border border-zinc-800/60 bg-black/15 px-3 py-2">
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Holding</div>
+                    <div className="mt-0.5 font-mono text-[14px] font-bold text-zinc-100">
+                      {selSh == null ? '—' : selSh.toFixed(2)} <span className="text-zinc-500">{tabLane === 'up' ? upLabel : downLabel}</span>
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-zinc-800/60 bg-black/15 px-3 py-2">
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Avg entry</div>
+                    <div className="mt-0.5 font-mono text-[14px] font-bold text-zinc-100">{selAvg == null ? '—' : `${(selAvg * 100).toFixed(1)}¢`}</div>
+                  </div>
+                  <div className="rounded-xl border border-zinc-800/60 bg-black/15 px-3 py-2">
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Current price</div>
+                    <div className="mt-0.5 font-mono text-[14px] font-bold text-zinc-100">{tabLane === 'up' ? fmtCents(upPx) : fmtCents(downPx)}</div>
+                  </div>
+                  <div className="rounded-xl border border-zinc-800/60 bg-black/15 px-3 py-2">
+                    <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Current value</div>
+                    <div className="mt-0.5 font-mono text-[14px] font-bold text-zinc-100">{selVal == null ? '—' : fmtUsdCents(selVal)}</div>
+                  </div>
+                </div>
+
+                <div className="mt-3 rounded-xl border border-zinc-800/60 bg-black/10 px-3 py-3">
+                  <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Sell input</div>
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <input
+                      value={sellQty}
+                      onChange={(e) => setSellQty(e.target.value)}
+                      inputMode="decimal"
+                      placeholder={`Qty (max ${selMax.toFixed(2)})`}
+                      className="min-h-[42px] flex-1 rounded-xl border border-zinc-800/70 bg-black/20 px-3 font-mono text-[13px] text-zinc-100 outline-none focus:border-zinc-600/70"
+                    />
+                    <button
+                      type="button"
+                      disabled={!Number.isFinite(selMax) || selMax <= 0 || busySubmit || busyRefresh}
+                      onClick={() => setSellQty(selMax > 0 ? String(floorShares4(selMax)) : '0')}
+                      className="min-h-[42px] rounded-xl border border-zinc-800/70 bg-black/20 px-3 text-[11px] font-bold text-zinc-200 hover:bg-black/30 disabled:opacity-40"
+                    >
+                      Max
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busySubmit || busyRefresh || !sellQtyOk || sellSharesClamped == null || sellSharesClamped <= 0}
+                      onClick={async () => {
+                        chooseAction('sell');
+                        await runMarketSell(sellSharesClamped ?? 0);
+                      }}
+                      className="min-h-[42px] rounded-xl bg-rose-500 px-4 text-[11px] font-black text-black hover:bg-rose-400 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      Sell
+                    </button>
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  disabled={busySubmit || busyRefresh || selSh == null || !(selSh > 0)}
+                  onClick={async () => {
+                    chooseAction('sell');
+                    await runMarketSell(selSh ?? 0);
+                  }}
+                  className="mt-3 min-h-[46px] w-full rounded-xl bg-zinc-100 px-4 text-sm font-black text-black hover:bg-white disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  Close Position (Sell All)
+                </button>
+
+                <details className="mt-3 rounded-xl border border-zinc-800/60 bg-zinc-950/30">
+                  <summary className="cursor-pointer select-none px-3 py-2 text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500 hover:text-zinc-400">
+                    Trade history
+                  </summary>
+                  <div className="border-t border-zinc-800/50 px-3 py-3">
+                    {recentFillsForToken.length ? (
+                      <div className="space-y-2">
+                        {recentFillsForToken.slice(0, 10).map((r) => (
+                          <div key={r.id} className="flex items-center justify-between gap-3 rounded-xl border border-zinc-800/60 bg-black/15 px-3 py-2">
+                            <div className="min-w-0">
+                              <div className="text-[11px] font-bold text-zinc-100">
+                                <span className={r.side === 'buy' ? 'text-emerald-200' : 'text-rose-200'}>{r.side.toUpperCase()}</span>{' '}
+                                {tabLane === 'up' ? upLabel : downLabel}
+                              </div>
+                              <div className="mt-0.5 font-mono text-[11px] text-zinc-400">
+                                {(r.shares ?? 0).toFixed(2)} @ {r.price01 == null ? '—' : `${(r.price01 * 100).toFixed(1)}¢`}
+                              </div>
+                            </div>
+                            <div className="font-mono text-[11px] text-zinc-300">{r.usdCents == null ? '—' : fmtUsdCents(Math.abs(r.usdCents))}</div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="rounded-xl border border-zinc-800/60 bg-black/15 px-3 py-2 text-[11px] text-zinc-500">No fills yet.</div>
+                    )}
+                  </div>
+                </details>
+              </div>
+            </div>
+          );
+        })()}
+      </div>
 
       <details className="mt-4 rounded-xl border border-zinc-800/60 bg-zinc-950/40 text-[10px] text-zinc-500">
         <summary className="cursor-pointer select-none px-3 py-2 font-medium text-zinc-500 hover:text-zinc-400">

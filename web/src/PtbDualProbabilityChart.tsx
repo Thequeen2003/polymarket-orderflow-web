@@ -37,6 +37,19 @@ function padProbSeries(pts: { t: number; v: number }[]): { t: number; v: number 
   return out;
 }
 
+function normalizeProbSeries(pts: SpotPoint[]): { t: number; v: number }[] {
+  const out = pts
+    .filter((p) => Number.isFinite(p.t) && Number.isFinite(p.v))
+    .map((p) => ({ t: p.t, v: clamp01(p.v) }))
+    .sort((a, b) => a.t - b.t);
+  if (out.length < 2) return out;
+  const tMax = out[out.length - 1]!.t;
+  // If timestamps are epoch seconds, they are ~1e9; epoch ms are ~1e12.
+  const isEpochMs = tMax > 50_000_000_000;
+  if (!isEpochMs) return out.map((p) => ({ t: p.t * 1000, v: p.v }));
+  return out;
+}
+
 /** Symmetric [0,1] window around 0.5 so PTB sits at vertical center of each panel. */
 function extentSymProb(minV: number, maxV: number): { min: number; max: number } {
   const lo = clamp01(minV);
@@ -151,7 +164,14 @@ function fmtCents(p: number): string {
 }
 
 function fmtChartWindowMin(tMin: number, tMax: number): string {
-  const m = Math.max(1, Math.round((tMax - tMin) / 60_000));
+  // Inclusive minute window. Using round() makes the label flip-flop by ~1 minute near boundaries.
+  // Example: a 5m stream with ~4m20s of samples would render "4 min" which feels wrong in a 5m context.
+  const dt = Math.max(0, tMax - tMin);
+  // Some streams provide epoch seconds; infer units from the absolute timestamp, not the delta.
+  // (A 5m window in epoch-ms is only ~300_000, which would otherwise look like "seconds" here.)
+  const isEpochMs = tMax > 50_000_000_000;
+  const ms = isEpochMs ? dt : dt * 1000;
+  const m = Math.max(1, Math.floor(ms / 60_000) + 1);
   if (m < 180) return `${m} min`;
   return `${(m / 60).toFixed(1)} h`;
 }
@@ -316,6 +336,8 @@ export function PtbDualProbabilityChart(props: {
   }) => void;
   /** Watch cards: strip analyst chrome, keep a thin regime / gate strip. */
   compactHeader?: boolean;
+  /** Place the PTB target engine block above or below the chart. */
+  enginePlacement?: 'above' | 'below';
   /** Optional: localStorage key grouping for PTB Dual playbook samples. */
   playbookSlug?: string;
 }): ReactElement | null {
@@ -332,6 +354,7 @@ export function PtbDualProbabilityChart(props: {
     onTapProb,
     onGapsUpdate,
     compactHeader = false,
+    enginePlacement = 'above',
     playbookSlug = '',
   } = props;
   const [now, setNow] = useState(() => Date.now());
@@ -375,8 +398,11 @@ export function PtbDualProbabilityChart(props: {
   }, [bookUp, bookDown]);
 
   const model = useMemo((): PtbDualChartModel | null => {
-    const u0 = padProbSeries(probUp.map((p) => ({ t: p.t, v: clamp01(p.v) })));
-    const d0 = padProbSeries(probDown.map((p) => ({ t: p.t, v: clamp01(p.v) })));
+    // Normalize timestamp units (seconds vs ms) so all markets render consistently.
+    const uN = normalizeProbSeries(probUp);
+    const dN = normalizeProbSeries(probDown);
+    const u0 = padProbSeries(uN);
+    const d0 = padProbSeries(dN);
     if (u0.length < 2 || d0.length < 2) return null;
     const tMin = Math.min(u0[0]!.t, d0[0]!.t);
     const tMax = Math.max(u0[u0.length - 1]!.t, d0[d0.length - 1]!.t);
@@ -902,6 +928,50 @@ export function PtbDualProbabilityChart(props: {
     };
   }, [engine.highlightGap, gapD, gapU, lastD, lastU, preMove, speedLabel, upLabel, downLabel]);
 
+  const goNoGo = useMemo(() => {
+    // 1) Fillability layer: can we enter AND exit cleanly at ref size?
+    const fillabilityOk = net4cTradeability.room === 'YES';
+
+    // 2) Liquidity heat check: avoid thin books / slow tape.
+    const liquidityOk = net4cTradeability.room !== 'NO' && speedLabel !== 'SLOW';
+
+    // 3) PTB alignment filter: trade only when the engine itself says ENTER (not WAIT/SCALP).
+    const ptbAligned = displayVerdict === 'ENTER';
+
+    // 4) Dual PTB non-conflict: if both lanes are competitive, do not treat it as a clean GO.
+    const dualNotConflicting = engine.enterBlockReason == null;
+
+    // 5) Entry timing window: require the execution gate to be ARMED (or PARTIAL only if tape is already FAST).
+    const entryTimingOk =
+      tradeTrigger.triggerPill === 'ARMED' || (tradeTrigger.triggerPill === 'PARTIAL' && speedLabel === 'FAST');
+
+    // 6) Mispricing detector proxy: require a gap/vacuum signature (the edge).
+    const mispricingExists = !!(gapU?.active || gapD?.active || engine.pathUpActive || engine.pathDnActive);
+
+    const go = fillabilityOk && liquidityOk && ptbAligned && dualNotConflicting && entryTimingOk && mispricingExists;
+
+    const checks = [
+      { k: 'Fillability (entry + exit)', ok: fillabilityOk, v: `Net +4¢ room: ${net4cTradeability.room}` },
+      { k: 'PTB aligned', ok: ptbAligned, v: `Regime: ${displayVerdict}` },
+      { k: 'Dual PTB conflict', ok: dualNotConflicting, v: dualNotConflicting ? 'No conflict block' : 'Both lanes competitive' },
+      { k: 'Entry timing', ok: entryTimingOk, v: `Gate: ${tradeTrigger.triggerPill} · tape ${speedLabel}` },
+      { k: 'Mispricing edge', ok: mispricingExists, v: mispricingExists ? 'Gap/vacuum detected' : 'No gap/vacuum yet' },
+      { k: 'Liquidity heat', ok: liquidityOk, v: net4cTradeability.room === 'NO' ? 'Thin / wide / no room' : 'OK' },
+    ] as const;
+
+    return { go, checks } as const;
+  }, [
+    displayVerdict,
+    engine.enterBlockReason,
+    engine.pathDnActive,
+    engine.pathUpActive,
+    gapD?.active,
+    gapU?.active,
+    net4cTradeability.room,
+    speedLabel,
+    tradeTrigger.triggerPill,
+  ]);
+
   const pairedExec = useMemo(
     () => ({
       up: computeLaneExecution({ lane: 'up', upLabel, downLabel, preMove, speedLabel, lastU, lastD }),
@@ -1146,6 +1216,7 @@ export function PtbDualProbabilityChart(props: {
           </div>
         </div>
       )}
+      {enginePlacement === 'above' ? (
       <div className="border-b border-zinc-800/80 px-4 py-3">
         {compactHeader ? (
           <div className="space-y-2">
@@ -1510,6 +1581,7 @@ export function PtbDualProbabilityChart(props: {
           </>
         )}
       </div>
+      ) : null}
 
       <div className="min-h-0 w-full space-y-4 overflow-x-auto overflow-y-visible px-1 pb-1 sm:px-2">
         <div className="rounded-xl border border-zinc-800/55 bg-zinc-950/50 p-1.5 shadow-inner shadow-black/30 ring-1 ring-white/[0.03]">
@@ -1645,6 +1717,151 @@ export function PtbDualProbabilityChart(props: {
               </div>
             </div>
           </div>
+        </div>
+      ) : null}
+
+      {enginePlacement === 'below' ? (
+        <div className="border-t border-zinc-800/80 px-4 py-3">
+          {compactHeader ? (
+            <div className="space-y-2">
+              <div
+                className="rounded-xl border border-zinc-800/70 bg-zinc-950/60 px-2.5 py-2 ring-1 ring-white/[0.04]"
+                title={ptbTarget.summaryLine}
+              >
+                <div className="text-[9px] font-black tracking-wide text-amber-200/90">PTB TARGET ENGINE</div>
+                <div className={`mt-1 space-y-0.5 text-[11px] font-bold leading-snug ${chartAccent}`}>
+                  <div>Side: {ptbTarget.side}</div>
+                  <div>Now: {ptbTarget.nowLabel}</div>
+                  <div>Momentum: {ptbTarget.momentum}</div>
+                  <div>Next Target: {ptbTarget.nextTargetLabel}</div>
+                  <div>Target Range: {ptbTarget.targetRangeLabel}</div>
+                  <div>First Wall: {ptbTarget.firstWallLabel}</div>
+                  <div>Reversal Risk: {ptbTarget.reversalRisk}</div>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-2 border-t border-zinc-800/50 pt-2">
+                <div className="flex flex-wrap gap-1.5">
+                  <span
+                    className={`rounded-lg border px-2 py-0.5 text-[9px] font-black ${
+                      displayVerdict === 'ENTER'
+                        ? 'border-emerald-500/50 text-emerald-200'
+                        : displayVerdict === 'SCALP'
+                          ? 'border-amber-500/45 text-amber-100'
+                          : 'border-zinc-700 text-zinc-300'
+                    }`}
+                  >
+                    {displayVerdict === 'ENTER' ? 'ENTER' : displayVerdict === 'SCALP' ? 'SCALP' : 'WAIT'}
+                  </span>
+                  <span className="rounded-lg border border-zinc-700 px-2 py-0.5 font-mono text-[9px] text-zinc-400">
+                    +4¢{' '}
+                    <span
+                      className={
+                        net4cTradeability.room === 'YES'
+                          ? 'text-emerald-300'
+                          : net4cTradeability.room === 'MARGINAL'
+                            ? 'text-amber-200'
+                            : 'text-rose-300'
+                      }
+                    >
+                      {net4cTradeability.room}
+                    </span>
+                  </span>
+                  <span className="rounded-lg border border-zinc-700 px-2 py-0.5 font-mono text-[9px] text-zinc-400">
+                    Gate {tradeTrigger.triggerPill === 'ARMED' ? 'ARMED' : tradeTrigger.triggerPill === 'PARTIAL' ? 'PARTIAL' : 'OFF'}
+                  </span>
+                </div>
+              </div>
+              <p className="text-[9px] leading-snug text-zinc-600">{tradeTrigger.enterOnlyIf}</p>
+            </div>
+          ) : (
+            <>
+              <div
+                className="rounded-2xl border border-zinc-700/55 bg-gradient-to-br from-zinc-900/85 via-zinc-950/80 to-black/50 px-3 py-2.5 ring-1 ring-white/[0.05]"
+                title={ptbTarget.summaryLine}
+              >
+                <div className="text-[10px] font-black tracking-wide text-amber-200/95">PTB TARGET ENGINE</div>
+                <div className={`mt-1 font-mono text-[12px] font-bold leading-snug ${chartAccent}`}>
+                  {ptbTarget.side} · now {ptbTarget.nowLabel} · mom {ptbTarget.momentum} · next {ptbTarget.nextTargetLabel} · range{' '}
+                  {ptbTarget.targetRangeLabel} · wall {ptbTarget.firstWallLabel} · rev {ptbTarget.reversalRisk}
+                </div>
+              </div>
+
+              <p className="mt-2 text-[9px] leading-snug text-zinc-600">{engine.regimeSubtitle}</p>
+
+              <div className="mt-3 flex flex-wrap items-center gap-x-2.5 gap-y-2 rounded-xl border border-zinc-800/70 bg-zinc-950/55 px-3 py-2.5 text-[10px] leading-tight text-zinc-200">
+                <span className="font-semibold text-zinc-500">Lane</span>
+                <span className="font-mono font-bold text-zinc-100">{ptbTarget.engineLane === 'up' ? upLabel : downLabel}</span>
+                <span className="text-zinc-600">·</span>
+                <span className="font-semibold text-zinc-500">Disposition</span>
+                <span
+                  className={`font-black ${
+                    displayVerdict === 'ENTER'
+                      ? 'text-emerald-300'
+                      : displayVerdict === 'SCALP'
+                        ? 'text-amber-200'
+                        : 'text-zinc-300'
+                  }`}
+                >
+                  {displayVerdict}
+                  {tradeTrigger.triggerPill === 'ARMED' && displayVerdict !== 'ENTER' ? (
+                    <span className="ml-1 font-mono text-[9px] font-semibold text-emerald-400/90">· gate ARMED</span>
+                  ) : null}
+                </span>
+                <span className="text-zinc-600">·</span>
+                <span className="font-semibold text-zinc-500">Enter line</span>
+                <span className="font-mono text-zinc-100">{tradeTrigger.line != null ? fmtCents(tradeTrigger.line) : '—'}</span>
+                <span className="text-zinc-600">·</span>
+                <span className="font-semibold text-zinc-500">Wall</span>
+                <span className="font-mono text-zinc-100">{ptbTarget.firstWallLabel}</span>
+                <span className="text-zinc-600">·</span>
+                <span className="font-semibold text-zinc-500">Net +4¢</span>
+                <span
+                  className={`font-mono font-bold ${
+                    net4cTradeability.room === 'YES'
+                      ? 'text-emerald-300'
+                      : net4cTradeability.room === 'MARGINAL'
+                        ? 'text-amber-200'
+                        : 'text-rose-300'
+                  }`}
+                >
+                  {net4cTradeability.room}
+                </span>
+                <span className="text-zinc-600">·</span>
+                <span className="font-semibold text-zinc-500">Invalidate</span>
+                <span className="min-w-0 max-w-[16rem] truncate font-mono text-[9px] text-zinc-400" title={engine.invalidation[0]}>
+                  {invalidationShort}
+                </span>
+              </div>
+
+              <div className="mt-2 rounded-xl border border-zinc-800/70 bg-black/20 px-3 py-2.5 text-[10px] text-zinc-200">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-[9px] font-black tracking-wide text-zinc-500">GO / NO-GO</div>
+                  <span
+                    className={`rounded-md px-2 py-0.5 text-[10px] font-black ${
+                      goNoGo.go ? 'bg-emerald-950/60 text-emerald-200' : 'bg-zinc-900/70 text-zinc-200'
+                    }`}
+                  >
+                    {goNoGo.go ? 'GO' : 'NO-GO'}
+                  </span>
+                </div>
+                <div className="mt-2 grid gap-x-3 gap-y-1.5 sm:grid-cols-2">
+                  {goNoGo.checks.map((c) => (
+                    <div key={c.k} className="flex min-w-0 items-start justify-between gap-2">
+                      <span className={`font-semibold ${c.ok ? 'text-emerald-200' : 'text-zinc-300'}`}>
+                        {c.ok ? '✓' : '—'} {c.k}
+                      </span>
+                      <span className="min-w-0 truncate font-mono text-[9px] text-zinc-500" title={c.v}>
+                        {c.v}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <div className="mt-2 text-[9px] leading-snug text-zinc-500">
+                  Exit structure: take profit into strength (+5–8¢) and cut quickly (−2–4¢) or if the book weakens into your target/wall.
+                </div>
+              </div>
+            </>
+          )}
         </div>
       ) : null}
     </div>

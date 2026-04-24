@@ -71,6 +71,7 @@ export function SignalsPtbOnly(props: {
   const hasDual = probUp.length >= 1 && probDown.length >= 1;
   const [spotChartLane, setSpotChartLane] = useState<'up' | 'down'>('up');
   const spotChartLive = priceToBeat != null && spot.length >= 2;
+  const [chartTab, setChartTab] = useState<'spot' | 'dual'>(() => (hasDual ? 'spot' : 'spot'));
 
   const ptbContext = useMemo(() => {
     if (priceToBeat == null || !Number.isFinite(priceToBeat) || spot.length < 2) return null;
@@ -157,29 +158,69 @@ export function SignalsPtbOnly(props: {
 
   const body = hasDual ? (
     <div className="space-y-3">
-      <FlowZoneSignalsPanel
-        market={market}
-        books={books}
-        outcomeLabels={outcomeLabels}
-        flowSeriesForSlug={flowSeriesForSlug}
-        priceToBeatUsd={priceToBeat}
-        endsInMs={endsInMs}
-        booksFetchedAt={booksFetchedAt}
-      />
-      {spotVsPtbSection}
-      <div className="rounded-xl border border-zinc-800/60 bg-zinc-950/35 px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-400">
-        Implied probability (Polymarket mids)
+      <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Chart</div>
+          <div className="flex gap-1 rounded-xl border border-zinc-800/60 bg-black/20 p-1">
+            <button
+              type="button"
+              onClick={() => setChartTab('spot')}
+              className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
+                chartTab === 'spot' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              Spot vs PTB
+            </button>
+            <button
+              type="button"
+              onClick={() => setChartTab('dual')}
+              className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
+                chartTab === 'dual' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              Dual PTB
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-3">
+          {chartTab === 'spot' ? (
+            spotVsPtbSection
+          ) : (
+            <PtbDualProbabilityChart
+              probUp={probUp}
+              probDown={probDown}
+              upLabel={upLabel}
+              downLabel={downLabel}
+              lastUpdateMs={probLastUpdateMs}
+              priceToBeatUsd={priceToBeat}
+              bookUp={bookAbove}
+              bookDown={bookBelow}
+              enginePlacement="below"
+            />
+          )}
+        </div>
       </div>
-      <PtbDualProbabilityChart
-        probUp={probUp}
-        probDown={probDown}
-        upLabel={upLabel}
-        downLabel={downLabel}
-        lastUpdateMs={probLastUpdateMs}
-        priceToBeatUsd={priceToBeat}
-        bookUp={bookAbove}
-        bookDown={bookBelow}
-      />
+
+      <details className="rounded-2xl border border-zinc-800/60 bg-zinc-950/35" open={false}>
+        <summary className="cursor-pointer select-none px-4 py-3 text-[11px] font-semibold text-zinc-400 hover:text-zinc-200 [&::-webkit-details-marker]:hidden">
+          <span className="mr-1 text-zinc-600" aria-hidden>
+            ▸
+          </span>
+          Signals + flow zones
+        </summary>
+        <div className="border-t border-zinc-800/50 p-3">
+          <FlowZoneSignalsPanel
+            market={market}
+            books={books}
+            outcomeLabels={outcomeLabels}
+            flowSeriesForSlug={flowSeriesForSlug}
+            priceToBeatUsd={priceToBeat}
+            endsInMs={endsInMs}
+            booksFetchedAt={booksFetchedAt}
+          />
+        </div>
+      </details>
       {upToken && downToken ? (
         <SignalsTradePanel
           upLabel={upLabel}

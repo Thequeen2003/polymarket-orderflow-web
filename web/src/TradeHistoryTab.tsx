@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useState, type ReactElement } from 'react';
 import {
   clearTradeHistory,
+  deleteTradeHistoryRow,
   loadTradeHistory,
   tradeHistoryToCsv,
   TRADE_HISTORY_CHANGED_EVENT,
   type TradeHistoryRow,
 } from './tradeHistory';
+import { loadPaperAccount, undoPaperFilledBuy } from './paperTrading';
 
 function fmtUsdCents(v: number | null): string {
   if (v == null) return '—';
@@ -227,6 +229,7 @@ export function TradeHistoryTab(): ReactElement {
                   <th className="whitespace-nowrap px-3 py-2.5 text-right">Shares</th>
                   <th className="whitespace-nowrap px-3 py-2.5 text-right">USD</th>
                   <th className="whitespace-nowrap px-3 py-2.5">Status</th>
+                  <th className="whitespace-nowrap px-3 py-2.5">Actions</th>
                 </tr>
               </thead>
               <tbody className="align-top">
@@ -302,6 +305,48 @@ export function TradeHistoryTab(): ReactElement {
                       >
                         {r.status === 'submitted' ? 'sent' : r.status}
                       </span>
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-2">
+                      {r.mode === 'paper' && r.status === 'filled' && r.side === 'buy' ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            // Safety: only allow undo if this is the most recent filled paper buy for this token.
+                            const all = loadTradeHistory();
+                            const later = all.find(
+                              (x) => x.ts > r.ts && x.mode === 'paper' && x.token === r.token && x.status === 'filled',
+                            );
+                            if (later) {
+                              window.alert('Cannot undo: there are later filled paper trades on this outcome.');
+                              return;
+                            }
+                            if (r.shares == null || r.fillAvgPrice01 == null || r.usdCents == null) {
+                              window.alert('Cannot undo: missing shares/price/usd on this row.');
+                              return;
+                            }
+                            const acct = loadPaperAccount();
+                            const u = undoPaperFilledBuy({
+                              account: acct,
+                              tokenId: r.token,
+                              shares: r.shares,
+                              price01: r.fillAvgPrice01,
+                              usdCents: Math.abs(r.usdCents),
+                            });
+                            if (!u.ok) {
+                              window.alert(`Undo failed: ${u.error}`);
+                              return;
+                            }
+                            deleteTradeHistoryRow(r.id);
+                            reload();
+                          }}
+                          className="rounded-lg border border-rose-800/40 bg-rose-950/10 px-2.5 py-1.5 text-[11px] font-semibold text-rose-100 hover:bg-rose-950/25"
+                          title="Undo this paper fill: refund cash and delete this history row."
+                        >
+                          Undo + refund
+                        </button>
+                      ) : (
+                        <span className="text-[11px] text-zinc-700">—</span>
+                      )}
                     </td>
                   </tr>
                 ))}

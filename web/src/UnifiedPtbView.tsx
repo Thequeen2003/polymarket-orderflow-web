@@ -32,6 +32,11 @@ function fmtTimeRemaining(endsInMs: number | null | undefined): string {
   return `${min}:${String(sec).padStart(2, '0')}`;
 }
 
+function fmtUsdShort(n: number | null, maxFrac = 2): string {
+  if (n == null || !Number.isFinite(n)) return '—';
+  return n.toLocaleString(undefined, { maximumFractionDigits: maxFrac });
+}
+
 function candleBucketCount(ptsLen: number): number {
   if (ptsLen < 4) return Math.max(2, ptsLen - 1);
   const n = Math.floor(ptsLen * 0.38);
@@ -105,6 +110,8 @@ export function UnifiedPtbView(props: {
   booksFetchedAt: number | null;
   endsInMs: number | null;
   spotStreamEligible?: boolean;
+  uiVariant?: 'default' | 'polymarket';
+  rightPanel?: ReactElement | null;
 }): ReactElement {
   const {
     market,
@@ -120,6 +127,8 @@ export function UnifiedPtbView(props: {
     booksFetchedAt,
     endsInMs,
     spotStreamEligible = false,
+    uiVariant = 'default',
+    rightPanel = null,
   } = props;
 
   const idx = resolveUpDownIndices(outcomeLabels, market);
@@ -177,6 +186,8 @@ export function UnifiedPtbView(props: {
   }, [priceToBeat, spot, bookFlowForChart]);
 
   const spotLast = spot.length ? spot[spot.length - 1]!.v : null;
+  const spotPrev = spot.length >= 2 ? spot[spot.length - 2]!.v : null;
+  const spotDelta = spotLast != null && spotPrev != null ? spotLast - spotPrev : null;
   const distUsd = derived?.distanceUsd ?? null;
   const distPct = derived?.distancePct ?? null;
 
@@ -211,18 +222,184 @@ export function UnifiedPtbView(props: {
     [priceToBeat, spotLast, derived, endsInMs, activeLane, laneLabel, upLabel, downLabel, upMid, downMid],
   );
 
+  const marketDetails = useMemo(() => {
+    if (!market || typeof market !== 'object') return null;
+    const m = market as Record<string, unknown>;
+    const conditionId = (m.conditionId ?? m.condition_id ?? m.condition_id_hex ?? m.id) as unknown;
+    const status = (m.status ?? m.active ?? m.state ?? '') as unknown;
+    const outcomes = outcomeLabels.length ? outcomeLabels : [];
+    return {
+      conditionId: conditionId != null ? String(conditionId) : null,
+      status: status != null ? String(status) : null,
+      outcomes,
+    };
+  }, [market, outcomeLabels]);
+
+  if (uiVariant === 'polymarket') {
+    return (
+      <div className="space-y-4">
+        <div className="sticky top-2 z-[60]">
+          <div className="grid gap-3 rounded-3xl border border-zinc-800/60 bg-[#0b1017]/70 p-4 shadow-[0_18px_70px_rgba(0,0,0,0.35)] ring-1 ring-white/[0.03] backdrop-blur-xl sm:grid-cols-3">
+            <div className="rounded-2xl border border-zinc-800/50 bg-black/20 p-4">
+              <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Price to beat</div>
+              <div className="mt-1 text-2xl font-semibold tracking-tight text-zinc-50">
+                {priceToBeat == null ? '—' : `$${fmtUsdShort(priceToBeat, 2)}`}
+              </div>
+              <div className="mt-1 text-[11px] text-zinc-500">{underlyingChartTitle(market)}</div>
+            </div>
+            <div className="rounded-2xl border border-zinc-800/50 bg-black/20 p-4 text-center">
+              <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Time left</div>
+              <div className="mt-1 font-mono text-3xl font-semibold tracking-tight text-zinc-50">{fmtTimeRemaining(endsInMs)}</div>
+              <div className="mt-1 text-[11px] text-zinc-600">Interval clock</div>
+            </div>
+            <div className="rounded-2xl border border-zinc-800/50 bg-black/20 p-4 text-right">
+              <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Spot price</div>
+              <div className="mt-1 text-2xl font-semibold tracking-tight text-zinc-50">
+                {spotLast == null ? '—' : `$${fmtUsdShort(spotLast, 2)}`}
+              </div>
+              <div className="mt-1 text-[11px] text-zinc-500">
+                {spotDelta == null ? '—' : `${spotDelta >= 0 ? '+' : ''}${spotDelta.toFixed(2)}`}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,1.8fr)_24rem] xl:items-start">
+          <div className="space-y-4">
+            <div className="rounded-[28px] border border-zinc-800/60 bg-[#0d1219] p-4 shadow-[0_18px_60px_rgba(0,0,0,0.25)] ring-1 ring-white/[0.03]">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-800/50 pb-3">
+                <div className="flex items-center gap-2">
+                  <div className="rounded-lg border border-zinc-700/60 bg-black/25 p-1">
+                    <button
+                      type="button"
+                      className="rounded-md bg-emerald-500/15 px-3 py-1 text-[11px] font-semibold text-emerald-200"
+                      title="Chart mode"
+                    >
+                      BTC Price
+                    </button>
+                  </div>
+                  <div className="text-[11px] font-semibold text-zinc-500">{underlyingChartTitle(market)}</div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="rounded-lg border border-zinc-700/60 bg-black/25 p-1">
+                    <button type="button" className="rounded-md bg-zinc-900/40 px-3 py-1 text-[11px] font-semibold text-zinc-200">
+                      LINE
+                    </button>
+                    <button type="button" className="rounded-md px-3 py-1 text-[11px] font-semibold text-zinc-500">
+                      OHLC
+                    </button>
+                  </div>
+                  <div className="inline-flex items-center gap-2 rounded-full border border-emerald-600/30 bg-emerald-950/25 px-3 py-1 text-[11px] font-semibold text-emerald-100">
+                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                    LIVE
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-4">
+                <PtbOpportunityModeChart
+                  mode={activeLane}
+                  spot={spot}
+                  priceToBeat={priceToBeat}
+                  lastUpdateMs={spotLastUpdateMs}
+                  endsInMs={endsInMs}
+                  chartTitle={underlyingChartTitle(market)}
+                  upLabel={upLabel}
+                  downLabel={downLabel}
+                  lastProbUp={upMid}
+                  lastProbDown={downMid}
+                  bookFlow={bookFlowForChart}
+                />
+              </div>
+            </div>
+
+            <div className="rounded-[28px] border border-zinc-800/60 bg-[#0d1219] p-4 shadow-[0_18px_60px_rgba(0,0,0,0.25)] ring-1 ring-white/[0.03]">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800/50 pb-3">
+                <div className="text-[12px] font-semibold text-zinc-100">Order Book</div>
+                <div className="flex gap-1">
+                  <button
+                    type="button"
+                    onClick={() => setActiveBookLane('up')}
+                    className={`rounded-lg border px-2.5 py-1 text-[12px] font-semibold transition-colors ${
+                      activeBookLane === 'up'
+                        ? 'border-emerald-500/50 bg-emerald-950/25 text-emerald-100'
+                        : 'border-zinc-800/60 bg-black/10 text-zinc-400 hover:text-zinc-200'
+                    }`}
+                  >
+                    {upLabel}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveBookLane('down')}
+                    className={`rounded-lg border px-2.5 py-1 text-[12px] font-semibold transition-colors ${
+                      activeBookLane === 'down'
+                        ? 'border-rose-500/50 bg-rose-950/20 text-rose-100'
+                        : 'border-zinc-800/60 bg-black/10 text-zinc-400 hover:text-zinc-200'
+                    }`}
+                  >
+                    {downLabel}
+                  </button>
+                </div>
+              </div>
+
+              <div className="mt-4">
+                {activeBook && !(upEntry?.error || downEntry?.error) ? (
+                  <OverallOrderBookPanel
+                    title={`${activeBookLabel} order book`}
+                    book={activeBook}
+                    lastUpdateMs={booksFetchedAt}
+                    maxLevels={14}
+                    prefillLane={activeBookLane}
+                  />
+                ) : (
+                  <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-4 text-sm text-zinc-500">
+                    Load a two-outcome UP/DOWN market with books to see the order book.
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="rounded-[28px] border border-zinc-800/60 bg-[#0d1219] p-4 shadow-[0_18px_60px_rgba(0,0,0,0.25)] ring-1 ring-white/[0.03]">
+              <div className="border-b border-zinc-800/50 pb-3">
+                <div className="text-[12px] font-semibold text-zinc-100">Market Details</div>
+              </div>
+              <div className="mt-4 space-y-2 text-[12px] text-zinc-300">
+                <div className="flex items-start justify-between gap-4">
+                  <span className="text-zinc-500">Condition ID</span>
+                  <span className="max-w-[70%] break-all text-right font-mono text-[11px] text-zinc-300">
+                    {marketDetails?.conditionId ?? '—'}
+                  </span>
+                </div>
+                <div className="flex items-start justify-between gap-4">
+                  <span className="text-zinc-500">Status</span>
+                  <span className="text-right">{marketDetails?.status ?? '—'}</span>
+                </div>
+                <div className="flex items-start justify-between gap-4">
+                  <span className="text-zinc-500">Outcomes</span>
+                  <span className="text-right">{marketDetails?.outcomes?.length ? marketDetails.outcomes.join(' / ') : '—'}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="xl:sticky xl:top-4">{rightPanel}</div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-4">
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1.65fr)_23rem]">
         <div className="space-y-4">
-        <div className="sticky top-2 z-[60]">
-          <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-zinc-800/70 bg-[#0b1017]/80 px-3 py-2 shadow-[0_10px_40px_rgba(0,0,0,0.22)] ring-1 ring-white/[0.03] backdrop-blur-xl">
-            <div className="min-w-0">
-              <div className="truncate text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Spot vs PTB</div>
-              <div className="truncate text-[12px] font-semibold text-zinc-200">{underlyingChartTitle(market)}</div>
+          <div className="sticky top-2 z-[60]">
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-zinc-800/70 bg-[#0b1017]/80 px-3 py-2 shadow-[0_10px_40px_rgba(0,0,0,0.22)] ring-1 ring-white/[0.03] backdrop-blur-xl">
+              <div className="min-w-0">
+                <div className="truncate text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Spot vs PTB</div>
+                <div className="truncate text-[12px] font-semibold text-zinc-200">{underlyingChartTitle(market)}</div>
+              </div>
             </div>
           </div>
-        </div>
 
         {spot.length < 2 ? (
           <div className="rounded-2xl border border-amber-900/35 bg-amber-950/15 px-4 py-3 text-sm leading-relaxed text-amber-100/90">
@@ -341,63 +518,67 @@ export function UnifiedPtbView(props: {
       </div>
 
       <div className="xl:sticky xl:top-4">
-        <div className="rounded-[28px] border border-zinc-800/70 bg-[#0d1219] p-5 shadow-[0_18px_60px_rgba(0,0,0,0.25)] ring-1 ring-white/[0.03]">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Unified panel</div>
-              <div className="mt-1 text-lg font-semibold tracking-tight text-zinc-50">Spot · PTB · Prob</div>
-            </div>
-            <div className="text-right">
-              <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Time remaining</div>
-              <div className="mt-1 font-mono text-xl font-semibold text-zinc-100">{fmtTimeRemaining(endsInMs)}</div>
-            </div>
-          </div>
-
-          <div className="mt-4 grid grid-cols-2 gap-3">
-            <div className="rounded-2xl border border-emerald-800/40 bg-emerald-950/20 p-3">
-              <div className="text-[10px] font-bold uppercase tracking-wide text-emerald-200/90">{upLabel} (YES)</div>
-              <div className="mt-1 font-mono text-2xl font-semibold text-emerald-100">{upMid == null ? '—' : `${Math.round(upMid * 100)}¢`}</div>
-              <div className="mt-1 text-[11px] text-emerald-200/70">{probLastUpdateMs ? new Date(probLastUpdateMs).toLocaleTimeString() : '—'}</div>
-            </div>
-            <div className="rounded-2xl border border-rose-800/40 bg-rose-950/20 p-3">
-              <div className="text-[10px] font-bold uppercase tracking-wide text-rose-200/90">{downLabel} (NO)</div>
-              <div className="mt-1 font-mono text-2xl font-semibold text-rose-100">{downMid == null ? '—' : `${Math.round(downMid * 100)}¢`}</div>
-              <div className="mt-1 text-[11px] text-rose-200/70">{probLastUpdateMs ? new Date(probLastUpdateMs).toLocaleTimeString() : '—'}</div>
-            </div>
-          </div>
-
-            <div className="mt-4 rounded-2xl border border-zinc-800/60 bg-black/20 p-3">
-            <div className="grid grid-cols-2 gap-2 text-[12px] text-zinc-300">
+        {rightPanel ? (
+          rightPanel
+        ) : (
+          <div className="rounded-[28px] border border-zinc-800/70 bg-[#0d1219] p-5 shadow-[0_18px_60px_rgba(0,0,0,0.25)] ring-1 ring-white/[0.03]">
+            <div className="flex items-start justify-between gap-3">
               <div>
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Spot</div>
-                <div className="mt-0.5 font-mono text-[13px] text-zinc-100">{fmtUsd(spotLast)}</div>
-                {spotLastUpdateMs ? (
-                  <div className="mt-0.5 font-mono text-[10px] text-zinc-600">
-                    RTDS {new Date(spotLastUpdateMs).toLocaleTimeString()}
-                  </div>
-                ) : null}
+                <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Unified panel</div>
+                <div className="mt-1 text-lg font-semibold tracking-tight text-zinc-50">Spot · PTB · Prob</div>
               </div>
               <div className="text-right">
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">PTB</div>
-                <div className="mt-0.5 font-mono text-[13px] text-amber-200/90">{fmtUsd(priceToBeat)}</div>
+                <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Time remaining</div>
+                <div className="mt-1 font-mono text-xl font-semibold text-zinc-100">{fmtTimeRemaining(endsInMs)}</div>
               </div>
             </div>
-            <div className="mt-3 grid grid-cols-2 gap-2">
-              <div className="rounded-xl border border-zinc-800/60 bg-zinc-950/35 p-2">
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Distance</div>
-                <div className="mt-0.5 font-mono text-[13px] text-zinc-100">
-                  {fmtUsdSigned(distUsd)} <span className="text-zinc-500">({fmtPctSigned(distPct)})</span>
-                </div>
-                <div className="mt-1 text-[11px] text-zinc-500">band {fmtUsd(band, 0)}</div>
+
+            <div className="mt-4 grid grid-cols-2 gap-3">
+              <div className="rounded-2xl border border-emerald-800/40 bg-emerald-950/20 p-3">
+                <div className="text-[10px] font-bold uppercase tracking-wide text-emerald-200/90">{upLabel} (YES)</div>
+                <div className="mt-1 font-mono text-2xl font-semibold text-emerald-100">{upMid == null ? '—' : `${Math.round(upMid * 100)}¢`}</div>
+                <div className="mt-1 text-[11px] text-emerald-200/70">{probLastUpdateMs ? new Date(probLastUpdateMs).toLocaleTimeString() : '—'}</div>
               </div>
-              <div className="rounded-xl border border-zinc-800/60 bg-zinc-950/35 p-2">
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Status</div>
-                <div className="mt-0.5 text-[12px] text-zinc-200">{derived?.controlSignal ?? '—'}</div>
-                <div className="mt-1 text-[11px] text-zinc-500">{derived?.controlBlurb ?? '—'}</div>
+              <div className="rounded-2xl border border-rose-800/40 bg-rose-950/20 p-3">
+                <div className="text-[10px] font-bold uppercase tracking-wide text-rose-200/90">{downLabel} (NO)</div>
+                <div className="mt-1 font-mono text-2xl font-semibold text-rose-100">{downMid == null ? '—' : `${Math.round(downMid * 100)}¢`}</div>
+                <div className="mt-1 text-[11px] text-rose-200/70">{probLastUpdateMs ? new Date(probLastUpdateMs).toLocaleTimeString() : '—'}</div>
+              </div>
+            </div>
+
+            <div className="mt-4 rounded-2xl border border-zinc-800/60 bg-black/20 p-3">
+              <div className="grid grid-cols-2 gap-2 text-[12px] text-zinc-300">
+                <div>
+                  <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Spot</div>
+                  <div className="mt-0.5 font-mono text-[13px] text-zinc-100">{fmtUsd(spotLast)}</div>
+                  {spotLastUpdateMs ? (
+                    <div className="mt-0.5 font-mono text-[10px] text-zinc-600">
+                      RTDS {new Date(spotLastUpdateMs).toLocaleTimeString()}
+                    </div>
+                  ) : null}
+                </div>
+                <div className="text-right">
+                  <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">PTB</div>
+                  <div className="mt-0.5 font-mono text-[13px] text-amber-200/90">{fmtUsd(priceToBeat)}</div>
+                </div>
+              </div>
+              <div className="mt-3 grid grid-cols-2 gap-2">
+                <div className="rounded-xl border border-zinc-800/60 bg-zinc-950/35 p-2">
+                  <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Distance</div>
+                  <div className="mt-0.5 font-mono text-[13px] text-zinc-100">
+                    {fmtUsdSigned(distUsd)} <span className="text-zinc-500">({fmtPctSigned(distPct)})</span>
+                  </div>
+                  <div className="mt-1 text-[11px] text-zinc-500">band {fmtUsd(band, 0)}</div>
+                </div>
+                <div className="rounded-xl border border-zinc-800/60 bg-zinc-950/35 p-2">
+                  <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Status</div>
+                  <div className="mt-0.5 text-[12px] text-zinc-200">{derived?.controlSignal ?? '—'}</div>
+                  <div className="mt-1 text-[11px] text-zinc-500">{derived?.controlBlurb ?? '—'}</div>
+                </div>
               </div>
             </div>
           </div>
-        </div>
+        )}
       </div>
     </div>
   );

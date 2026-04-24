@@ -301,3 +301,50 @@ export function markToMarket(args: { account: PaperAccount; tokenId: string; mid
   };
 }
 
+export function undoPaperFilledBuy(args: {
+  account: PaperAccount;
+  tokenId: string;
+  shares: number;
+  price01: number;
+  usdCents: number;
+  now?: number;
+}): { ok: true; account: PaperAccount } | { ok: false; error: string } {
+  const token = String(args.tokenId ?? '').trim();
+  if (!token) return { ok: false, error: 'missing_token' };
+  const shares = Number(args.shares);
+  const price01 = Number(args.price01);
+  const usdCents = Math.round(Number(args.usdCents));
+  if (!Number.isFinite(shares) || shares <= 0) return { ok: false, error: 'invalid_shares' };
+  if (!Number.isFinite(price01) || price01 <= 0 || price01 >= 1) return { ok: false, error: 'invalid_price' };
+  if (!Number.isFinite(usdCents) || usdCents <= 0) return { ok: false, error: 'invalid_usd' };
+
+  const next: PaperAccount = JSON.parse(JSON.stringify(args.account)) as PaperAccount;
+  next.updatedAt = args.now ?? Date.now();
+  if (!next.positionsByToken) next.positionsByToken = {};
+  if (!next.positionsByToken[token]) next.positionsByToken[token] = { shares: 0, avgCost01: null };
+  const pos = next.positionsByToken[token];
+
+  const prevShares = roundPositionShares(Number(pos.shares) || 0);
+  if (prevShares + 1e-9 < shares) {
+    return { ok: false, error: `Cannot undo: position only ${prevShares.toFixed(6)}sh but undo needs ${shares.toFixed(6)}sh.` };
+  }
+
+  // Refund cash and subtract shares. Recompute avg cost as if removing a lot at `price01`.
+  next.cashUsdCents += usdCents;
+  const remainingShares = roundPositionShares(Math.max(0, prevShares - shares));
+  if (remainingShares < MIN_SELL_SHARES) {
+    pos.shares = 0;
+    pos.avgCost01 = null;
+    savePaperAccount(next);
+    return { ok: true, account: next };
+  }
+
+  const prevAvg = pos.avgCost01 == null ? price01 : Number(pos.avgCost01);
+  const numer = prevAvg * prevShares - clamp01(price01) * shares;
+  const nextAvg = clamp01(numer / Math.max(1e-9, remainingShares));
+  pos.shares = remainingShares;
+  pos.avgCost01 = nextAvg;
+  savePaperAccount(next);
+  return { ok: true, account: next };
+}
+

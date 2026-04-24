@@ -13,8 +13,10 @@ export function OverallOrderBookPanel(props: {
   book: unknown;
   lastUpdateMs: number | null;
   maxLevels?: number;
+  /** Optional: clicking a level can prefill the trade panel via a window event. */
+  prefillLane?: 'up' | 'down';
 }): ReactElement {
-  const { title = 'Order Book', book, lastUpdateMs, maxLevels = 12 } = props;
+  const { title = 'Order Book', book, lastUpdateMs, maxLevels = 12, prefillLane } = props;
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 1_000);
@@ -67,11 +69,44 @@ export function OverallOrderBookPanel(props: {
     const px = isAsk ? 'text-rose-200' : 'text-emerald-200';
     const wall = isAsk ? insights.wallAsk?.price === p.price : insights.wallBid?.price === p.price;
     const thin = p.size <= p.max * 0.18;
+    const canPrefill = prefillLane != null;
     return (
       <div
-        className={`relative grid grid-cols-[72px_1fr_72px] items-center gap-2 px-3 py-1.5 font-mono text-[11px] ${
+        role={canPrefill ? 'button' : undefined}
+        tabIndex={canPrefill ? 0 : undefined}
+        onClick={() => {
+          if (!canPrefill) return;
+          const priceCents = Math.round(p.price * 1000) / 10; // keep 0.1¢ precision (matches other UI)
+          window.dispatchEvent(
+            new CustomEvent('bpx-trade-prefill', {
+              detail: {
+                lane: prefillLane,
+                tone: p.tone,
+                price01: p.price,
+                priceCents,
+              },
+            }),
+          );
+        }}
+        onKeyDown={(e) => {
+          if (!canPrefill) return;
+          if (e.key !== 'Enter' && e.key !== ' ') return;
+          e.preventDefault();
+          const priceCents = Math.round(p.price * 1000) / 10;
+          window.dispatchEvent(
+            new CustomEvent('bpx-trade-prefill', {
+              detail: {
+                lane: prefillLane,
+                tone: p.tone,
+                price01: p.price,
+                priceCents,
+              },
+            }),
+          );
+        }}
+        className={`relative grid grid-cols-[72px_1fr_72px] items-center gap-2 px-3 py-1.5 font-mono text-[11px] outline-none ${
           wall ? 'bg-amber-950/15' : thin ? 'bg-zinc-900/15' : ''
-        }`}
+        } ${canPrefill ? 'cursor-pointer transition-colors hover:bg-white/[0.03] focus-visible:ring-2 focus-visible:ring-indigo-500/25' : ''}`}
       >
         <div className={`tabular-nums ${px}`}>
           {displayPrice(p.price)} {wall ? <span className="ml-1 text-[10px] font-bold text-amber-200">WALL</span> : thin ? <span className="ml-1 text-[10px] text-zinc-500">thin</span> : null}
