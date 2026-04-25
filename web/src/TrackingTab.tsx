@@ -13,13 +13,21 @@ function fmt01(p: number | null): string {
 
 function pickOrderId(o: unknown): string | null {
   const r = o && typeof o === 'object' ? (o as Record<string, unknown>) : null;
-  const id = (typeof r?.orderID === 'string' && r.orderID) || (typeof r?.order_id === 'string' && r.order_id) || '';
+  const id =
+    (typeof r?.id === 'string' && r.id) ||
+    (typeof r?.orderID === 'string' && r.orderID) ||
+    (typeof r?.order_id === 'string' && r.order_id) ||
+    '';
   return id.trim() ? id.trim() : null;
 }
 
 function pickTokenId(o: unknown): string | null {
   const r = o && typeof o === 'object' ? (o as Record<string, unknown>) : null;
-  const t = (typeof r?.tokenID === 'string' && r.tokenID) || (typeof r?.token_id === 'string' && r.token_id) || '';
+  const t =
+    (typeof r?.asset_id === 'string' && r.asset_id) ||
+    (typeof r?.tokenID === 'string' && r.tokenID) ||
+    (typeof r?.token_id === 'string' && r.token_id) ||
+    '';
   return t.trim() ? t.trim() : null;
 }
 
@@ -31,16 +39,28 @@ function pickSide(o: unknown): string {
 
 function pickPrice01(o: unknown): number | null {
   const r = o && typeof o === 'object' ? (o as Record<string, unknown>) : null;
-  const raw = r?.price;
+  const raw = r?.price ?? r?.price01;
   const n = typeof raw === 'string' ? Number(raw) : typeof raw === 'number' ? raw : NaN;
-  return Number.isFinite(n) ? n : null;
+  if (!Number.isFinite(n) || n <= 0) return null;
+  if (n <= 1) return n;
+  if (n <= 100) return n / 100;
+  return null;
 }
 
-function pickSize(o: unknown): number | null {
+/** Resting size left to fill (matches Polymarket “open” column), not `original_size` alone. */
+function pickRemainingShares(o: unknown): number | null {
   const r = o && typeof o === 'object' ? (o as Record<string, unknown>) : null;
-  const raw = r?.original_size ?? r?.size ?? r?.remaining_size ?? null;
-  const n = typeof raw === 'string' ? Number(raw) : typeof raw === 'number' ? raw : NaN;
-  return Number.isFinite(n) ? n : null;
+  if (!r) return null;
+  const pickN = (v: unknown): number | null => {
+    const n = typeof v === 'string' ? Number(v) : typeof v === 'number' ? v : NaN;
+    return Number.isFinite(n) ? n : null;
+  };
+  const rem = pickN(r.remaining ?? r.sizeRemaining ?? r.remaining_size);
+  if (rem != null) return rem;
+  const orig = pickN(r.original_size ?? r.originalSize ?? r.size ?? r.total_size);
+  const matched = pickN(r.size_matched ?? r.sizeMatched ?? r.matched_size);
+  if (orig != null && matched != null) return Math.max(0, orig - matched);
+  return orig;
 }
 
 export function TrackingTab(props: { upToken: string; downToken: string }): ReactElement {
@@ -61,8 +81,8 @@ export function TrackingTab(props: { upToken: string; downToken: string }): Reac
       const [bal, o, up, down] = await Promise.all([
         tradeBalanceAllowance({ assetType: 'collateral' }),
         tradeOpenOrders(tokens.length === 1 ? { tokenId: tokens[0] } : undefined),
-        upToken ? tradeAvgEntry(upToken) : Promise.resolve({ ok: true, data: { tokenId: '', avgEntry: null, shares: 0 } } as ApiOk<any>),
-        downToken ? tradeAvgEntry(downToken) : Promise.resolve({ ok: true, data: { tokenId: '', avgEntry: null, shares: 0 } } as ApiOk<any>),
+        upToken ? tradeAvgEntry({ tokenId: upToken }) : Promise.resolve({ ok: true, data: { tokenId: '', avgEntry: null, shares: 0 } } as ApiOk<any>),
+        downToken ? tradeAvgEntry({ tokenId: downToken }) : Promise.resolve({ ok: true, data: { tokenId: '', avgEntry: null, shares: 0 } } as ApiOk<any>),
       ]);
 
       if (isOk(bal)) setUsdc(bal.data.balance);
@@ -180,14 +200,14 @@ export function TrackingTab(props: { upToken: string; downToken: string }): Reac
               <span>Token</span>
               <span>Side</span>
               <span className="text-right">Price</span>
-              <span className="text-right">Size</span>
+              <span className="text-right">Remaining</span>
               <span className="text-right">Action</span>
             </div>
             {orders.slice(0, 200).map((o, idx) => {
               const oid = pickOrderId(o);
               const tok = pickTokenId(o);
               const px = pickPrice01(o);
-              const sz = pickSize(o);
+              const sz = pickRemainingShares(o);
               return (
                 <div
                   key={`${oid ?? 'row'}-${idx}`}

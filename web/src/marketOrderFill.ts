@@ -28,13 +28,27 @@ function toPrice01(raw: number): number | null {
 
 function collectContainers(data: unknown): Record<string, unknown>[] {
   if (!data || typeof data !== 'object') return [];
-  const o = data as Record<string, unknown>;
-  const list: Record<string, unknown>[] = [o];
-  for (const key of ['order', 'data', 'result', 'response']) {
-    const inner = o[key];
-    if (inner && typeof inner === 'object' && !Array.isArray(inner)) list.push(inner as Record<string, unknown>);
+  const root = data as Record<string, unknown>;
+  const seen = new Set<object>();
+  const out: Record<string, unknown>[] = [];
+  const push = (x: Record<string, unknown>) => {
+    const r = x as object;
+    if (seen.has(r)) return;
+    seen.add(r);
+    out.push(x);
+  };
+  for (const key of ['order', 'data', 'result', 'response'] as const) {
+    const inner = root[key];
+    if (!inner || typeof inner !== 'object' || Array.isArray(inner)) continue;
+    push(inner as Record<string, unknown>);
+    const sub = inner as Record<string, unknown>;
+    const innerOrder = sub.order ?? sub.result;
+    if (innerOrder && typeof innerOrder === 'object' && !Array.isArray(innerOrder)) {
+      push(innerOrder as Record<string, unknown>);
+    }
   }
-  return list;
+  push(root);
+  return out;
 }
 
 function firstNum(containers: Record<string, unknown>[], keys: string[]): number | null {
@@ -108,8 +122,11 @@ export function bestEffortMarketFill(
     let shares =
       w?.shares != null
         ? w.shares
-        : sizeRaw != null && plausibleOutcomeShares(sizeRaw)
-          ? sizeRaw
+        : sizeRaw != null && plausibleOutcomeShares(sizeRaw) && ctx.requestedShares > 0
+          ? // Guard: some payloads report notional-ish sizes; only trust if near requested shares.
+            Math.abs(sizeRaw - ctx.requestedShares) <= Math.max(0.02, ctx.requestedShares * 0.15)
+            ? sizeRaw
+            : null
           : ctx.requestedShares > 0
             ? ctx.requestedShares
             : null;
@@ -133,7 +150,17 @@ export function bestEffortMarketFill(
       : ctx.requestedShares != null && Number.isFinite(ctx.requestedShares) && ctx.requestedShares > 0
         ? ctx.requestedShares
         : null;
-  if ((shares == null || !Number.isFinite(shares)) && sizeRaw != null && plausibleOutcomeShares(sizeRaw)) shares = sizeRaw;
+  // Some SDK payloads reuse "filled_size" for USDC-like notional. Only trust sizeRaw if it matches expected shares.
+  if ((shares == null || !Number.isFinite(shares)) && sizeRaw != null && plausibleOutcomeShares(sizeRaw)) {
+    const expected = price01 != null && price01 > 0 ? ctx.amountUsd / price01 : null;
+    if (expected != null && expected > 0) {
+      const ratio = sizeRaw / expected;
+      if (Number.isFinite(ratio) && ratio > 0.2 && ratio < 5) shares = sizeRaw;
+    } else {
+      // If we can't compute expected shares, fall back cautiously (avoid huge bogus numbers).
+      if (sizeRaw < 50_000) shares = sizeRaw;
+    }
+  }
 
   if (price01 == null && shares != null && shares > 0 && ctx.amountUsd > 0) {
     price01 = ctx.amountUsd / shares;

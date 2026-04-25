@@ -42,6 +42,7 @@ import { SmartMoneyPaperPanel } from './SmartMoneyPaperPanel';
 import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
 import { PolySimulatorTradePanel } from './PolySimulatorTradePanel';
 import type { SpotPoint } from './SpotLevelChart';
+import { openClobMarketChannel } from './clobMarketChannel';
 import {
   bookIntelForAssistant,
   bookIntelLines,
@@ -341,7 +342,9 @@ function OutcomePane({
 
   // Global clock tick for freshness badges / relative time. Keep low-frequency to avoid re-render thrash.
   useEffect(() => {
-    const id = window.setInterval(() => setNow(Date.now()), 5_000);
+    // Drive countdown clocks (e.g. "Time remaining") at 1s resolution.
+    // API polling still happens on its own cadence; this only updates the UI clock.
+    const id = window.setInterval(() => setNow(Date.now()), 1_000);
     return () => window.clearInterval(id);
   }, []);
 
@@ -933,7 +936,103 @@ function App() {
     else setError(pretty(res));
   }, [selectedSlug, ptbWatchSlugs]);
 
-  // When enabled, poll books every 5s to drive the chart.
+  // Prefer WS market channel (instant); polling remains as a fallback.
+  const booksWsRef = useRef<ReturnType<typeof openClobMarketChannel> | null>(null);
+  const booksCacheRef = useRef<Map<string, { bids: { price: string; size: string }[]; asks: { price: string; size: string }[] }>>(new Map());
+  const booksWsIdsRef = useRef<string>('');
+  const booksRafRef = useRef<number | null>(null);
+  const booksDirtyRef = useRef(false);
+
+  useEffect(() => {
+    const ids = tokenIds;
+    const key = ids.join(',');
+    if (!ids || ids.length === 0) {
+      booksWsRef.current?.close();
+      booksWsRef.current = null;
+      booksCacheRef.current = new Map();
+      booksWsIdsRef.current = '';
+      return;
+    }
+    if (booksWsRef.current && booksWsIdsRef.current === key) return;
+
+    booksWsRef.current?.close();
+    booksWsRef.current = null;
+    booksCacheRef.current = new Map();
+    booksWsIdsRef.current = key;
+
+    // Keep UI responsive while we wait for first WS book snapshot.
+    setBooksLoading(true);
+    setError(null);
+
+    const toEntries = () => {
+      const out: { token: string; book: unknown; error: string | null }[] = [];
+      for (const token of ids) {
+        const b = booksCacheRef.current.get(token);
+        out.push({ token, book: b ? { bids: b.bids, asks: b.asks } : { bids: [], asks: [] }, error: null });
+      }
+      return out;
+    };
+
+    const flushBooks = () => {
+      booksRafRef.current = null;
+      if (!booksDirtyRef.current) return;
+      booksDirtyRef.current = false;
+      const ts = Date.now();
+      setBooks(toEntries());
+      setBooksFetchedAt(ts);
+      setBooksLoading(false);
+    };
+
+    const scheduleFlush = () => {
+      booksDirtyRef.current = true;
+      if (booksRafRef.current != null) return;
+      booksRafRef.current = window.requestAnimationFrame(flushBooks);
+    };
+
+    booksWsRef.current = openClobMarketChannel({
+      assetIds: ids,
+      onBook: (assetId, book) => {
+        booksCacheRef.current.set(assetId, book);
+        scheduleFlush();
+      },
+      onPriceChanges: (changes) => {
+        let touched = false;
+        for (const c of changes) {
+          const id = c.asset_id;
+          if (!ids.includes(id)) continue;
+          const book = booksCacheRef.current.get(id);
+          if (!book) continue;
+          const side = c.side === 'BUY' ? 'bids' : 'asks';
+          const px = String(c.price);
+          const sz = String(c.size);
+          const arr = book[side];
+          const idx = arr.findIndex((x) => x.price === px);
+          if (sz === '0' || sz === '0.0' || sz === '0.00') {
+            if (idx !== -1) arr.splice(idx, 1);
+          } else if (idx !== -1) {
+            arr[idx] = { price: px, size: sz };
+          } else {
+            arr.push({ price: px, size: sz });
+          }
+          touched = true;
+        }
+        if (touched) scheduleFlush();
+      },
+    });
+
+    return () => {
+      if (booksRafRef.current != null) window.cancelAnimationFrame(booksRafRef.current);
+      booksRafRef.current = null;
+      booksDirtyRef.current = false;
+      booksWsRef.current?.close();
+      booksWsRef.current = null;
+      booksCacheRef.current = new Map();
+      booksWsIdsRef.current = '';
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tokenIds.join(',')]);
+
+  // When enabled, poll books every 5s to drive the chart (fallback).
   useEffect(() => {
     if (!chartEnabled) return;
     if (!tokenIds || tokenIds.length === 0) return;
@@ -966,9 +1065,11 @@ function App() {
               ? ' · Assistant (set MOONSHOT_API_KEY or OPENAI_API_KEY in repo or api/.env)'
               : '';
         setApiHealth(
-          h.data.polymarket
-            ? `API OK — ${h.data.polymarket}${g}${a}`
-            : `API OK (HTTP mode — no polymarket CLI)${g}${a}`,
+          h.data.trading_ready === true
+            ? `API OK — trading ready${h.data.polymarket ? ` · ${h.data.polymarket}` : ' · (no polymarket CLI)'}${g}${a}`
+            : h.data.polymarket
+              ? `API OK — ${h.data.polymarket}${g}${a}`
+              : `API OK (HTTP mode — no polymarket CLI)${g}${a}`,
         );
       }
       else setApiHealth(`API error: ${h.error}${!isOk(h) && h.error === 'fetch_failed' ? ' — is the API running on :8787?' : ''}`);
@@ -1499,10 +1600,12 @@ function App() {
   }
 
   return (
-    <div className="min-h-full bg-zinc-950 bg-[radial-gradient(100%_60%_at_50%_-10%,rgba(99,102,241,0.08),transparent_52%),linear-gradient(180deg,#0b0b0f_0%,#09090b_45%,#060608_100%)] font-sans text-zinc-200 antialiased">
-      <div
-        className={`mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8 ${tradePanelOpen ? '2xl:pr-[400px]' : ''}`}
-      >
+    <div
+      className={`min-h-full bg-zinc-950 bg-[radial-gradient(100%_60%_at_50%_-10%,rgba(99,102,241,0.08),transparent_52%),linear-gradient(180deg,#0b0b0f_0%,#09090b_45%,#060608_100%)] font-sans text-zinc-200 antialiased ${
+        tradePanelOpen ? 'md:pr-[380px] 2xl:pr-[400px]' : ''
+      } transition-[padding] duration-200`}
+    >
+      <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
         <header className="rounded-2xl border border-zinc-800/50 bg-zinc-900/20 px-5 py-5 shadow-lg shadow-black/20 ring-1 ring-white/[0.03] backdrop-blur-sm sm:px-6">
           <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
             <div>

@@ -8,6 +8,12 @@ import {
   type TradeHistoryRow,
 } from './tradeHistory';
 import { loadPaperAccount, undoPaperFilledBuy } from './paperTrading';
+import type { ApiErr, ApiOk } from './lib/api';
+import { tradeCancelOrder } from './lib/api';
+
+function isOk<T>(r: ApiOk<T> | ApiErr): r is ApiOk<T> {
+  return r.ok === true;
+}
 
 function fmtUsdCents(v: number | null): string {
   if (v == null) return '—';
@@ -45,7 +51,7 @@ export function TradeHistoryTab(): ReactElement {
   const [historySide, setHistorySide] = useState<'all' | 'buy' | 'sell'>('all');
   const [historyMode, setHistoryMode] = useState<'all' | 'paper' | 'live'>('all');
   const [historyStatus, setHistoryStatus] = useState<
-    'all' | 'filled' | 'sent' | 'sending' | 'failed' | 'no_fill' | 'submitted'
+    'all' | 'filled' | 'partial' | 'sent' | 'sending' | 'pending' | 'failed' | 'no_fill' | 'cancelled' | 'submitted'
   >('all');
 
   const reload = useCallback(() => setHistoryRows(loadTradeHistory()), []);
@@ -97,7 +103,7 @@ export function TradeHistoryTab(): ReactElement {
     for (const r of filteredHistory) {
       if (r.side === 'buy') buys++;
       else sells++;
-      if (r.status === 'submitted' || r.status === 'sent') submitted++;
+      if (r.status === 'submitted' || r.status === 'sent' || r.status === 'pending' || r.status === 'sending') submitted++;
       else if (r.status === 'error' || r.status === 'failed') errors++;
       if (r.usdCents != null) {
         const abs = Math.abs(r.usdCents);
@@ -177,7 +183,17 @@ export function TradeHistoryTab(): ReactElement {
                   value={historyStatus}
                   onChange={(e) =>
                     setHistoryStatus(
-                      e.target.value as 'all' | 'filled' | 'sent' | 'sending' | 'failed' | 'no_fill' | 'submitted',
+                      e.target.value as
+                        | 'all'
+                        | 'filled'
+                        | 'partial'
+                        | 'sent'
+                        | 'sending'
+                        | 'pending'
+                        | 'failed'
+                        | 'no_fill'
+                        | 'cancelled'
+                        | 'submitted',
                     )
                   }
                   className="h-10 rounded-lg border border-zinc-800/70 bg-black/30 px-2.5 text-[12px] text-zinc-200 outline-none"
@@ -185,9 +201,12 @@ export function TradeHistoryTab(): ReactElement {
                 >
                   <option value="all">All status</option>
                   <option value="filled">Filled</option>
+                  <option value="partial">Partial fill</option>
                   <option value="sent">Sent / resting</option>
                   <option value="sending">Sending</option>
+                  <option value="pending">Pending fill</option>
                   <option value="no_fill">No fill</option>
+                  <option value="cancelled">Cancelled</option>
                   <option value="failed">Failed</option>
                   <option value="submitted">Submitted (legacy)</option>
                 </select>
@@ -226,9 +245,10 @@ export function TradeHistoryTab(): ReactElement {
                   <th className="whitespace-nowrap px-3 py-2.5">Sent</th>
                   <th className="whitespace-nowrap px-3 py-2.5">Fill</th>
                   <th className="whitespace-nowrap px-3 py-2.5">RTT</th>
-                  <th className="whitespace-nowrap px-3 py-2.5 text-right">Shares</th>
+                  <th className="whitespace-nowrap px-3 py-2.5 text-right">Filled / Req</th>
                   <th className="whitespace-nowrap px-3 py-2.5 text-right">USD</th>
                   <th className="whitespace-nowrap px-3 py-2.5">Status</th>
+                  <th className="whitespace-nowrap px-3 py-2.5">Order</th>
                   <th className="whitespace-nowrap px-3 py-2.5">Actions</th>
                 </tr>
               </thead>
@@ -277,7 +297,11 @@ export function TradeHistoryTab(): ReactElement {
                       {r.roundTripMs == null ? '—' : `${r.roundTripMs}ms`}
                     </td>
                     <td className="whitespace-nowrap px-3 py-2 text-right font-mono tabular-nums text-zinc-300">
-                      {r.shares == null ? '—' : r.shares.toFixed(2)}
+                      {r.shares == null
+                        ? '—'
+                        : `${r.shares.toFixed(2)}${r.requestedShares != null ? ` / ${r.requestedShares.toFixed(2)}` : ''}${
+                            r.remainingShares != null ? ` · rem ${r.remainingShares.toFixed(2)}` : ''
+                          }`}
                     </td>
                     <td
                       className={`whitespace-nowrap px-3 py-2 text-right font-mono tabular-nums ${
@@ -293,7 +317,7 @@ export function TradeHistoryTab(): ReactElement {
                             ? 'border-emerald-700/35 bg-emerald-950/15 text-emerald-200/90'
                             : r.status === 'sent' || r.status === 'submitted'
                               ? 'border-sky-700/35 bg-sky-950/15 text-sky-200/85'
-                              : r.status === 'sending'
+                              : r.status === 'sending' || r.status === 'pending'
                                 ? 'border-amber-700/35 bg-amber-950/15 text-amber-200/90'
                                 : r.status === 'no_fill' || r.status === 'cancelled'
                                   ? 'border-zinc-600/40 bg-zinc-950/25 text-zinc-300/90'
@@ -307,7 +331,44 @@ export function TradeHistoryTab(): ReactElement {
                       </span>
                     </td>
                     <td className="whitespace-nowrap px-3 py-2">
-                      {r.mode === 'paper' && r.status === 'filled' && r.side === 'buy' ? (
+                      {r.orderId ? (
+                        <button
+                          type="button"
+                          className="rounded-lg border border-zinc-800/60 bg-black/15 px-2 py-1 font-mono text-[10px] text-zinc-300 hover:bg-black/25"
+                          title="Copy order id"
+                          onClick={() => {
+                            try {
+                              void navigator.clipboard.writeText(r.orderId ?? '');
+                            } catch {
+                              /* ignore */
+                            }
+                          }}
+                        >
+                          {r.orderId.slice(0, 6)}…{r.orderId.slice(-4)}
+                        </button>
+                      ) : (
+                        <span className="text-[11px] text-zinc-700">—</span>
+                      )}
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-2">
+                      {r.mode === 'live' && r.orderId && (r.status === 'sent' || r.status === 'partial' || r.status === 'pending') ? (
+                        <button
+                          type="button"
+                          className="rounded-lg border border-zinc-800/70 bg-black/15 px-2.5 py-1.5 text-[11px] font-semibold text-zinc-200 hover:bg-black/25"
+                          title="Cancel this resting order on Polymarket"
+                          onClick={async () => {
+                            const oid = r.orderId;
+                            if (!oid) return;
+                            const res = await tradeCancelOrder(oid);
+                            if (!isOk(res)) {
+                              window.alert(`${res.error}${res.details ? ` · ${JSON.stringify(res.details)}` : ''}`);
+                            }
+                            reload();
+                          }}
+                        >
+                          Cancel order
+                        </button>
+                      ) : r.mode === 'paper' && r.status === 'filled' && r.side === 'buy' ? (
                         <button
                           type="button"
                           onClick={() => {

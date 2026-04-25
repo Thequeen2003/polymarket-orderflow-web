@@ -35,6 +35,22 @@ function apiUrl(path: string): string {
   return base ? `${base}${p}` : p;
 }
 
+export function apiWsUrl(path: string): string {
+  const base = apiBase();
+  const p = path.startsWith('/') ? path : `/${path}`;
+  if (base) {
+    const u = new URL(base);
+    u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
+    u.pathname = p;
+    u.search = '';
+    u.hash = '';
+    return u.toString();
+  }
+  const loc = window.location;
+  const proto = loc.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${proto}//${loc.host}${p}`;
+}
+
 function parseJsonBody(text: string): { ok: true; value: unknown } | { ok: false } {
   const trimmed = text.trim();
   if (!trimmed) return { ok: false };
@@ -239,6 +255,8 @@ export function health() {
     polymarket: string | null;
     note: string;
     gamma_reachable?: boolean;
+    trading_ready?: boolean;
+    trading_backend?: string | null;
     assistant_available?: boolean;
     assistant_provider?: string | null;
     assistant_model?: string | null;
@@ -341,15 +359,29 @@ export function assistantChat(body: {
   return postJson<{ message: string }>('/api/assistant/chat', body);
 }
 
-export function tradeMarketOrder(body: { token: string; side: 'buy' | 'sell'; amount: number; signatureType?: string | null }) {
+export function tradeMarketOrder(body: {
+  token: string;
+  side: 'buy' | 'sell';
+  amount: number;
+  signatureType?: string | null;
+  marketSlug?: string;
+  outcome?: string;
+}) {
   return postJson<unknown>('/api/trade/market-order', body);
 }
 
 export function tradeMarketOrderWithOpts(
-  body: { token: string; side: 'buy' | 'sell'; amount: number; signatureType?: string | null },
+  body: {
+    token: string;
+    side: 'buy' | 'sell';
+    amount: number;
+    signatureType?: string | null;
+    marketSlug?: string;
+    outcome?: string;
+  },
   opts?: JsonOpts,
 ) {
-  return postJsonWithOpts<unknown>('/api/trade/market-order', body, opts);
+  return postJsonWithOpts<unknown>('/api/trade/market-order', { ...body, market_slug: body.marketSlug ?? '', outcome: body.outcome ?? '' }, opts);
 }
 
 export function tradeCreateOrder(body: {
@@ -358,8 +390,10 @@ export function tradeCreateOrder(body: {
   price: number;
   size: number;
   signatureType?: string | null;
+  marketSlug?: string;
+  outcome?: string;
 }) {
-  return postJson<unknown>('/api/trade/create-order', body);
+  return postJson<unknown>('/api/trade/create-order', { ...body, market_slug: body.marketSlug ?? '', outcome: body.outcome ?? '' });
 }
 
 export function tradeCreateOrderWithOpts(
@@ -369,17 +403,30 @@ export function tradeCreateOrderWithOpts(
     price: number;
     size: number;
     signatureType?: string | null;
+    marketSlug?: string;
+    outcome?: string;
   },
   opts?: JsonOpts,
 ) {
-  return postJsonWithOpts<unknown>('/api/trade/create-order', body, opts);
+  return postJsonWithOpts<unknown>(
+    '/api/trade/create-order',
+    { ...body, market_slug: body.marketSlug ?? '', outcome: body.outcome ?? '' },
+    opts,
+  );
 }
 
 /** CLOB cached balance (USDC for buys, outcome shares for sells). */
-export function tradeBalanceAllowance(params: { tokenId?: string; assetType: 'collateral' | 'conditional' }) {
+export function tradeBalanceAllowance(params: {
+  tokenId?: string;
+  assetType: 'collateral' | 'conditional';
+  marketSlug?: string;
+  outcome?: string;
+}) {
   const q = new URLSearchParams();
   q.set('asset_type', params.assetType);
   if (params.tokenId) q.set('token_id', params.tokenId);
+  if (params.marketSlug) q.set('market_slug', params.marketSlug);
+  if (params.outcome) q.set('outcome', params.outcome);
   return getJson<{ balance: string; allowance: string }>(`/api/trade/balance-allowance?${q.toString()}`);
 }
 
@@ -391,12 +438,26 @@ export function tradeUpdateBalanceAllowance(body: { tokenId?: string; assetType:
   });
 }
 
-export function tradeAvgEntry(tokenId: string) {
-  return getJson<{ tokenId: string; avgEntry: number | null; shares: number }>(`/api/trade/avg-entry?token_id=${encodeURIComponent(tokenId)}`);
+export function tradeAvgEntry(params: { tokenId: string; marketSlug?: string; outcome?: string }) {
+  const q = new URLSearchParams();
+  q.set('token_id', params.tokenId);
+  if (params.marketSlug) q.set('market_slug', params.marketSlug);
+  if (params.outcome) q.set('outcome', params.outcome);
+  return getJson<{ tokenId: string; avgEntry: number | null; shares: number }>(`/api/trade/avg-entry?${q.toString()}`);
 }
 
 export function tradeGetOrder(orderId: string, opts?: JsonOpts) {
   return getJson<unknown>(`/api/trade/order?order_id=${encodeURIComponent(orderId)}`, opts);
+}
+
+/** CLOB trades tape keyed by order id — same source as Polymarket fills; used to reconcile local history. */
+export function tradeOrderFillIndex(params: { tokenId: string }, opts?: JsonOpts) {
+  const q = new URLSearchParams();
+  q.set('token_id', params.tokenId);
+  return getJson<{
+    token_id: string;
+    by_order_id: Record<string, { shares: number; avg_price_01: number; side: string; updated_at_ms: number }>;
+  }>(`/api/trade/order-fill-index?${q.toString()}`, opts);
 }
 
 export function tradeOpenOrders(params?: { tokenId?: string }) {
@@ -404,6 +465,23 @@ export function tradeOpenOrders(params?: { tokenId?: string }) {
   if (params?.tokenId) q.set('token_id', params.tokenId);
   const suffix = q.toString();
   return getJson<{ token_id: string | null; orders: unknown[] }>(`/api/trade/open-orders${suffix ? `?${suffix}` : ''}`);
+}
+
+export type MyFillRow = {
+  token_id: string;
+  order_id: string;
+  side: 'buy' | 'sell';
+  price_01: number;
+  shares: number;
+  match_time_ms: number;
+  role: 'taker' | 'maker';
+};
+
+export function tradeMyFills(params: { tokenId: string; limit?: number }, opts?: JsonOpts) {
+  const q = new URLSearchParams();
+  q.set('token_id', params.tokenId);
+  if (params.limit != null) q.set('limit', String(params.limit));
+  return getJson<{ token_id: string; fills: MyFillRow[] }>(`/api/trade/my-fills?${q.toString()}`, opts);
 }
 
 export function tradeCancelOrder(orderId: string) {

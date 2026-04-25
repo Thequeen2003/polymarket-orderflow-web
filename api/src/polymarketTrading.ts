@@ -129,7 +129,16 @@ export function getTradingConfigFromEnv(env: NodeJS.ProcessEnv = process.env): T
   };
 }
 
-function cacheKeyFor(config: TradingConfig): string {
+function apiCredsCacheKey(env: NodeJS.ProcessEnv = process.env): string {
+  // Include API creds in the cache key so rotating keys takes effect immediately.
+  // (We keep this server-side only; still never log these values.)
+  const key = String(env.POLYMARKET_API_KEY ?? '').trim();
+  const secret = String(env.POLYMARKET_API_SECRET ?? '').trim();
+  const passphrase = String(env.POLYMARKET_API_PASSPHRASE ?? '').trim();
+  return [key, secret, passphrase].join('|');
+}
+
+function cacheKeyFor(config: TradingConfig, env: NodeJS.ProcessEnv = process.env): string {
   return [
     config.host,
     String(config.chainId),
@@ -137,6 +146,7 @@ function cacheKeyFor(config: TradingConfig): string {
     config.funderAddress.toLowerCase(),
     String(config.signatureType),
     String(config.useServerTime),
+    apiCredsCacheKey(env),
   ].join('|');
 }
 
@@ -159,7 +169,9 @@ async function buildTradingClient(config: TradingConfig): Promise<{ client: Clob
   ] as const;
 
   const authClient = new ClobClient(...baseArgs);
-  const creds = await resolveApiCreds(authClient);
+  // For trading, prefer deriving/creating creds from the signer to avoid stale/invalid env key bundles
+  // breaking live execution.
+  const creds = await resolveApiCreds(authClient, { preferEnv: false });
   const client = new ClobClient(
     config.host,
     config.chainId,
@@ -178,11 +190,16 @@ async function buildTradingClient(config: TradingConfig): Promise<{ client: Clob
   return { client, config };
 }
 
-async function resolveApiCreds(client: ClobClient, env: NodeJS.ProcessEnv = process.env): Promise<ApiKeyCreds> {
+async function resolveApiCreds(
+  client: ClobClient,
+  opts?: { preferEnv?: boolean; env?: NodeJS.ProcessEnv },
+): Promise<ApiKeyCreds> {
+  const preferEnv = opts?.preferEnv ?? true;
+  const env = opts?.env ?? process.env;
   const key = String(env.POLYMARKET_API_KEY ?? '').trim();
   const secret = String(env.POLYMARKET_API_SECRET ?? '').trim();
   const passphrase = String(env.POLYMARKET_API_PASSPHRASE ?? '').trim();
-  if (key && secret && passphrase) return { key, secret, passphrase };
+  if (preferEnv && key && secret && passphrase) return { key, secret, passphrase };
 
   try {
     return await client.deriveApiKey();
@@ -195,7 +212,7 @@ export async function getTradingClient(): Promise<TradingClientResult> {
   const configResult = getTradingConfigFromEnv();
   if (!configResult.ok) return configResult;
 
-  const key = cacheKeyFor(configResult.config);
+  const key = cacheKeyFor(configResult.config, process.env);
   if (!clientCache || clientCache.key !== key) {
     clientCache = {
       key,

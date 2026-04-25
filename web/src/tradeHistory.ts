@@ -5,6 +5,7 @@ export type TradeHistoryExec = 'touch' | 'market' | 'limit';
 /** Live order lifecycle; legacy rows may still read `submitted` / `error` until re-saved. */
 export type TradeHistoryOrderStatus =
   | 'sending'
+  | 'pending'
   | 'sent'
   | 'partial'
   | 'filled'
@@ -35,13 +36,25 @@ export type TradeHistoryRow = {
   price01: number | null;
   /** Touch / limit quote or mid at intent time (what the UI showed). */
   quotedPrice01?: number | null;
+  /** The price the user chose/clicked (pre-submit intent). */
+  intendedPrice01?: number | null;
   /** Exact limit or cross price sent to the CLOB (after tick rounding). */
   submittedPrice01?: number | null;
   /** Volume-weighted average fill when filled or partially filled. */
   fillAvgPrice01?: number | null;
   /** Book or chart mid at click (mark), for slippage context. */
   markPrice01?: number | null;
+  /**
+   * Filled shares so far.
+   * - For `filled`: equals the final filled shares.
+   * - For `partial`: the amount filled so far.
+   * - For `sent` / `sending`: may be the requested size (legacy optimistic rows) or null.
+   */
   shares: number | null;
+  /** Requested / submitted shares (original order size), when known. */
+  requestedShares?: number | null;
+  /** Remaining shares to fill (requested - filled), when known. */
+  remainingShares?: number | null;
   usdCents: number | null;
   status: TradeHistoryOrderStatus;
   /** Client ↔ API round trip (ms), when measured. */
@@ -78,7 +91,7 @@ function safeJsonParse(raw: string): unknown {
 
 function migrateStatus(v: string): TradeHistoryOrderStatus {
   const s = v.toLowerCase();
-  if (s === 'sending' || s === 'sent' || s === 'partial' || s === 'filled' || s === 'failed' || s === 'no_fill' || s === 'cancelled') {
+  if (s === 'sending' || s === 'pending' || s === 'sent' || s === 'partial' || s === 'filled' || s === 'failed' || s === 'no_fill' || s === 'cancelled') {
     return s as TradeHistoryOrderStatus;
   }
   if (s === 'submitted') return 'sent';
@@ -91,6 +104,8 @@ function rowFromPartial(r: Partial<TradeHistoryRow>): TradeHistoryRow {
   const price01 = r.price01 == null ? null : Number.isFinite(Number(r.price01)) ? Number(r.price01) : null;
   const quotedPrice01 =
     r.quotedPrice01 == null ? null : Number.isFinite(Number(r.quotedPrice01)) ? Number(r.quotedPrice01) : null;
+  const intendedPrice01 =
+    r.intendedPrice01 == null ? null : Number.isFinite(Number(r.intendedPrice01)) ? Number(r.intendedPrice01) : null;
   const submittedPrice01 =
     r.submittedPrice01 == null ? null : Number.isFinite(Number(r.submittedPrice01)) ? Number(r.submittedPrice01) : null;
   const fillAvgPrice01 =
@@ -99,6 +114,11 @@ function rowFromPartial(r: Partial<TradeHistoryRow>): TradeHistoryRow {
   const roundTripMs =
     r.roundTripMs == null ? null : Number.isFinite(Number(r.roundTripMs)) ? Number(r.roundTripMs) : null;
   const orderId = r.orderId != null && String(r.orderId).trim() ? String(r.orderId).trim() : null;
+  const shares = r.shares == null ? null : Number.isFinite(Number(r.shares)) ? Number(r.shares) : null;
+  const requestedShares =
+    r.requestedShares == null ? null : Number.isFinite(Number(r.requestedShares)) ? Number(r.requestedShares) : null;
+  const remainingShares =
+    r.remainingShares == null ? null : Number.isFinite(Number(r.remainingShares)) ? Number(r.remainingShares) : null;
   return {
     id: String(r.id ?? ''),
     ts: typeof r.ts === 'number' && Number.isFinite(r.ts) ? r.ts : 0,
@@ -113,11 +133,18 @@ function rowFromPartial(r: Partial<TradeHistoryRow>): TradeHistoryRow {
     marketSlug: r.marketSlug != null && String(r.marketSlug).trim() ? String(r.marketSlug).trim() : undefined,
     marketTitle: r.marketTitle != null && String(r.marketTitle).trim() ? String(r.marketTitle).trim() : undefined,
     price01,
-    quotedPrice01: quotedPrice01 ?? (status === 'filled' ? price01 : null),
-    submittedPrice01: submittedPrice01 ?? (status === 'sent' || status === 'filled' || status === 'partial' ? price01 : null),
-    fillAvgPrice01: fillAvgPrice01 ?? (status === 'filled' || status === 'partial' ? price01 : null),
+    // Never backfill quoted/submitted/fill from legacy `price01` for LIVE rows — that caused incorrect prices
+    // when `price01` was a “best guess” (e.g. mid / estimate) rather than an execution price.
+    // Paper rows can still fall back for older persisted history.
+    quotedPrice01: quotedPrice01 ?? (status === 'filled' && String(r.mode ?? '').toLowerCase() !== 'live' ? price01 : null),
+    intendedPrice01: intendedPrice01 ?? null,
+    submittedPrice01:
+      submittedPrice01 ?? ((status === 'sent' || status === 'filled' || status === 'partial') && String(r.mode ?? '').toLowerCase() !== 'live' ? price01 : null),
+    fillAvgPrice01: fillAvgPrice01 ?? ((status === 'filled' || status === 'partial') && String(r.mode ?? '').toLowerCase() !== 'live' ? price01 : null),
     markPrice01: markPrice01 ?? null,
-    shares: r.shares == null ? null : Number.isFinite(Number(r.shares)) ? Number(r.shares) : null,
+    shares,
+    requestedShares: requestedShares ?? null,
+    remainingShares: remainingShares ?? null,
     usdCents: r.usdCents == null ? null : Number.isFinite(Number(r.usdCents)) ? Number(r.usdCents) : null,
     status,
     roundTripMs,
@@ -196,10 +223,13 @@ export function appendTradeHistory(row: Omit<TradeHistoryRow, 'id' | 'ts'> & { i
     marketTitle: row.marketTitle,
     price01: row.price01 ?? null,
     quotedPrice01: row.quotedPrice01 ?? null,
+    intendedPrice01: row.intendedPrice01 ?? null,
     submittedPrice01: row.submittedPrice01 ?? null,
     fillAvgPrice01: row.fillAvgPrice01 ?? null,
     markPrice01: row.markPrice01 ?? null,
     shares: row.shares ?? null,
+    requestedShares: row.requestedShares ?? null,
+    remainingShares: row.remainingShares ?? null,
     usdCents: row.usdCents ?? null,
     status: row.status,
     roundTripMs: row.roundTripMs ?? null,
@@ -230,8 +260,11 @@ export function updateTradeHistoryRow(
       | 'error'
       | 'price01'
       | 'shares'
+      | 'requestedShares'
+      | 'remainingShares'
       | 'usdCents'
       | 'quotedPrice01'
+      | 'intendedPrice01'
       | 'submittedPrice01'
       | 'fillAvgPrice01'
       | 'markPrice01'
@@ -278,12 +311,15 @@ export function tradeHistoryToCsv(rows: TradeHistoryRow[]): string {
     'market_title',
     'token',
     'quoted_price01',
+    'intended_price01',
     'submitted_price01',
     'fill_avg_price01',
     'mark_price01',
     'price01_legacy',
     'price_cents_legacy',
     'shares',
+    'requested_shares',
+    'remaining_shares',
     'usd_cents_abs',
     'status',
     'round_trip_ms',
@@ -307,12 +343,15 @@ export function tradeHistoryToCsv(rows: TradeHistoryRow[]): string {
         csvEscape(r.marketTitle ?? ''),
         csvEscape(r.token),
         r.quotedPrice01 == null ? '' : String(r.quotedPrice01),
+        r.intendedPrice01 == null ? '' : String(r.intendedPrice01),
         r.submittedPrice01 == null ? '' : String(r.submittedPrice01),
         r.fillAvgPrice01 == null ? '' : String(r.fillAvgPrice01),
         r.markPrice01 == null ? '' : String(r.markPrice01),
         r.price01 == null ? '' : String(r.price01),
         csvEscape(priceCents),
         r.shares == null ? '' : String(r.shares),
+        r.requestedShares == null ? '' : String(r.requestedShares),
+        r.remainingShares == null ? '' : String(r.remainingShares),
         r.usdCents == null ? '' : String(Math.abs(r.usdCents)),
         csvEscape(r.status),
         r.roundTripMs == null ? '' : String(r.roundTripMs),

@@ -1,13 +1,15 @@
 import { type ReactElement, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
-import type { ApiErr } from './lib/api';
+import type { ApiErr, MyFillRow } from './lib/api';
 import {
+  apiWsUrl,
+  lastTradePrice,
   tradeAvgEntry,
   tradeBalanceAllowance,
   tradeCancelAllOrders,
   tradeCancelOrder,
   tradeCreateOrderWithOpts,
   tradeGetOrder,
-  tradeMarketOrderWithOpts,
+  tradeMyFills,
   tradeOpenOrders,
   tradeUpdateBalanceAllowance,
 } from './lib/api';
@@ -34,16 +36,17 @@ import {
 } from './tradeHistory';
 import { playTradeClick, playTradeError, playTradeFill } from './tradeSounds';
 import { PAPER_ACCOUNT_SYNC_EVENT } from './paperAccountSync';
-import { bestEffortMarketFill } from './marketOrderFill';
 import { parseRestingOrderSnapshot } from './orderStatusParse';
 import { floorShares4, roundPrice01, roundShares4, roundUsd2 } from './tradingRound';
 import { extractOrderIdFromClobPayload, unwrapTradeActionData } from './tradeExecutionMeta';
+import { reconcileTradeHistoryFromClob } from './reconcileTradeHistoryFromClob';
 
 function isOk<T>(res: { ok: boolean } & Record<string, unknown>): res is { ok: true; data: T } {
   return res.ok === true;
 }
 
 function parseUsdcBalance(raw: string): number | null {
+  if (raw.trim() === '') return null;
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 0) return null;
   return roundUsd2(n);
@@ -51,13 +54,27 @@ function parseUsdcBalance(raw: string): number | null {
 
 /** Conservative 4dp floor so max-sell never exceeds wallet conditional balance. */
 function parseOutcomeSharesBalance(raw: string): number | null {
+  if (raw.trim() === '') return null;
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 0) return null;
   return floorShares4(n);
 }
 
 function fmtCents(p01: number | null): string {
-  return p01 == null ? '—' : `${(p01 * 100).toFixed(1)}¢`;
+  if (p01 == null) return '—';
+  // Always show whole cents (no ".5").
+  return `${Math.round(p01 * 100)}¢`;
+}
+
+/** CLOB `last-trade-price` returns a decimal string (0..1) or occasionally cents as a number string. */
+function parseClobPriceStringTo01(raw: string): number | null {
+  const s = raw.trim();
+  if (!s) return null;
+  const n = Number(s);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  if (n <= 1) return roundPrice01(n);
+  if (n <= 100) return roundPrice01(n / 100);
+  return null;
 }
 
 function clamp01(x: number): number {
@@ -99,7 +116,8 @@ function asStr(x: unknown): string | null {
 function orderIdFromRow(o: unknown): string | null {
   if (!o || typeof o !== 'object') return null;
   const r = o as Record<string, unknown>;
-  return asStr(r.orderID ?? r.orderId ?? r.id ?? r.order_id);
+  // CLOB `OpenOrder` uses `id`; other payloads use orderID / order_id.
+  return asStr(r.id ?? r.orderID ?? r.orderId ?? r.order_id);
 }
 
 function orderSideFromRow(o: unknown): 'buy' | 'sell' | null {
@@ -109,33 +127,47 @@ function orderSideFromRow(o: unknown): 'buy' | 'sell' | null {
   return s === 'buy' || s === 'sell' ? (s as 'buy' | 'sell') : null;
 }
 
+/** CLOB prices are usually 0–1; some payloads use 1–100 (¢). */
+function clobPriceRawTo01(raw: number | null): number | null {
+  if (raw == null || !Number.isFinite(raw) || raw <= 0) return null;
+  if (raw <= 1) return raw;
+  if (raw <= 100) return raw / 100;
+  return null;
+}
+
 function orderPrice01FromRow(o: unknown): number | null {
   if (!o || typeof o !== 'object') return null;
   const r = o as Record<string, unknown>;
-  return asNum(r.price ?? r.price01);
+  const n = asNum(r.price ?? r.price01);
+  return clobPriceRawTo01(n);
 }
 
 function orderSizeFromRow(o: unknown): number | null {
   if (!o || typeof o !== 'object') return null;
   const r = o as Record<string, unknown>;
-  return asNum(r.size ?? r.original_size ?? r.originalSize);
+  return asNum(r.original_size ?? r.originalSize ?? r.size ?? r.total_size ?? r.totalSize);
 }
 
 function orderRemainingFromRow(o: unknown): number | null {
   if (!o || typeof o !== 'object') return null;
   const r = o as Record<string, unknown>;
-  const rem = asNum(r.remaining ?? r.sizeRemaining);
+  const rem = asNum(r.remaining ?? r.sizeRemaining ?? r.remaining_size ?? r.remainingSize);
   if (rem != null) return rem;
   const size = orderSizeFromRow(o);
-  const matched = asNum(r.size_matched ?? r.sizeMatched);
+  const matched = asNum(r.size_matched ?? r.sizeMatched ?? r.matched_size ?? r.matchedSize);
   if (size != null && matched != null) return Math.max(0, size - matched);
   return null;
 }
 
-function orderCreatedAtFromRow(o: unknown): string | null {
+function orderCreatedAtFromRow(o: unknown): string | number | null {
   if (!o || typeof o !== 'object') return null;
   const r = o as Record<string, unknown>;
-  return asStr(r.createdAt ?? r.created_at ?? r.timestamp);
+  const s = asStr(r.createdAt ?? r.created_at ?? r.timestamp);
+  if (s) return s;
+  const n = asNum(r.created_at);
+  if (n == null || n <= 0) return null;
+  // CLOB uses unix seconds for `created_at` on open orders; normalize to ms for `fmtWhen`.
+  return n < 1e12 ? n * 1000 : n;
 }
 
 function fmtWhen(v: string | number | null | undefined): string {
@@ -164,42 +196,6 @@ function fmtShares(shares: number | null, style: 'full' | 'compact' = 'compact')
   if (style === 'full') return SHARES_FULL_FMT.format(shares);
   if (style === 'compact' && abs >= 10_000) return SHARES_COMPACT_FMT.format(shares);
   return SHARES_FMT.format(shares);
-}
-
-/** Polymarket rejects market BUY when notional is under $1 (e.g. shares × mid = $0.9988). */
-const LIVE_MARKET_MIN_BUY_USD = 1;
-
-function resolveLiveMarketBuyUsdc(
-  unit: 'dollars' | 'shares',
-  amtNum: number,
-  mid: number | null,
-):
-  | { ok: true; usd: number; raw: number; minAdjusted: boolean }
-  | { ok: false; raw: number; hint: string } {
-  const rawUnrounded = unit === 'dollars' ? amtNum : mid != null && mid > 0 ? amtNum * mid : NaN;
-  const raw = Number.isFinite(rawUnrounded) ? roundUsd2(rawUnrounded as number) : rawUnrounded;
-  if (!Number.isFinite(raw) || raw <= 0) {
-    return {
-      ok: false,
-      raw,
-      hint:
-        unit === 'shares' && (mid == null || mid <= 0)
-          ? 'Need a valid price per share for this size (wait for the book or chart to load), or switch to $ and enter dollars.'
-          : 'Enter a valid amount.',
-    };
-  }
-  if (raw >= LIVE_MARKET_MIN_BUY_USD - 0.005) {
-    return { ok: true, usd: raw, raw: rawUnrounded as number, minAdjusted: false };
-  }
-  const bumped = Math.ceil(raw * 100) / 100;
-  if (bumped >= LIVE_MARKET_MIN_BUY_USD - 0.005) {
-    return { ok: true, usd: bumped, raw: rawUnrounded as number, minAdjusted: true };
-  }
-  return {
-    ok: false,
-    raw,
-    hint: `Live market buys need at least $${LIVE_MARKET_MIN_BUY_USD.toFixed(2)} notional. At this price, your size is about $${raw.toFixed(2)}. Increase size or use Limit.`,
-  };
 }
 
 export type SignalsTradePanelProps = {
@@ -233,7 +229,7 @@ export type SignalsTradePanelProps = {
 };
 
 /**
- * Signals tab: order entry (buy/sell, market/limit, amounts) against Polymarket CLOB via API.
+ * Signals tab: order entry (buy/sell, limit/touch, amounts) against Polymarket CLOB via API.
  */
 export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const {
@@ -264,15 +260,38 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
 
   const [action, setAction] = useState<'buy' | 'sell'>('buy');
   const [laneState, setLaneState] = useState<'up' | 'down'>(controlledLane ?? 'up');
-  const [execMode, setExecMode] = useState<'touch' | 'market' | 'limit'>('touch');
+  const [execMode, setExecMode] = useState<'touch' | 'limit'>('touch');
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [unit, setUnit] = useState<'dollars' | 'shares'>('dollars');
   const [accountMode, setAccountMode] = useState<'paper' | 'live'>('paper');
   const [paperAccount, setPaperAccount] = useState(() => loadPaperAccount());
   const [historyRows, setHistoryRows] = useState<TradeHistoryRow[]>(() => loadTradeHistory());
+  const [pendingPos, setPendingPos] = useState<
+    | {
+        token: string;
+        side: 'buy' | 'sell';
+        kind: 'shares';
+        shares: number;
+        price01: number | null;
+        status: 'submitting' | 'live' | 'filled' | 'partial' | 'rejected';
+        createdAt: number;
+      }
+    | {
+        token: string;
+        side: 'buy';
+        kind: 'usd';
+        usd: number;
+        price01: number | null;
+        status: 'submitting' | 'live' | 'filled' | 'partial' | 'rejected';
+        createdAt: number;
+      }
+    | null
+  >(null);
   const [openOrders, setOpenOrders] = useState<unknown[]>([]);
   const [openOrdersLoading, setOpenOrdersLoading] = useState(false);
   const [openOrdersErr, setOpenOrdersErr] = useState<string | null>(null);
+  const [myFills, setMyFills] = useState<MyFillRow[]>([]);
+  const [myFillsErr, setMyFillsErr] = useState<string | null>(null);
 
   const [amount, setAmount] = useState('10');
   const [sellQty, setSellQty] = useState('');
@@ -286,8 +305,6 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const [pickAutoCancelMs] = useState('1500');
   const [buyNowShares, setBuyNowShares] = useState('5');
   const [buyBidCents, setBuyBidCents] = useState('');
-  const [sellNowShares, setSellNowShares] = useState('5');
-  const [sellAskCents, setSellAskCents] = useState('');
 
   const [busySubmit, setBusySubmit] = useState(false);
   const [busyRefresh, setBusyRefresh] = useState(false);
@@ -335,6 +352,9 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const [balError, setBalError] = useState<string | null>(null);
   const [avgEntryUp, setAvgEntryUp] = useState<number | null>(null);
   const [avgEntryDown, setAvgEntryDown] = useState<number | null>(null);
+  /** CLOB last-trade print per outcome (live) — aligns “current price” with Polymarket-style marks. */
+  const [lastTradeUp01, setLastTradeUp01] = useState<number | null>(null);
+  const [lastTradeDown01, setLastTradeDown01] = useState<number | null>(null);
   const [flashToast, setFlashToast] = useState<string | null>(null);
   const flashTimerRef = useRef<number | null>(null);
   const toastIdRef = useRef(0);
@@ -368,6 +388,40 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     return c ?? b;
   }, [lane, upMid, downMid, bookMidUp, bookMidDown, accountMode]);
 
+  /** Live: last trade when available; paper: book/chart mid only. Used when book touch is missing. */
+  const displayMark01 = useMemo(() => {
+    if (accountMode !== 'live') return mid;
+    const lt = lane === 'up' ? lastTradeUp01 : lastTradeDown01;
+    return lt ?? mid;
+  }, [accountMode, lane, lastTradeUp01, lastTradeDown01, mid]);
+
+  const fetchLastTradesBoth = useCallback(async () => {
+    if (accountMode !== 'live' || !upToken || !downToken) return;
+    const [u, d] = await Promise.all([lastTradePrice(upToken), lastTradePrice(downToken)]);
+    if (isOk(u) && u.data.price) setLastTradeUp01(parseClobPriceStringTo01(u.data.price));
+    else setLastTradeUp01(null);
+    if (isOk(d) && d.data.price) setLastTradeDown01(parseClobPriceStringTo01(d.data.price));
+    else setLastTradeDown01(null);
+  }, [accountMode, upToken, downToken]);
+
+  useEffect(() => {
+    if (accountMode !== 'live' || !upToken || !downToken) {
+      setLastTradeUp01(null);
+      setLastTradeDown01(null);
+      return;
+    }
+    let cancelled = false;
+    const tick = () => {
+      if (!cancelled) void fetchLastTradesBoth();
+    };
+    tick();
+    const id = window.setInterval(tick, 500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [accountMode, upToken, downToken, fetchLastTradesBoth]);
+
   const livePositionShares = lane === 'up' ? balUp : balDown;
   const liveAvgEntry = lane === 'up' ? avgEntryUp : avgEntryDown;
   const paperPos = useMemo(() => getPaperPosition(paperAccount, token), [paperAccount, token]);
@@ -386,10 +440,38 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
 
   const recentFillsForToken = useMemo(() => {
     if (!token) return [];
+    // Prefer confirmed Polymarket fills for live mode.
+    if (accountMode === 'live' && myFills.length) {
+      return myFills
+        .slice()
+        .sort((a, b) => (b.match_time_ms ?? 0) - (a.match_time_ms ?? 0))
+        .slice(0, 12)
+        .map((f) => ({
+          id: `${f.order_id}-${f.match_time_ms}-${f.shares}`,
+          mode: 'live' as const,
+          side: f.side,
+          token: f.token_id,
+          orderId: f.order_id,
+          quotedPrice01: null,
+          submittedPrice01: null,
+          fillAvgPrice01: f.price_01,
+          price01: f.price_01,
+          shares: f.shares,
+          requestedShares: null,
+          remainingShares: null,
+          usdCents: Math.abs(Math.round(f.price_01 * f.shares * 100)),
+          status: 'filled' as const,
+          ts: f.match_time_ms,
+          role: f.role,
+        }));
+    }
+    // Fallback: local reconciled history rows.
     return historyRows
-      .filter((r) => r.token === token && r.status === 'filled')
-      .slice(0, 5);
-  }, [historyRows, token]);
+      .filter((r) => r.token === token && (r.status === 'filled' || r.status === 'partial'))
+      .slice()
+      .sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))
+      .slice(0, 8);
+  }, [accountMode, historyRows, myFills, token]);
 
   const midUpChart = upMid != null && Number.isFinite(upMid) && upMid > 0 ? upMid : null;
   const midDownChart = downMid != null && Number.isFinite(downMid) && downMid > 0 ? downMid : null;
@@ -420,8 +502,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       const bid = bookTouch?.bestBid;
       if (bid != null && bid > 0 && bid < 1) return roundPrice01(bid);
     }
-    return mid != null && mid > 0 ? roundPrice01(mid) : null;
-  }, [action, bookTouch?.bestAsk, bookTouch?.bestBid, mid]);
+    return displayMark01 != null && displayMark01 > 0 ? roundPrice01(displayMark01) : null;
+  }, [action, bookTouch?.bestAsk, bookTouch?.bestBid, displayMark01]);
 
   const targets = useMemo(() => {
     const quote = executableQuote01;
@@ -446,6 +528,29 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       spreadCents: (spread01 * 100).toFixed(2),
     };
   }, [action, bookTouch, executableQuote01]);
+
+  /** Seed resting bid (¢) from the book when the outcome changes; do not chase every tick once set for that token. */
+  const buyBidAutoSeedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (action !== 'buy' || !token) {
+      buyBidAutoSeedRef.current = null;
+      return;
+    }
+    const ask = bookTouch?.bestAsk;
+    if (ask == null || !Number.isFinite(ask) || ask <= 0 || ask >= 1) {
+      if (buyBidAutoSeedRef.current != null && buyBidAutoSeedRef.current !== token) buyBidAutoSeedRef.current = null;
+      return;
+    }
+    const seededFor = buyBidAutoSeedRef.current === token;
+    const c = Math.max(1, Math.min(99, Math.round(ask * 100 - 1)));
+    const next = String(c);
+    if (!seededFor) {
+      buyBidAutoSeedRef.current = token;
+      setBuyBidCents(next);
+      return;
+    }
+    setBuyBidCents((prev) => (prev.trim() === '' ? next : prev));
+  }, [action, token, bookTouch?.bestAsk]);
 
   useEffect(() => {
     if (!isSlide) return;
@@ -540,14 +645,17 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const positionShares = accountMode === 'paper' ? paperPos.shares : livePositionShares;
   const avgEntry = accountMode === 'paper' ? paperPos.avgCost01 : liveAvgEntry;
 
+  /** Live: never inflate position from pending intent — balances come from CLOB after fill. */
+  const optimisticPositionShares = positionShares;
+
   const midCents = mid != null ? mid * 100 : null;
   const defaultLimitCents = useMemo(() => {
     if (midCents == null) return '';
     if (action === 'buy') {
-      const c = Math.min(99, Math.max(1, midCents + 0.5));
+      const c = Math.min(99, Math.max(1, midCents));
       return String(Math.round(c));
     }
-    const c = Math.max(1, Math.min(99, midCents - 0.5));
+    const c = Math.max(1, Math.min(99, midCents));
     return String(Math.round(c));
   }, [midCents, action]);
 
@@ -557,6 +665,48 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     const c = Math.max(1, Math.min(99, midCents + bump));
     return String(Math.round(c));
   }, [midCents, action]);
+
+  const quickLimitBuyPresets = useMemo(() => {
+    const out: { key: string; label: string; cents: number }[] = [];
+    const push = (key: string, label: string, cents: number) => {
+      const c = Math.max(1, Math.min(99, Math.round(cents)));
+      if (!out.some((x) => x.key === key)) out.push({ key, label, cents: c });
+    };
+    const ask = bookTouch?.bestAsk;
+    if (ask != null && ask > 0 && ask < 1) {
+      const ac = Math.round(ask * 100);
+      push('ask', `Ask ${ac}¢`, ac);
+      push('ask-1', 'Ask−1', ac - 1);
+      push('ask-2', 'Ask−2', ac - 2);
+    }
+    if (midCents != null) {
+      const m = Math.round(midCents);
+      push('mid', `Mid ${m}¢`, m);
+      for (const d of [1, 2, 3]) push(`m+${d}`, `Mid+${d}`, m + d);
+    }
+    return out.slice(0, 8);
+  }, [bookTouch?.bestAsk, midCents]);
+
+  const quickLimitSellPresets = useMemo(() => {
+    const out: { key: string; label: string; cents: number }[] = [];
+    const push = (key: string, label: string, cents: number) => {
+      const c = Math.max(1, Math.min(99, Math.round(cents)));
+      if (!out.some((x) => x.key === key)) out.push({ key, label, cents: c });
+    };
+    const bid = bookTouch?.bestBid;
+    if (bid != null && bid > 0 && bid < 1) {
+      const bc = Math.round(bid * 100);
+      push('bid', `Bid ${bc}¢`, bc);
+      push('bid+1', 'Bid+1', bc + 1);
+      push('bid+2', 'Bid+2', bc + 2);
+    }
+    if (midCents != null) {
+      const m = Math.round(midCents);
+      push('mid', `Mid ${m}¢`, m);
+      for (const d of [1, 2, 3]) push(`m-${d}`, `Mid−${d}`, m - d);
+    }
+    return out.slice(0, 8);
+  }, [bookTouch?.bestBid, midCents]);
 
   useEffect(() => {
     if (accountMode !== 'live') return;
@@ -568,8 +718,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       try {
         const [rC, rU, rD] = await Promise.all([
           tradeBalanceAllowance({ assetType: 'collateral' }),
-          tradeBalanceAllowance({ tokenId: upToken, assetType: 'conditional' }),
-          tradeBalanceAllowance({ tokenId: downToken, assetType: 'conditional' }),
+          tradeBalanceAllowance({ tokenId: upToken, assetType: 'conditional', marketSlug: marketSlug ?? '', outcome: upLabel }),
+          tradeBalanceAllowance({ tokenId: downToken, assetType: 'conditional', marketSlug: marketSlug ?? '', outcome: downLabel }),
         ]);
         if (cancelled) return;
         if (isOk(rC)) setAvailUsdc(parseUsdcBalance(rC.data.balance));
@@ -595,9 +745,15 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const refreshAvgEntry = useCallback(() => {
     if (accountMode !== 'live') return;
     if (!upToken || !downToken) return;
+    const startedAt = performance.now();
     void (async () => {
       try {
-        const [u, d] = await Promise.all([tradeAvgEntry(upToken), tradeAvgEntry(downToken)]);
+        const [u, d] = await Promise.all([
+          tradeAvgEntry({ tokenId: upToken, marketSlug: marketSlug ?? '', outcome: upLabel }),
+          tradeAvgEntry({ tokenId: downToken, marketSlug: marketSlug ?? '', outcome: downLabel }),
+        ]);
+        // Prevent out-of-order flips: ignore very stale responses.
+        if (performance.now() - startedAt > 5000) return;
         if (isOk(u)) setAvgEntryUp(u.data.avgEntry);
         else setAvgEntryUp(null);
         if (isOk(d)) setAvgEntryDown(d.data.avgEntry);
@@ -609,9 +765,94 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     })();
   }, [accountMode, upToken, downToken]);
 
-  useEffect(() => {
-    refreshAvgEntry();
+  // Throttle Bullpen-backed reads so the UI doesn't "flip" between delayed responses.
+  const avgEntryThrottleRef = useRef<{ lastMs: number; timer: number | null }>({ lastMs: 0, timer: null });
+  const liveBalThrottleRef = useRef<{ lastMs: number; timer: number | null }>({ lastMs: 0, timer: null });
+
+  const refreshAvgEntryThrottled = useCallback(() => {
+    const minGapMs = 800;
+    const now = Date.now();
+    const ref = avgEntryThrottleRef.current;
+    if (now - ref.lastMs >= minGapMs) {
+      ref.lastMs = now;
+      refreshAvgEntry();
+      return;
+    }
+    if (ref.timer != null) return;
+    ref.timer = window.setTimeout(() => {
+      ref.timer = null;
+      ref.lastMs = Date.now();
+      refreshAvgEntry();
+    }, Math.max(0, minGapMs - (now - ref.lastMs)));
   }, [refreshAvgEntry]);
+
+  const liveBalancesRefreshRef = useRef<{ gen: number; inflight: boolean }>({ gen: 0, inflight: false });
+
+  const readLiveBalancesOnce = useCallback(async () => {
+    if (!upToken || !downToken) return;
+    const [rC, rU, rD] = await Promise.all([
+      tradeBalanceAllowance({ assetType: 'collateral' }),
+      tradeBalanceAllowance({ tokenId: upToken, assetType: 'conditional', marketSlug: marketSlug ?? '', outcome: upLabel }),
+      tradeBalanceAllowance({ tokenId: downToken, assetType: 'conditional', marketSlug: marketSlug ?? '', outcome: downLabel }),
+    ]);
+    if (isOk(rC)) setAvailUsdc(parseUsdcBalance(rC.data.balance));
+    if (isOk(rU)) setBalUp(parseOutcomeSharesBalance(rU.data.balance));
+    if (isOk(rD)) setBalDown(parseOutcomeSharesBalance(rD.data.balance));
+    if (!isOk(rU) || !isOk(rD)) setBalError('Position/balance unavailable — is the API trading key configured?');
+  }, [downToken, upToken]);
+
+  const refreshLiveBalances = useCallback(async () => {
+    if (accountMode !== 'live') return;
+    if (!upToken || !downToken) return;
+    setBalError(null);
+    const gen = (liveBalancesRefreshRef.current.gen += 1);
+    if (liveBalancesRefreshRef.current.inflight) return;
+    liveBalancesRefreshRef.current.inflight = true;
+    try {
+      // Fast path: read immediately (no waiting on allowance refresh).
+      await readLiveBalancesOnce();
+
+      // Background reconcile: ask the API to refresh then read again.
+      void (async () => {
+        try {
+          await Promise.all([
+            tradeUpdateBalanceAllowance({ assetType: 'collateral' }),
+            tradeUpdateBalanceAllowance({ tokenId: upToken, assetType: 'conditional' }),
+            tradeUpdateBalanceAllowance({ tokenId: downToken, assetType: 'conditional' }),
+          ]);
+          if (gen !== liveBalancesRefreshRef.current.gen) return;
+          await readLiveBalancesOnce();
+        } catch {
+          /* ignore background refresh errors */
+        }
+      })();
+    } catch {
+      setBalError('Could not load balances.');
+    } finally {
+      liveBalancesRefreshRef.current.inflight = false;
+    }
+  }, [accountMode, downToken, readLiveBalancesOnce, upToken]);
+
+  const refreshLiveBalancesThrottled = useCallback(() => {
+    const minGapMs = 600;
+    const now = Date.now();
+    const ref = liveBalThrottleRef.current;
+    if (now - ref.lastMs >= minGapMs) {
+      ref.lastMs = now;
+      void refreshLiveBalances();
+      return;
+    }
+    if (ref.timer != null) return;
+    ref.timer = window.setTimeout(() => {
+      ref.timer = null;
+      ref.lastMs = Date.now();
+      void refreshLiveBalances();
+    }, Math.max(0, minGapMs - (now - ref.lastMs)));
+  }, [refreshLiveBalances]);
+
+  useEffect(() => {
+    refreshAvgEntryThrottled();
+  }, [refreshAvgEntryThrottled]);
 
   const refreshOpenOrders = useCallback(async () => {
     if (accountMode !== 'live') return;
@@ -627,6 +868,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       } else {
         const orders = (r.data as { orders?: unknown }).orders;
         setOpenOrders(Array.isArray(orders) ? orders : []);
+        void reconcileTradeHistoryFromClob(token);
       }
     } catch (e) {
       setOpenOrdersErr(`open_orders_failed · ${String(e)}`);
@@ -636,21 +878,42 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     }
   }, [accountMode, token]);
 
+  const refreshMyFills = useCallback(async () => {
+    if (accountMode !== 'live') return;
+    if (!token) return;
+    setMyFillsErr(null);
+    try {
+      const r = await tradeMyFills({ tokenId: token, limit: 40 }, { timeoutMs: 25_000 });
+      if (!isOk(r)) {
+        const e = r as ApiErr;
+        setMyFillsErr(`${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`);
+        setMyFills([]);
+      } else {
+        setMyFills(Array.isArray(r.data.fills) ? r.data.fills : []);
+      }
+    } catch (e) {
+      setMyFillsErr(`my_fills_failed · ${String(e)}`);
+      setMyFills([]);
+    }
+  }, [accountMode, token]);
+
   useEffect(() => {
     if (accountMode !== 'live') return;
     if (!token) return;
     let cancelled = false;
     void (async () => {
       if (!cancelled) await refreshOpenOrders();
+      if (!cancelled) await refreshMyFills();
     })();
     const t = window.setInterval(() => {
       if (!cancelled) void refreshOpenOrders();
+      if (!cancelled) void refreshMyFills();
     }, 5000);
     return () => {
       cancelled = true;
       window.clearInterval(t);
     };
-  }, [accountMode, refreshOpenOrders, token]);
+  }, [accountMode, refreshMyFills, refreshOpenOrders, token]);
 
   const chooseAction = useCallback((a: 'buy' | 'sell') => {
     setAction(a);
@@ -752,43 +1015,229 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     }
   }, [accountMode, paperPos.shares, token, upToken, downToken]);
 
+  // Keep live Sell view feeling instant: when switching to Sell (or swapping lane),
+  // proactively refresh position + open orders in the background and auto-fill sell qty.
+  useEffect(() => {
+    if (accountMode !== 'live') return;
+    if (action !== 'sell') return;
+    if (!token) return;
+    void refreshPositionAndMaxSell();
+    void refreshOpenOrders();
+    refreshAvgEntryThrottled();
+    refreshLiveBalancesThrottled();
+  }, [accountMode, action, token, refreshAvgEntryThrottled, refreshLiveBalancesThrottled, refreshOpenOrders, refreshPositionAndMaxSell]);
+
+  useEffect(() => {
+    if (accountMode !== 'live') return;
+    if (!token) return;
+    const ws = new WebSocket(apiWsUrl('/api/trade/user-ws'));
+    let alive = true;
+    ws.addEventListener('message', (ev) => {
+      if (!alive) return;
+      let msg: unknown;
+      try {
+        msg = JSON.parse(String(ev.data));
+      } catch {
+        return;
+      }
+      if (!msg || typeof msg !== 'object') return;
+      const o = msg as Record<string, unknown>;
+      const assetId = String(o.asset_id ?? '');
+      if (!assetId || (assetId !== upToken && assetId !== downToken)) return;
+      const eventType = String(o.event_type ?? o.type ?? '');
+
+      if (/trade/i.test(eventType)) void fetchLastTradesBoth();
+      void refreshLiveBalances();
+      void refreshOpenOrders();
+      refreshAvgEntryThrottled();
+
+      if (assetId !== token) return;
+
+      const parseWsNum = (v: unknown): number | null => {
+        if (typeof v === 'number' && Number.isFinite(v)) return v;
+        if (typeof v === 'string') {
+          const n = parseFloat(v);
+          if (Number.isFinite(n)) return n;
+        }
+        return null;
+      };
+      const toPrice01 = (raw: number | null): number | null => {
+        if (raw == null || !Number.isFinite(raw) || raw <= 0) return null;
+        if (raw <= 1) return raw;
+        if (raw <= 100) return raw / 100;
+        return null;
+      };
+
+      // Use *exact* trade prints from the user channel to correct displayed fills.
+      // This reduces small (~1–2¢) mismatches vs Polymarket in fast books.
+      if (/trade/i.test(eventType)) {
+        const px01 = toPrice01(parseWsNum(o.my_price01 ?? o.price));
+        const sh = parseWsNum(o.my_size ?? o.size);
+        const side = String(o.my_side ?? o.side ?? '').toLowerCase() === 'sell' ? 'sell' : 'buy';
+        const status = String(o.status ?? '').toUpperCase();
+        const orderIds = new Set<string>();
+        const taker = String(o.taker_order_id ?? '').trim();
+        if (taker) orderIds.add(taker);
+        const makerOrders = o.maker_orders;
+        if (Array.isArray(makerOrders)) {
+          for (const mo of makerOrders) {
+            if (!mo || typeof mo !== 'object') continue;
+            const id = String((mo as Record<string, unknown>).order_id ?? '').trim();
+            if (id) orderIds.add(id);
+          }
+        }
+        if (px01 != null && sh != null && Number.isFinite(sh) && sh > 0 && orderIds.size > 0) {
+          const rows = loadTradeHistory();
+          const match = rows.find(
+            (r) =>
+              r.mode === 'live' &&
+              r.token === token &&
+              r.side === side &&
+              r.orderId &&
+              orderIds.has(r.orderId) &&
+              (r.status === 'sending' || r.status === 'pending' || r.status === 'sent' || r.status === 'partial'),
+          );
+          if (match) {
+            const prevShares = typeof match.shares === 'number' && Number.isFinite(match.shares) ? match.shares : 0;
+            const prevPx = typeof match.fillAvgPrice01 === 'number' && Number.isFinite(match.fillAvgPrice01) ? match.fillAvgPrice01 : null;
+            const nextShares = roundShares4(prevShares + sh);
+            const nextPx =
+              prevPx != null && prevShares > 0
+                ? roundPrice01((prevPx * prevShares + px01 * sh) / Math.max(1e-9, prevShares + sh))
+                : roundPrice01(px01);
+            updateTradeHistoryRow(match.id, {
+              status: status === 'MATCHED' ? 'partial' : 'filled',
+              fillAvgPrice01: nextPx,
+              price01: nextPx,
+              shares: nextShares,
+              usdCents: Math.abs(Math.round(nextPx * nextShares * 100)),
+              auditNote: `user_ws_${status || 'trade'}`,
+              error: undefined,
+            });
+            setHistoryRows(loadTradeHistory());
+          }
+        }
+        void reconcileTradeHistoryFromClob(token);
+      }
+
+      if (pendingPos && pendingPos.token === token) {
+        if (/order/i.test(eventType)) setPendingPos((p) => (p && p.token === token ? { ...p, status: 'live' } : p));
+        if (/trade/i.test(eventType)) {
+          setPendingPos((p) => (p && p.token === token ? { ...p, status: 'filled' } : p));
+          window.setTimeout(() => setPendingPos((p) => (p && p.token === token ? null : p)), 1200);
+        }
+      }
+    });
+    ws.addEventListener('error', () => {
+      alive = false;
+      try {
+        ws.close();
+      } catch {
+        /* ignore */
+      }
+    });
+    ws.addEventListener('close', () => {
+      alive = false;
+    });
+    return () => {
+      alive = false;
+      try {
+        ws.close();
+      } catch {
+        /* ignore */
+      }
+    };
+  }, [
+    accountMode,
+    apiWsUrl,
+    downToken,
+    fetchLastTradesBoth,
+    pendingPos,
+    refreshAvgEntryThrottled,
+    refreshLiveBalances,
+    refreshOpenOrders,
+    token,
+    upToken,
+  ]);
+
+  // Avoid confusing cross-mode UI residue when toggling paper/live.
+  useEffect(() => {
+    setErr(null);
+    setOkMsg(null);
+    setSubmitAbort(null);
+    submitLockRef.current = false;
+    setBusySubmit(false);
+    setPendingPos(null);
+  }, [accountMode]);
+
   const pollRestingOrderFill = useCallback(
-    (rowId: string, orderId: string, submittedSize: number, submittedPrice01: number, quotedPrice01: number | null) => {
+    (rowId: string, orderId: string, submittedSize: number, intendedPrice01: number, quotedPrice01: number | null) => {
       const myGen = liveSubmitGenRef.current;
       const started = performance.now();
+      let lastMatched = 0;
+      let acceptedChecked = false;
       const tick = async () => {
         if (myGen !== liveSubmitGenRef.current) return;
         const res = await tradeGetOrder(orderId);
         if (myGen !== liveSubmitGenRef.current) return;
         if (!isOk(res)) {
-          if (performance.now() - started < 28_000) window.setTimeout(tick, 500);
+          if (performance.now() - started < 120_000) window.setTimeout(tick, 350);
           return;
         }
-        const p = parseRestingOrderSnapshot(res.data);
+        const rowTok = loadTradeHistory().find((r) => r.id === rowId)?.token?.trim();
+        const p = parseRestingOrderSnapshot(res.data, rowTok || undefined);
         const matched = p.matchedShares ?? 0;
         const orig = p.originalShares ?? submittedSize;
         const fullyFilled = orig > 0 ? matched >= orig - 1e-4 : matched > 0;
+        const remaining = orig > 0 ? Math.max(0, orig - matched) : null;
+
+        // Never trust local "submitted" price. After first successful fetch, mirror Polymarket's accepted limit.
+        if (!acceptedChecked) {
+          acceptedChecked = true;
+          const accepted = p.limitPrice01;
+          if (accepted != null && accepted > 0) {
+            updateTradeHistoryRow(rowId, {
+              submittedPrice01: accepted,
+              quotedPrice01: quotedPrice01 ?? undefined,
+            });
+            setHistoryRows(loadTradeHistory());
+            const mismatch = Math.abs(accepted - intendedPrice01) > 5e-6;
+            if (mismatch) {
+              pushToast(
+                'err',
+                `PRICE MISMATCH — DO NOT TRUST UI · intended ${(intendedPrice01 * 100).toFixed(1)}¢ · exchange ${(accepted * 100).toFixed(1)}¢`,
+                12000,
+              );
+            }
+          }
+        }
 
         if (p.isCancelled) {
           updateTradeHistoryRow(rowId, {
             status: 'cancelled',
+            requestedShares: orig,
+            remainingShares: remaining,
             auditNote: p.statusRaw ? `cancelled:${p.statusRaw}` : 'cancelled',
           });
           setHistoryRows(loadTradeHistory());
+          void refreshAvgEntry();
+          void refreshPositionAndMaxSell();
           return;
         }
 
-        const fillPx = p.avgPrice01 ?? submittedPrice01;
-        if (fullyFilled && fillPx != null && fillPx > 0) {
+        const fillPx = p.avgPrice01 != null && p.avgPrice01 > 0 ? p.avgPrice01 : null;
+        if (fullyFilled && fillPx != null) {
           const sh = matched > 0 ? matched : submittedSize;
-          const note = priceAuditNote(quotedPrice01, submittedPrice01, p.avgPrice01);
+          const note = priceAuditNote(quotedPrice01, intendedPrice01, p.avgPrice01);
           updateTradeHistoryRow(rowId, {
             status: 'filled',
-            fillAvgPrice01: p.avgPrice01 ?? submittedPrice01,
-            submittedPrice01,
+            fillAvgPrice01: fillPx,
+            submittedPrice01: p.limitPrice01 ?? undefined,
             quotedPrice01: quotedPrice01 ?? undefined,
             price01: fillPx,
             shares: sh,
+            requestedShares: orig,
+            remainingShares: 0,
             usdCents: Math.abs(Math.round(fillPx * sh * 100)),
             roundTripMs: Math.round(performance.now() - started),
             auditNote: note,
@@ -799,29 +1248,54 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
           return;
         }
 
-        if (performance.now() - started < 28_000) {
-          window.setTimeout(tick, 450);
+        // Update partial fills live (so UI matches Polymarket faster).
+        if (matched > 1e-6 && matched > lastMatched + 1e-6) {
+          lastMatched = matched;
+          updateTradeHistoryRow(rowId, {
+            status: 'partial',
+            fillAvgPrice01: p.avgPrice01 ?? undefined,
+            shares: matched,
+            requestedShares: orig,
+            remainingShares: remaining,
+            price01: fillPx ?? undefined,
+            usdCents: fillPx != null ? Math.abs(Math.round(fillPx * matched * 100)) : null,
+            auditNote: p.avgPrice01 != null ? 'partial_live' : 'partial_live_no_avg',
+          });
+          setHistoryRows(loadTradeHistory());
+          void refreshAvgEntry();
+          void refreshPositionAndMaxSell();
+        }
+
+        if (performance.now() - started < 120_000) {
+          const age = performance.now() - started;
+          const delay = age < 2500 ? 180 : age < 12_000 ? 260 : age < 45_000 ? 420 : 700;
+          window.setTimeout(tick, delay);
           return;
         }
 
         if (matched < 1e-6) {
           updateTradeHistoryRow(rowId, {
             status: 'no_fill',
+            requestedShares: orig,
+            remainingShares: orig,
             auditNote: 'watch_timeout_no_match',
           });
         } else {
           updateTradeHistoryRow(rowId, {
             status: 'partial',
-            fillAvgPrice01: p.avgPrice01,
+            fillAvgPrice01: p.avgPrice01 ?? undefined,
             shares: matched,
-            price01: p.avgPrice01,
-            usdCents: p.avgPrice01 != null ? Math.abs(Math.round(p.avgPrice01 * matched * 100)) : null,
+            requestedShares: orig,
+            remainingShares: remaining,
+            price01: p.avgPrice01 != null && p.avgPrice01 > 0 ? p.avgPrice01 : undefined,
+            usdCents:
+              p.avgPrice01 != null && p.avgPrice01 > 0 ? Math.abs(Math.round(p.avgPrice01 * matched * 100)) : null,
             auditNote: 'watch_timeout_partial',
           });
         }
         setHistoryRows(loadTradeHistory());
       };
-      window.setTimeout(tick, 380);
+      window.setTimeout(tick, 160);
     },
     [refreshAvgEntry, refreshPositionAndMaxSell],
   );
@@ -884,15 +1358,22 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const maxSellStr =
     positionShares != null && positionShares > 0 ? fmtShares(positionShares, 'compact') : accountMode === 'live' && balLoading ? '…' : '—';
 
+  const activeLiveOrderRow = useMemo(() => {
+    if (accountMode !== 'live') return null;
+    const tok = token?.trim();
+    if (!tok) return null;
+    for (const r of historyRows) {
+      if (r.mode !== 'live') continue;
+      if (r.token?.trim() !== tok) continue;
+      if (r.status === 'sending' || r.status === 'pending' || r.status === 'sent' || r.status === 'partial') return r;
+    }
+    return null;
+  }, [accountMode, historyRows, token]);
+
   const maxBuyDisabledReason =
     unit === 'shares' && (mid == null || mid <= 0)
       ? 'Need a valid mid to convert USDC to shares for Max'
       : undefined;
-
-  const liveMarketBuyUsdc = useMemo(() => {
-    if (accountMode !== 'live' || action !== 'buy' || execMode !== 'market' || !amtOk) return null;
-    return resolveLiveMarketBuyUsdc(unit, amtNum, mid);
-  }, [accountMode, action, execMode, amtOk, unit, amtNum, mid]);
 
   const passiveLadder = useMemo(() => {
     if (action !== 'buy') return null;
@@ -929,14 +1410,20 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     };
   }, [action, passiveChunks, passiveLevels, passiveTargetCents, passiveTotalShares]);
 
+  /** Quick max / widget sells: resting limit at best bid (or mid), not a market order. */
   const runMarketSell = async (shares: number) => {
     if (!Number.isFinite(shares) || shares <= 0) return;
     if (!token?.trim()) {
       setErr('Outcome token is not ready yet — wait for this market to finish loading, then retry.');
       return;
     }
+    const pxAgg = executableQuote01 ?? (mid != null && mid > 0 ? roundPrice01(mid) : null);
+    if (pxAgg == null || !Number.isFinite(pxAgg) || pxAgg <= 0 || pxAgg >= 1) {
+      setErr('Need a book bid or mid to price this quick limit sell.');
+      return;
+    }
     if (accountMode === 'paper') {
-      const res = paperTrade({ account: paperAccount, tokenId: token, side: 'sell', shares, price01: mid });
+      const res = paperTrade({ account: paperAccount, tokenId: token, side: 'sell', shares, price01: pxAgg });
       if (!res.ok) {
         setErr(res.error);
       } else {
@@ -945,7 +1432,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         setHistoryRows(
           appendTradeHistory({ ...tradeHistoryMarketMeta,
             mode: 'paper',
-            exec: execMode,
+            exec: 'touch',
             side: 'sell',
             token,
             label,
@@ -964,80 +1451,78 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       setErr('Sell size is too small after rounding to 4 decimal shares.');
       return;
     }
-    liveSubmitGenRef.current += 1;
-    const quoted01 = executableQuote01;
-    const mark01 = mid != null && mid > 0 ? roundPrice01(mid) : null;
-    const optimistic = appendTradeHistoryWithId({ ...tradeHistoryMarketMeta,
-      mode: 'live',
-      exec: 'market',
-      side: 'sell',
-      token,
-      label,
-      price01: quoted01,
-      quotedPrice01: quoted01,
-      submittedPrice01: null,
-      fillAvgPrice01: null,
-      markPrice01: mark01,
-      shares: sellAmt,
-      usdCents: null,
-      status: 'sending',
-    });
-    setHistoryRows(optimistic.rows);
-    const controller = new AbortController();
-    setSubmitAbort(controller);
-    const tClient0 = performance.now();
-    const res = await tradeMarketOrderWithOpts(
-      { token, side: 'sell', amount: sellAmt, signatureType: null },
-      { signal: controller.signal, timeoutMs: 25_000 },
-    );
-    const clientMs = Math.round(performance.now() - tClient0);
-    if (!isOk(res)) {
-      const e = res as ApiErr;
-      setErr(`${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`);
-      setHistoryRows(
-        updateTradeHistoryRow(optimistic.id, {
-          status: 'failed',
-          error: `${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`,
-        }),
+    if (submitLockRef.current) return;
+    submitLockRef.current = true;
+    setBusySubmit(true);
+    try {
+      liveSubmitGenRef.current += 1;
+      const price = roundPrice01(pxAgg);
+      const quoted01 = price;
+      const mark01 = mid != null && mid > 0 ? roundPrice01(mid) : null;
+      const optimistic = appendTradeHistoryWithId({ ...tradeHistoryMarketMeta,
+        mode: 'live',
+        exec: 'touch',
+        side: 'sell',
+        token,
+        label,
+        price01: quoted01,
+        quotedPrice01: quoted01,
+        intendedPrice01: price,
+        submittedPrice01: null,
+        fillAvgPrice01: null,
+        markPrice01: mark01,
+        shares: sellAmt,
+        requestedShares: sellAmt,
+        remainingShares: sellAmt,
+        usdCents: Math.abs(Math.round(price * sellAmt * 100)),
+        status: 'sending',
+      });
+      setHistoryRows(optimistic.rows);
+      const controller = new AbortController();
+      setSubmitAbort(controller);
+      const tClient0 = performance.now();
+      const res = await tradeCreateOrderWithOpts(
+        { token, side: 'sell', price, size: sellAmt, signatureType: null, marketSlug: marketSlug ?? '', outcome: label },
+        { signal: controller.signal, timeoutMs: 25_000 },
       );
-    } else {
-      const { result, execution } = unwrapTradeActionData(res.data);
-      const fill = bestEffortMarketFill(result, { kind: 'sell', requestedShares: sellAmt, mid01: mid });
-      const submitted01 = execution?.submitted_price_01 ?? null;
-      const fillPx = fill.price01;
-      const note = priceAuditNote(quoted01, submitted01, fillPx);
-      const rt = mergeRoundTripMs(execution?.round_trip_ms, clientMs);
-      setLastExecLatencyMs(rt);
-      setHistoryRows(
-        updateTradeHistoryRow(optimistic.id, {
-          status: 'filled',
-          submittedPrice01: submitted01 ?? undefined,
-          fillAvgPrice01: fillPx ?? undefined,
-          price01: fillPx ?? submitted01 ?? quoted01,
-          shares: fill.shares ?? sellAmt,
-          usdCents: fill.usdCents,
-          roundTripMs: rt,
-          orderId: execution?.order_id ?? undefined,
-          auditNote: note,
-          error: undefined,
-        }),
-      );
-      const q = quoted01 != null ? `${(quoted01 * 100).toFixed(1)}¢` : '—';
-      const s = submitted01 != null ? `${(submitted01 * 100).toFixed(1)}¢` : '—';
-      const f = fillPx != null ? `${(fillPx * 100).toFixed(1)}¢` : '—';
-      setOkMsg(`Sold ${(fill.shares ?? sellAmt).toFixed(2)} ${label} · quoted ${q} · sent ${s} · filled ${f} · ${rt}ms`);
-      setSellQty('');
-      void (async () => {
-        const r = await tradeBalanceAllowance({ tokenId: token, assetType: 'conditional' });
-        if (isOk(r)) {
-          const sh = parseOutcomeSharesBalance(r.data.balance);
-          if (token === upToken) setBalUp(sh);
-          else if (token === downToken) setBalDown(sh);
-        }
-        refreshAvgEntry();
-      })();
+      const clientMs = Math.round(performance.now() - tClient0);
+      if (!isOk(res)) {
+        const e = res as ApiErr;
+        setErr(`${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`);
+        setHistoryRows(
+          updateTradeHistoryRow(optimistic.id, {
+            status: 'failed',
+            error: `${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`,
+          }),
+        );
+      } else {
+        const { result, execution } = unwrapTradeActionData(res.data);
+        const oid = execution?.order_id ?? extractOrderIdFromClobPayload(result);
+        const rt = mergeRoundTripMs(execution?.round_trip_ms, clientMs);
+        setLastExecLatencyMs(rt);
+        setHistoryRows(
+          updateTradeHistoryRow(optimistic.id, {
+            status: 'sent',
+            // Don't trust local "submitted price". We will read back the accepted limit from Polymarket via getOrder().
+            submittedPrice01: null,
+            orderId: oid ?? undefined,
+            roundTripMs: rt,
+            price01: quoted01,
+            error: undefined,
+          }),
+        );
+        if (oid) pollRestingOrderFill(optimistic.id, oid, sellAmt, price, quoted01);
+        setOkMsg(`Sell sent · intended ${(price * 100).toFixed(1)}¢ · ack ${rt}ms — reading exchange state…`);
+        void refreshLiveBalances();
+        void refreshOpenOrders();
+        void refreshAvgEntry();
+        setSellQty('');
+      }
+    } finally {
+      submitLockRef.current = false;
+      setBusySubmit(false);
+      setSubmitAbort(null);
     }
-    setSubmitAbort(null);
   };
 
   const isSidebarOnly = visualStyle === 'sidebar';
@@ -1118,7 +1603,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
             </p>
           ) : (
             <p className="mt-1 text-[11px] leading-relaxed text-zinc-500">
-              Smart limit (quick) is the default — chart stays visible. Advanced lets you switch to market or a custom limit.
+              Smart limit (quick) is the default — chart stays visible. Advanced switches between quick and custom limit ¢.
             </p>
           )}
           {accountMode === 'live' ? (
@@ -1311,6 +1796,90 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
           </details>
         ) : null}
 
+        {accountMode === 'live' && activeLiveOrderRow ? (
+          <div className="rounded-xl border border-amber-800/35 bg-amber-950/15 px-3 py-2.5 text-[11px] text-amber-100/90">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div className="min-w-0">
+                <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-amber-200/80">Live order status</div>
+                <div className="mt-1 text-[12px] font-bold text-amber-100">
+                  {activeLiveOrderRow.status === 'partial'
+                    ? 'PARTIALLY FILLED'
+                    : activeLiveOrderRow.status === 'sent'
+                      ? 'RESTING (OPEN)'
+                      : activeLiveOrderRow.status === 'pending'
+                        ? 'PENDING'
+                        : 'SENDING'}
+                </div>
+                <div className="mt-1 flex flex-wrap gap-2 font-mono text-[11px] text-amber-100/85">
+                  <span className="rounded-lg border border-amber-800/30 bg-black/15 px-2 py-1">
+                    filled {activeLiveOrderRow.shares == null ? '—' : activeLiveOrderRow.shares.toFixed(4)}
+                    {activeLiveOrderRow.requestedShares != null ? ` / ${activeLiveOrderRow.requestedShares.toFixed(4)}` : ''}
+                    {activeLiveOrderRow.remainingShares != null ? ` · rem ${activeLiveOrderRow.remainingShares.toFixed(4)}` : ''}
+                  </span>
+                  <span
+                    className={`rounded-lg border bg-black/15 px-2 py-1 ${
+                      activeLiveOrderRow.intendedPrice01 != null &&
+                      activeLiveOrderRow.submittedPrice01 != null &&
+                      Math.abs(activeLiveOrderRow.intendedPrice01 - activeLiveOrderRow.submittedPrice01) > 5e-6
+                        ? 'border-rose-700/40 text-rose-100'
+                        : 'border-amber-800/30'
+                    }`}
+                  >
+                    intended {activeLiveOrderRow.intendedPrice01 == null ? '—' : `${(activeLiveOrderRow.intendedPrice01 * 100).toFixed(1)}¢`}
+                    {' '}· accepted {activeLiveOrderRow.submittedPrice01 == null ? '—' : `${(activeLiveOrderRow.submittedPrice01 * 100).toFixed(1)}¢`}
+                  </span>
+                  <span className="rounded-lg border border-amber-800/30 bg-black/15 px-2 py-1">
+                    avg {activeLiveOrderRow.fillAvgPrice01 == null ? '—' : `${(activeLiveOrderRow.fillAvgPrice01 * 100).toFixed(2)}¢`}
+                  </span>
+                  {activeLiveOrderRow.orderId ? (
+                    <span className="rounded-lg border border-amber-800/30 bg-black/15 px-2 py-1">
+                      oid {activeLiveOrderRow.orderId.slice(0, 6)}…{activeLiveOrderRow.orderId.slice(-4)}
+                    </span>
+                  ) : null}
+                </div>
+              </div>
+              <div className="flex shrink-0 flex-wrap gap-2">
+                <button
+                  type="button"
+                  disabled={!activeLiveOrderRow.orderId}
+                  onClick={async () => {
+                    const oid = activeLiveOrderRow.orderId;
+                    if (!oid) return;
+                    const r = await tradeCancelOrder(oid);
+                    if (!isOk(r)) {
+                      const e = r as ApiErr;
+                      pushToast('err', `${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`);
+                    } else {
+                      pushToast('ok', 'Cancel sent.');
+                      void refreshOpenOrders();
+                      setHistoryRows(loadTradeHistory());
+                    }
+                  }}
+                  className="min-h-[40px] rounded-xl border border-rose-800/40 bg-rose-950/20 px-3 text-[11px] font-black text-rose-100 hover:bg-rose-950/35 disabled:cursor-not-allowed disabled:opacity-40"
+                  title="Cancel the active resting order (requires an order id)"
+                >
+                  Cancel order
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    try {
+                      if (activeLiveOrderRow.orderId) void navigator.clipboard.writeText(activeLiveOrderRow.orderId);
+                    } catch {
+                      /* ignore */
+                    }
+                  }}
+                  disabled={!activeLiveOrderRow.orderId}
+                  className="min-h-[40px] rounded-xl border border-zinc-700/60 bg-black/15 px-3 text-[11px] font-semibold text-zinc-100 hover:bg-black/25 disabled:opacity-40"
+                  title="Copy order id"
+                >
+                  Copy oid
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+
         {!isSlide ? <div className="grid grid-cols-2 gap-2">
           <button
             type="button"
@@ -1443,17 +2012,17 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                 className="mt-0.5 truncate text-[9px] tabular-nums text-zinc-500 sm:text-[10px]"
                 title={`@ ${
                   accountMode === 'paper' && paperUpPos.avgCost01 != null && paperUpPos.avgCost01 > 0
-                    ? `${(paperUpPos.avgCost01 * 100).toFixed(1)}¢`
+                    ? fmtCents(paperUpPos.avgCost01)
                     : avgEntryUp != null
-                      ? `${(avgEntryUp * 100).toFixed(1)}¢`
+                      ? fmtCents(avgEntryUp)
                       : '—'
                 } · mid ${fmtCents(midUpEff)}`}
               >
                 @{' '}
                 {accountMode === 'paper' && paperUpPos.avgCost01 != null && paperUpPos.avgCost01 > 0
-                  ? `${(paperUpPos.avgCost01 * 100).toFixed(1)}¢`
+                  ? fmtCents(paperUpPos.avgCost01)
                   : avgEntryUp != null
-                    ? `${(avgEntryUp * 100).toFixed(1)}¢`
+                    ? fmtCents(avgEntryUp)
                     : '—'}{' '}
                 · mid {fmtCents(midUpEff)}
               </div>
@@ -1473,17 +2042,17 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                 className="mt-0.5 truncate text-[9px] tabular-nums text-zinc-500 sm:text-[10px]"
                 title={`@ ${
                   accountMode === 'paper' && paperDownPos.avgCost01 != null && paperDownPos.avgCost01 > 0
-                    ? `${(paperDownPos.avgCost01 * 100).toFixed(1)}¢`
+                    ? fmtCents(paperDownPos.avgCost01)
                     : avgEntryDown != null
-                      ? `${(avgEntryDown * 100).toFixed(1)}¢`
+                      ? fmtCents(avgEntryDown)
                       : '—'
                 } · mid ${fmtCents(midDownEff)}`}
               >
                 @{' '}
                 {accountMode === 'paper' && paperDownPos.avgCost01 != null && paperDownPos.avgCost01 > 0
-                  ? `${(paperDownPos.avgCost01 * 100).toFixed(1)}¢`
+                  ? fmtCents(paperDownPos.avgCost01)
                   : avgEntryDown != null
-                    ? `${(avgEntryDown * 100).toFixed(1)}¢`
+                    ? fmtCents(avgEntryDown)
                     : '—'}{' '}
                 · mid {fmtCents(midDownEff)}
               </div>
@@ -1572,67 +2141,45 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   {showAdvanced ? 'Hide advanced' : 'Advanced'}
                 </button>
               </div>
-              {!showAdvanced ? (
-                <div className="mt-2 rounded-xl border border-zinc-800/60 bg-zinc-950/30 px-3 py-3">
-                  <TradeSegmentedControl
-                    value={execMode === 'market' ? 'market' : 'limit'}
-                    onChange={(v) => {
-                      const next = v === 'market' ? 'market' : 'touch';
-                      setExecMode(next);
-                      setErr(null);
-                      setOkMsg(null);
-                      if (next === 'touch' && touchLimitCents) setLimitPriceCents(touchLimitCents);
-                    }}
-                    options={[
-                      { value: 'market', label: 'Market', title: 'Fill immediately at the best prices in the book right now' },
-                      { value: 'limit', label: 'Limit', title: 'Smart limit near mid (default)' },
-                    ]}
-                  />
-                </div>
-              ) : null}
-              {showAdvanced ? (
-                <div className="mt-2 space-y-2 rounded-xl border border-zinc-800/60 bg-zinc-950/30 px-3 py-3">
-                  <TradeSegmentedControl
-                    value={execMode}
-                    onChange={(v) => {
-                      setExecMode(v as 'touch' | 'market' | 'limit');
-                      setErr(null);
-                      setOkMsg(null);
-                      if (v === 'touch' && touchLimitCents) setLimitPriceCents(touchLimitCents);
-                      else if (v === 'limit' && defaultLimitCents) setLimitPriceCents(defaultLimitCents);
-                    }}
-                    options={[
-                      { value: 'touch', label: 'Quick', title: 'Places a limit very close to the current price — best for fast clicks' },
-                      { value: 'market', label: 'Market', title: 'Fill immediately at the best prices in the book right now' },
-                      { value: 'limit', label: 'Limit', title: 'You set the price; the order waits until the market comes to you' },
-                    ]}
-                  />
-                  <p className="text-[11px] leading-relaxed text-zinc-500">
-                    {execMode === 'touch'
-                      ? 'Quick: tight limit around the mid — low fuss, good default.'
-                      : execMode === 'market'
-                        ? 'Market: trade now; final price depends on book depth.'
-                        : 'Limit: your price; may take time to fill.'}
-                  </p>
-                </div>
-              ) : null}
+              <div className="mt-2 rounded-xl border border-zinc-800/60 bg-zinc-950/30 px-3 py-3">
+                <p className="mb-2 text-[10px] leading-snug text-zinc-500">
+                  Limit orders only. Quick = auto ¢ near the quote; Custom = you type the ¢. Use Advanced for book tools.
+                </p>
+                <TradeSegmentedControl
+                  value={execMode}
+                  onChange={(v) => {
+                    const next = v as 'touch' | 'limit';
+                    setExecMode(next);
+                    setErr(null);
+                    setOkMsg(null);
+                    if (next === 'touch' && touchLimitCents) setLimitPriceCents(touchLimitCents);
+                    else if (next === 'limit' && defaultLimitCents) setLimitPriceCents(defaultLimitCents);
+                  }}
+                  options={[
+                    { value: 'touch', label: 'Quick', title: 'Resting limit priced tight to the quote' },
+                    { value: 'limit', label: 'Custom', title: 'You set the limit price in cents' },
+                  ]}
+                />
+              </div>
             </div>
           ) : (
             <div className="mt-4">
               <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Order type</div>
               <div className="mt-2 rounded-xl border border-zinc-800/60 bg-zinc-950/30 px-3 py-3">
+                <p className="mb-2 text-[10px] leading-snug text-zinc-500">Limit-only — quick vs custom ¢.</p>
                 <TradeSegmentedControl
-                  value={execMode === 'market' ? 'market' : 'limit'}
+                  value={execMode}
                   onChange={(v) => {
-                    const next = v === 'market' ? 'market' : 'touch';
+                    const next = v as 'touch' | 'limit';
                     setExecMode(next);
                     setErr(null);
                     setOkMsg(null);
                     if (next === 'touch' && touchLimitCents) setLimitPriceCents(touchLimitCents);
+                    else if (next === 'limit' && defaultLimitCents) setLimitPriceCents(defaultLimitCents);
                   }}
                   options={[
-                    { value: 'market', label: 'Market', title: 'Fill immediately at the best prices in the book right now' },
-                    { value: 'limit', label: 'Limit', title: 'Smart limit near mid (default)' },
+                    { value: 'touch', label: 'Quick', title: 'Resting limit priced tight to the quote' },
+                    { value: 'limit', label: 'Custom', title: 'You set the limit price in cents' },
                   ]}
                   className="w-full"
                   size="md"
@@ -1642,50 +2189,36 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
           )}
 
           {!isSlide && showAdvanced ? (
-            <details className="mt-4 rounded-xl border border-zinc-800/60 bg-zinc-950/30">
+            <details className="mt-4 rounded-xl border border-zinc-800/60 bg-zinc-950/30" open>
               <summary className="cursor-pointer px-3 py-2 text-[11px] font-semibold text-zinc-400 hover:text-zinc-300">
-                Advanced entry tools · order book + passive ladder
+                Advanced entry tools · order book + ladder
               </summary>
               <div className="border-t border-zinc-800/50 px-3 py-3">
-            <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Entry mode</div>
-            <TradeSegmentedControl
-              value={buyEntryMode}
-              onChange={(v) => {
-                setBuyEntryMode(v as 'single' | 'passive');
-                setErr(null);
-                setOkMsg(null);
-              }}
-              options={[
-                { value: 'single', label: 'Single', title: 'One order: quick/manual sizing' },
-                { value: 'passive', label: 'Passive ladder', title: 'Many small limit bids across 1–3 levels (no chasing)' },
-              ]}
-            />
-            <div className="mt-3 rounded-xl border border-zinc-800/70 bg-zinc-950/25 p-3">
-              <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Buy from the order book (simple)</div>
-              <div className="mt-2 text-[11px] leading-relaxed text-zinc-400">
-                Click <span className="font-semibold text-zinc-200">Buy now</span> on a price level to take that liquidity at that exact price.
-                If it doesn’t fill quickly, it auto-cancels so you don’t accidentally leave resting orders.
+                <div className="mt-4 space-y-2">
+            <div className="mt-0 rounded-xl border border-zinc-800/70 bg-zinc-950/25 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">From the book</div>
+                <div className="flex flex-wrap gap-1.5 text-[10px] font-mono text-zinc-400">
+                  <span className="rounded border border-zinc-800/60 bg-black/20 px-1.5 py-0.5" title="Best bid (info)">
+                    Bid {bookTouch?.bestBid != null ? `${(bookTouch.bestBid * 100).toFixed(1)}¢` : '—'}
+                  </span>
+                  <span className="rounded border border-zinc-800/60 bg-black/20 px-1.5 py-0.5" title="Best ask (info)">
+                    Ask {bookTouch?.bestAsk != null ? `${(bookTouch.bestAsk * 100).toFixed(1)}¢` : '—'}
+                  </span>
+                  <span className="rounded border border-zinc-800/60 bg-black/20 px-1.5 py-0.5" title="Spread">
+                    Spr{' '}
+                    {bookTouch?.bestBid != null && bookTouch?.bestAsk != null
+                      ? `${Math.max(0, Math.round((bookTouch.bestAsk - bookTouch.bestBid) * 1000) / 10).toFixed(1)}¢`
+                      : '—'}
+                  </span>
+                </div>
               </div>
-              <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-zinc-500">
-                <span className="rounded-lg border border-zinc-800/60 bg-black/20 px-2 py-1 font-mono">
-                  Best bid {bookTouch?.bestBid != null ? `${(bookTouch.bestBid * 100).toFixed(1)}¢` : '—'}
-                </span>
-                <span className="rounded-lg border border-zinc-800/60 bg-black/20 px-2 py-1 font-mono">
-                  Best ask {bookTouch?.bestAsk != null ? `${(bookTouch.bestAsk * 100).toFixed(1)}¢` : '—'}
-                </span>
-                <span className="rounded-lg border border-zinc-800/60 bg-black/20 px-2 py-1 font-mono">
-                  Spread{' '}
-                  {bookTouch?.bestBid != null && bookTouch?.bestAsk != null
-                    ? `${Math.max(0, Math.round((bookTouch.bestAsk - bookTouch.bestBid) * 1000) / 10).toFixed(1)}¢`
-                    : '—'}
-                </span>
-              </div>
-              <div className="mt-2 text-[11px] text-zinc-500">
-                You can also type shares in <span className="font-mono text-zinc-200">Take</span> first.
-              </div>
+              <p className="mt-1.5 text-[11px] leading-snug text-zinc-500">
+                Hit the ask or post a bid. Optional level ladder below.
+              </p>
 
               <div className="mt-3 rounded-xl border border-zinc-800/60 bg-black/20 p-3">
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">1-click buy</div>
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Quick size</div>
                 <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-center">
                   <label className="flex min-w-0 flex-1 items-center gap-2 rounded-lg border border-zinc-800/70 bg-black/25 px-3 py-2">
                     <span className="text-[11px] font-semibold text-zinc-400">Shares</span>
@@ -1697,6 +2230,30 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                       placeholder="5"
                     />
                   </label>
+                  <div className="flex flex-wrap gap-1">
+                    {([5, 10, 25, 50] as const).map((n) => (
+                      <button
+                        key={`book-sh-${n}`}
+                        type="button"
+                        onClick={() => setBuyNowShares(String(n))}
+                        className="rounded-lg border border-zinc-700/60 bg-zinc-900/40 px-2 py-1.5 text-[11px] font-semibold text-zinc-200 hover:bg-zinc-800/60"
+                      >
+                        {n}
+                      </button>
+                    ))}
+                    <button
+                      type="button"
+                      disabled={estShares == null || !Number.isFinite(estShares) || estShares <= 0}
+                      title="Copy estimated shares from your main order size above"
+                      onClick={() => {
+                        if (estShares == null || !Number.isFinite(estShares) || estShares <= 0) return;
+                        setBuyNowShares(String(Math.max(0.01, floorShares4(estShares))));
+                      }}
+                      className="rounded-lg border border-emerald-800/45 bg-emerald-950/25 px-2 py-1.5 text-[11px] font-bold text-emerald-100 hover:bg-emerald-950/40 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      = order
+                    </button>
+                  </div>
                   <label className="flex min-w-0 flex-1 items-center gap-2 rounded-lg border border-zinc-800/70 bg-black/25 px-3 py-2">
                     <span className="text-[11px] font-semibold text-zinc-400">Bid (¢)</span>
                     <input
@@ -1792,38 +2349,70 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                           return;
                         }
 
+                        liveSubmitGenRef.current += 1;
+                        const quoted01 = roundPrice01(bestAsk);
+                        const mark01 = mid != null && mid > 0 ? roundPrice01(mid) : null;
+                        const optimistic = appendTradeHistoryWithId({
+                          ...tradeHistoryMarketMeta,
+                          mode: 'live',
+                          exec: 'limit',
+                          side: 'buy',
+                          token,
+                          label,
+                          price01: quoted01,
+                          quotedPrice01: quoted01,
+                          intendedPrice01: bestAsk,
+                          submittedPrice01: null,
+                          fillAvgPrice01: null,
+                          markPrice01: mark01,
+                          shares: sharesReq,
+                          requestedShares: sharesReq,
+                          remainingShares: sharesReq,
+                          usdCents: Math.abs(Math.round(bestAsk * sharesReq * 100)),
+                          status: 'sending',
+                        });
+                        setHistoryRows(optimistic.rows);
+                        const tClient0 = performance.now();
                         const res = await tradeCreateOrderWithOpts(
-                          { token, side: 'buy', price: bestAsk, size: sharesReq, signatureType: null },
+                          { token, side: 'buy', price: bestAsk, size: sharesReq, signatureType: null, marketSlug: marketSlug ?? '', outcome: label },
                           { timeoutMs: 25_000 },
                         );
+                        const clientMs = Math.round(performance.now() - tClient0);
                         if (!isOk(res)) {
                           const e = res as ApiErr;
                           setErr(`${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`);
+                          setHistoryRows(
+                            updateTradeHistoryRow(optimistic.id, {
+                              status: 'failed',
+                              error: `${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`,
+                            }),
+                          );
                           return;
                         }
                         const { result, execution } = unwrapTradeActionData(res.data);
                         const oid = execution?.order_id ?? extractOrderIdFromClobPayload(result);
+                        const rt = mergeRoundTripMs(execution?.round_trip_ms, clientMs);
+                        setLastExecLatencyMs(rt);
                         setHistoryRows(
-                          appendTradeHistory({
-                            ...tradeHistoryMarketMeta,
-                            mode: 'live',
-                            exec: 'limit',
-                            side: 'buy',
-                            token,
-                            label,
-                            price01: bestAsk,
-                            shares: sharesReq,
-                            usdCents: Math.abs(Math.round(bestAsk * sharesReq * 100)),
+                          updateTradeHistoryRow(optimistic.id, {
                             status: 'sent',
-                            orderId: oid ?? null,
+                            submittedPrice01: null,
+                            orderId: oid ?? undefined,
+                            roundTripMs: rt,
+                            price01: quoted01,
+                            error: undefined,
                           }),
                         );
                         if (oid) {
+                          pollRestingOrderFill(optimistic.id, oid, sharesReq, bestAsk, quoted01);
                           window.setTimeout(() => {
                             void tradeCancelOrder(oid);
                           }, cancelMs);
                         }
-                        setOkMsg(`Buy best ask sent ${sharesReq.toFixed(2)} ${label} @ ${(bestAsk * 100).toFixed(1)}¢`);
+                        setOkMsg(`Buy sent · intended ${(bestAsk * 100).toFixed(1)}¢ — reading exchange state…`);
+                        void refreshLiveBalances();
+                        void refreshOpenOrders();
+                        void refreshAvgEntry();
                       } finally {
                         setBusySubmit(false);
                         submitLockRef.current = false;
@@ -1886,33 +2475,65 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                           return;
                         }
 
+                        liveSubmitGenRef.current += 1;
+                        const quoted01 = roundPrice01(px01);
+                        const mark01 = mid != null && mid > 0 ? roundPrice01(mid) : null;
+                        const optimistic = appendTradeHistoryWithId({
+                          ...tradeHistoryMarketMeta,
+                          mode: 'live',
+                          exec: 'limit',
+                          side: 'buy',
+                          token,
+                          label,
+                          price01: quoted01,
+                          quotedPrice01: quoted01,
+                          intendedPrice01: px01,
+                          submittedPrice01: null,
+                          fillAvgPrice01: null,
+                          markPrice01: mark01,
+                          shares: sharesReq,
+                          requestedShares: sharesReq,
+                          remainingShares: sharesReq,
+                          usdCents: Math.abs(Math.round(px01 * sharesReq * 100)),
+                          status: 'sending',
+                        });
+                        setHistoryRows(optimistic.rows);
+                        const tClient0 = performance.now();
                         const res = await tradeCreateOrderWithOpts(
-                          { token, side: 'buy', price: px01, size: sharesReq, signatureType: null },
+                          { token, side: 'buy', price: px01, size: sharesReq, signatureType: null, marketSlug: marketSlug ?? '', outcome: label },
                           { timeoutMs: 25_000 },
                         );
+                        const clientMs = Math.round(performance.now() - tClient0);
                         if (!isOk(res)) {
                           const e = res as ApiErr;
                           setErr(`${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`);
+                          setHistoryRows(
+                            updateTradeHistoryRow(optimistic.id, {
+                              status: 'failed',
+                              error: `${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`,
+                            }),
+                          );
                           return;
                         }
                         const { result, execution } = unwrapTradeActionData(res.data);
                         const oid = execution?.order_id ?? extractOrderIdFromClobPayload(result);
+                        const rt = mergeRoundTripMs(execution?.round_trip_ms, clientMs);
+                        setLastExecLatencyMs(rt);
                         setHistoryRows(
-                          appendTradeHistory({
-                            ...tradeHistoryMarketMeta,
-                            mode: 'live',
-                            exec: 'limit',
-                            side: 'buy',
-                            token,
-                            label,
-                            price01: px01,
-                            shares: sharesReq,
-                            usdCents: Math.abs(Math.round(px01 * sharesReq * 100)),
+                          updateTradeHistoryRow(optimistic.id, {
                             status: 'sent',
-                            orderId: oid ?? null,
+                            submittedPrice01: null,
+                            orderId: oid ?? undefined,
+                            roundTripMs: rt,
+                            price01: quoted01,
+                            error: undefined,
                           }),
                         );
-                        setOkMsg(`Bid placed: buy ${sharesReq.toFixed(2)} ${label} @ ${(px01 * 100).toFixed(1)}¢ (waiting)`);
+                        if (oid) pollRestingOrderFill(optimistic.id, oid, sharesReq, px01, quoted01);
+                        setOkMsg(`Bid placed · intended ${(px01 * 100).toFixed(1)}¢ — reading exchange state…`);
+                        void refreshLiveBalances();
+                        void refreshOpenOrders();
+                        void refreshAvgEntry();
                       } finally {
                         setBusySubmit(false);
                         submitLockRef.current = false;
@@ -2011,7 +2632,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                               }
 
                               const res = await tradeCreateOrderWithOpts(
-                                { token, side: 'buy', price: l.price, size: takeNum, signatureType: null },
+                                { token, side: 'buy', price: l.price, size: takeNum, signatureType: null, marketSlug: marketSlug ?? '', outcome: label },
                                 { timeoutMs: 25_000 },
                               );
                               if (!isOk(res)) {
@@ -2056,6 +2677,24 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                 </div>
               </div>
               </details>
+
+            </div>
+
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Size mode</span>
+              <TradeSegmentedControl
+                value={buyEntryMode}
+                onChange={(v) => {
+                  setBuyEntryMode(v as 'single' | 'passive');
+                  setErr(null);
+                  setOkMsg(null);
+                }}
+                options={[
+                  { value: 'single', label: 'One order', title: 'Main buy button below' },
+                  { value: 'passive', label: 'Ladder', title: 'Split into several resting bids' },
+                ]}
+              />
+            </div>
             {buyEntryMode === 'passive' ? (
               <div className="rounded-xl border border-zinc-800/70 bg-zinc-950/25 p-3">
                 <div className="grid gap-2 sm:grid-cols-4">
@@ -2101,10 +2740,9 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   </label>
                 </div>
 
-                <div className="mt-2 text-[11px] leading-relaxed text-zinc-500">
-                  Places multiple small <span className="font-semibold text-zinc-300">limit buys</span> at your bid levels and waits for sellers to hit them
-                  (no chasing upward).
-                </div>
+                <p className="mt-2 text-[11px] leading-snug text-zinc-500">
+                  Splits size into small resting bids (not for Market mode on live).
+                </p>
 
                 <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
                   <div className="text-[11px] text-zinc-400">
@@ -2114,9 +2752,9 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   </div>
                   <button
                     type="button"
-                    disabled={busySubmit || passiveLadder == null || !token?.trim() || accountMode === 'live' && execMode === 'market'}
+                    disabled={busySubmit || passiveLadder == null || !token?.trim()}
                     className="rounded-xl border border-emerald-800/45 bg-emerald-950/25 px-4 py-2 text-[12px] font-bold text-emerald-100 hover:bg-emerald-950/35 disabled:cursor-not-allowed disabled:opacity-40"
-                    title={execMode === 'market' ? 'Passive ladder uses resting limit orders (switch off Market).' : 'Place multiple small limit bids.'}
+                    title="Place multiple small limit bids."
                     onClick={async () => {
                       if (submitLockRef.current) return;
                       submitLockRef.current = true;
@@ -2159,7 +2797,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                         // Live: place multiple small GTC limit orders (resting).
                         for (const leg of passiveLadder.plan) {
                           const res = await tradeCreateOrderWithOpts(
-                            { token, side: 'buy', price: leg.price01, size: leg.shares, signatureType: null },
+                            { token, side: 'buy', price: leg.price01, size: leg.shares, signatureType: null, marketSlug: marketSlug ?? '', outcome: label },
                             { timeoutMs: 25_000 },
                           );
                           if (!isOk(res)) {
@@ -2305,77 +2943,92 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
             </button>
           </div>
 
-          {execMode !== 'market' ? (
-            <div className="mt-4">
-              <label htmlFor={idLimitBuy} className="text-xs font-semibold text-zinc-400">
-                Price (¢)
-              </label>
-              <div className="mt-1 rounded-xl border border-zinc-800/70 bg-black/25 px-3 py-3 focus-within:border-zinc-600/70">
-                <input
-                  id={idLimitBuy}
-                  value={limitPriceCents}
-                  onChange={(e) => setLimitPriceCents(e.target.value)}
-                  inputMode="numeric"
-                  aria-describedby={`${idLimitBuy}-hint`}
-                  className="min-h-[44px] w-full bg-transparent text-lg font-semibold tabular-nums text-zinc-100 outline-none"
-                  placeholder={execMode === 'touch' ? touchLimitCents || defaultLimitCents || '50' : defaultLimitCents || '50'}
-                />
-              </div>
-              <p id={`${idLimitBuy}-hint`} className="mt-1 text-[11px] text-zinc-500">
-                {execMode === 'touch'
-                  ? `Quick mode uses a fast limit near mid (≤ ${limitPriceCents || touchLimitCents || defaultLimitCents || '—'}¢).`
-                  : `Your buy fills when the market trades at or below ${limitPriceCents || defaultLimitCents || '—'}¢.`}
-              </p>
+          <div className="mt-4">
+            <label htmlFor={idLimitBuy} className="text-xs font-semibold text-zinc-400">
+              Price (¢)
+            </label>
+            <div className="mt-1 rounded-xl border border-zinc-800/70 bg-black/25 px-3 py-3 focus-within:border-zinc-600/70">
+              <input
+                id={idLimitBuy}
+                value={limitPriceCents}
+                onChange={(e) => setLimitPriceCents(e.target.value)}
+                inputMode="numeric"
+                aria-describedby={`${idLimitBuy}-hint`}
+                className="min-h-[44px] w-full bg-transparent text-lg font-semibold tabular-nums text-zinc-100 outline-none"
+                placeholder={execMode === 'touch' ? touchLimitCents || defaultLimitCents || '50' : defaultLimitCents || '50'}
+              />
             </div>
-          ) : null}
-
-          <div className="mt-4 rounded-xl border border-zinc-800/70 bg-black/20 p-3 text-sm text-zinc-300">
-            <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Estimation preview</div>
-            {outcomeLocked ? (
-              <p className="mt-2 rounded-lg border border-amber-800/30 bg-amber-950/15 px-2 py-1.5 text-[11px] leading-relaxed text-amber-100/90">
-                Locked price detected ({midIsExtremeLow ? '≈0¢' : midIsExtremeHigh ? '≈100¢' : 'extreme'}). Preview + buying are disabled to avoid
-                invalid “infinite shares” math.
-              </p>
-            ) : null}
-            <div className="mt-2 flex items-center justify-between">
-              <div className="text-zinc-500">Price / share</div>
-              <div className="font-mono tabular-nums">
-                {outcomeLocked ? (midIsExtremeLow ? '0.0¢ (locked)' : midIsExtremeHigh ? '100.0¢ (locked)' : fmtCents(mid)) : fmtCents(mid)}
-              </div>
+            <p id={`${idLimitBuy}-hint`} className="mt-1 text-[11px] text-zinc-500">
+              {execMode === 'touch'
+                ? `Quick mode uses a fast limit near mid (≤ ${limitPriceCents || touchLimitCents || defaultLimitCents || '—'}¢).`
+                : `Your buy fills when the market trades at or below ${limitPriceCents || defaultLimitCents || '—'}¢.`}
+            </p>
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {quickLimitBuyPresets.map((p) => (
+                <button
+                  key={`qbuy-${p.key}`}
+                  type="button"
+                  onClick={() => {
+                    setExecMode('limit');
+                    setLimitPriceCents(String(p.cents));
+                    setErr(null);
+                    setOkMsg(null);
+                  }}
+                  className="rounded-lg border border-zinc-700/60 bg-zinc-900/45 px-2 py-1 text-[10px] font-bold text-zinc-200 hover:bg-zinc-800/70"
+                >
+                  {p.label}
+                </button>
+              ))}
             </div>
-            <div className="mt-2 flex items-center justify-between">
-              <div className="text-zinc-500">Est. shares</div>
-              <div className="font-mono tabular-nums">{estShares == null ? '—' : estShares.toFixed(2)}</div>
-            </div>
-            <div className="mt-2 flex items-center justify-between">
-              <div className="text-zinc-500">Cost</div>
-              <div className="font-mono tabular-nums">{estCost == null ? '—' : `$${estCost.toFixed(2)}`}</div>
-            </div>
-            {liveMarketBuyUsdc?.ok === true && liveMarketBuyUsdc.minAdjusted ? (
-              <p className="mt-2 rounded-lg border border-amber-800/30 bg-amber-950/15 px-2 py-1.5 text-[11px] leading-relaxed text-amber-100/90">
-                Live <span className="font-medium">Market</span> buy: notional was just under $1, so the request is rounded up to{' '}
-                <span className="font-mono font-semibold">${liveMarketBuyUsdc.usd.toFixed(2)}</span> (exchange minimum).
-              </p>
-            ) : null}
-            {liveMarketBuyUsdc?.ok === false ? (
-              <p className="mt-2 rounded-lg border border-rose-900/35 bg-rose-950/15 px-2 py-1.5 text-[11px] leading-relaxed text-rose-100/90">
-                {liveMarketBuyUsdc.hint}
-              </p>
-            ) : null}
-            <div className="mt-2 flex items-center justify-between">
-              <div className="text-zinc-500">Potential payout</div>
-              <div className="font-mono tabular-nums text-emerald-200">{payout == null ? '—' : `$${payout.toFixed(2)}`}</div>
-            </div>
-            <div className="mt-2 flex items-center justify-between">
-              <div className="text-zinc-500">Potential profit</div>
-              <div className="font-mono tabular-nums text-emerald-200">{profit == null ? '—' : `$${profit.toFixed(2)}`}</div>
-            </div>
-            {isSlide && mid != null && execMode === 'touch' ? (
-              <p className="mt-2 border-t border-zinc-800/50 pt-2 text-[10px] leading-relaxed text-zinc-500">
-                Preview: +5¢ / −2¢ vs mid — reference only (not a bracket order on the CLOB yet).
-              </p>
-            ) : null}
+            <p className="mt-2 text-[10px] text-zinc-500">Then tap the main <span className="text-zinc-400">Buy</span> below.</p>
           </div>
+
+          <details
+            open={!isSlide}
+            className="group mt-4 rounded-xl border border-zinc-800/70 bg-black/20 text-sm text-zinc-300 open:pb-0"
+          >
+            <summary className="flex cursor-pointer list-none items-center justify-between gap-2 px-3 py-2.5 marker:content-none [&::-webkit-details-marker]:hidden">
+              <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Order estimate</span>
+              <span className="shrink-0 font-mono text-[12px] tabular-nums text-zinc-200">
+                {estCost != null ? `$${estCost.toFixed(2)}` : '—'} · {estShares != null ? `${estShares.toFixed(2)} sh` : '—'}
+              </span>
+            </summary>
+            <div className="border-t border-zinc-800/50 px-3 pb-3 pt-2">
+              {outcomeLocked ? (
+                <p className="rounded-lg border border-amber-800/30 bg-amber-950/15 px-2 py-1.5 text-[11px] leading-relaxed text-amber-100/90">
+                  Locked price detected ({midIsExtremeLow ? '≈0¢' : midIsExtremeHigh ? '≈100¢' : 'extreme'}). Preview + buying are disabled to avoid invalid
+                  “infinite shares” math.
+                </p>
+              ) : null}
+              <div className="flex items-center justify-between">
+                <div className="text-zinc-500">Price / share</div>
+                <div className="font-mono tabular-nums">
+                  {outcomeLocked ? (midIsExtremeLow ? '0¢ (locked)' : midIsExtremeHigh ? '100¢ (locked)' : fmtCents(mid)) : fmtCents(mid)}
+                </div>
+              </div>
+              <div className="mt-2 flex items-center justify-between">
+                <div className="text-zinc-500">Est. shares</div>
+                <div className="font-mono tabular-nums">{estShares == null ? '—' : estShares.toFixed(2)}</div>
+              </div>
+              <div className="mt-2 flex items-center justify-between">
+                <div className="text-zinc-500">Cost</div>
+                <div className="font-mono tabular-nums">{estCost == null ? '—' : `$${estCost.toFixed(2)}`}</div>
+              </div>
+              <div className="mt-2 flex items-center justify-between">
+                <div className="text-zinc-500">Potential payout</div>
+                <div className="font-mono tabular-nums text-emerald-200">{payout == null ? '—' : `$${payout.toFixed(2)}`}</div>
+              </div>
+              <div className="mt-2 flex items-center justify-between">
+                <div className="text-zinc-500">Potential profit</div>
+                <div className="font-mono tabular-nums text-emerald-200">{profit == null ? '—' : `$${profit.toFixed(2)}`}</div>
+              </div>
+              {isSlide && mid != null && execMode === 'touch' ? (
+                <p className="mt-2 border-t border-zinc-800/50 pt-2 text-[10px] leading-relaxed text-zinc-500">
+                  Preview: +5¢ / −2¢ vs mid — reference only (not a bracket order on the CLOB yet).
+                </p>
+              ) : null}
+            </div>
+          </details>
 
           {targets ? (
             <div className="mt-3 rounded-xl border border-zinc-800/70 bg-zinc-950/25 p-3">
@@ -2399,6 +3052,11 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                 <div className="rounded-lg border border-emerald-800/45 bg-emerald-950/20 px-3 py-2">
                   <div className="text-[10px] font-semibold uppercase tracking-wide text-emerald-200/80">{targets.sideLabel}</div>
                   <div className="mt-1 font-mono text-lg font-black tabular-nums text-emerald-100">{targets.tpCents}¢</div>
+                  <div className="mt-1 text-[10px] text-emerald-200/70">
+                    {targets.quoteCents ? (
+                      <>Δ {Number(targets.tpCents) >= Number(targets.quoteCents) ? '+' : ''}{(Number(targets.tpCents) - Number(targets.quoteCents)).toFixed(1)}¢ vs quote</>
+                    ) : null}
+                  </div>
                   <button
                     type="button"
                     className="mt-2 w-full rounded-lg border border-emerald-700/40 bg-emerald-500/15 px-3 py-2 text-[11px] font-bold text-emerald-100 hover:bg-emerald-500/20"
@@ -2411,10 +3069,38 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   >
                     Use as limit price
                   </button>
+                  {positionShares != null && positionShares > 0 ? (
+                    <div className="mt-2 grid grid-cols-3 gap-2">
+                      {[0.25, 0.5, 1].map((pct) => (
+                        <button
+                          key={`tp-${pct}`}
+                          type="button"
+                          className="rounded-lg border border-emerald-700/30 bg-black/20 px-2 py-1.5 text-[10px] font-bold text-emerald-100 hover:bg-black/30"
+                          title="Switch to Sell, set limit, set size"
+                          onClick={() => {
+                            chooseAction('sell');
+                            setExecMode('limit');
+                            setLimitPriceCents(targets.tpCents);
+                            const sh = floorShares4(positionShares * pct);
+                            setSellQty(sh > 0 ? String(sh) : '0');
+                            setErr(null);
+                            setOkMsg(null);
+                          }}
+                        >
+                          Sell {Math.round(pct * 100)}%
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
                 <div className="rounded-lg border border-rose-800/40 bg-rose-950/15 px-3 py-2">
                   <div className="text-[10px] font-semibold uppercase tracking-wide text-rose-200/80">Stop / invalidation</div>
                   <div className="mt-1 font-mono text-lg font-black tabular-nums text-rose-100">{targets.stopCents}¢</div>
+                  <div className="mt-1 text-[10px] text-rose-200/70">
+                    {targets.quoteCents ? (
+                      <>Δ {Number(targets.stopCents) >= Number(targets.quoteCents) ? '+' : ''}{(Number(targets.stopCents) - Number(targets.quoteCents)).toFixed(1)}¢ vs quote</>
+                    ) : null}
+                  </div>
                   <button
                     type="button"
                     className="mt-2 w-full rounded-lg border border-rose-700/40 bg-rose-500/10 px-3 py-2 text-[11px] font-bold text-rose-100 hover:bg-rose-500/15"
@@ -2427,27 +3113,45 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   >
                     Use as limit price
                   </button>
+                  {positionShares != null && positionShares > 0 ? (
+                    <div className="mt-2 grid grid-cols-3 gap-2">
+                      {[0.25, 0.5, 1].map((pct) => (
+                        <button
+                          key={`stop-${pct}`}
+                          type="button"
+                          className="rounded-lg border border-rose-700/30 bg-black/20 px-2 py-1.5 text-[10px] font-bold text-rose-100 hover:bg-black/30"
+                          title="Switch to Sell, set limit, set size"
+                          onClick={() => {
+                            chooseAction('sell');
+                            setExecMode('limit');
+                            setLimitPriceCents(targets.stopCents);
+                            const sh = floorShares4(positionShares * pct);
+                            setSellQty(sh > 0 ? String(sh) : '0');
+                            setErr(null);
+                            setOkMsg(null);
+                          }}
+                        >
+                          Sell {Math.round(pct * 100)}%
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
               </div>
             </div>
           ) : null}
 
-          <button
-            type="button"
-            disabled={
-              busySubmit ||
-              outcomeLocked ||
-              !amtOk ||
-              (execMode !== 'market' && (limit01 == null || !Number.isFinite(limit01))) ||
-              (liveMarketBuyUsdc != null && !liveMarketBuyUsdc.ok)
-            }
-            aria-busy={busySubmit}
-            className={`mt-4 w-full rounded-xl px-4 py-3 text-sm font-black text-black disabled:cursor-not-allowed disabled:opacity-40 ${
-              isSlide
-                ? 'min-h-[48px] bg-emerald-400/70 shadow-none hover:bg-emerald-300/80'
-                : 'min-h-[52px] bg-emerald-400 shadow-lg shadow-emerald-950/30 hover:bg-emerald-300'
-            } ${isSlide ? 'inline-flex items-center justify-center gap-2' : ''}`}
-            onClick={async () => {
+          <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto] sm:items-stretch">
+            <button
+              type="button"
+              disabled={busySubmit || outcomeLocked || !amtOk || limit01 == null || !Number.isFinite(limit01)}
+              aria-busy={busySubmit}
+              className={`w-full rounded-xl px-4 py-3 text-sm font-black text-black disabled:cursor-not-allowed disabled:opacity-40 ${
+                isSlide
+                  ? 'min-h-[48px] bg-emerald-400/70 shadow-none hover:bg-emerald-300/80'
+                  : 'min-h-[52px] bg-emerald-400 shadow-lg shadow-emerald-950/30 hover:bg-emerald-300'
+              } ${isSlide ? 'inline-flex items-center justify-center gap-2' : ''}`}
+              onClick={async () => {
               if (submitLockRef.current) return;
               submitLockRef.current = true;
               playTradeClick();
@@ -2460,176 +3164,83 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   return;
                 }
                 if (accountMode === 'paper') {
-                  const px = execMode === 'market' ? mid : limit01;
+                  const px = limit01;
                   const shares = unit === 'shares' ? amtNum : px != null && px > 0 ? amtNum / px : NaN;
-                  if (execMode === 'market') {
-                    const r = paperTrade({ account: paperAccount, tokenId: token, side: 'buy', shares, price01: px });
-                    if (!r.ok) {
-                      setErr(r.error);
-                      setHistoryRows(
-                        appendTradeHistory({ ...tradeHistoryMarketMeta,
-                          mode: 'paper',
-                          exec: execMode,
-                          side: 'buy',
-                          token,
-                          label,
-                          price01: px ?? null,
-                          shares: Number.isFinite(shares) ? shares : null,
-                          usdCents: null,
-                          status: 'error',
-                          error: r.error,
-                        }),
-                      );
-                    } else {
-                      setPaperAccount(r.account);
-                      setOkMsg(`Paper bought ${shares.toFixed(2)} sh of ${label} @ ${(px! * 100).toFixed(1)}¢`);
-                      setHistoryRows(
-                        appendTradeHistory({ ...tradeHistoryMarketMeta,
-                          mode: 'paper',
-                          exec: execMode,
-                          side: 'buy',
-                          token,
-                          label,
-                          price01: r.fill.price01,
-                          shares: r.fill.shares,
-                          usdCents: Math.abs(r.fill.usdCents),
-                          status: 'filled',
-                        }),
-                      );
-                    }
+                  // Limit/touch in paper mode: rest if not marketable, auto-fill later when mid crosses.
+                  if (mid == null || limit01 == null) {
+                    setErr('Need a valid mid and limit price.');
                   } else {
-                    // Limit/touch in paper mode: rest if not marketable, auto-fill later when mid crosses.
-                    if (mid == null || limit01 == null) {
-                      setErr('Need a valid mid and limit price.');
-                    } else {
-                      const limit = limit01;
-                      const marketable = mid <= limit;
-                      if (marketable) {
-                        const r = paperTrade({ account: paperAccount, tokenId: token, side: 'buy', shares, price01: Math.min(mid, limit) });
-                        if (!r.ok) setErr(r.error);
-                        else {
-                          setPaperAccount(r.account);
-                          setOkMsg(`Paper filled buy ${shares.toFixed(2)} sh of ${label}`);
-                          setHistoryRows(
-                            appendTradeHistory({ ...tradeHistoryMarketMeta,
-                              mode: 'paper',
-                              exec: execMode,
-                              side: 'buy',
-                              token,
-                              label,
-                              price01: r.fill.price01,
-                              shares: r.fill.shares,
-                              usdCents: Math.abs(r.fill.usdCents),
-                              status: 'filled',
-                            }),
-                          );
-                        }
-                      } else {
-                        const o = addPaperOrder({ tokenId: token, side: 'buy', limit01: limit, shares });
-                        setOkMsg(`Paper order resting: buy ${shares.toFixed(2)} sh ≤ ${(limit * 100).toFixed(1)}¢`);
+                    const limit = limit01;
+                    const marketable = mid <= limit;
+                    if (marketable) {
+                      const r = paperTrade({ account: paperAccount, tokenId: token, side: 'buy', shares, price01: Math.min(mid, limit) });
+                      if (!r.ok) setErr(r.error);
+                      else {
+                        setPaperAccount(r.account);
+                        setOkMsg(`Paper filled buy ${shares.toFixed(2)} sh of ${label}`);
                         setHistoryRows(
                           appendTradeHistory({ ...tradeHistoryMarketMeta,
-                            id: o.id,
-                            ts: o.createdAt,
                             mode: 'paper',
                             exec: execMode,
                             side: 'buy',
                             token,
                             label,
-                            price01: limit,
-                            shares,
-                            usdCents: Math.abs(Math.round(limit * shares * 100)),
-                            status: 'sent',
+                            price01: r.fill.price01,
+                            shares: r.fill.shares,
+                            usdCents: Math.abs(r.fill.usdCents),
+                            status: 'filled',
                           }),
                         );
                       }
+                    } else {
+                      const o = addPaperOrder({ tokenId: token, side: 'buy', limit01: limit, shares });
+                      setOkMsg(`Paper order resting: buy ${shares.toFixed(2)} sh ≤ ${(limit * 100).toFixed(1)}¢`);
+                      setHistoryRows(
+                        appendTradeHistory({ ...tradeHistoryMarketMeta,
+                          id: o.id,
+                          ts: o.createdAt,
+                          mode: 'paper',
+                          exec: execMode,
+                          side: 'buy',
+                          token,
+                          label,
+                          price01: limit,
+                          shares,
+                          usdCents: Math.abs(Math.round(limit * shares * 100)),
+                          status: 'sent',
+                        }),
+                      );
                     }
                   }
                   return;
                 }
-                if (execMode === 'market') {
-                  if (!token?.trim()) {
-                    setErr('Outcome token is not ready yet — wait for this market to finish loading, then retry.');
-                    return;
-                  }
-                  const resolved = resolveLiveMarketBuyUsdc(unit, amtNum, mid);
-                  if (!resolved.ok) {
-                    setErr(resolved.hint);
-                    return;
-                  }
-                  liveSubmitGenRef.current += 1;
-                  const amountUsd = resolved.usd;
-                  const quoted01 = executableQuote01;
-                  const mark01 = mid != null && mid > 0 ? roundPrice01(mid) : null;
-                  const optimistic = appendTradeHistoryWithId({ ...tradeHistoryMarketMeta,
-                    mode: 'live',
-                    exec: 'market',
-                    side: 'buy',
-                    token,
-                    label,
-                    price01: quoted01,
-                    quotedPrice01: quoted01,
-                    submittedPrice01: null,
-                    fillAvgPrice01: null,
-                    markPrice01: mark01,
-                    shares: unit === 'shares' && Number.isFinite(amtNum) ? roundShares4(amtNum) : null,
-                    usdCents: Math.abs(Math.round(amountUsd * 100)),
-                    status: 'sending',
-                  });
-                  setHistoryRows(optimistic.rows);
-                  const controller = new AbortController();
-                  setSubmitAbort(controller);
-                  const tClient0 = performance.now();
-                  const res = await tradeMarketOrderWithOpts(
-                    { token, side: 'buy', amount: amountUsd, signatureType: null },
-                    { signal: controller.signal, timeoutMs: 25_000 },
-                  );
-                  const clientMs = Math.round(performance.now() - tClient0);
-                  if (!isOk(res)) {
-                    const e = res as ApiErr;
-                    setErr(`${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`);
-                    setHistoryRows(
-                      updateTradeHistoryRow(optimistic.id, {
-                        status: 'failed',
-                        error: `${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`,
-                      }),
-                    );
+                // Instant local position preview for LIVE submits.
+                // This is corrected by user-channel events + background balance refresh.
+                if (token?.trim()) {
+                  const pxPreview = limit01;
+                  const px =
+                    pxPreview != null && Number.isFinite(pxPreview) && pxPreview > 0 && pxPreview < 1 ? pxPreview : null;
+                  if (unit === 'dollars') {
+                    // For $-based market buys, shares are not knowable until fill; do not guess.
+                    const usd = Number.isFinite(amtNum) && amtNum > 0 ? roundUsd2(amtNum) : 0;
+                    if (usd > 0) {
+                      setPendingPos({ token, side: 'buy', kind: 'usd', usd, price01: px, status: 'submitting', createdAt: Date.now() });
+                    }
                   } else {
-                    const { result, execution } = unwrapTradeActionData(res.data);
-                    const fill = bestEffortMarketFill(result, {
-                      kind: 'buy',
-                      amountUsd,
-                      mid01: mid,
-                      requestedShares: unit === 'shares' && Number.isFinite(amtNum) ? roundShares4(amtNum) : null,
-                    });
-                    const submitted01 = execution?.submitted_price_01 ?? null;
-                    const fillPx = fill.price01;
-                    const note = priceAuditNote(quoted01, submitted01, fillPx);
-                    const rt = mergeRoundTripMs(execution?.round_trip_ms, clientMs);
-                    setLastExecLatencyMs(rt);
-                    setHistoryRows(
-                      updateTradeHistoryRow(optimistic.id, {
-                        status: 'filled',
-                        submittedPrice01: submitted01 ?? undefined,
-                        fillAvgPrice01: fillPx ?? undefined,
-                        price01: fillPx ?? submitted01 ?? quoted01,
-                        shares: fill.shares,
-                        usdCents: fill.usdCents ?? Math.abs(Math.round(amountUsd * 100)),
-                        roundTripMs: rt,
-                        orderId: execution?.order_id ?? undefined,
-                        auditNote: note,
-                        error: undefined,
-                      }),
-                    );
-                    const q = quoted01 != null ? `${(quoted01 * 100).toFixed(1)}¢` : '—';
-                    const s = submitted01 != null ? `${(submitted01 * 100).toFixed(1)}¢` : '—';
-                    const f = fillPx != null ? `${(fillPx * 100).toFixed(1)}¢` : '—';
-                    setOkMsg(
-                      `${resolved.minAdjusted ? `Bought ~$${amountUsd.toFixed(2)} of ${label} (min $${LIVE_MARKET_MIN_BUY_USD})` : `Bought ~$${amountUsd.toFixed(2)} of ${label}`} · quoted ${q} · sent ${s} · filled ${f} · ${rt}ms`,
-                    );
-                    void refreshAvgEntry();
+                    const shPreview = roundShares4(amtNum);
+                    if (Number.isFinite(shPreview) && shPreview > 0) {
+                      setPendingPos({
+                        token,
+                        side: 'buy',
+                        kind: 'shares',
+                        shares: shPreview,
+                        price01: px,
+                        status: 'submitting',
+                        createdAt: Date.now(),
+                      });
+                    }
                   }
-                } else {
+                }
                   if (!token?.trim()) {
                     setErr('Outcome token is not ready yet — wait for this market to finish loading, then retry.');
                     return;
@@ -2652,10 +3263,13 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                     label,
                     price01: quoted01,
                     quotedPrice01: quoted01,
+                    intendedPrice01: price,
                     submittedPrice01: null,
                     fillAvgPrice01: null,
                     markPrice01: mark01,
                     shares: sizeShares,
+                    requestedShares: sizeShares,
+                    remainingShares: sizeShares,
                     usdCents: Number.isFinite(price) ? Math.abs(Math.round(price * sizeShares * 100)) : null,
                     status: 'sending',
                   });
@@ -2664,7 +3278,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   setSubmitAbort(controller);
                   const tClient0 = performance.now();
                   const res = await tradeCreateOrderWithOpts(
-                    { token, side: 'buy', price, size: sizeShares, signatureType: null },
+                    { token, side: 'buy', price, size: sizeShares, signatureType: null, marketSlug: marketSlug ?? '', outcome: label },
                     { signal: controller.signal, timeoutMs: 25_000 },
                   );
                   const clientMs = Math.round(performance.now() - tClient0);
@@ -2680,33 +3294,34 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   } else {
                     const { result, execution } = unwrapTradeActionData(res.data);
                     const oid = execution?.order_id ?? extractOrderIdFromClobPayload(result);
-                    const sub = execution?.submitted_price_01 ?? price;
                     const rt = mergeRoundTripMs(execution?.round_trip_ms, clientMs);
                     setLastExecLatencyMs(rt);
                     setHistoryRows(
                       updateTradeHistoryRow(optimistic.id, {
                         status: 'sent',
-                        submittedPrice01: sub,
+                        submittedPrice01: null,
                         orderId: oid ?? undefined,
                         roundTripMs: rt,
                         price01: quoted01,
                         error: undefined,
                       }),
                     );
-                    if (oid) pollRestingOrderFill(optimistic.id, oid, sizeShares, sub, quoted01);
+                    if (oid) pollRestingOrderFill(optimistic.id, oid, sizeShares, price, quoted01);
                     setOkMsg(
-                      `${execMode === 'touch' ? 'Quick' : 'Limit'} buy sent ${sizeShares.toFixed(2)} ${label} @ ${(price * 100).toFixed(1)}¢ · ack ${rt}ms — watching fill`,
+                      `${execMode === 'touch' ? 'Quick' : 'Limit'} buy sent · intended ${(price * 100).toFixed(1)}¢ · ack ${rt}ms — reading exchange state…`,
                     );
+                    // Make “Positions” feel instant after submit.
+                    void refreshLiveBalances();
+                    void refreshOpenOrders();
                     void refreshAvgEntry();
                   }
-                }
               } finally {
                 setBusySubmit(false);
                 setSubmitAbort(null);
                 submitLockRef.current = false;
               }
-            }}
-          >
+              }}
+            >
             {busySubmit ? (
               <>
                 {isSlide ? (
@@ -2722,7 +3337,32 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
             ) : (
               `Sell ${label}`
             )}
-          </button>
+            </button>
+            {accountMode === 'live' && activeLiveOrderRow?.orderId ? (
+              <button
+                type="button"
+                disabled={busySubmit}
+                className="min-h-[48px] rounded-xl border border-rose-800/40 bg-rose-950/20 px-4 text-[12px] font-black text-rose-100 hover:bg-rose-950/35 disabled:cursor-not-allowed disabled:opacity-40"
+                title="Cancel the active live order for this outcome"
+                onClick={async () => {
+                  const oid = activeLiveOrderRow.orderId;
+                  if (!oid) return;
+                  const r = await tradeCancelOrder(oid);
+                  if (!isOk(r)) {
+                    const e = r as ApiErr;
+                    pushToast('err', `${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`);
+                  } else {
+                    pushToast('ok', 'Cancel sent.');
+                    void refreshOpenOrders();
+                    void refreshMyFills();
+                    setHistoryRows(loadTradeHistory());
+                  }
+                }}
+              >
+                Cancel
+              </button>
+            ) : null}
+          </div>
         </>
       ) : (
         <>
@@ -2730,18 +3370,20 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
             <div className="mt-4">
               <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Order type</div>
               <div className="mt-2 rounded-xl border border-zinc-800/60 bg-zinc-950/30 px-3 py-3">
+                <p className="mb-2 text-[10px] leading-snug text-zinc-500">Limit-only — quick vs custom ¢.</p>
                 <TradeSegmentedControl
-                  value={execMode === 'market' ? 'market' : 'limit'}
+                  value={execMode}
                   onChange={(v) => {
-                    const next = v === 'market' ? 'market' : 'touch';
+                    const next = v as 'touch' | 'limit';
                     setExecMode(next);
                     setErr(null);
                     setOkMsg(null);
                     if (next === 'touch' && touchLimitCents) setLimitPriceCents(touchLimitCents);
+                    else if (next === 'limit' && defaultLimitCents) setLimitPriceCents(defaultLimitCents);
                   }}
                   options={[
-                    { value: 'market', label: 'Market', title: 'Sell now at the best bids available' },
-                    { value: 'limit', label: 'Limit', title: 'Smart limit near mid (default)' },
+                    { value: 'touch', label: 'Quick', title: 'Resting limit priced tight to the quote' },
+                    { value: 'limit', label: 'Custom', title: 'You set the limit price in cents' },
                   ]}
                   className="w-full"
                   size="md"
@@ -2755,7 +3397,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                 <TradeSegmentedControl
                   value={execMode}
                   onChange={(v) => {
-                    setExecMode(v as 'touch' | 'market' | 'limit');
+                    setExecMode(v as 'touch' | 'limit');
                     setErr(null);
                     setOkMsg(null);
                     if (v === 'touch' && touchLimitCents) setLimitPriceCents(touchLimitCents);
@@ -2767,298 +3409,28 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                       label: 'Quick',
                       title: 'Places a limit very close to the current price — best for fast exits',
                     },
-                    { value: 'market', label: 'Market', title: 'Sell now at the best bids available' },
-                    { value: 'limit', label: 'Limit', title: 'You set the minimum price you are willing to accept' },
+                    { value: 'limit', label: 'Custom', title: 'You set the minimum price you are willing to accept' },
                   ]}
                 />
                 <p className="max-w-md text-[11px] leading-relaxed text-zinc-500">
                   {execMode === 'touch'
-                    ? 'Quick: a tight limit around the mid for a fast, controlled exit.'
-                    : execMode === 'market'
-                      ? 'Market: sell the position immediately; price follows the book.'
-                      : 'Limit: wait for the market to reach your price.'}
+                    ? 'Quick: a tight limit around the quote for a fast, controlled exit.'
+                    : 'Custom: wait for the market to reach your limit price.'}
                 </p>
               </div>
             </div>
           )}
 
-          {!isSlide ? (
-            <div className="mt-4 rounded-xl border border-zinc-800/60 bg-black/20 p-3">
-            <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">1-click sell</div>
-            <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-zinc-500">
-              <span className="rounded-lg border border-zinc-800/60 bg-black/20 px-2 py-1 font-mono">
-                Best bid {bookTouch?.bestBid != null ? `${(bookTouch.bestBid * 100).toFixed(1)}¢` : '—'}
-              </span>
-              <span className="rounded-lg border border-zinc-800/60 bg-black/20 px-2 py-1 font-mono">
-                Best ask {bookTouch?.bestAsk != null ? `${(bookTouch.bestAsk * 100).toFixed(1)}¢` : '—'}
-              </span>
-            </div>
-            <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-center">
-              <label className="flex min-w-0 flex-1 items-center gap-2 rounded-lg border border-zinc-800/70 bg-black/25 px-3 py-2">
-                <span className="text-[11px] font-semibold text-zinc-400">Shares</span>
-                <input
-                  value={sellNowShares}
-                  onChange={(e) => setSellNowShares(e.target.value)}
-                  inputMode="decimal"
-                  className="min-w-0 flex-1 bg-transparent text-right font-mono text-[13px] font-semibold text-zinc-100 outline-none"
-                  placeholder="5"
-                />
-              </label>
-              <label className="flex min-w-0 flex-1 items-center gap-2 rounded-lg border border-zinc-800/70 bg-black/25 px-3 py-2">
-                <span className="text-[11px] font-semibold text-zinc-400">Ask (¢)</span>
-                <input
-                  value={sellAskCents}
-                  onChange={(e) => setSellAskCents(e.target.value)}
-                  inputMode="decimal"
-                  className="min-w-0 flex-1 bg-transparent text-right font-mono text-[13px] font-semibold text-zinc-100 outline-none"
-                  placeholder="99.0"
-                />
-              </label>
-              <div className="flex w-full flex-wrap gap-1.5 sm:w-auto">
-                <button
-                  type="button"
-                  className="rounded-lg border border-zinc-700/60 bg-black/20 px-2.5 py-1.5 text-[11px] font-semibold text-zinc-200 hover:bg-black/30"
-                  disabled={bookTouch?.bestBid == null}
-                  title="Set ask to best bid + 1¢"
-                  onClick={() => {
-                    if (bookTouch?.bestBid == null) return;
-                    setSellAskCents(Math.max(1, Math.min(99, Math.round(bookTouch.bestBid * 100 + 1))).toFixed(0));
-                  }}
-                >
-                  Bid+1¢
-                </button>
-                <button
-                  type="button"
-                  className="rounded-lg border border-zinc-700/60 bg-black/20 px-2.5 py-1.5 text-[11px] font-semibold text-zinc-200 hover:bg-black/30"
-                  disabled={bookTouch?.bestBid == null}
-                  title="Set ask to best bid + 2¢"
-                  onClick={() => {
-                    if (bookTouch?.bestBid == null) return;
-                    setSellAskCents(Math.max(1, Math.min(99, Math.round(bookTouch.bestBid * 100 + 2))).toFixed(0));
-                  }}
-                >
-                  Bid+2¢
-                </button>
-                <button
-                  type="button"
-                  className="rounded-lg border border-zinc-700/60 bg-black/20 px-2.5 py-1.5 text-[11px] font-semibold text-zinc-200 hover:bg-black/30"
-                  disabled={bookTouch?.bestBid == null}
-                  title="Set ask to best bid + 5¢"
-                  onClick={() => {
-                    if (bookTouch?.bestBid == null) return;
-                    setSellAskCents(Math.max(1, Math.min(99, Math.round(bookTouch.bestBid * 100 + 5))).toFixed(0));
-                  }}
-                >
-                  Bid+5¢
-                </button>
-              </div>
-              <button
-                type="button"
-                disabled={
-                  busySubmit ||
-                  !token?.trim() ||
-                  action !== 'sell' ||
-                  bookTouch?.bestBid == null ||
-                  !Number.isFinite(Number(sellNowShares)) ||
-                  Number(sellNowShares) <= 0
-                }
-                className="min-h-[44px] rounded-xl bg-rose-500 px-4 text-[12px] font-bold text-black hover:bg-rose-400 disabled:cursor-not-allowed disabled:opacity-40"
-                title="Sells at the current best bid level (exact price), then auto-cancels if not filled quickly."
-                onClick={async () => {
-                  if (submitLockRef.current) return;
-                  submitLockRef.current = true;
-                  setErr(null);
-                  setOkMsg(null);
-                  if (!token?.trim()) {
-                    submitLockRef.current = false;
-                    return;
-                  }
-                  const bestBid = bookTouch?.bestBid;
-                  const sharesReq = Number(sellNowShares);
-                  if (bestBid == null || !Number.isFinite(bestBid) || !Number.isFinite(sharesReq) || sharesReq <= 0) {
-                    submitLockRef.current = false;
-                    return;
-                  }
-                  const cancelMs = Math.max(250, Math.min(5000, Math.floor(Number(pickAutoCancelMs) || 1500)));
-                  setBusySubmit(true);
-                  try {
-                    if (accountMode === 'paper') {
-                      const r = paperTrade({ account: paperAccount, tokenId: token, side: 'sell', shares: sharesReq, price01: bestBid });
-                      if (!r.ok) setErr(r.error);
-                      else {
-                        setPaperAccount(r.account);
-                        setHistoryRows(
-                          appendTradeHistory({
-                            ...tradeHistoryMarketMeta,
-                            mode: 'paper',
-                            exec: 'limit',
-                            side: 'sell',
-                            token,
-                            label,
-                            price01: r.fill.price01,
-                            shares: r.fill.shares,
-                            usdCents: Math.abs(r.fill.usdCents),
-                            status: 'filled',
-                          }),
-                        );
-                        setOkMsg(`Sold ${r.fill.shares.toFixed(2)} ${label} @ ${(r.fill.price01 * 100).toFixed(1)}¢`);
-                      }
-                      return;
-                    }
-
-                    const res = await tradeCreateOrderWithOpts(
-                      { token, side: 'sell', price: bestBid, size: sharesReq, signatureType: null },
-                      { timeoutMs: 25_000 },
-                    );
-                    if (!isOk(res)) {
-                      const e = res as ApiErr;
-                      setErr(`${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`);
-                      return;
-                    }
-                    const { result, execution } = unwrapTradeActionData(res.data);
-                    const oid = execution?.order_id ?? extractOrderIdFromClobPayload(result);
-                    setHistoryRows(
-                      appendTradeHistory({
-                        ...tradeHistoryMarketMeta,
-                        mode: 'live',
-                        exec: 'limit',
-                        side: 'sell',
-                        token,
-                        label,
-                        price01: bestBid,
-                        shares: sharesReq,
-                        usdCents: Math.abs(Math.round(bestBid * sharesReq * 100)),
-                        status: 'sent',
-                        orderId: oid ?? null,
-                      }),
-                    );
-                    if (oid) {
-                      window.setTimeout(() => {
-                        void tradeCancelOrder(oid);
-                      }, cancelMs);
-                    }
-                    void refreshOpenOrders();
-                    setOkMsg(
-                      `Sell best bid sent ${sharesReq.toFixed(2)} ${label} @ ${(bestBid * 100).toFixed(1)}¢${
-                        oid ? '' : ' (no order id returned; check Open Orders)'
-                      }`,
-                    );
-                  } finally {
-                    setBusySubmit(false);
-                    submitLockRef.current = false;
-                  }
-                }}
-              >
-                Sell best bid
-              </button>
-              <button
-                type="button"
-                disabled={
-                  busySubmit ||
-                  !token?.trim() ||
-                  action !== 'sell' ||
-                  !Number.isFinite(Number(sellNowShares)) ||
-                  Number(sellNowShares) <= 0 ||
-                  sellAskCents.trim() === '' ||
-                  !Number.isFinite(Number(sellAskCents)) ||
-                  Number(sellAskCents) <= 0
-                }
-                className="min-h-[44px] rounded-xl border border-zinc-700/60 bg-black/20 px-4 text-[12px] font-bold text-zinc-100 hover:bg-black/30 disabled:cursor-not-allowed disabled:opacity-40"
-                title="Places a resting limit ask at your price (fills only if buyers lift you)."
-                onClick={async () => {
-                  if (submitLockRef.current) return;
-                  submitLockRef.current = true;
-                  setErr(null);
-                  setOkMsg(null);
-                  if (!token?.trim()) {
-                    submitLockRef.current = false;
-                    return;
-                  }
-                  const sharesReq = Number(sellNowShares);
-                  const pxC = Number(sellAskCents);
-                  const px01 = clamp01(pxC / 100);
-                  if (!Number.isFinite(sharesReq) || sharesReq <= 0 || !Number.isFinite(px01) || px01 <= 0 || px01 >= 1) {
-                    submitLockRef.current = false;
-                    return;
-                  }
-                  setBusySubmit(true);
-                  try {
-                    if (accountMode === 'paper') {
-                      const o = addPaperOrder({ tokenId: token, side: 'sell', limit01: px01, shares: sharesReq });
-                      setHistoryRows(
-                        appendTradeHistory({
-                          ...tradeHistoryMarketMeta,
-                          id: o.id,
-                          ts: o.createdAt,
-                          mode: 'paper',
-                          exec: 'limit',
-                          side: 'sell',
-                          token,
-                          label,
-                          price01: px01,
-                          shares: sharesReq,
-                          usdCents: Math.abs(Math.round(px01 * sharesReq * 100)),
-                          status: 'sent',
-                        }),
-                      );
-                      setOkMsg(`Ask placed: sell ${sharesReq.toFixed(2)} ${label} @ ${(px01 * 100).toFixed(1)}¢ (waiting)`);
-                      return;
-                    }
-
-                    const res = await tradeCreateOrderWithOpts(
-                      { token, side: 'sell', price: px01, size: sharesReq, signatureType: null },
-                      { timeoutMs: 25_000 },
-                    );
-                    if (!isOk(res)) {
-                      const e = res as ApiErr;
-                      setErr(`${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`);
-                      return;
-                    }
-                    const { result, execution } = unwrapTradeActionData(res.data);
-                    const oid = execution?.order_id ?? extractOrderIdFromClobPayload(result);
-                    setHistoryRows(
-                      appendTradeHistory({
-                        ...tradeHistoryMarketMeta,
-                        mode: 'live',
-                        exec: 'limit',
-                        side: 'sell',
-                        token,
-                        label,
-                        price01: px01,
-                        shares: sharesReq,
-                        usdCents: Math.abs(Math.round(px01 * sharesReq * 100)),
-                        status: 'sent',
-                        orderId: oid ?? null,
-                      }),
-                    );
-                    void refreshOpenOrders();
-                    setOkMsg(
-                      `Ask placed: sell ${sharesReq.toFixed(2)} ${label} @ ${(px01 * 100).toFixed(1)}¢ (waiting)${
-                        oid ? '' : ' (no order id returned; check Open Orders)'
-                      }`,
-                    );
-                  } finally {
-                    setBusySubmit(false);
-                    submitLockRef.current = false;
-                  }
-                }}
-              >
-                Place ask
-              </button>
-            </div>
-          </div>
-          ) : null}
-
           <div className="mt-4 rounded-xl border border-zinc-800/70 bg-black/20 p-4">
             <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Your position</div>
             <div className="mt-2 flex flex-wrap items-baseline justify-between gap-2">
               <div className="text-sm text-zinc-200">
-                {positionShares != null ? (
+                {optimisticPositionShares != null ? (
                   <span
                     className="inline-flex max-w-full flex-wrap items-baseline gap-x-1.5 gap-y-0.5"
-                    title={`${fmtShares(positionShares, 'full')} shares`}
+                    title={`${fmtShares(optimisticPositionShares, 'full')} shares`}
                   >
-                    <span className="font-mono text-lg font-bold tabular-nums">{fmtShares(positionShares, 'compact')}</span>
+                    <span className="font-mono text-lg font-bold tabular-nums">{fmtShares(optimisticPositionShares, 'compact')}</span>
                     <span className="text-xs font-semibold text-zinc-500">shares</span>
                     <span className="text-zinc-600">·</span>
                     <span className={`font-medium ${lane === 'up' ? 'text-emerald-300' : 'text-rose-300'}`}>{lane === 'up' ? upLabel : downLabel}</span>
@@ -3066,10 +3438,25 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                 ) : (
                   <span className="text-zinc-500">—</span>
                 )}
+                {accountMode === 'live' && pendingPos && pendingPos.token === token ? (
+                  <div className="mt-1 text-[11px] text-amber-200/90">
+                    {pendingPos.kind === 'usd' ? (
+                      <>
+                        Pending buy ${pendingPos.usd.toFixed(2)} {pendingPos.price01 != null ? `@ ~${(pendingPos.price01 * 100).toFixed(1)}¢` : ''} ·{' '}
+                        {pendingPos.status}
+                      </>
+                    ) : (
+                      <>
+                        Pending {pendingPos.side} {pendingPos.shares.toFixed(2)} sh{' '}
+                        {pendingPos.price01 != null ? `@ ${(pendingPos.price01 * 100).toFixed(1)}¢` : ''} · {pendingPos.status}
+                      </>
+                    )}
+                  </div>
+                ) : null}
               </div>
               <div className="font-mono text-sm tabular-nums text-zinc-400">
                 Value{' '}
-                {positionShares != null && mid != null ? `$${(positionShares * mid).toFixed(2)}` : '—'} · Mid {fmtCents(mid)}
+                {optimisticPositionShares != null && mid != null ? `$${(optimisticPositionShares * mid).toFixed(2)}` : '—'} · Mid {fmtCents(mid)}
               </div>
             </div>
 
@@ -3105,23 +3492,39 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
               </div>
             </details>
 
-            {execMode !== 'market' ? (
-              <div className="mt-3">
-                <label htmlFor={idLimitSell} className="text-xs font-semibold text-zinc-400">
-                  Price (¢)
-                </label>
-                <div className="mt-1 rounded-lg border border-zinc-800/70 bg-black/20 px-3 py-2.5">
-                  <input
-                    id={idLimitSell}
-                    value={limitPriceCents}
-                    onChange={(e) => setLimitPriceCents(e.target.value)}
-                    inputMode="numeric"
-                    className="min-h-[40px] w-full bg-transparent text-base font-semibold tabular-nums text-zinc-100 outline-none"
-                    placeholder={execMode === 'touch' ? touchLimitCents || defaultLimitCents || '50' : defaultLimitCents || '50'}
-                  />
-                </div>
+            <div className="mt-3">
+              <label htmlFor={idLimitSell} className="text-xs font-semibold text-zinc-400">
+                Price (¢)
+              </label>
+              <div className="mt-1 rounded-lg border border-zinc-800/70 bg-black/20 px-3 py-2.5">
+                <input
+                  id={idLimitSell}
+                  value={limitPriceCents}
+                  onChange={(e) => setLimitPriceCents(e.target.value)}
+                  inputMode="numeric"
+                  className="min-h-[40px] w-full bg-transparent text-base font-semibold tabular-nums text-zinc-100 outline-none"
+                  placeholder={execMode === 'touch' ? touchLimitCents || defaultLimitCents || '50' : defaultLimitCents || '50'}
+                />
               </div>
-            ) : null}
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {quickLimitSellPresets.map((p) => (
+                  <button
+                    key={`qsell-${p.key}`}
+                    type="button"
+                    onClick={() => {
+                      setExecMode('limit');
+                      setLimitPriceCents(String(p.cents));
+                      setErr(null);
+                      setOkMsg(null);
+                    }}
+                    className="rounded-lg border border-zinc-700/60 bg-zinc-900/45 px-2 py-1 text-[10px] font-bold text-zinc-200 hover:bg-zinc-800/70"
+                  >
+                    {p.label}
+                  </button>
+                ))}
+              </div>
+              <p className="mt-2 text-[10px] text-zinc-500">Use <span className="text-zinc-400">Max</span> for size, then the main sell button.</p>
+            </div>
 
             <div className="mt-4">
               <div className="flex items-end justify-between gap-2">
@@ -3158,66 +3561,21 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   </button>
                   <button
                     type="button"
-                    disabled={
-                      busySubmit ||
-                      sellSharesClamped == null ||
-                      sellSharesClamped <= 0 ||
-                      (execMode !== 'market' && (limit01 == null || !Number.isFinite(limit01)))
-                    }
+                    disabled={busySubmit || sellSharesClamped == null || sellSharesClamped <= 0 || limit01 == null || !Number.isFinite(limit01)}
                     aria-busy={busySubmit}
                     className={`min-h-[48px] min-w-[6rem] rounded-xl bg-rose-500 px-4 text-sm font-bold text-black shadow-md shadow-rose-950/40 hover:bg-rose-400 disabled:cursor-not-allowed disabled:opacity-40 ${
                       isSlide ? 'inline-flex items-center justify-center gap-2' : ''
                     }`}
                     onClick={async () => {
                       if (submitLockRef.current) return;
+                      if (sellSharesClamped == null || sellSharesClamped <= 0) return;
                       submitLockRef.current = true;
                       playTradeClick();
                       setErr(null);
                       setOkMsg(null);
-                      if (sellSharesClamped == null || sellSharesClamped <= 0) return;
                       setBusySubmit(true);
                       try {
                         if (accountMode === 'paper') {
-                          if (execMode === 'market') {
-                            const px = mid;
-                            const r = paperTrade({ account: paperAccount, tokenId: token, side: 'sell', shares: sellSharesClamped, price01: px });
-                            if (!r.ok) {
-                              setErr(r.error);
-                              setHistoryRows(
-                                appendTradeHistory({ ...tradeHistoryMarketMeta,
-                                  mode: 'paper',
-                                  exec: execMode,
-                                  side: 'sell',
-                                  token,
-                                  label,
-                                  price01: px ?? null,
-                                  shares: sellSharesClamped,
-                                  usdCents: null,
-                                  status: 'error',
-                                  error: r.error,
-                                }),
-                              );
-                            } else {
-                              setPaperAccount(r.account);
-                              setOkMsg(`Paper sold ${sellSharesClamped.toFixed(2)} sh of ${label} @ ${(px! * 100).toFixed(1)}¢`);
-                              setHistoryRows(
-                                appendTradeHistory({ ...tradeHistoryMarketMeta,
-                                  mode: 'paper',
-                                  exec: execMode,
-                                  side: 'sell',
-                                  token,
-                                  label,
-                                  price01: r.fill.price01,
-                                  shares: r.fill.shares,
-                                  usdCents: Math.abs(r.fill.usdCents),
-                                  status: 'filled',
-                                }),
-                              );
-                              setSellQty('');
-                            }
-                            return;
-                          }
-
                           // Limit/touch in paper mode: rest if not marketable, auto-fill later when mid crosses.
                           if (mid == null || limit01 == null) {
                             setErr('Need a valid mid and limit price.');
@@ -3272,9 +3630,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                           setErr('Outcome token is not ready yet — wait for this market to finish loading, then retry.');
                           return;
                         }
-                        if (execMode === 'market') {
-                          await runMarketSell(sellSharesClamped);
-                        } else {
+                        {
                           const price = limit01 ?? NaN;
                           const sizeLive = floorShares4(sellSharesClamped);
                           if (sizeLive < 1e-4) {
@@ -3292,10 +3648,13 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                             label,
                             price01: quoted01,
                             quotedPrice01: quoted01,
+                            intendedPrice01: price,
                             submittedPrice01: null,
                             fillAvgPrice01: null,
                             markPrice01: mark01,
                             shares: sizeLive,
+                            requestedShares: sizeLive,
+                            remainingShares: sizeLive,
                             usdCents: Number.isFinite(price) ? Math.abs(Math.round(price * sizeLive * 100)) : null,
                             status: 'sending',
                           });
@@ -3310,6 +3669,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                               price,
                               size: sizeLive,
                               signatureType: null,
+                              marketSlug: marketSlug ?? '',
+                              outcome: label,
                             },
                             { signal: controller.signal, timeoutMs: 25_000 },
                           );
@@ -3326,22 +3687,21 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                           } else {
                             const { result, execution } = unwrapTradeActionData(res.data);
                             const oid = execution?.order_id ?? extractOrderIdFromClobPayload(result);
-                            const sub = execution?.submitted_price_01 ?? price;
                             const rt = mergeRoundTripMs(execution?.round_trip_ms, clientMs);
                             setLastExecLatencyMs(rt);
                             setHistoryRows(
                               updateTradeHistoryRow(optimistic.id, {
                                 status: 'sent',
-                                submittedPrice01: sub,
+                                submittedPrice01: null,
                                 orderId: oid ?? undefined,
                                 roundTripMs: rt,
                                 price01: quoted01,
                                 error: undefined,
                               }),
                             );
-                            if (oid) pollRestingOrderFill(optimistic.id, oid, sizeLive, sub, quoted01);
+                            if (oid) pollRestingOrderFill(optimistic.id, oid, sizeLive, price, quoted01);
                             setOkMsg(
-                              `${execMode === 'touch' ? 'Quick' : 'Limit'} sell sent ${sizeLive.toFixed(2)} ${label} @ ${(price * 100).toFixed(1)}¢ · ack ${rt}ms — watching fill`,
+                              `${execMode === 'touch' ? 'Quick' : 'Limit'} sell sent · intended ${(price * 100).toFixed(1)}¢ · ack ${rt}ms — reading exchange state…`,
                             );
                             void refreshAvgEntry();
                           }
@@ -3417,15 +3777,20 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
               }`}
               onClick={async () => {
                 if (submitLockRef.current) return;
+                if (positionShares == null || positionShares <= 0) return;
                 submitLockRef.current = true;
                 playTradeClick();
                 setErr(null);
                 setOkMsg(null);
-                if (positionShares == null || positionShares <= 0) return;
                 setBusySubmit(true);
                 try {
                   if (accountMode === 'paper') {
-                    const px = execMode === 'market' ? mid : limit01;
+                    const px =
+                      execMode === 'touch' ? (executableQuote01 ?? mid ?? limit01) : limit01;
+                    if (px == null || !Number.isFinite(px) || !(px > 0) || px >= 1) {
+                      setErr('Need a valid limit price (or quote) to close.');
+                      return;
+                    }
                     const r = paperTrade({ account: paperAccount, tokenId: token, side: 'sell', shares: positionShares, price01: px });
                     if (!r.ok) {
                       setErr(r.error);
@@ -3467,83 +3832,87 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                     setErr('Outcome token is not ready yet — wait for this market to finish loading, then retry.');
                     return;
                   }
-                  if (execMode === 'market') {
-                    await runMarketSell(positionShares);
-                  } else {
-                    const price =
-                      execMode === 'touch'
-                        ? // Quick sell = aggressive limit at executable reference (best bid; falls back to mid)
-                          (executableQuote01 ?? mid ?? NaN)
-                        : (limit01 ?? NaN);
-                    const sizeLive = floorShares4(positionShares);
-                    if (sizeLive < 1e-4) {
-                      setErr('Sell size is too small after rounding to 4 decimal shares.');
-                      return;
-                    }
-                    liveSubmitGenRef.current += 1;
-                    const quoted01 = Number.isFinite(price) ? roundPrice01(price) : null;
-                    const mark01 = mid != null && mid > 0 ? roundPrice01(mid) : null;
-                    const optimistic = appendTradeHistoryWithId({ ...tradeHistoryMarketMeta,
-                      mode: 'live',
-                      exec: execMode,
-                      side: 'sell',
+                  const price =
+                    execMode === 'touch'
+                      ? // Quick sell = aggressive limit at executable reference (best bid; falls back to mid)
+                        (executableQuote01 ?? mid ?? NaN)
+                      : (limit01 ?? NaN);
+                  if (!Number.isFinite(price) || !(price > 0) || price >= 1) {
+                    setErr('Need a valid limit price (or quote) to close.');
+                    return;
+                  }
+                  const sizeLive = floorShares4(positionShares);
+                  if (sizeLive < 1e-4) {
+                    setErr('Sell size is too small after rounding to 4 decimal shares.');
+                    return;
+                  }
+                  liveSubmitGenRef.current += 1;
+                  const quoted01 = Number.isFinite(price) ? roundPrice01(price) : null;
+                  const mark01 = mid != null && mid > 0 ? roundPrice01(mid) : null;
+                  const optimistic = appendTradeHistoryWithId({ ...tradeHistoryMarketMeta,
+                    mode: 'live',
+                    exec: execMode,
+                    side: 'sell',
+                    token,
+                    label,
+                    price01: quoted01,
+                    quotedPrice01: quoted01,
+                    intendedPrice01: price,
+                    submittedPrice01: null,
+                    fillAvgPrice01: null,
+                    markPrice01: mark01,
+                    shares: sizeLive,
+                    requestedShares: sizeLive,
+                    remainingShares: sizeLive,
+                    usdCents: Number.isFinite(price) ? Math.abs(Math.round(price * sizeLive * 100)) : null,
+                    status: 'sending',
+                  });
+                  setHistoryRows(optimistic.rows);
+                  const controller = new AbortController();
+                  setSubmitAbort(controller);
+                  const tClient0 = performance.now();
+                  const res = await tradeCreateOrderWithOpts(
+                    {
                       token,
-                      label,
-                      price01: quoted01,
-                      quotedPrice01: quoted01,
-                      submittedPrice01: null,
-                      fillAvgPrice01: null,
-                      markPrice01: mark01,
-                      shares: sizeLive,
-                      usdCents: Number.isFinite(price) ? Math.abs(Math.round(price * sizeLive * 100)) : null,
-                      status: 'sending',
-                    });
-                    setHistoryRows(optimistic.rows);
-                    const controller = new AbortController();
-                    setSubmitAbort(controller);
-                    const tClient0 = performance.now();
-                    const res = await tradeCreateOrderWithOpts(
-                      {
-                        token,
-                        side: 'sell',
-                        price,
-                        size: sizeLive,
-                        signatureType: null,
-                      },
-                      { signal: controller.signal, timeoutMs: 25_000 },
+                      side: 'sell',
+                      price,
+                      size: sizeLive,
+                      signatureType: null,
+                      marketSlug: marketSlug ?? '',
+                      outcome: label,
+                    },
+                    { signal: controller.signal, timeoutMs: 25_000 },
+                  );
+                  const clientMs = Math.round(performance.now() - tClient0);
+                  if (!isOk(res)) {
+                    const e = res as ApiErr;
+                    setErr(`${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`);
+                    setHistoryRows(
+                      updateTradeHistoryRow(optimistic.id, {
+                        status: 'failed',
+                        error: `${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`,
+                      }),
                     );
-                    const clientMs = Math.round(performance.now() - tClient0);
-                    if (!isOk(res)) {
-                      const e = res as ApiErr;
-                      setErr(`${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`);
-                      setHistoryRows(
-                        updateTradeHistoryRow(optimistic.id, {
-                          status: 'failed',
-                          error: `${e.error}${e.details ? ` · ${JSON.stringify(e.details)}` : ''}`,
-                        }),
-                      );
-                    } else {
-                      const { result, execution } = unwrapTradeActionData(res.data);
-                      const oid = execution?.order_id ?? extractOrderIdFromClobPayload(result);
-                      const sub = execution?.submitted_price_01 ?? price;
-                      const rt = mergeRoundTripMs(execution?.round_trip_ms, clientMs);
-                      setLastExecLatencyMs(rt);
-                      setHistoryRows(
-                        updateTradeHistoryRow(optimistic.id, {
-                          status: 'sent',
-                          submittedPrice01: sub,
-                          orderId: oid ?? undefined,
-                          roundTripMs: rt,
-                          price01: quoted01,
-                          error: undefined,
-                        }),
-                      );
-                      if (oid) pollRestingOrderFill(optimistic.id, oid, sizeLive, sub, quoted01);
-                      setOkMsg(
-                        `${execMode === 'touch' ? 'Quick' : 'Limit'} sell-all sent ${sizeLive.toFixed(2)} ${label} @ ${(price * 100).toFixed(1)}¢ · ack ${rt}ms — watching fill`,
-                      );
-                      void refreshAvgEntry();
-                    }
+                  } else {
+                    const { result, execution } = unwrapTradeActionData(res.data);
+                    const oid = execution?.order_id ?? extractOrderIdFromClobPayload(result);
+                    const rt = mergeRoundTripMs(execution?.round_trip_ms, clientMs);
+                    setLastExecLatencyMs(rt);
+                    setHistoryRows(
+                      updateTradeHistoryRow(optimistic.id, {
+                        status: 'sent',
+                        submittedPrice01: null,
+                        orderId: oid ?? undefined,
+                        roundTripMs: rt,
+                        price01: quoted01,
+                        error: undefined,
+                      }),
+                    );
+                    if (oid) pollRestingOrderFill(optimistic.id, oid, sizeLive, price, quoted01);
+                    setOkMsg(
+                      `${execMode === 'touch' ? 'Quick' : 'Limit'} sell-all sent · intended ${(price * 100).toFixed(1)}¢ · ack ${rt}ms — reading exchange state…`,
+                    );
+                    void refreshAvgEntry();
                   }
                 } finally {
                   setBusySubmit(false);
@@ -3620,6 +3989,25 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
               </span>
             </summary>
             <div className="px-4 pb-4">
+              {accountMode === 'live' ? (() => {
+                const counts = new Map<string, number>();
+                for (const o of openOrders) {
+                  const side = orderSideFromRow(o) ?? '—';
+                  const key = `${side}:${token ?? ''}`;
+                  counts.set(key, (counts.get(key) ?? 0) + 1);
+                }
+                const dupBuy = (counts.get(`buy:${token ?? ''}`) ?? 0) > 1;
+                const dupSell = (counts.get(`sell:${token ?? ''}`) ?? 0) > 1;
+                if (!dupBuy && !dupSell) return null;
+                return (
+                  <div className="mb-3 rounded-xl border border-amber-800/35 bg-amber-950/15 px-3 py-2 text-[11px] text-amber-100/90">
+                    Multiple open orders detected for this outcome/side. Double-check before submitting again.
+                    <div className="mt-1 font-mono text-[10px] text-amber-100/80">
+                      {dupBuy ? 'buy: 2+ open · ' : ''}{dupSell ? 'sell: 2+ open' : ''}
+                    </div>
+                  </div>
+                );
+              })() : null}
               {accountMode === 'live' ? (
                 openOrders.length ? (
                   <div className="space-y-2">
@@ -3628,6 +4016,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                       const side = orderSideFromRow(o);
                       const px = orderPrice01FromRow(o);
                       const rem = orderRemainingFromRow(o) ?? orderSizeFromRow(o);
+                      const size = orderSizeFromRow(o);
+                      const filled = size != null && rem != null ? Math.max(0, size - rem) : null;
                       const when = orderCreatedAtFromRow(o);
                       const notionalCents =
                         rem != null && px != null ? Math.abs(Math.round(rem * px * 100)) : null;
@@ -3645,7 +4035,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                                 {label}
                               </div>
                               <div className="mt-0.5 font-mono text-[11px] text-zinc-400">
-                                {fmtShares(rem, 'full')} shares @ {px == null ? '—' : `${(px * 100).toFixed(1)}¢`}
+                                rem {fmtShares(rem, 'full')} / sz {fmtShares(size, 'full')}{filled != null ? ` · filled ${fmtShares(filled, 'full')}` : ''} @{' '}
+                                {px == null ? '—' : `${(px * 100).toFixed(1)}¢`}
                               </div>
                             </div>
                             <button
@@ -3722,27 +4113,63 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
 
           <div className="border-t border-zinc-800/50 px-4 py-3">
             <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Recent fills</div>
+            {accountMode === 'live' && myFillsErr ? (
+              <div className="mt-2 rounded-xl border border-rose-900/35 bg-rose-950/15 px-3 py-2 text-[11px] text-rose-100">
+                Confirmed fills unavailable: {myFillsErr}
+              </div>
+            ) : null}
             {recentFillsForToken.length ? (
               <div className="mt-2 space-y-2">
-                {recentFillsForToken.slice(0, 8).map((r) => (
-                  <div key={r.id} className="rounded-xl border border-zinc-800/60 bg-black/15 px-3 py-2">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <div className="text-[11px] font-bold text-zinc-100">
-                          <span className={r.side === 'buy' ? 'text-emerald-200' : 'text-rose-200'}>{r.side.toUpperCase()}</span> {label}{' '}
-                          <span className="ml-2 rounded-full border border-emerald-800/30 bg-emerald-950/15 px-2 py-0.5 text-[9px] font-bold text-emerald-200/90">
-                            FILLED
-                          </span>
+                {recentFillsForToken.map((r) => {
+                  const badge =
+                    r.status === 'partial'
+                      ? { text: 'PARTIAL', cls: 'border-violet-700/35 bg-violet-950/15 text-violet-200/90' }
+                      : { text: 'FILLED', cls: 'border-emerald-800/30 bg-emerald-950/15 text-emerald-200/90' };
+                  const px = r.fillAvgPrice01 ?? r.price01;
+                  const filled = r.shares;
+                  const req = (r as any).requestedShares as number | null | undefined;
+                  const rem = (r as any).remainingShares as number | null | undefined;
+                  return (
+                    <div key={r.id} className="rounded-xl border border-zinc-800/60 bg-black/15 px-3 py-2">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2 text-[11px] font-bold text-zinc-100">
+                            <span className={r.side === 'buy' ? 'text-emerald-200' : 'text-rose-200'}>{r.side.toUpperCase()}</span>
+                            <span className="text-zinc-300">{label}</span>
+                            <span className={`rounded-full border px-2 py-0.5 text-[9px] font-black ${badge.cls}`}>{badge.text}</span>
+                            {r.mode === 'live' ? (
+                              <span className="rounded-full border border-sky-800/35 bg-sky-950/15 px-2 py-0.5 text-[9px] font-black text-sky-100/90">LIVE</span>
+                            ) : (
+                              <span className="rounded-full border border-amber-800/35 bg-amber-950/15 px-2 py-0.5 text-[9px] font-black text-amber-100/90">PAPER</span>
+                            )}
+                          </div>
+                          <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11px] text-zinc-300">
+                            <span>
+                              {filled == null ? '—' : filled.toFixed(4)}
+                              {req != null ? ` / ${Number(req).toFixed(4)}` : ''}{rem != null ? ` · rem ${Number(rem).toFixed(4)}` : ''}
+                              {' '}sh
+                            </span>
+                            <span>
+                              avg {px == null ? '—' : `${(px * 100).toFixed(2)}¢`}
+                            </span>
+                            {r.orderId ? (
+                              <span className="text-zinc-500">
+                                oid {r.orderId.slice(0, 6)}…{r.orderId.slice(-4)}
+                              </span>
+                            ) : null}
+                          </div>
                         </div>
-                        <div className="mt-0.5 font-mono text-[11px] text-zinc-400">
-                          {fmtShares(r.shares ?? null, 'full')} @ {r.price01 == null ? '—' : `${(r.price01 * 100).toFixed(1)}¢`}
+                        <div className="text-right font-mono text-[11px] text-zinc-200">{r.usdCents == null ? '—' : fmtUsdCents(Math.abs(r.usdCents))}</div>
+                      </div>
+                      <div className="mt-1.5 flex items-center justify-between gap-3 text-[10px] text-zinc-500">
+                        <div className="font-mono">{fmtWhen(r.ts)}</div>
+                        <div className="font-mono">
+                          {r.submittedPrice01 != null ? `sent ${(r.submittedPrice01 * 100).toFixed(1)}¢` : 'sent —'}
                         </div>
                       </div>
-                      <div className="font-mono text-[11px] text-zinc-300">{r.usdCents == null ? '—' : fmtUsdCents(Math.abs(r.usdCents))}</div>
                     </div>
-                    <div className="mt-1.5 font-mono text-[10px] text-zinc-500">{fmtWhen((r as any).ts ?? (r as any).createdAt ?? (r as any).timestamp)}</div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             ) : (
               <div className="mt-2 rounded-xl border border-zinc-800/60 bg-black/15 px-3 py-2 text-[11px] text-zinc-500">No fills yet.</div>
@@ -3891,7 +4318,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   }}
                   className="mt-3 min-h-[46px] w-full rounded-xl bg-zinc-100 px-4 text-sm font-black text-black hover:bg-white disabled:cursor-not-allowed disabled:opacity-40"
                 >
-                  Close Position (Sell All)
+                  Close Position (Sell All {selSh != null ? `${selSh.toFixed(2)} sh` : ''})
                 </button>
 
                 <details className="mt-3 rounded-xl border border-zinc-800/60 bg-zinc-950/30">
@@ -3907,9 +4334,23 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                               <div className="text-[11px] font-bold text-zinc-100">
                                 <span className={r.side === 'buy' ? 'text-emerald-200' : 'text-rose-200'}>{r.side.toUpperCase()}</span>{' '}
                                 {tabLane === 'up' ? upLabel : downLabel}
+                                {r.status === 'partial' ? (
+                                  <span className="ml-2 rounded-full border border-violet-700/35 bg-violet-950/15 px-2 py-0.5 text-[9px] font-black text-violet-200/90">
+                                    PARTIAL
+                                  </span>
+                                ) : (
+                                  <span className="ml-2 rounded-full border border-emerald-800/30 bg-emerald-950/15 px-2 py-0.5 text-[9px] font-black text-emerald-200/90">
+                                    FILLED
+                                  </span>
+                                )}
                               </div>
                               <div className="mt-0.5 font-mono text-[11px] text-zinc-400">
-                                {(r.shares ?? 0).toFixed(2)} @ {r.price01 == null ? '—' : `${(r.price01 * 100).toFixed(1)}¢`}
+                                {(r.shares ?? 0).toFixed(4)}
+                                {(r as any).requestedShares != null ? ` / ${Number((r as any).requestedShares).toFixed(4)}` : ''}{' '}
+                                @{' '}
+                                {(r.fillAvgPrice01 ?? r.price01) == null
+                                  ? '—'
+                                  : `${((r.fillAvgPrice01 ?? r.price01)! * 100).toFixed(1)}¢`}
                               </div>
                             </div>
                             <div className="font-mono text-[11px] text-zinc-300">{r.usdCents == null ? '—' : fmtUsdCents(Math.abs(r.usdCents))}</div>

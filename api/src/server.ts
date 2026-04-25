@@ -2,16 +2,20 @@ import dotenv from 'dotenv';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
+import http from 'node:http';
 import express from 'express';
+import { WebSocketServer, WebSocket } from 'ws';
 import {
   AssetType,
   type ClobClient,
+  type CreateOrderOptions,
   COLLATERAL_TOKEN_DECIMALS,
   CONDITIONAL_TOKEN_DECIMALS,
   OrderType,
   Side,
   type TradeParams,
 } from '@polymarket/clob-client';
+import { extractCanonicalMarketFill } from './clobFillExtract.js';
 import { getTradingClient, getTradingConfigFromEnv } from './polymarketTrading.js';
 
 // Load env: monorepo root `.env` first, then `api/.env` (overrides) so keys work from either location.
@@ -63,6 +67,111 @@ function runCli(args: string[], opts?: { timeoutMs?: number }): Promise<CliResul
       resolve({ ok: false, stdout: '', stderr: err instanceof Error ? err.message : String(err), code: null, signal: null });
     });
   });
+}
+
+function runBullpen(args: string[], opts?: { timeoutMs?: number }): Promise<CliResult> {
+  const bin = process.env.BULLPEN_BIN || 'bullpen';
+  const timeoutMs = opts?.timeoutMs ?? 35_000;
+  return new Promise((resolve) => {
+    const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let done = false;
+    const finish = (r: CliResult) => {
+      if (done) return;
+      done = true;
+      resolve(r);
+    };
+    const t = setTimeout(() => {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* ignore */
+      }
+    }, timeoutMs);
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => (stdout += String(d)));
+    child.stderr.on('data', (d) => (stderr += String(d)));
+    child.on('error', () => {
+      clearTimeout(t);
+      finish({ ok: false, stdout, stderr, code: null, signal: null });
+    });
+    child.on('close', (code, signal) => {
+      clearTimeout(t);
+      if (code === 0) finish({ ok: true, stdout });
+      else finish({ ok: false, stdout, stderr, code, signal });
+    });
+  });
+}
+
+function parseJsonMaybe(text: string): unknown | null {
+  const t = text.trim();
+  if (!t) return null;
+  try {
+    return JSON.parse(t) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function envFlagTrue(raw: string | undefined): boolean {
+  const v = String(raw ?? '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+}
+
+/** When false (default), slug+outcome do not route through Bullpen; use CLOB only. Set POLYMARKET_USE_BULLPEN=true for legacy Bullpen execution + position reads. */
+function polymarketUseBullpen(): boolean {
+  return envFlagTrue(process.env.POLYMARKET_USE_BULLPEN);
+}
+
+type BullpenPositionsCache = {
+  fetchedAtMs: number;
+  // The raw parsed JSON root (whatever Bullpen returns).
+  parsed: unknown;
+  // Best-effort normalized array of position objects.
+  positions: Record<string, unknown>[];
+};
+
+const bullpenPositionsCache: { value: BullpenPositionsCache | null; inflight: Promise<void> | null } = {
+  value: null,
+  inflight: null,
+};
+
+function positionsArrayFromBullpenParsed(parsed: unknown): Record<string, unknown>[] {
+  if (!parsed) return [];
+  if (Array.isArray(parsed)) return parsed.filter((x) => x && typeof x === 'object') as Record<string, unknown>[];
+  if (typeof parsed !== 'object') return [];
+  const root = parsed as Record<string, unknown>;
+  const maybe = (root.positions ?? root.data ?? root.result) as unknown;
+  if (Array.isArray(maybe)) return maybe.filter((x) => x && typeof x === 'object') as Record<string, unknown>[];
+  return [];
+}
+
+async function refreshBullpenPositions(opts?: { force?: boolean }): Promise<void> {
+  const now = Date.now();
+  const ttlMs = 250; // keep UI feeling "live" despite CLI latency
+  if (!opts?.force && bullpenPositionsCache.value && now - bullpenPositionsCache.value.fetchedAtMs < ttlMs) return;
+  if (bullpenPositionsCache.inflight) return;
+  const env = String(process.env.BULLPEN_ENV ?? 'production').trim() || 'production';
+  bullpenPositionsCache.inflight = (async () => {
+    try {
+      const r = await runBullpen(['polymarket', 'positions', '--env', env, '--output', 'json'], { timeoutMs: 25_000 });
+      if (!r.ok) return;
+      const parsed = parseJsonMaybe(r.stdout);
+      if (parsed == null) return;
+      bullpenPositionsCache.value = {
+        fetchedAtMs: Date.now(),
+        parsed,
+        positions: positionsArrayFromBullpenParsed(parsed),
+      };
+    } finally {
+      bullpenPositionsCache.inflight = null;
+    }
+  })();
+  await bullpenPositionsCache.inflight;
+}
+
+function cachedBullpenPositionsOrNull(): BullpenPositionsCache | null {
+  return bullpenPositionsCache.value;
 }
 
 async function httpGetJson(url: string): Promise<unknown> {
@@ -1236,6 +1345,14 @@ function parseNumber(name: string, v: unknown): number | null {
   return n;
 }
 
+function toPrice01Maybe(v: unknown): number | null {
+  const n = parseNumber('price', v);
+  if (n == null) return null;
+  if (n > 0 && n <= 1) return n;
+  if (n > 1 && n <= 100) return n / 100;
+  return null;
+}
+
 function roundPrice01Api(n: number): number {
   return Math.round(n * 1_000_000) / 1_000_000;
 }
@@ -1297,10 +1414,29 @@ function bestAskBestBidFromBook(book: unknown): { bestAsk: number | null; bestBi
 
 function extractOrderIdFromClobPayload(obj: unknown): string | null {
   if (!obj || typeof obj !== 'object') return null;
-  const o = obj as Record<string, unknown>;
-  for (const k of ['orderID', 'orderId', 'order_id', 'id'] as const) {
-    const v = o[k];
-    if (typeof v === 'string' && v.trim()) return v.trim();
+  const pick = (o: Record<string, unknown>): string | null => {
+    for (const k of ['orderID', 'orderId', 'order_id', 'id'] as const) {
+      const v = o[k];
+      if (typeof v === 'string' && v.trim()) return v.trim();
+    }
+    return null;
+  };
+  const root = obj as Record<string, unknown>;
+  const direct = pick(root);
+  if (direct) return direct;
+  for (const k of ['order', 'data', 'result', 'payload', 'response'] as const) {
+    const v = root[k];
+    if (v && typeof v === 'object') {
+      const got = pick(v as Record<string, unknown>);
+      if (got) return got;
+      for (const k2 of ['order', 'data', 'result'] as const) {
+        const vv = (v as Record<string, unknown>)[k2];
+        if (vv && typeof vv === 'object') {
+          const got2 = pick(vv as Record<string, unknown>);
+          if (got2) return got2;
+        }
+      }
+    }
   }
   return null;
 }
@@ -1351,6 +1487,15 @@ type FakMarketPayload = {
   price?: number;
 };
 
+/** `createAndPostOrder` / `createAndPostMarketOrder` post-options — see Polymarket `clob-client` README on GitHub. */
+async function clobOrderBuilderOptions(
+  client: ClobClient,
+  tokenId: string,
+): Promise<Pick<CreateOrderOptions, 'tickSize' | 'negRisk'>> {
+  const [tickSize, negRisk] = await Promise.all([client.getTickSize(tokenId), client.getNegRisk(tokenId)]);
+  return { tickSize, negRisk };
+}
+
 /**
  * Prefer an explicit tick-aligned cross price from the live book on every market order.
  * Skips SDK-only `calculateMarketPrice` when possible — that path often disagrees with the matcher by a tick.
@@ -1374,8 +1519,9 @@ async function attachBookCrossPricePrefer(client: ClobClient, base: FakMarketPay
 }
 
 async function createAndPostMarketOrderWithBookSlippage(client: ClobClient, base: FakMarketPayload): Promise<unknown> {
+  const ob = await clobOrderBuilderOptions(client, base.tokenID);
   try {
-    return await client.createAndPostMarketOrder(base, undefined, OrderType.FAK);
+    return await client.createAndPostMarketOrder(base, ob, OrderType.FAK);
   } catch (first) {
     const msg = first instanceof Error ? first.message : String(first);
     if (!isLiquidityClassMarketError(msg)) throw first;
@@ -1396,11 +1542,11 @@ async function createAndPostMarketOrderWithBookSlippage(client: ClobClient, base
 
     const slipped = { ...base, price: slip, orderType: OrderType.FAK as const };
     try {
-      return await client.createAndPostMarketOrder(slipped, undefined, OrderType.FAK);
+      return await client.createAndPostMarketOrder(slipped, ob, OrderType.FAK);
     } catch {
       return await client.createAndPostMarketOrder(
         { ...slipped, orderType: OrderType.FOK as const },
-        undefined,
+        ob,
         OrderType.FOK,
       );
     }
@@ -1412,8 +1558,32 @@ app.get('/api/trade/balance-allowance', async (req, res) => {
   const tokenId = String(req.query.token_id ?? '').trim();
   const raw = String(req.query.asset_type ?? 'conditional').trim().toLowerCase();
   const assetType = raw === 'collateral' ? AssetType.COLLATERAL : AssetType.CONDITIONAL;
+  const marketSlug = String(req.query.market_slug ?? '').trim();
+  const outcome = String(req.query.outcome ?? '').trim();
   if (assetType === AssetType.CONDITIONAL && !tokenId) {
     return json(res, 400, { ok: false, error: 'missing_token_id', details: { hint: 'Pass token_id for outcome (conditional) balance.' } });
+  }
+
+  // Optional: when POLYMARKET_USE_BULLPEN=true, Bullpen positions for slug+outcome (must hit a row or we fall through to CLOB).
+  if (assetType === AssetType.CONDITIONAL && marketSlug && outcome && polymarketUseBullpen()) {
+    const cached = cachedBullpenPositionsOrNull();
+    if (!cached) await refreshBullpenPositions({ force: true });
+    else void refreshBullpenPositions();
+
+    const arr = (cachedBullpenPositionsOrNull()?.positions ?? []) as Record<string, unknown>[];
+    const norm = (s: unknown) => String(s ?? '').trim().toLowerCase();
+    const hit = arr.find((p) => {
+      if (!p || typeof p !== 'object') return false;
+      const o = p as Record<string, unknown>;
+      const slug = norm(o.slug ?? o.market_slug ?? o.marketSlug ?? o.market);
+      const out = norm(o.outcome ?? o.outcome_name ?? o.outcomeName);
+      return slug === norm(marketSlug) && out === norm(outcome);
+    }) as Record<string, unknown> | undefined;
+    if (hit) {
+      const size = parseNumber('size', hit.size ?? hit.shares ?? hit.position ?? hit.quantity) ?? 0;
+      return json(res, 200, { ok: true, data: { balance: String(size), allowance: '' } });
+    }
+    // No matching Bullpen row — use CLOB balance (avoids false zero vs Polymarket).
   }
 
   const ready = await getTradingClient();
@@ -1478,8 +1648,263 @@ function tradeInvolvesAddresses(trade: Record<string, unknown>, addrs: Set<strin
   return false;
 }
 
+/** Paginated CLOB trades for one outcome token (same tape Polymarket uses for fills / profile). */
+async function clobListTradesForAssetId(client: ClobClient, tokenId: string, maxPages: number): Promise<Record<string, unknown>[]> {
+  const params: TradeParams = { asset_id: tokenId };
+  const items: Record<string, unknown>[] = [];
+  let cursor: string | undefined = undefined;
+  for (let page = 0; page < maxPages; page++) {
+    const batch = await client.getTradesPaginated(params as never, cursor);
+    for (const tr of batch.trades) items.push(tr as unknown as Record<string, unknown>);
+    const next = batch.next_cursor;
+    if (!next || next === 'LTE=' || batch.trades.length === 0) break;
+    cursor = next;
+  }
+  items.sort((a, b) => tradeMatchTimeMs(a) - tradeMatchTimeMs(b));
+  return items;
+}
+
+type OrderFillIndexEntry = {
+  shares: number;
+  avg_price_01: number;
+  side: 'buy' | 'sell';
+  updated_at_ms: number;
+};
+
+/** VWAP fill per CLOB order id (taker_order_id or maker resting id) for reconciliation with local UI history. */
+function buildOrderFillIndexFromTrades(
+  items: Record<string, unknown>[],
+  tokenId: string,
+  myAddrs: Set<string>,
+): Record<string, OrderFillIndexEntry> {
+  type Cell = { sz: number; pxSz: number; t: number; side: 'buy' | 'sell' };
+  const map = new Map<string, Cell>();
+
+  const anyAddrHit = items.some((t) => String(t.asset_id ?? '') === tokenId && tradeInvolvesAddresses(t, myAddrs));
+
+  const bump = (orderId: string, shares: number, price01: number, side: 'buy' | 'sell', at: number) => {
+    if (!orderId || shares <= 0 || price01 <= 0 || price01 >= 1) return;
+    const cur = map.get(orderId);
+    if (!cur) {
+      map.set(orderId, { sz: shares, pxSz: shares * price01, t: at, side });
+      return;
+    }
+    cur.sz += shares;
+    cur.pxSz += shares * price01;
+    cur.t = Math.max(cur.t, at);
+    map.set(orderId, cur);
+  };
+
+  for (const trade of items) {
+    if (String(trade.asset_id ?? '') !== tokenId) continue;
+    if (anyAddrHit && !tradeInvolvesAddresses(trade, myAddrs)) continue;
+
+    const owner = typeof trade.owner === 'string' ? trade.owner.toLowerCase() : '';
+    const isTaker = Boolean(owner && myAddrs.has(owner));
+    const mos = trade.maker_orders;
+    const myMakerOrders: Record<string, unknown>[] = [];
+    if (Array.isArray(mos)) {
+      for (const mo of mos) {
+        if (!mo || typeof mo !== 'object') continue;
+        const m = mo as Record<string, unknown>;
+        const ma = typeof m.maker_address === 'string' ? m.maker_address.toLowerCase() : '';
+        const ow = typeof m.owner === 'string' ? m.owner.toLowerCase() : '';
+        const asset = String(m.asset_id ?? '');
+        if (asset !== tokenId) continue;
+        if ((ma && myAddrs.has(ma)) || (ow && myAddrs.has(ow))) myMakerOrders.push(m);
+      }
+    }
+    const isMaker = myMakerOrders.length > 0;
+    if (!isTaker && !isMaker) continue;
+
+    const tradeSideRaw = String(trade.side ?? '').toUpperCase();
+    const takerIsBuy = tradeSideRaw === 'BUY' || tradeSideRaw === 'B';
+    const takerIsSell = tradeSideRaw === 'SELL' || tradeSideRaw === 'S';
+    if (!takerIsBuy && !takerIsSell) continue;
+
+    const effectiveIsBuy = isMaker ? takerIsSell : takerIsBuy;
+    const effectiveIsSell = isMaker ? takerIsBuy : takerIsSell;
+    const at = tradeMatchTimeMs(trade);
+
+    if (isTaker) {
+      const price01 = toPrice01Maybe(trade.price);
+      if (price01 == null) continue;
+      const sizeRaw = trade.size ?? trade.amount ?? trade.quantity;
+      const sizeNorm = normalizeAmountMaybe(sizeRaw, CONDITIONAL_TOKEN_DECIMALS, 'conditional');
+      const size = parseNumber('size', sizeNorm ?? sizeRaw);
+      if (size == null || size <= 0) continue;
+      const side: 'buy' | 'sell' = effectiveIsBuy ? 'buy' : 'sell';
+      const oid = String(trade.taker_order_id ?? (trade as { takerOrderId?: unknown }).takerOrderId ?? '').trim();
+      if (oid) bump(oid, size, price01, side, at);
+      continue;
+    }
+
+    if (isMaker) {
+      for (const m of myMakerOrders) {
+        const mo = m as Record<string, unknown>;
+        const oid = String(mo.order_id ?? mo.orderId ?? '').trim();
+        if (!oid) continue;
+        const p01 = toPrice01Maybe(mo.price);
+        if (p01 == null) continue;
+        const raw = (mo.matched_amount ?? mo.matchedAmount ?? mo.size ?? mo.amount ?? mo.quantity) as unknown;
+        const norm = normalizeAmountMaybe(raw, CONDITIONAL_TOKEN_DECIMALS, 'conditional');
+        const sz = parseNumber('size', norm ?? raw);
+        if (sz == null || sz <= 0) continue;
+        const moSide = String(mo.side ?? '').toUpperCase();
+        const side: 'buy' | 'sell' = moSide === 'SELL' || moSide === 'S' ? 'sell' : 'buy';
+        bump(oid, sz, p01, side, at);
+      }
+    }
+  }
+
+  const out: Record<string, OrderFillIndexEntry> = {};
+  for (const [k, v] of map) {
+    if (v.sz <= 0) continue;
+    out[k] = {
+      shares: roundSizeShares4(v.sz),
+      avg_price_01: roundPrice01Api(v.pxSz / v.sz),
+      side: v.side,
+      updated_at_ms: v.t,
+    };
+  }
+  return out;
+}
+
 /** Avg entry price (cost basis) for current user and token (0..1), from CLOB `/data/trades` for this `asset_id`. */
 app.get('/api/trade/avg-entry', async (req, res) => {
+  const tokenId = String(req.query.token_id ?? '').trim();
+  if (!tokenId) return json(res, 400, { ok: false, error: 'missing_token_id' });
+  const marketSlug = String(req.query.market_slug ?? '').trim();
+  const outcome = String(req.query.outcome ?? '').trim();
+
+  if (marketSlug && outcome && polymarketUseBullpen()) {
+    const cached = cachedBullpenPositionsOrNull();
+    if (!cached) await refreshBullpenPositions({ force: true });
+    else void refreshBullpenPositions();
+
+    const arr = (cachedBullpenPositionsOrNull()?.positions ?? []) as Record<string, unknown>[];
+    if (arr.length > 0) {
+      const norm = (s: unknown) => String(s ?? '').trim().toLowerCase();
+      const hit = arr.find((p) => {
+        if (!p || typeof p !== 'object') return false;
+        const o = p as Record<string, unknown>;
+        const slug = norm(o.slug ?? o.market_slug ?? o.marketSlug ?? o.market);
+        const out = norm(o.outcome ?? o.outcome_name ?? o.outcomeName);
+        return slug === norm(marketSlug) && out === norm(outcome);
+      }) as Record<string, unknown> | undefined;
+      if (hit) {
+        const avg = toPrice01Maybe(hit.avg_entry ?? hit.avgEntry ?? hit.entry_price ?? hit.entryPrice ?? hit.avg_price ?? hit.avgPrice);
+        const shares = parseNumber('size', hit.size ?? hit.shares ?? hit.position ?? hit.quantity) ?? 0;
+        return json(res, 200, { ok: true, data: { tokenId, avgEntry: avg, shares: roundSizeShares4(shares) } });
+      }
+    }
+    // fall through to CLOB-derived avg when Bullpen off, empty, or no matching row
+  }
+
+  const ready = await getTradingClient();
+  if (!ready.ok) {
+    return json(res, ready.error === 'trading_auth_failed' ? 502 : 503, {
+      ok: false,
+      error: ready.error,
+      details: { hint: ready.hint, reason: ready.details },
+    });
+  }
+
+  try {
+    const funder = ready.config.funderAddress.toLowerCase();
+    const signer = ready.config.signerAddress.toLowerCase();
+    const myAddrs = new Set([funder, signer].filter(Boolean));
+
+    const items = await clobListTradesForAssetId(ready.client, tokenId, 24);
+
+    const anyAddrHit = items.some((t) => String(t.asset_id ?? '') === tokenId && tradeInvolvesAddresses(t, myAddrs));
+
+    let pos = 0;
+    let cost = 0;
+    for (const trade of items) {
+      if (String(trade.asset_id ?? '') !== tokenId) continue;
+      if (anyAddrHit && !tradeInvolvesAddresses(trade, myAddrs)) continue;
+
+      // Trade payload side is from the taker perspective. If we are a maker on this fill,
+      // our effective side is the opposite (maker sells to a BUY taker, and vice versa).
+      const owner = typeof trade.owner === 'string' ? trade.owner.toLowerCase() : '';
+      const isTaker = owner && myAddrs.has(owner);
+      const mos = trade.maker_orders;
+      const myMakerOrders: Record<string, unknown>[] = [];
+      if (Array.isArray(mos)) {
+        for (const mo of mos) {
+          if (!mo || typeof mo !== 'object') continue;
+          const m = mo as Record<string, unknown>;
+          const ma = typeof m.maker_address === 'string' ? m.maker_address.toLowerCase() : '';
+          const ow = typeof m.owner === 'string' ? m.owner.toLowerCase() : '';
+          const asset = String(m.asset_id ?? '');
+          if (asset !== tokenId) continue;
+          if ((ma && myAddrs.has(ma)) || (ow && myAddrs.has(ow))) myMakerOrders.push(m);
+        }
+      }
+      const isMaker = myMakerOrders.length > 0;
+      if (!isTaker && !isMaker) continue;
+
+      const tradeSideRaw = String(trade.side ?? '').toUpperCase();
+      const takerIsBuy = tradeSideRaw === 'BUY' || tradeSideRaw === 'B';
+      const takerIsSell = tradeSideRaw === 'SELL' || tradeSideRaw === 'S';
+      if (!takerIsBuy && !takerIsSell) continue;
+
+      const effectiveIsBuy = isMaker ? takerIsSell : takerIsBuy;
+      const effectiveIsSell = isMaker ? takerIsBuy : takerIsSell;
+
+      const price =
+        // Prefer maker order price when we are maker (more reliable for our fills).
+        isMaker ? parseNumber('price', myMakerOrders[0]?.price) : parseNumber('price', trade.price);
+      if (price == null || price <= 0 || price >= 1) continue;
+
+      // Size should be OUR matched amount, not necessarily the whole trade size.
+      let size: number | null = null;
+      if (isMaker) {
+        let sum = 0;
+        for (const m of myMakerOrders) {
+          const raw = (m.matched_amount ?? m.matchedAmount ?? m.size ?? m.amount ?? m.quantity) as unknown;
+          const norm = normalizeAmountMaybe(raw, CONDITIONAL_TOKEN_DECIMALS, 'conditional');
+          const s = parseNumber('size', norm ?? raw);
+          if (s != null && s > 0) sum += s;
+        }
+        size = sum > 0 ? sum : null;
+      } else {
+        const sizeRaw = trade.size ?? trade.amount ?? trade.quantity;
+        const sizeNorm = normalizeAmountMaybe(sizeRaw, CONDITIONAL_TOKEN_DECIMALS, 'conditional');
+        size = parseNumber('size', sizeNorm ?? sizeRaw);
+      }
+      if (size == null || size <= 0) continue;
+
+      if (effectiveIsBuy) {
+        pos += size;
+        cost += size * price;
+      } else if (effectiveIsSell) {
+        if (pos <= 0) continue;
+        const avg = cost / pos;
+        const qty = Math.min(size, pos);
+        cost -= qty * avg;
+        pos -= qty;
+      }
+    }
+
+    const avgEntry = pos > 0 ? roundPrice01Api(cost / pos) : null;
+    const sharesOut = roundSizeShares4(pos);
+    return json(res, 200, { ok: true, data: { tokenId, avgEntry, shares: sharesOut } });
+  } catch (error) {
+    return json(res, 502, {
+      ok: false,
+      error: 'avg_entry_failed',
+      details: { message: error instanceof Error ? error.message : String(error) },
+    });
+  }
+});
+
+/**
+ * Canonical fill snapshot per CLOB order id (from the same `/data` trades feed as Polymarket profile).
+ * Lets the web UI overwrite optimistic rows so shares/avg match the exchange.
+ */
+app.get('/api/trade/order-fill-index', async (req, res) => {
   const tokenId = String(req.query.token_id ?? '').trim();
   if (!tokenId) return json(res, 400, { ok: false, error: 'missing_token_id' });
 
@@ -1496,58 +1921,141 @@ app.get('/api/trade/avg-entry', async (req, res) => {
     const funder = ready.config.funderAddress.toLowerCase();
     const signer = ready.config.signerAddress.toLowerCase();
     const myAddrs = new Set([funder, signer].filter(Boolean));
-
-    const params: TradeParams = { asset_id: tokenId };
-    const items: Record<string, unknown>[] = [];
-    let cursor: string | undefined = undefined;
-    for (let page = 0; page < 24; page++) {
-      const batch = await ready.client.getTradesPaginated(params, cursor);
-      for (const tr of batch.trades) items.push(tr as unknown as Record<string, unknown>);
-      const next = batch.next_cursor;
-      if (!next || next === 'LTE=' || batch.trades.length === 0) break;
-      cursor = next;
-    }
-
-    items.sort((a, b) => tradeMatchTimeMs(a) - tradeMatchTimeMs(b));
-
-    const anyAddrHit = items.some((t) => String(t.asset_id ?? '') === tokenId && tradeInvolvesAddresses(t, myAddrs));
-
-    let pos = 0;
-    let cost = 0;
-    for (const trade of items) {
-      if (String(trade.asset_id ?? '') !== tokenId) continue;
-      if (anyAddrHit && !tradeInvolvesAddresses(trade, myAddrs)) continue;
-
-      const price = parseNumber('price', trade.price);
-      const sizeRaw = trade.size ?? trade.amount ?? trade.quantity;
-      const sizeNorm = normalizeAmountMaybe(sizeRaw, CONDITIONAL_TOKEN_DECIMALS, 'conditional');
-      const size = parseNumber('size', sizeNorm ?? sizeRaw);
-      if (price == null || size == null || price <= 0 || price >= 1 || size <= 0) continue;
-
-      const sideRaw = String(trade.side ?? '').toUpperCase();
-      const isBuy = sideRaw === 'BUY' || sideRaw === 'B';
-      const isSell = sideRaw === 'SELL' || sideRaw === 'S';
-      if (!isBuy && !isSell) continue;
-
-      if (isBuy) {
-        pos += size;
-        cost += size * price;
-      } else {
-        if (pos <= 0) continue;
-        const avg = cost / pos;
-        const qty = Math.min(size, pos);
-        cost -= qty * avg;
-        pos -= qty;
-      }
-    }
-
-    const avgEntry = pos > 0 ? roundPrice01Api(cost / pos) : null;
-    const sharesOut = roundSizeShares4(pos);
-    return json(res, 200, { ok: true, data: { tokenId, avgEntry, shares: sharesOut } });
+    const items = await clobListTradesForAssetId(ready.client, tokenId, 28);
+    const by_order_id = buildOrderFillIndexFromTrades(items, tokenId, myAddrs);
+    return json(res, 200, { ok: true, data: { token_id: tokenId, by_order_id } });
   } catch (error) {
     return json(res, 502, {
       ok: false,
-      error: 'avg_entry_failed',
+      error: 'order_fill_index_failed',
+      details: { message: error instanceof Error ? error.message : String(error) },
+    });
+  }
+});
+
+type MyFillRow = {
+  token_id: string;
+  order_id: string;
+  side: 'buy' | 'sell';
+  price_01: number;
+  shares: number;
+  match_time_ms: number;
+  role: 'taker' | 'maker';
+};
+
+/**
+ * Confirmed fills for the authenticated wallet, derived from the same CLOB trades tape Polymarket uses.
+ * Returns the most recent fills for one outcome token (asset_id).
+ */
+app.get('/api/trade/my-fills', async (req, res) => {
+  const tokenId = String(req.query.token_id ?? '').trim();
+  if (!tokenId) return json(res, 400, { ok: false, error: 'missing_token_id' });
+  const limit = Math.max(1, Math.min(200, parseInt(String(req.query.limit ?? '40'), 10) || 40));
+
+  const ready = await getTradingClient();
+  if (!ready.ok) {
+    return json(res, ready.error === 'trading_auth_failed' ? 502 : 503, {
+      ok: false,
+      error: ready.error,
+      details: { hint: ready.hint, reason: ready.details },
+    });
+  }
+
+  try {
+    const funder = ready.config.funderAddress.toLowerCase();
+    const signer = ready.config.signerAddress.toLowerCase();
+    const myAddrs = new Set([funder, signer].filter(Boolean));
+
+    const items = await clobListTradesForAssetId(ready.client, tokenId, 28);
+    const out: MyFillRow[] = [];
+
+    for (const trade of items) {
+      if (String(trade.asset_id ?? '') !== tokenId) continue;
+      if (!tradeInvolvesAddresses(trade, myAddrs)) continue;
+
+      const owner = typeof trade.owner === 'string' ? trade.owner.toLowerCase() : '';
+      const isTaker = Boolean(owner && myAddrs.has(owner));
+      const mos = trade.maker_orders;
+      const myMakerOrders: Record<string, unknown>[] = [];
+      if (Array.isArray(mos)) {
+        for (const mo of mos) {
+          if (!mo || typeof mo !== 'object') continue;
+          const m = mo as Record<string, unknown>;
+          const ma = typeof m.maker_address === 'string' ? m.maker_address.toLowerCase() : '';
+          const ow = typeof m.owner === 'string' ? m.owner.toLowerCase() : '';
+          const asset = String(m.asset_id ?? '');
+          if (asset !== tokenId) continue;
+          if ((ma && myAddrs.has(ma)) || (ow && myAddrs.has(ow))) myMakerOrders.push(m);
+        }
+      }
+      const isMaker = myMakerOrders.length > 0;
+      if (!isTaker && !isMaker) continue;
+
+      const px = toPrice01Maybe(trade.price);
+      if (px == null) continue;
+
+      const tradeSideRaw = String(trade.side ?? '').toUpperCase();
+      const takerIsBuy = tradeSideRaw === 'BUY' || tradeSideRaw === 'B';
+      const takerIsSell = tradeSideRaw === 'SELL' || tradeSideRaw === 'S';
+      if (!takerIsBuy && !takerIsSell) continue;
+
+      const at = tradeMatchTimeMs(trade);
+
+      // If we were taker, emit one fill row keyed by taker_order_id.
+      if (isTaker) {
+        const sizeRaw = trade.size ?? trade.amount ?? trade.quantity;
+        const sizeNorm = normalizeAmountMaybe(sizeRaw, CONDITIONAL_TOKEN_DECIMALS, 'conditional');
+        const size = parseNumber('size', sizeNorm ?? sizeRaw);
+        if (size == null || size <= 0) continue;
+        const side: 'buy' | 'sell' = takerIsBuy ? 'buy' : 'sell';
+        const oid = String(trade.taker_order_id ?? (trade as { takerOrderId?: unknown }).takerOrderId ?? '').trim();
+        if (oid) {
+          out.push({
+            token_id: tokenId,
+            order_id: oid,
+            side,
+            price_01: roundPrice01Api(px),
+            shares: roundSizeShares4(size),
+            match_time_ms: at,
+            role: 'taker',
+          });
+        }
+      }
+
+      // If we were maker, emit one row per maker order id (only our maker orders).
+      if (isMaker) {
+        for (const m of myMakerOrders) {
+          const mo = m as Record<string, unknown>;
+          const oid = String(mo.order_id ?? mo.orderId ?? '').trim();
+          if (!oid) continue;
+
+          // Maker matched size is on maker_order object.
+          const raw = (mo.matched_amount ?? mo.matchedAmount ?? mo.size ?? mo.amount ?? mo.quantity) as unknown;
+          const norm = normalizeAmountMaybe(raw, CONDITIONAL_TOKEN_DECIMALS, 'conditional');
+          const sz = parseNumber('size', norm ?? raw);
+          if (sz == null || sz <= 0) continue;
+
+          // When we are maker, our effective side is opposite the taker side.
+          const side: 'buy' | 'sell' = takerIsBuy ? 'sell' : 'buy';
+          out.push({
+            token_id: tokenId,
+            order_id: oid,
+            side,
+            price_01: roundPrice01Api(px),
+            shares: roundSizeShares4(sz),
+            match_time_ms: at,
+            role: 'maker',
+          });
+        }
+      }
+    }
+
+    out.sort((a, b) => b.match_time_ms - a.match_time_ms);
+    return json(res, 200, { ok: true, data: { token_id: tokenId, fills: out.slice(0, limit) } });
+  } catch (error) {
+    return json(res, 502, {
+      ok: false,
+      error: 'my_fills_failed',
       details: { message: error instanceof Error ? error.message : String(error) },
     });
   }
@@ -1592,10 +2100,19 @@ app.post('/api/trade/update-balance-allowance', async (req, res) => {
  * Use FAK so available liquidity can fill partially instead of killing the whole order.
  */
 app.post('/api/trade/market-order', async (req, res) => {
-  const body = req.body as { token?: unknown; amount?: unknown; side?: unknown; signatureType?: unknown };
+  const body = req.body as {
+    token?: unknown;
+    amount?: unknown;
+    side?: unknown;
+    signatureType?: unknown;
+    market_slug?: unknown;
+    outcome?: unknown;
+  };
   const token = typeof body.token === 'string' ? body.token.trim() : '';
   const side = typeof body.side === 'string' ? body.side.trim().toLowerCase() : 'buy';
   const amount = parseNumber('amount', body.amount);
+  const marketSlug = typeof body.market_slug === 'string' ? body.market_slug.trim() : '';
+  const outcome = typeof body.outcome === 'string' ? body.outcome.trim() : '';
 
   if (!token) return json(res, 400, { ok: false, error: 'missing_token' });
   if (side !== 'buy' && side !== 'sell') return json(res, 400, { ok: false, error: 'bad_side' });
@@ -1634,6 +2151,49 @@ app.post('/api/trade/market-order', async (req, res) => {
         details: { hint: 'Sell size is too small after rounding to 4 decimal shares.' },
       });
     }
+  }
+
+  // Optional: slug+outcome + POLYMARKET_USE_BULLPEN=true routes execution through Bullpen CLI.
+  if (marketSlug && outcome && polymarketUseBullpen()) {
+    const env = String(process.env.BULLPEN_ENV ?? 'production').trim() || 'production';
+    const t0 = Date.now();
+    const args =
+      side === 'buy'
+        ? ['polymarket', 'buy', '--env', env, '--output', 'json', '--yes', marketSlug, outcome, String(orderAmount)]
+        : ['polymarket', 'sell', '--env', env, '--output', 'json', '--yes', marketSlug, outcome, String(orderAmount)];
+    const r = await runBullpen(args, { timeoutMs: 45_000 });
+    if (!r.ok) {
+      return json(res, 502, {
+        ok: false,
+        error: 'bullpen_trade_failed',
+        details: {
+          message: (r.stderr || r.stdout || '').trim().slice(0, 1200) || 'Bullpen CLI failed.',
+          code: r.code,
+          hint: 'Ensure `bullpen` is installed and authenticated (`bullpen status`, `bullpen login`).',
+        },
+      });
+    }
+    const parsed = parseJsonMaybe(r.stdout) ?? { stdout: r.stdout.trim() };
+    const asObj = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null;
+    const orderId = asObj ? extractOrderIdFromClobPayload(asObj) : null;
+    const fillPrice01 = asObj ? (typeof asObj.price01 === 'number' ? asObj.price01 : typeof asObj.price === 'number' ? asObj.price : null) : null;
+    const fill = extractCanonicalMarketFill(parsed, { side: side as 'buy' | 'sell', amount: orderAmount, tokenID: token });
+    return json(res, 200, {
+      ok: true,
+      data: {
+        result: parsed,
+        execution: {
+          submitted_price_01: typeof fillPrice01 === 'number' && Number.isFinite(fillPrice01) ? fillPrice01 : null,
+          order_id: orderId,
+          round_trip_ms: Date.now() - t0,
+          fill: {
+            filled_shares: fill.filled_shares,
+            avg_fill_price_01: fill.avg_fill_price_01,
+            status: fill.status,
+          },
+        },
+      },
+    });
   }
 
   const ready = await getTradingClient();
@@ -1692,6 +2252,7 @@ app.post('/api/trade/market-order', async (req, res) => {
       throw err;
     }
 
+    const fill = extractCanonicalMarketFill(parsed, { side: side as 'buy' | 'sell', amount: orderAmount, tokenID: token });
     return json(res, 200, {
       ok: true,
       data: {
@@ -1700,6 +2261,11 @@ app.post('/api/trade/market-order', async (req, res) => {
           submitted_price_01: submittedCrossPrice,
           order_id: extractOrderIdFromClobPayload(parsed),
           round_trip_ms: Date.now() - t0,
+          fill: {
+            filled_shares: fill.filled_shares,
+            avg_fill_price_01: fill.avg_fill_price_01,
+            status: fill.status,
+          },
         },
       },
     });
@@ -1719,11 +2285,21 @@ app.post('/api/trade/market-order', async (req, res) => {
 
 /** Real-money trading via the Polymarket CLOB API: limit orders (shares size + price). */
 app.post('/api/trade/create-order', async (req, res) => {
-  const body = req.body as { token?: unknown; price?: unknown; size?: unknown; side?: unknown; signatureType?: unknown };
+  const body = req.body as {
+    token?: unknown;
+    price?: unknown;
+    size?: unknown;
+    side?: unknown;
+    signatureType?: unknown;
+    market_slug?: unknown;
+    outcome?: unknown;
+  };
   const token = typeof body.token === 'string' ? body.token.trim() : '';
   const side = typeof body.side === 'string' ? body.side.trim().toLowerCase() : 'buy';
   const priceRaw = parseNumber('price', body.price);
   const sizeRaw = parseNumber('size', body.size);
+  const marketSlug = typeof body.market_slug === 'string' ? body.market_slug.trim() : '';
+  const outcome = typeof body.outcome === 'string' ? body.outcome.trim() : '';
 
   if (!token) return json(res, 400, { ok: false, error: 'missing_token' });
   if (side !== 'buy' && side !== 'sell') return json(res, 400, { ok: false, error: 'bad_side' });
@@ -1747,6 +2323,42 @@ app.post('/api/trade/create-order', async (req, res) => {
     });
   }
 
+  if (marketSlug && outcome && polymarketUseBullpen()) {
+    const env = String(process.env.BULLPEN_ENV ?? 'production').trim() || 'production';
+    const t0 = Date.now();
+    const cmd =
+      side === 'buy'
+        ? ['polymarket', 'limit-buy', '--env', env, '--output', 'json', '--yes', '--price', String(price), '--shares', String(size), marketSlug, outcome]
+        : ['polymarket', 'limit-sell', '--env', env, '--output', 'json', '--yes', '--price', String(price), '--shares', String(size), marketSlug, outcome];
+    const r = await runBullpen(cmd, { timeoutMs: 45_000 });
+    if (!r.ok) {
+      return json(res, 502, {
+        ok: false,
+        error: 'bullpen_trade_failed',
+        details: {
+          message: (r.stderr || r.stdout || '').trim().slice(0, 1200) || 'Bullpen CLI failed.',
+          code: r.code,
+          hint: 'Ensure `bullpen` is installed and authenticated (`bullpen status`, `bullpen login`).',
+        },
+      });
+    }
+    const parsed = parseJsonMaybe(r.stdout) ?? { stdout: r.stdout.trim() };
+    const asObj = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null;
+    const orderId = asObj ? extractOrderIdFromClobPayload(asObj) : null;
+    return json(res, 200, {
+      ok: true,
+      data: {
+        result: parsed,
+        execution: {
+          submitted_price_01: price,
+          submitted_size_shares: size,
+          order_id: orderId,
+          round_trip_ms: Date.now() - t0,
+        },
+      },
+    });
+  }
+
   const ready = await getTradingClient();
   if (!ready.ok) {
     return json(res, ready.error === 'trading_auth_failed' ? 502 : 503, {
@@ -1764,6 +2376,7 @@ app.post('/api/trade/create-order', async (req, res) => {
       await ready.client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL });
     }
 
+    const ob = await clobOrderBuilderOptions(ready.client, token);
     const parsed = await ready.client.createAndPostOrder(
       {
         tokenID: token,
@@ -1771,7 +2384,7 @@ app.post('/api/trade/create-order', async (req, res) => {
         size,
         side: side === 'buy' ? Side.BUY : Side.SELL,
       },
-      undefined,
+      ob,
       OrderType.GTC,
     );
     const orderId = extractOrderIdFromClobPayload(parsed);
@@ -1837,19 +2450,13 @@ app.get('/api/trade/open-orders', async (req, res) => {
 
   try {
     const params = tokenId ? ({ token_id: tokenId } as Record<string, unknown>) : ({} as Record<string, unknown>);
-    const items: unknown[] = [];
-    let cursor: string | undefined = undefined;
-    for (let page = 0; page < 10; page++) {
-      const batch = await ready.client.getOpenOrders(params as never, false, cursor);
-      const next = (batch as { next_cursor?: unknown }).next_cursor;
-      const data = (batch as { data?: unknown }).data;
-      if (Array.isArray(data)) {
-        for (const o of data) items.push(o);
-      }
-      const nextStr = typeof next === 'string' ? next : '';
-      if (!nextStr || nextStr === 'LTE=' || (Array.isArray(data) && data.length === 0)) break;
-      cursor = nextStr;
-    }
+    // `ClobClient.getOpenOrders` returns `OpenOrder[]` (it paginates internally); older code wrongly expected `{ data, next_cursor }`.
+    const batch = await ready.client.getOpenOrders(params as never, false);
+    const items: unknown[] = Array.isArray(batch)
+      ? batch
+      : batch && typeof batch === 'object' && Array.isArray((batch as { data?: unknown }).data)
+        ? ((batch as { data: unknown[] }).data as unknown[])
+        : [];
     return json(res, 200, { ok: true, data: { token_id: tokenId || null, orders: items } });
   } catch (error) {
     return json(res, 502, {
@@ -1937,7 +2544,211 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
 });
 
 const port = Number(process.env.PORT ?? 8787);
-app.listen(port, () => {
+
+function safeJsonStringify(obj: unknown): string {
+  try {
+    return JSON.stringify(obj);
+  } catch {
+    return JSON.stringify({ ok: false, error: 'stringify_failed' });
+  }
+}
+
+function userChannelAuthFromEnv(): { apiKey: string; secret: string; passphrase: string } | null {
+  const apiKey = String(process.env.POLYMARKET_API_KEY ?? '').trim();
+  const secret = String(process.env.POLYMARKET_API_SECRET ?? '').trim();
+  const passphrase = String(process.env.POLYMARKET_API_PASSPHRASE ?? '').trim();
+  if (!apiKey || !secret || !passphrase) return null;
+  return { apiKey, secret, passphrase };
+}
+
+const server = http.createServer(app);
+
+// Server-side bridge: Polymarket user WS -> browser WS (never expose creds to web).
+const wss = new WebSocketServer({ server, path: '/api/trade/user-ws' });
+wss.on('connection', async (client) => {
+  const auth = userChannelAuthFromEnv();
+  if (!auth) {
+    client.send(
+      safeJsonStringify({
+        ok: false,
+        error: 'missing_api_creds_for_user_ws',
+        details: { hint: 'Set POLYMARKET_API_KEY / POLYMARKET_API_SECRET / POLYMARKET_API_PASSPHRASE in api/.env' },
+      }),
+    );
+    client.close();
+    return;
+  }
+
+  // Best-effort: annotate user WS messages from *our* perspective (maker vs taker),
+  // so the web UI can display the same fill side/price Polymarket shows.
+  const ready = await getTradingClient();
+  const myAddrs =
+    ready.ok
+      ? new Set([ready.config.funderAddress.toLowerCase(), ready.config.signerAddress.toLowerCase()].filter(Boolean))
+      : new Set<string>();
+
+  const wsNum = (v: unknown): number | null => {
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+    if (typeof v === 'string') {
+      const n = Number(v);
+      if (Number.isFinite(n)) return n;
+    }
+    return null;
+  };
+
+  const wsPrice01 = (raw: unknown): number | null => {
+    const n = wsNum(raw);
+    if (n == null) return null;
+    if (n > 0 && n <= 1) return n;
+    if (n > 1 && n <= 100) return n / 100;
+    return null;
+  };
+
+  const perspectiveFromPayload = (obj: Record<string, unknown>): { myRole?: 'maker' | 'taker'; mySide?: 'buy' | 'sell'; myPrice01?: number; mySize?: number } => {
+    if (myAddrs.size === 0) return {};
+    const tradeSideRaw = String(obj.side ?? '').toUpperCase();
+    const takerIsBuy = tradeSideRaw === 'BUY' || tradeSideRaw === 'B';
+    const takerIsSell = tradeSideRaw === 'SELL' || tradeSideRaw === 'S';
+    if (!takerIsBuy && !takerIsSell) return {};
+
+    const owner = typeof obj.owner === 'string' ? obj.owner.toLowerCase() : '';
+    const isTaker = owner && myAddrs.has(owner);
+
+    const makerOrders = obj.maker_orders;
+    let isMaker = false;
+    let makerMatched = 0;
+    let makerPrice01: number | null = null;
+    if (Array.isArray(makerOrders)) {
+      for (const mo of makerOrders) {
+        if (!mo || typeof mo !== 'object') continue;
+        const m = mo as Record<string, unknown>;
+        const ma = typeof m.maker_address === 'string' ? m.maker_address.toLowerCase() : '';
+        const ow = typeof m.owner === 'string' ? m.owner.toLowerCase() : '';
+        const hit = (ma && myAddrs.has(ma)) || (ow && myAddrs.has(ow));
+        if (!hit) continue;
+        isMaker = true;
+        const amtRaw = m.matched_amount ?? m.matchedAmount ?? m.size ?? m.amount ?? m.quantity;
+        const norm = normalizeAmountMaybe(amtRaw, CONDITIONAL_TOKEN_DECIMALS, 'conditional');
+        const s = wsNum(norm ?? amtRaw);
+        if (s != null && s > 0) makerMatched += s;
+        if (makerPrice01 == null) makerPrice01 = wsPrice01(m.price);
+      }
+    }
+
+    if (!isTaker && !isMaker) return {};
+    const role: 'maker' | 'taker' = isMaker ? 'maker' : 'taker';
+    const mySide: 'buy' | 'sell' =
+      role === 'maker'
+        ? takerIsBuy
+          ? 'sell'
+          : 'buy'
+        : takerIsBuy
+          ? 'buy'
+          : 'sell';
+
+    const myPrice01 = role === 'maker' ? makerPrice01 ?? wsPrice01(obj.price) : wsPrice01(obj.price);
+    const mySize =
+      role === 'maker'
+        ? makerMatched > 0
+          ? makerMatched
+          : wsNum(obj.size)
+        : wsNum(obj.size);
+
+    return { myRole: role, mySide, myPrice01: myPrice01 ?? undefined, mySize: mySize ?? undefined };
+  };
+
+  let upstream: WebSocket | null = null;
+  let pingTimer: NodeJS.Timeout | null = null;
+  const closeAll = () => {
+    if (pingTimer) clearInterval(pingTimer);
+    pingTimer = null;
+    try {
+      upstream?.close();
+    } catch {
+      /* ignore */
+    }
+    upstream = null;
+    try {
+      client.close();
+    } catch {
+      /* ignore */
+    }
+  };
+
+  try {
+    upstream = new WebSocket('wss://ws-subscriptions-clob.polymarket.com/ws/user');
+  } catch {
+    client.send(safeJsonStringify({ ok: false, error: 'user_ws_connect_failed' }));
+    closeAll();
+    return;
+  }
+
+  upstream.on('open', () => {
+    upstream?.send(
+      safeJsonStringify({
+        type: 'user',
+        auth: { apiKey: auth.apiKey, secret: auth.secret, passphrase: auth.passphrase },
+      }),
+    );
+    // Docs: keepalive PING every ~10s.
+    pingTimer = setInterval(() => {
+      try {
+        upstream?.send(safeJsonStringify({ type: 'PING' }));
+      } catch {
+        /* ignore */
+      }
+    }, 10_000);
+  });
+
+  upstream.on('message', (buf) => {
+    try {
+      if (client.readyState !== WebSocket.OPEN) return;
+      const raw = String(buf);
+      if (myAddrs.size === 0) {
+        client.send(raw);
+        return;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw) as unknown;
+      } catch {
+        client.send(raw);
+        return;
+      }
+      if (!parsed || typeof parsed !== 'object') {
+        client.send(raw);
+        return;
+      }
+      const obj = parsed as Record<string, unknown>;
+      const p = perspectiveFromPayload(obj);
+      if (p.mySide || p.myPrice01 != null || p.mySize != null) {
+        obj.my_role = p.myRole;
+        obj.my_side = p.mySide;
+        obj.my_price01 = p.myPrice01;
+        obj.my_size = p.mySize;
+      }
+      client.send(safeJsonStringify(obj));
+    } catch {
+      /* ignore */
+    }
+  });
+  upstream.on('close', () => {
+    closeAll();
+  });
+  upstream.on('error', () => {
+    client.send(safeJsonStringify({ ok: false, error: 'user_ws_upstream_error' }));
+    closeAll();
+  });
+
+  client.on('close', () => {
+    closeAll();
+  });
+  client.on('error', () => {
+    closeAll();
+  });
+});
+
+server.listen(port, () => {
   console.log(`[api] listening on http://127.0.0.1:${port}`);
   void ensureRtdsWs().catch(() => {
     /* RTDS warms on first /api/rtds/crypto request if this fails */
