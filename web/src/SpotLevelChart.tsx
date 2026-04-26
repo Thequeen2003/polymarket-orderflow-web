@@ -169,10 +169,10 @@ export function SpotLevelChart({
   return (
     <div className="rounded-2xl border border-zinc-800/50 bg-zinc-950/35 p-4 shadow-inner shadow-black/15 ring-1 ring-white/[0.02]">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-[13px] font-medium tracking-wide text-zinc-200">{title}</div>
+        <div className="text-[15px] font-semibold tracking-wide text-zinc-200">{title}</div>
         <div className="flex flex-wrap gap-2">
           <div
-            className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide ${
+            className={`rounded-full border px-3 py-1.5 text-[13px] font-semibold uppercase tracking-wide ${
               stale ? 'border-zinc-700/40 bg-zinc-950/40 text-zinc-500' : 'border-emerald-700/40 bg-emerald-950/25 text-emerald-200'
             }`}
             title={lastUpdateMs ? `Last RTDS tick ${new Date(lastUpdateMs).toLocaleTimeString()}` : 'No ticks yet'}
@@ -181,7 +181,7 @@ export function SpotLevelChart({
           </div>
           {bookFlow != null && bookFlow.length > 0 ? (
             <div
-              className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide ${
+              className={`rounded-full border px-3 py-1.5 text-[13px] font-semibold uppercase tracking-wide ${
                 flowStale ? 'border-zinc-700/40 bg-zinc-950/40 text-zinc-500' : 'border-sky-700/40 bg-sky-950/25 text-sky-200'
               }`}
               title="Book snapshots aligned to PTB-touch buckets (~5s poll)"
@@ -192,20 +192,20 @@ export function SpotLevelChart({
         </div>
       </div>
 
-      <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-zinc-400">
-        <div className="rounded-md bg-zinc-900/50 px-2 py-1 font-mono">spot {last != null ? fmtUsd(last) : '—'}</div>
-        <div className="rounded-md border border-amber-800/40 bg-amber-950/25 px-2 py-1 font-mono text-amber-100/90">
+      <div className="mt-2 flex flex-wrap gap-2 text-[13px] text-zinc-300">
+        <div className="rounded-md bg-zinc-900/50 px-2.5 py-1.5 font-mono">spot {last != null ? fmtUsd(last) : '—'}</div>
+        <div className="rounded-md border border-amber-800/40 bg-amber-950/25 px-2.5 py-1.5 font-mono text-amber-100/90">
           PTB {priceToBeat != null ? fmtUsd(priceToBeat) : '—'}
         </div>
         <div
-          className="rounded-md bg-zinc-900/50 px-2 py-1 font-mono"
+          className="rounded-md bg-zinc-900/50 px-2.5 py-1.5 font-mono"
           title="Absolute distance — direction matters less than how price meets the line"
         >
           |vs PTB| {absDist != null ? fmtUsd(absDist) : '—'}
         </div>
         {reaction ? (
           <div
-            className="rounded-md border border-zinc-600/50 bg-zinc-900/60 px-2 py-1 font-mono text-zinc-200"
+            className="rounded-md border border-zinc-600/50 bg-zinc-900/60 px-2.5 py-1.5 font-mono text-zinc-200"
             title="Half-width of the interaction band around PTB"
           >
             band ±{reaction.eps.toFixed(2)}
@@ -213,7 +213,7 @@ export function SpotLevelChart({
         ) : null}
         {reaction ? (
           <div
-            className="rounded-md border border-violet-800/35 bg-violet-950/25 px-2 py-1 font-mono text-violet-100/90"
+            className="rounded-md border border-violet-800/35 bg-violet-950/25 px-2.5 py-1.5 font-mono text-violet-100/90"
             title="Follow-through vs stall after PTB contact"
           >
             ext {extFtLabel(reaction.extensionFollowThrough)}
@@ -259,6 +259,53 @@ export function SpotLevelChart({
           </div>
           <p className="mt-2.5 text-[13px] font-medium leading-snug text-zinc-50">{reaction.reactionStrength.primary}</p>
           <p className="mt-2 text-[11px] leading-snug text-amber-100/85">{reaction.headline}</p>
+
+          {priceToBeat != null && last != null ? (() => {
+            const eps = reaction.eps;
+            const dist = last - priceToBeat;
+            const absDist = Math.abs(dist);
+            const inBand = absDist <= eps * 1.05;
+            const side = dist >= 0 ? 'UP' : 'DOWN';
+            const tier = reaction.reactionStrength.tier;
+            const kind = reaction.kind;
+            const isChop = kind === 'choppy_at_line' || tier === 'weak';
+            const isRejection = tier === 'rejection' || kind === 'rejecting_off_line';
+            const isConfirm = kind === 'break_hold' || kind === 'extension_confirming' || tier === 'strong';
+            const verdict =
+              inBand || isChop ? 'WAIT' : isRejection ? 'FADE / WAIT' : isConfirm ? `ENTER ${side}` : `LEAN ${side}`;
+            const tone =
+              verdict.startsWith('ENTER UP')
+                ? 'border-emerald-700/45 bg-emerald-950/20 text-emerald-100'
+                : verdict.startsWith('ENTER DOWN')
+                  ? 'border-rose-700/45 bg-rose-950/20 text-rose-100'
+                  : verdict.startsWith('LEAN UP')
+                    ? 'border-emerald-800/35 bg-black/20 text-emerald-200/90'
+                    : verdict.startsWith('LEAN DOWN')
+                      ? 'border-rose-800/35 bg-black/20 text-rose-200/90'
+                      : verdict.startsWith('FADE')
+                        ? 'border-amber-700/45 bg-amber-950/15 text-amber-100'
+                        : 'border-zinc-700/60 bg-zinc-950/25 text-zinc-200';
+            const why =
+              inBand
+                ? `Inside band (±$${eps.toFixed(2)}) — wait for a clean break + hold.`
+                : isChop
+                  ? 'Chop / weak reaction — do not force entries at the line.'
+                  : isRejection
+                    ? 'Rejection at PTB — continuation is less trustworthy right now.'
+                    : isConfirm
+                      ? `Confirmed separation ${dist >= 0 ? 'above' : 'below'} PTB — trade the break side until reclaim.`
+                      : `Outside band ${dist >= 0 ? 'above' : 'below'} PTB — bias exists but needs more confirmation.`;
+            return (
+              <div className="mt-2 rounded-xl border border-zinc-800/60 bg-black/20 px-3 py-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Best side right now</div>
+                  <div className={`rounded-lg border px-2 py-1 text-[11px] font-black ${tone}`}>{verdict}</div>
+                </div>
+                <div className="mt-1 text-[11px] leading-snug text-zinc-300">{why}</div>
+              </div>
+            );
+          })() : null}
+
           <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[10px] text-zinc-500">
             <span className="rounded border border-zinc-700/50 bg-zinc-900/60 px-1.5 py-0.5 font-mono">{kindLabel(reaction.kind)}</span>
             <span>{reaction.candleAtPtb}</span>
@@ -266,7 +313,7 @@ export function SpotLevelChart({
         </div>
       ) : null}
 
-      <svg viewBox={`0 0 ${width} ${height}`} className="mt-3 h-[260px] w-full">
+      <svg viewBox={`0 0 ${width} ${height}`} className="mt-3 h-[320px] w-full">
         <defs>
           <linearGradient id="spotExtAbove" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor="rgb(16 185 129)" stopOpacity="0.14" />

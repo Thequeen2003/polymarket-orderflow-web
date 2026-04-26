@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
 import {
   assistantChat,
   clobBooks,
@@ -19,28 +19,36 @@ import { MomentumChart, type SeriesPoint } from './MomentumChart';
 import { resolveUpDownIndices } from './upDown';
 import { OrderFlowChart } from './OrderFlowChart';
 import { snapshotFromBook, type BookSnapshot } from './orderflowMetrics';
-import { MomentumAlertsTab } from './MomentumAlertsTab';
+const MomentumAlertsTab = lazy(() => import('./MomentumAlertsTab').then((m) => ({ default: m.MomentumAlertsTab })));
 import { AboveBelowDashboard } from './AboveBelowDashboard';
-import { FlowZonesTab } from './FlowZonesTab';
-import { SignalsPtbOnly } from './SignalsPtbOnly';
+const FlowZonesTab = lazy(() => import('./FlowZonesTab').then((m) => ({ default: m.FlowZonesTab })));
+const SignalsPtbOnly = lazy(() => import('./SignalsPtbOnly').then((m) => ({ default: m.SignalsPtbOnly })));
 import { SignalsTradePanel } from './SignalsTradePanel';
 import { TradeSegmentedControl } from './tradeUi';
-import { PtbWatchTab } from './PtbWatchTab';
+const PtbWatchTab = lazy(() => import('./PtbWatchTab').then((m) => ({ default: m.PtbWatchTab })));
 import { priceToBeat, rtdsCrypto, type RtdsCryptoPoint } from './lib/api';
-import { WorkspaceTab } from './WorkspaceTab';
+const WorkspaceTab = lazy(() => import('./WorkspaceTab').then((m) => ({ default: m.WorkspaceTab })));
 import { DualPtbReferenceTab } from './DualPtbReferenceTab';
-import { TradeSlidePanel } from './TradeSlidePanel';
-import { PositionsCommandPanel } from './PositionsCommandPanel';
-import { TradeHistoryTab } from './TradeHistoryTab';
+const TradeSlidePanel = lazy(() => import('./TradeSlidePanel').then((m) => ({ default: m.TradeSlidePanel })));
+const PositionsCommandPanel = lazy(() =>
+  import('./PositionsCommandPanel').then((m) => ({ default: m.PositionsCommandPanel })),
+);
+const TradeHistoryTab = lazy(() => import('./TradeHistoryTab').then((m) => ({ default: m.TradeHistoryTab })));
 import { shortTradeTabLabel, TradeSessionTabsBar, type TradeSessionTab } from './TradeSessionTabsBar';
-import { PtbMultiAssetGrid, type PtbMultiAssetRow } from './PtbMultiAssetGrid';
-import { UnifiedPtbView } from './UnifiedPtbView';
-import { TrackingTab } from './TrackingTab';
-import { PtbThreeUp } from './PtbThreeUp';
-import { MultiMarketCommandView, type MarketKey, type MultiMarketRow } from './MultiMarketCommandView';
-import { SmartMoneyPaperPanel } from './SmartMoneyPaperPanel';
+const PtbMultiAssetGrid = lazy(() => import('./PtbMultiAssetGrid').then((m) => ({ default: m.PtbMultiAssetGrid })));
+import type { PtbMultiAssetRow } from './PtbMultiAssetGrid';
+const UnifiedPtbView = lazy(() => import('./UnifiedPtbView').then((m) => ({ default: m.UnifiedPtbView })));
+const TrackingTab = lazy(() => import('./TrackingTab').then((m) => ({ default: m.TrackingTab })));
+const PtbThreeUp = lazy(() => import('./PtbThreeUp').then((m) => ({ default: m.PtbThreeUp })));
+const MultiMarketCommandView = lazy(() =>
+  import('./MultiMarketCommandView').then((m) => ({ default: m.MultiMarketCommandView })),
+);
+import type { MarketKey, MultiMarketRow } from './MultiMarketCommandView';
+const SmartMoneyPaperPanel = lazy(() => import('./SmartMoneyPaperPanel').then((m) => ({ default: m.SmartMoneyPaperPanel })));
 import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
-import { PolySimulatorTradePanel } from './PolySimulatorTradePanel';
+const PolySimulatorTradePanel = lazy(() =>
+  import('./PolySimulatorTradePanel').then((m) => ({ default: m.PolySimulatorTradePanel })),
+);
 import type { SpotPoint } from './SpotLevelChart';
 import { openClobMarketChannel } from './clobMarketChannel';
 import {
@@ -53,6 +61,7 @@ import {
 import { outcomeEntryExitHints } from './chartReadouts';
 import { buildRollingContext, rollingContextText } from './contextSummary';
 import { nextUpdownSlug, parseUpdownSlug } from './sixPackUpdownSlugs';
+import { BtcSpotPaperTest } from './BtcSpotPaperTest';
 
 function pretty(value: unknown) {
   return JSON.stringify(value, null, 2);
@@ -522,6 +531,7 @@ type MainTab =
   | 'tradehistory'
   | 'dualptb'
   | 'threeup'
+  | 'btc'
   | 'command'
   | 'unified'
   | 'multiscan'
@@ -547,6 +557,8 @@ function mainTabTitle(tab: MainTab): string {
       return 'Dual PTB';
     case 'threeup':
       return '3-up';
+    case 'btc':
+      return 'BTC (paper)';
     case 'command':
       return 'Command';
     case 'unified':
@@ -616,7 +628,7 @@ function App() {
     if (typeof window === 'undefined') return '5m';
     try {
       const s = localStorage.getItem(PTB_THREE_UP_INTERVAL_KEY);
-      if (s === '5m' || s === '15m') return s;
+      if (s === '5m' || s === '15m' || s === '1h' || s === '4h' || s === '1d') return s;
     } catch {
       /* ignore */
     }
@@ -639,14 +651,19 @@ function App() {
   const [flowSeriesBySlug, setFlowSeriesBySlug] = useState<Record<string, Record<string, BookSnapshot[]>>>({});
   const [flowMode, setFlowMode] = useState<'price' | 'flow'>('flow');
   const [ssrPriceToBeat, setSsrPriceToBeat] = useState<number | null>(null);
+  const [ptbError, setPtbError] = useState<string | null>(null);
   const [rtdsSpot, setRtdsSpot] = useState<number | null>(null);
   const [rtdsTickAt, setRtdsTickAt] = useState<number | null>(null);
+  const [rtdsError, setRtdsError] = useState<string | null>(null);
   const [spotSeriesBySlug, setSpotSeriesBySlug] = useState<Record<string, SpotPoint[]>>({});
   /** RTDS Chainlink series per `btc/usd` | `eth/usd` | `sol/usd` — drives multi-asset scan + selected slug. */
   const [spotBySymbol, setSpotBySymbol] = useState<Record<string, SpotPoint[]>>({});
   const [watchMetaBySlug, setWatchMetaBySlug] = useState<Record<string, { ptb: number | null; endsInMs: number | null }>>({});
   const [now, setNow] = useState(() => Date.now());
   const spotBySymbolRef = useRef<Record<string, SpotPoint[]>>({});
+  const selectedSlugRef = useRef<string>('');
+  const wantSeriesRef = useRef<boolean>(false);
+  const wantFlowRef = useRef<boolean>(false);
 
   const [globalTradeLane, setGlobalTradeLane] = useState<'up' | 'down'>('up');
   const [tradePanelOpen, setTradePanelOpen] = useState(false);
@@ -671,6 +688,21 @@ function App() {
   useEffect(() => {
     spotBySymbolRef.current = spotBySymbol;
   }, [spotBySymbol]);
+
+  useEffect(() => {
+    selectedSlugRef.current = selectedSlug;
+  }, [selectedSlug]);
+
+  useEffect(() => {
+    wantSeriesRef.current =
+      mainTab === 'book' ||
+      mainTab === 'flowzones' ||
+      mainTab === 'signals' ||
+      mainTab === 'unified' ||
+      mainTab === 'momentum' ||
+      mainTab === 'dualptb';
+    wantFlowRef.current = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'unified';
+  }, [mainTab]);
 
   const prevDepthMapsRef = useRef<Record<string, { bids: Map<string, number>; asks: Map<string, number> }>>({});
 
@@ -888,7 +920,7 @@ function App() {
     });
   }, [activeTradeSessionTabId, currentTradeContext.question, currentTradeContext.slug, selectedSlug]);
 
-  const loadBooks = useCallback(async (ids: string[]) => {
+  const loadBooks = useCallback(async (ids: string[], opts?: { updateSeries?: boolean; updateFlow?: boolean }) => {
     if (ids.length === 0) {
       setBooks(null);
       return;
@@ -901,40 +933,46 @@ function App() {
       setBooks(res.data);
       const ts = Date.now();
       setBooksFetchedAt(ts);
-      // update chart series
-      setChartSeriesBySlug((m) => {
-        if (!selectedSlug) return m;
-        const existingForSlug = m[selectedSlug] ?? {};
-        const nextForSlug: Record<string, SeriesPoint[]> = { ...existingForSlug };
-        for (const e of res.data) {
-          const token = e.token;
-          const v = e.error ? null : midPrice(e.book);
-          const prev = nextForSlug[token] ?? [];
-          nextForSlug[token] = [...prev, { t: ts, v }].slice(-180);
-        }
-        return { ...m, [selectedSlug]: nextForSlug };
-      });
+      const updateSeries = opts?.updateSeries === true;
+      const updateFlow = opts?.updateFlow === true;
+      if (updateSeries) {
+        // update chart series (only when user is on chart-heavy tabs)
+        setChartSeriesBySlug((m) => {
+          if (!selectedSlug) return m;
+          const existingForSlug = m[selectedSlug] ?? {};
+          const nextForSlug: Record<string, SeriesPoint[]> = { ...existingForSlug };
+          for (const e of res.data) {
+            const token = e.token;
+            const v = e.error ? null : midPrice(e.book);
+            const prev = nextForSlug[token] ?? [];
+            nextForSlug[token] = [...prev, { t: ts, v }].slice(-180);
+          }
+          return { ...m, [selectedSlug]: nextForSlug };
+        });
+      }
 
-      // update order-flow metrics series (per token)
-      setFlowSeriesBySlug((m) => {
-        if (!selectedSlug) return m;
-        const existingForSlug = m[selectedSlug] ?? {};
-        const nextForSlug: Record<string, BookSnapshot[]> = { ...existingForSlug };
-        for (const e of res.data) {
-          const token = e.token;
-          const key = `${selectedSlug}:${token}`;
-          const prevMaps = prevDepthMapsRef.current[key] ?? null;
-          const prev = nextForSlug[token] ?? [];
-          if (e.error) continue;
-          const { snap, next } = snapshotFromBook(e.book, ts, prevMaps);
-          prevDepthMapsRef.current[key] = next;
-          nextForSlug[token] = [...prev, snap].slice(-360);
-        }
-        return { ...m, [selectedSlug]: nextForSlug };
-      });
+      if (updateFlow) {
+        // update order-flow metrics series (per token)
+        setFlowSeriesBySlug((m) => {
+          if (!selectedSlug) return m;
+          const existingForSlug = m[selectedSlug] ?? {};
+          const nextForSlug: Record<string, BookSnapshot[]> = { ...existingForSlug };
+          for (const e of res.data) {
+            const token = e.token;
+            const key = `${selectedSlug}:${token}`;
+            const prevMaps = prevDepthMapsRef.current[key] ?? null;
+            const prev = nextForSlug[token] ?? [];
+            if (e.error) continue;
+            const { snap, next } = snapshotFromBook(e.book, ts, prevMaps);
+            prevDepthMapsRef.current[key] = next;
+            nextForSlug[token] = [...prev, snap].slice(-360);
+          }
+          return { ...m, [selectedSlug]: nextForSlug };
+        });
+      }
     }
     else setError(pretty(res));
-  }, [selectedSlug, ptbWatchSlugs]);
+  }, [selectedSlug]);
 
   // Prefer WS market channel (instant); polling remains as a fallback.
   const booksWsRef = useRef<ReturnType<typeof openClobMarketChannel> | null>(null);
@@ -942,10 +980,12 @@ function App() {
   const booksWsIdsRef = useRef<string>('');
   const booksRafRef = useRef<number | null>(null);
   const booksDirtyRef = useRef(false);
+  const [booksWsStatus, setBooksWsStatus] = useState<string | null>(null);
 
   useEffect(() => {
     const ids = tokenIds;
     const key = ids.join(',');
+    const idsSet = new Set(ids);
     if (!ids || ids.length === 0) {
       booksWsRef.current?.close();
       booksWsRef.current = null;
@@ -978,15 +1018,68 @@ function App() {
       if (!booksDirtyRef.current) return;
       booksDirtyRef.current = false;
       const ts = Date.now();
-      setBooks(toEntries());
+      const entries = toEntries();
+      setBooks(entries);
       setBooksFetchedAt(ts);
       setBooksLoading(false);
+
+      const slug = selectedSlugRef.current.trim();
+      if (!slug) return;
+
+      if (wantSeriesRef.current) {
+        setChartSeriesBySlug((m) => {
+          const existingForSlug = m[slug] ?? {};
+          const nextForSlug: Record<string, SeriesPoint[]> = { ...existingForSlug };
+          for (const e of entries) {
+            const token = e.token;
+            const v = e.error ? null : midPrice(e.book);
+            const prev = nextForSlug[token] ?? [];
+            nextForSlug[token] = [...prev, { t: ts, v }].slice(-180);
+          }
+          return { ...m, [slug]: nextForSlug };
+        });
+      }
+
+      if (wantFlowRef.current) {
+        setFlowSeriesBySlug((m) => {
+          const existingForSlug = m[slug] ?? {};
+          const nextForSlug: Record<string, BookSnapshot[]> = { ...existingForSlug };
+          for (const e of entries) {
+            const token = e.token;
+            const key = `${slug}:${token}`;
+            const prevMaps = prevDepthMapsRef.current[key] ?? null;
+            const prev = nextForSlug[token] ?? [];
+            if (e.error) continue;
+            const { snap, next } = snapshotFromBook(e.book, ts, prevMaps);
+            prevDepthMapsRef.current[key] = next;
+            nextForSlug[token] = [...prev, snap].slice(-360);
+          }
+          return { ...m, [slug]: nextForSlug };
+        });
+      }
     };
+
+    // Coalesce book updates to avoid rendering at full WS tick rate.
+    // Rendering ~60fps from websocket churn can cause visible UI jank.
+    const MIN_FLUSH_MS = 120;
+    let lastFlushAt = 0;
+    let flushTimer: number | null = null;
 
     const scheduleFlush = () => {
       booksDirtyRef.current = true;
-      if (booksRafRef.current != null) return;
-      booksRafRef.current = window.requestAnimationFrame(flushBooks);
+      if (booksRafRef.current != null || flushTimer != null) return;
+      const now = Date.now();
+      const waitMs = Math.max(0, MIN_FLUSH_MS - (now - lastFlushAt));
+      if (waitMs === 0) {
+        lastFlushAt = now;
+        booksRafRef.current = window.requestAnimationFrame(flushBooks);
+        return;
+      }
+      flushTimer = window.setTimeout(() => {
+        flushTimer = null;
+        lastFlushAt = Date.now();
+        if (booksRafRef.current == null) booksRafRef.current = window.requestAnimationFrame(flushBooks);
+      }, waitMs);
     };
 
     booksWsRef.current = openClobMarketChannel({
@@ -995,11 +1088,14 @@ function App() {
         booksCacheRef.current.set(assetId, book);
         scheduleFlush();
       },
+      onStatus: (s) => {
+        setBooksWsStatus(s.state === 'open' ? 'open' : s.state === 'closed' ? 'closed' : `error:${s.detail ?? ''}`);
+      },
       onPriceChanges: (changes) => {
         let touched = false;
         for (const c of changes) {
           const id = c.asset_id;
-          if (!ids.includes(id)) continue;
+          if (!idsSet.has(id)) continue;
           const book = booksCacheRef.current.get(id);
           if (!book) continue;
           const side = c.side === 'BUY' ? 'bids' : 'asks';
@@ -1023,6 +1119,8 @@ function App() {
     return () => {
       if (booksRafRef.current != null) window.cancelAnimationFrame(booksRafRef.current);
       booksRafRef.current = null;
+      if (flushTimer != null) window.clearTimeout(flushTimer);
+      flushTimer = null;
       booksDirtyRef.current = false;
       booksWsRef.current?.close();
       booksWsRef.current = null;
@@ -1035,19 +1133,20 @@ function App() {
   // When enabled, poll books every 5s to drive the chart (fallback).
   useEffect(() => {
     if (!chartEnabled) return;
+    if (mainTab !== 'book') return;
     if (!tokenIds || tokenIds.length === 0) return;
     if (!selectedSlug) return;
     let stopped = false;
     const tick = async () => {
       if (stopped) return;
-      await loadBooks(tokenIds);
+      await loadBooks(tokenIds, { updateSeries: true, updateFlow: true });
     };
     const id = window.setInterval(() => void tick(), 5_000);
     return () => {
       stopped = true;
       window.clearInterval(id);
     };
-  }, [chartEnabled, loadBooks, selectedSlug, tokenIds]);
+  }, [chartEnabled, loadBooks, mainTab, selectedSlug, tokenIds]);
 
   useEffect(() => {
     void (async () => {
@@ -1074,16 +1173,34 @@ function App() {
       }
       else setApiHealth(`API error: ${h.error}${!isOk(h) && h.error === 'fetch_failed' ? ' — is the API running on :8787?' : ''}`);
 
-      const list = await marketsList(25);
-      if (isOk(list)) {
-        setMarkets(asMarketRows(list.data));
-        if (asMarketRows(list.data).length === 0) {
-          setMarketsError('Markets list returned zero rows. Is the Polymarket CLI installed and on PATH? Try `Open by slug` below.');
+      // Defer the market list so first paint happens quickly.
+      const defer = (cb: () => void) => {
+        try {
+          const ric = (window as unknown as { requestIdleCallback?: (fn: () => void, opts?: { timeout?: number }) => number })
+            .requestIdleCallback;
+          if (typeof ric === 'function') {
+            ric(cb, { timeout: 1200 });
+            return;
+          }
+        } catch {
+          /* ignore */
         }
-      } else {
-        setMarkets([]);
-        setMarketsError(pretty(list) + apiReachabilityHint(list));
-      }
+        window.setTimeout(cb, 250);
+      };
+      defer(() => {
+        void (async () => {
+          const list = await marketsList(25);
+          if (isOk(list)) {
+            setMarkets(asMarketRows(list.data));
+            if (asMarketRows(list.data).length === 0) {
+              setMarketsError('Markets list returned zero rows. Is the Polymarket CLI installed and on PATH? Try `Open by slug` below.');
+            }
+          } else {
+            setMarkets([]);
+            setMarketsError(pretty(list) + apiReachabilityHint(list));
+          }
+        })();
+      });
     })();
   }, []);
 
@@ -1092,8 +1209,16 @@ function App() {
       queueMicrotask(() => setBooks(null));
       return;
     }
-    queueMicrotask(() => void loadBooks(tokenIds));
-  }, [tokenIds, loadBooks]);
+    const wantSeries =
+      mainTab === 'book' ||
+      mainTab === 'flowzones' ||
+      mainTab === 'signals' ||
+      mainTab === 'unified' ||
+      mainTab === 'momentum' ||
+      mainTab === 'dualptb';
+    const wantFlow = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'unified';
+    queueMicrotask(() => void loadBooks(tokenIds, { updateSeries: wantSeries, updateFlow: wantFlow }));
+  }, [tokenIds, loadBooks, mainTab]);
 
   useEffect(() => {
     if (!books || books.length === 0) {
@@ -1119,7 +1244,12 @@ function App() {
       const ptb = await priceToBeat(slug);
       if (stopped) return;
       // Keep last good PTB on transient fetch errors (prevents chart flicker).
-      if (isOk(ptb)) setSsrPriceToBeat(ptb.data.price_to_beat);
+      if (isOk(ptb)) {
+        setSsrPriceToBeat(ptb.data.price_to_beat);
+        setPtbError(null);
+      } else {
+        setPtbError(pretty(ptb));
+      }
     };
     void tick();
     const id = window.setInterval(() => void tick(), 20_000);
@@ -1147,6 +1277,7 @@ function App() {
   }, [ptbWatchSlugs]);
 
   useEffect(() => {
+    if (mainTab !== 'threeup') return;
     let stopped = false;
     const assets: UpdownShortcutAsset[] = ['btc', 'eth', 'sol'];
     const tick = async () => {
@@ -1158,9 +1289,9 @@ function App() {
         const r = res[i]!;
         if (!isOk(r)) continue;
         const cur = r.data.slug;
-        // 5m: prior window — PTB is previous bucket open; smoother right after a roll. 15m: use the live window
-        // (prior is a full 15m back and is often the wrong/closed book for the round you are trading).
-        const slug = threeUpInterval === '15m' ? cur : (nextUpdownSlug(cur, -1) ?? cur);
+        // 5m: prior window — PTB is previous bucket open; smoother right after a roll.
+        // 15m/1h/4h/1d: use the live window (prior windows are often inactive/closed).
+        const slug = threeUpInterval === '5m' ? (nextUpdownSlug(cur, -1) ?? cur) : cur;
         nextSlugs[a] = slug;
       }
       setThreeUpSlugs(nextSlugs);
@@ -1193,7 +1324,7 @@ function App() {
       stopped = true;
       window.clearInterval(id);
     };
-  }, [threeUpInterval]);
+  }, [mainTab, threeUpInterval]);
 
   useEffect(() => {
     writeStringArray(PTB_WATCH_RECENT_KEY, ptbWatchRecentSlugs);
@@ -1215,7 +1346,7 @@ function App() {
 
   useEffect(() => {
     const symFromSlug = (slug: string): string | null => {
-      const m = slug.trim().toLowerCase().match(/^([a-z0-9]{2,10})-updown-(5m|15m)-(\d+)$/);
+      const m = slug.trim().toLowerCase().match(/^([a-z0-9]{2,10})-updown-(5m|15m|1h|4h|1d)-(\d+)$/);
       if (!m) return null;
       return `${m[1]!}/usd`;
     };
@@ -1223,49 +1354,73 @@ function App() {
       const s = new Set<string>(['btc/usd', 'eth/usd', 'sol/usd']);
       const a = symFromSlug(selectedSlug);
       if (a) s.add(a);
-      for (const w of ptbWatchSlugs) {
-        const sym = symFromSlug(w);
-        if (sym) s.add(sym);
+      // Only fan out to watchlist when the user is on tabs that need it.
+      if (mainTab === 'watch' || mainTab === 'multiscan' || mainTab === 'threeup') {
+        for (const w of ptbWatchSlugs) {
+          const sym = symFromSlug(w);
+          if (sym) s.add(sym);
+        }
       }
       return Array.from(s).slice(0, 10);
     };
-    const SYMS = collect();
+    const selectedSym = symFromSlug(selectedSlug);
+    // Fast-boot should hydrate the active chart quickly without hammering RTDS for every watched slug.
+    const SYMS = rtdsPollFast
+      ? selectedSym
+        ? [selectedSym]
+        : ['btc/usd', 'eth/usd', 'sol/usd']
+      : collect();
     let stopped = false;
+    let inflight = false;
     const tick = async () => {
       if (stopped) return;
-      const results = await Promise.all(SYMS.map((s) => rtdsCrypto(s)));
-      const base = spotBySymbolRef.current;
-      const next: Record<string, SpotPoint[]> = { ...base };
-      for (let i = 0; i < SYMS.length; i++) {
-        const sym = SYMS[i]!;
-        const res = results[i]!;
-        if (!isOk(res)) continue;
-        next[sym] = mergeSpotHistory(base[sym] ?? [], res.data);
-      }
-      setSpotBySymbol(next);
-      const p = parseUpdownSlug(selectedSlug);
-      if (!p) {
-        queueMicrotask(() => {
-          setRtdsSpot(null);
-          setRtdsTickAt(null);
-          setSpotSeriesBySlug((m) => {
-            if (!selectedSlug.trim()) return m;
-            const { [selectedSlug]: _removed, ...rest } = m;
-            return rest;
-          });
-        });
-        return;
-      }
-      const sym = `${p.asset}/usd`;
-      const series = next[sym] ?? [];
-      queueMicrotask(() => {
-        setSpotSeriesBySlug((m) => ({ ...m, [selectedSlug]: series }));
-        if (series.length > 0) {
-          const last = series[series.length - 1]!;
-          setRtdsSpot(last.v);
-          setRtdsTickAt(last.t);
+      if (inflight) return;
+      inflight = true;
+      try {
+        const results = await Promise.all(SYMS.map((s) => rtdsCrypto(s)));
+        const base = spotBySymbolRef.current;
+        const next: Record<string, SpotPoint[]> = { ...base };
+        let okAny = false;
+        let firstErr: string | null = null;
+        for (let i = 0; i < SYMS.length; i++) {
+          const sym = SYMS[i]!;
+          const res = results[i]!;
+          if (!isOk(res)) {
+            if (firstErr == null) firstErr = pretty(res);
+            continue;
+          }
+          okAny = true;
+          next[sym] = mergeSpotHistory(base[sym] ?? [], res.data);
         }
-      });
+        setSpotBySymbol(next);
+        setRtdsError(okAny ? null : firstErr);
+        const p = parseUpdownSlug(selectedSlug);
+        if (!p) {
+          queueMicrotask(() => {
+            setRtdsSpot(null);
+            setRtdsTickAt(null);
+            setSpotSeriesBySlug((m) => {
+              if (!selectedSlug.trim()) return m;
+              const rest = { ...m };
+              delete (rest as Record<string, unknown>)[selectedSlug];
+              return rest;
+            });
+          });
+          return;
+        }
+        const sym = `${p.asset}/usd`;
+        const series = next[sym] ?? [];
+        queueMicrotask(() => {
+          setSpotSeriesBySlug((m) => ({ ...m, [selectedSlug]: series }));
+          if (series.length > 0) {
+            const last = series[series.length - 1]!;
+            setRtdsSpot(last.v);
+            setRtdsTickAt(last.t);
+          }
+        });
+      } finally {
+        inflight = false;
+      }
     };
     void tick();
     const bootTimers = [
@@ -1283,9 +1438,10 @@ function App() {
       window.clearInterval(id);
       for (const t of bootTimers) window.clearTimeout(t);
     };
-  }, [selectedSlug, ptbWatchSlugs, rtdsPollFast]);
+  }, [selectedSlug, ptbWatchSlugs, rtdsPollFast, mainTab]);
 
   useEffect(() => {
+    if (mainTab !== 'watch' && mainTab !== 'multiscan') return;
     const slugs = [...new Set(ptbWatchSlugs.filter((s) => parseUpdownSlug(s) != null))];
     if (slugs.length === 0) {
       queueMicrotask(() => setWatchMetaBySlug({}));
@@ -1325,7 +1481,7 @@ function App() {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [ptbWatchSlugs]);
+  }, [ptbWatchSlugs, mainTab]);
 
   const marketEndsInMs = useMemo(() => {
     if (!marketJson || typeof marketJson !== 'object') return null;
@@ -1365,11 +1521,11 @@ function App() {
     const p = updownParsed;
     if (!p) return [];
     const step = p.stepSec;
-    // Snap to exact 5m/15m boundary. (ts is epoch seconds.)
+    // Snap to exact window boundary. (ts is epoch seconds.)
     const snapped = Math.floor(p.ts / step) * step;
     const items: { slug: string; label: string; ts: number }[] = [];
-    // Show the last ~2 hours of windows (24×5m = 2h; 12×15m = 3h).
-    const count = p.interval === '15m' ? 12 : 24;
+    // Show a useful range per interval (keeps dropdown manageable).
+    const count = p.interval === '1d' ? 14 : p.interval === '4h' ? 36 : p.interval === '1h' ? 48 : p.interval === '15m' ? 12 : 24;
     for (let i = 0; i < count; i++) {
       const ts = snapped - i * step;
       const slug = `${p.asset}-updown-${p.interval}-${ts}`;
@@ -1532,21 +1688,51 @@ function App() {
     setShortcutBusy({ asset, interval });
     setLastShortcut({ asset, interval });
     try {
-      const res = await marketsUpdownShortcut(asset, interval);
-      if (!isOk(res)) {
-        setMarketsError(pretty(res));
-        return;
+      const first = await marketsUpdownShortcut(asset, interval);
+      let okRes: ApiOk<{
+        slug: string;
+        asset: string;
+        interval?: string;
+        window: string;
+        tested?: boolean;
+        active?: boolean;
+        closed?: boolean;
+        start?: string | null;
+        end?: string | null;
+      }> | null = null;
+
+      if (isOk(first)) okRes = first;
+      else {
+        // Polymarket does not always have a live 1h window market available.
+        // Fall back to 15m so the user still gets a moving market.
+        if (interval === '1h' && first.error === 'no_updown_1h') {
+          const fallback = await marketsUpdownShortcut(asset, '15m');
+          if (isOk(fallback)) {
+            setMarketsError(`${asset.toUpperCase()} 1h not available right now — opened ${asset.toUpperCase()} 15m instead.`);
+            okRes = fallback;
+          } else {
+            setMarketsError(pretty(first));
+            return;
+          }
+        } else {
+          setMarketsError(pretty(first));
+          return;
+        }
       }
-      if (res.data.start && res.data.end) {
+
+      if (!okRes) return;
+
+      if (okRes.data.start && okRes.data.end) {
         setMarketsError(
-          `${asset.toUpperCase()} ${interval} window: ${new Date(res.data.start).toLocaleTimeString()}–${new Date(res.data.end).toLocaleTimeString()} · slug ${res.data.slug}`,
+          `${asset.toUpperCase()} ${interval} window: ${new Date(okRes.data.start).toLocaleTimeString()}–${new Date(okRes.data.end).toLocaleTimeString()} · slug ${okRes.data.slug}`,
         );
       } else {
         setMarketsError(null);
       }
-      // 5m: open prior round (PTB = previous window open, less noisy at the roll). 15m: open the live window from the API.
+      // 5m: open prior round (PTB = previous window open, less noisy at the roll).
+      // 15m/1h/4h/1d: open the live window from the API (prior windows are often inactive/closed).
       const slugToOpen =
-        interval === '15m' ? res.data.slug : (nextUpdownSlug(res.data.slug, -1) ?? res.data.slug);
+        interval === '5m' ? (nextUpdownSlug(okRes.data.slug, -1) ?? okRes.data.slug) : okRes.data.slug;
       await loadMarket(slugToOpen);
     } finally {
       setShortcutBusy(null);
@@ -1600,11 +1786,22 @@ function App() {
   }
 
   return (
-    <div
-      className={`min-h-full bg-zinc-950 bg-[radial-gradient(100%_60%_at_50%_-10%,rgba(99,102,241,0.08),transparent_52%),linear-gradient(180deg,#0b0b0f_0%,#09090b_45%,#060608_100%)] font-sans text-zinc-200 antialiased ${
-        tradePanelOpen ? 'md:pr-[380px] 2xl:pr-[400px]' : ''
-      } transition-[padding] duration-200`}
+    <Suspense
+      fallback={
+        <div className="min-h-full bg-zinc-950 font-sans text-zinc-200 antialiased">
+          <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
+            <div className="rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-5 text-sm text-zinc-400">
+              Loading…
+            </div>
+          </div>
+        </div>
+      }
     >
+      <div
+        className={`min-h-full bg-zinc-950 bg-[radial-gradient(100%_60%_at_50%_-10%,rgba(99,102,241,0.08),transparent_52%),linear-gradient(180deg,#0b0b0f_0%,#09090b_45%,#060608_100%)] font-sans text-zinc-200 antialiased ${
+          tradePanelOpen ? 'md:pr-[380px] 2xl:pr-[400px]' : ''
+        } transition-[padding] duration-200`}
+      >
       <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
         <header className="rounded-2xl border border-zinc-800/50 bg-zinc-900/20 px-5 py-5 shadow-lg shadow-black/20 ring-1 ring-white/[0.03] backdrop-blur-sm sm:px-6">
           <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
@@ -1639,6 +1836,21 @@ function App() {
               <div className="rounded-full border border-zinc-700/40 bg-zinc-950/50 px-3 py-1.5 font-mono text-[11px] leading-snug text-zinc-400">
                 {apiHealth}
               </div>
+              {booksWsStatus ? (
+                <div className="rounded-full border border-zinc-700/40 bg-zinc-950/50 px-3 py-1.5 font-mono text-[11px] leading-snug text-zinc-400">
+                  CLOB WS {booksWsStatus}
+                </div>
+              ) : null}
+              {rtdsError ? (
+                <div className="rounded-full border border-rose-800/40 bg-rose-950/20 px-3 py-1.5 font-mono text-[11px] leading-snug text-rose-100">
+                  RTDS error: {rtdsError}
+                </div>
+              ) : null}
+              {ptbError ? (
+                <div className="rounded-full border border-amber-800/40 bg-amber-950/20 px-3 py-1.5 font-mono text-[11px] leading-snug text-amber-100/90">
+                  PTB error: {ptbError}
+                </div>
+              ) : null}
             </div>
           </div>
           <p className="mt-4 max-w-3xl text-sm leading-relaxed text-zinc-500">
@@ -1676,29 +1888,35 @@ function App() {
                 })}
               </div>
               <p className="text-[10px] leading-snug text-zinc-600">5m Up/Down — taps resolve the current Gamma slug (live window).</p>
-              <div className="mt-2 flex flex-wrap gap-2">
-                {(['btc', 'eth', 'sol'] as const).map((asset) => {
-                  const busy = shortcutBusy?.asset === asset && shortcutBusy.interval === '15m';
-                  return (
-                    <button
-                      key={`15m-${asset}`}
-                      type="button"
-                      disabled={shortcutBusy !== null}
-                      onClick={() => void openUpdownShortcut(asset, '15m')}
-                      className={`min-w-[4.5rem] flex-1 rounded-xl border px-3 py-2.5 text-center text-sm font-semibold uppercase tracking-wide transition-colors disabled:cursor-wait disabled:opacity-50 sm:flex-none ${
-                        asset === 'btc'
-                          ? 'border-amber-700/50 bg-amber-950/30 text-amber-100 hover:bg-amber-950/50'
-                          : asset === 'eth'
-                            ? 'border-indigo-700/50 bg-indigo-950/30 text-indigo-100 hover:bg-indigo-950/50'
-                            : 'border-violet-700/50 bg-violet-950/30 text-violet-100 hover:bg-violet-950/50'
-                      }`}
-                    >
-                      {busy ? '…' : `${asset} 15m`}
-                    </button>
-                  );
-                })}
-              </div>
-              <p className="text-[10px] leading-snug text-zinc-600">15m Up/Down — same assets, 15-minute windows.</p>
+              {(['15m', '1h', '4h', '1d'] as const).map((interval) => (
+                <div key={interval} className="mt-2">
+                  <div className="flex flex-wrap gap-2">
+                    {(['btc', 'eth', 'sol'] as const).map((asset) => {
+                      const busy = shortcutBusy?.asset === asset && shortcutBusy.interval === interval;
+                      return (
+                        <button
+                          key={`${interval}-${asset}`}
+                          type="button"
+                          disabled={shortcutBusy !== null}
+                          onClick={() => void openUpdownShortcut(asset, interval)}
+                          className={`min-w-[4.5rem] flex-1 rounded-xl border px-3 py-2.5 text-center text-sm font-semibold uppercase tracking-wide transition-colors disabled:cursor-wait disabled:opacity-50 sm:flex-none ${
+                            asset === 'btc'
+                              ? 'border-amber-700/50 bg-amber-950/30 text-amber-100 hover:bg-amber-950/50'
+                              : asset === 'eth'
+                                ? 'border-indigo-700/50 bg-indigo-950/30 text-indigo-100 hover:bg-indigo-950/50'
+                                : 'border-violet-700/50 bg-violet-950/30 text-violet-100 hover:bg-violet-950/50'
+                          }`}
+                        >
+                          {busy ? '…' : `${asset} ${interval}`}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <p className="mt-1 text-[10px] leading-snug text-zinc-600">
+                    {interval} Up/Down — BTC/ETH/SOL windows.
+                  </p>
+                </div>
+              ))}
               <div className="flex gap-2">
                 <input
                   value={slugInput}
@@ -1816,6 +2034,7 @@ function App() {
               <MainTabButton id="tradehistory" label="History" title="Trade history (paper + live log)" active={mainTab === 'tradehistory'} onSelect={setMainTab} />
               <MainTabButton id="dualptb" label="Dual PTB" title="Reference PTB continuation tab" active={mainTab === 'dualptb'} onSelect={setMainTab} />
               <MainTabButton id="threeup" label="3-up" title="BTC/ETH/SOL spot vs PTB (simultaneous)" active={mainTab === 'threeup'} onSelect={setMainTab} />
+              <MainTabButton id="btc" label="BTC" title="BTC live spot + paper trading" active={mainTab === 'btc'} onSelect={setMainTab} />
               <MainTabButton id="command" label="Command" title="Multi-market command tiles + command center" active={mainTab === 'command'} onSelect={setMainTab} />
               <MainTabButton id="unified" label="Unified" title="Unified PTB view (chart + panel)" active={mainTab === 'unified'} onSelect={setMainTab} />
               <MainTabButton id="multiscan" label="Multi" title="Multi-asset PTB scan" active={mainTab === 'multiscan'} onSelect={setMainTab} />
@@ -1969,7 +2188,11 @@ function App() {
               </div>
             ) : null}
 
-            {tokenIds.length === 0 && mainTab !== 'watch' && mainTab !== 'momentum' && mainTab !== 'tradehistory' ? (
+            {tokenIds.length === 0 &&
+            mainTab !== 'watch' &&
+            mainTab !== 'momentum' &&
+            mainTab !== 'tradehistory' &&
+            mainTab !== 'btc' ? (
               <div className="mt-4 text-sm leading-relaxed text-zinc-500">Select a market to load token ids and ladders.</div>
             ) : null}
 
@@ -2096,6 +2319,8 @@ function App() {
                 }}
               />
             ) : null}
+
+            {mainTab === 'btc' ? <BtcSpotPaperTest /> : null}
 
             {mainTab === 'watch' ? (
               <PtbWatchTab
@@ -2622,7 +2847,8 @@ function App() {
           }}
         />
       </div>
-    </div>
+      </div>
+    </Suspense>
   );
 }
 

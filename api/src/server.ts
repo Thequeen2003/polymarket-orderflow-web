@@ -32,6 +32,13 @@ const CLOB = 'https://clob.polymarket.com';
 const DATA_API = 'https://data-api.polymarket.com';
 const POLYMARKET_WEB = 'https://polymarket.com';
 
+// Hot-path cache to keep the UI "instant" during rapid trading.
+// We keep this very short to avoid stale positions, while preventing repeated slow remote calls.
+const avgEntryCache = new Map<
+  string,
+  { at: number; data: { tokenId: string; avgEntry: number | null; shares: number } }
+>();
+
 type CliResult =
   | { ok: true; stdout: string }
   | { ok: false; stdout: string; stderr: string; code: number | null; signal: NodeJS.Signals | null };
@@ -364,10 +371,28 @@ const UPDOWN_15M_SEARCH: Record<string, string> = {
   sol: 'solana 15m up or down',
 };
 
+const UPDOWN_1H_SEARCH: Record<string, string[]> = {
+  btc: ['bitcoin 1h up or down', 'bitcoin hourly up or down', 'bitcoin up or down hourly', 'bitcoin up or down 1 hour', 'bitcoin up or down'],
+  eth: ['ethereum 1h up or down', 'ethereum hourly up or down', 'ethereum up or down hourly', 'ethereum up or down 1 hour', 'ethereum up or down'],
+  sol: ['solana 1h up or down', 'solana hourly up or down', 'solana up or down hourly', 'solana up or down 1 hour', 'solana up or down'],
+};
+
+const UPDOWN_4H_SEARCH: Record<string, string> = {
+  btc: 'bitcoin 4h up or down',
+  eth: 'ethereum 4h up or down',
+  sol: 'solana 4h up or down',
+};
+
+const UPDOWN_1D_SEARCH: Record<string, string> = {
+  btc: 'bitcoin daily up or down',
+  eth: 'ethereum daily up or down',
+  sol: 'solana daily up or down',
+};
+
 function rankUpdownCandidates(
   rows: unknown[],
   asset: string,
-  interval: '5m' | '15m',
+  interval: '5m' | '15m' | '1h' | '4h' | '1d',
 ): { slug: string; ts: number; active: boolean; closed: boolean; tokenIds: string[] }[] {
   const pref = `${asset.toLowerCase()}-updown-${interval}-`;
   const found: { slug: string; ts: number; active: boolean; closed: boolean; tokenIds: string[] }[] = [];
@@ -423,6 +448,87 @@ async function gammaSearchMarkets(q: string, limitPerType: number, maxResults: n
   return combined.slice(0, maxResults);
 }
 
+function parseIsoMs(raw: unknown): number | null {
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  const ms = Date.parse(raw);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function assetSearchNeedle(asset: string): { slugNeedle: string; textNeedles: string[] } {
+  const a = asset.toLowerCase().trim();
+  if (a === 'btc') return { slugNeedle: 'btc', textNeedles: ['btc', 'bitcoin'] };
+  if (a === 'eth') return { slugNeedle: 'eth', textNeedles: ['eth', 'ethereum'] };
+  return { slugNeedle: 'sol', textNeedles: ['sol', 'solana'] };
+}
+
+function pickBestUpdownGeneral(
+  rows: unknown[],
+  asset: string,
+  interval: '1h' | '1d',
+): { slug: string; active: boolean; closed: boolean; tokenIds: string[]; startMs: number | null; endMs: number | null } | null {
+  const { slugNeedle, textNeedles } = assetSearchNeedle(asset);
+  const targetDurMs = interval === '1h' ? 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+  const scored: {
+    slug: string;
+    active: boolean;
+    closed: boolean;
+    tokenIds: string[];
+    startMs: number | null;
+    endMs: number | null;
+    score: number;
+  }[] = [];
+
+  for (const r of rows) {
+    if (!r || typeof r !== 'object') continue;
+    const o = r as Record<string, unknown>;
+    const slugRaw = String(o.slug ?? '').trim();
+    const slug = slugRaw.toLowerCase();
+    if (!slugRaw) continue;
+    // Must be an up/down style market.
+    const title = String(o.title ?? o.question ?? '');
+    const hay = `${slug} ${title}`.toLowerCase();
+    if (!hay.includes('up') || !hay.includes('down')) continue;
+    if (!textNeedles.some((n) => hay.includes(n))) continue;
+
+    const tokenIds = parseClobTokenIds(o.clobTokenIds ?? o.clob_token_ids);
+    if (tokenIds.length < 2) continue;
+
+    const active = o.active === true;
+    const closed = o.closed === true;
+    // Closed markets are never useful as a "shortcut".
+    if (closed) continue;
+    const startMs = parseIsoMs(o.startDate ?? o.start_date);
+    const endMs = parseIsoMs(o.endDate ?? o.end_date);
+
+    // Prefer open, active, and nearer-expiring markets.
+    const now = Date.now();
+    const endDelta = endMs != null ? Math.abs(endMs - now) : 9e15;
+    const durMs = startMs != null && endMs != null ? Math.max(0, endMs - startMs) : null;
+    let score = 0;
+    if (active && !closed) score += 5;
+    if (!closed) score += 2;
+    if (slug.includes(`${slugNeedle}-updown-`)) score += 2;
+    // Strongly prefer candidates whose window duration matches the requested interval.
+    if (durMs != null && durMs > 0) {
+      const ratio = Math.abs(durMs - targetDurMs) / targetDurMs; // 0 is perfect
+      // within 10% => big boost; within 25% => medium; else penalize.
+      if (ratio <= 0.1) score += 6;
+      else if (ratio <= 0.25) score += 3;
+      else score -= Math.min(6, ratio * 6);
+    } else {
+      // Unknown duration: mild penalty (still allow).
+      score -= 1;
+    }
+    // nearer is better
+    score += Math.max(0, 3 - Math.min(3, endDelta / (6 * 60 * 60 * 1000))); // within ~6h gets boost
+
+    scored.push({ slug: slugRaw, active, closed, tokenIds, startMs, endMs, score });
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0] ?? null;
+}
+
 async function gammaMarketBySlugOrId(slugOrId: string): Promise<unknown> {
   const numeric = /^\d+$/.test(slugOrId);
   const path = numeric ? `/markets/${slugOrId}` : `/markets/slug/${encodeURIComponent(slugOrId)}`;
@@ -460,7 +566,7 @@ async function tryPriceToBeat(slug: string): Promise<{ value: number; source: st
 function parseUpdownBucketFromSlug(slug: string): { symbol: string; bucketStartMs: number } | null {
   const s = slug.trim().toLowerCase();
   // Current API shortcut slugs look like: btc-updown-5m-1776735900
-  const m = /^([a-z0-9]{2,10})-updown-(5m|15m)-(\d{9,12})$/.exec(s);
+  const m = /^([a-z0-9]{2,10})-updown-(5m|15m|1h|4h|1d)-(\d{9,12})$/.exec(s);
   if (!m) return null;
   const asset = m[1]!;
   const startSec = Number(m[3]!);
@@ -670,6 +776,22 @@ app.use(express.json({ limit: '256kb' }));
 const ASSISTANT_SYSTEM =
   'You are a concise assistant for Polymarket CLOB order flow and prediction markets. Explain bids, asks, implied prices, and liquidity in plain language. Do not tell the user what to buy or sell; avoid personalized financial advice. If context is missing or partial, say so.';
 
+type CacheEntry<T> = { ts: number; value: T };
+
+function cacheGet<T>(entry: CacheEntry<T> | null, ttlMs: number): T | null {
+  if (!entry) return null;
+  if (Date.now() - entry.ts > ttlMs) return null;
+  return entry.value;
+}
+
+function cacheSet<T>(value: T): CacheEntry<T> {
+  return { ts: Date.now(), value };
+}
+
+// Local-only in-memory caches to avoid hammering Gamma / CLI on tight UI refresh loops.
+let gammaReachableCache: CacheEntry<boolean> | null = null;
+const marketsListCache = new Map<number, CacheEntry<unknown[]>>();
+
 function assistantConfig(): { ok: true; provider: string; baseUrl: string; apiKey: string; model: string } | { ok: false } {
   const apiKey =
     process.env.ASSISTANT_API_KEY?.trim() ||
@@ -688,12 +810,16 @@ function assistantConfig(): { ok: true; provider: string; baseUrl: string; apiKe
 
 app.get('/api/health', async (_req, res) => {
   const version = await runCli(['--version'], { timeoutMs: 5_000 });
-  let gammaOk = false;
-  try {
-    const r = await fetch(`${GAMMA}/markets?limit=1`, { headers: { accept: 'application/json' } });
-    gammaOk = r.ok;
-  } catch {
-    gammaOk = false;
+  const cachedGamma = cacheGet(gammaReachableCache, 30_000);
+  let gammaOk = cachedGamma ?? false;
+  if (cachedGamma == null) {
+    try {
+      const r = await fetch(`${GAMMA}/markets?limit=1`, { headers: { accept: 'application/json' } });
+      gammaOk = r.ok;
+    } catch {
+      gammaOk = false;
+    }
+    gammaReachableCache = cacheSet(gammaOk);
   }
   const a = assistantConfig();
   const trading = getTradingConfigFromEnv();
@@ -718,10 +844,14 @@ app.get('/api/health', async (_req, res) => {
 
 app.get('/api/markets', async (req, res) => {
   const limit = Math.max(1, Math.min(100, Number(req.query.limit ?? 20) || 20));
+  const cached = cacheGet(marketsListCache.get(limit) ?? null, 15_000);
+  if (cached) return json(res, 200, { ok: true, data: cached });
+
   const out = await runCli(['--output', 'json', 'markets', 'list', '--limit', String(limit)]);
   if (out.ok) {
     try {
       const rows = marketsArrayFromStdout(out.stdout).map(normalizeMarket);
+      marketsListCache.set(limit, cacheSet(rows));
       return json(res, 200, { ok: true, data: rows });
     } catch {
       /* fall through to HTTP */
@@ -729,6 +859,7 @@ app.get('/api/markets', async (req, res) => {
   }
   try {
     const rows = (await gammaMarketsList(limit)).map(normalizeMarket);
+    marketsListCache.set(limit, cacheSet(rows));
     return json(res, 200, { ok: true, data: rows });
   } catch (e) {
     return json(res, 502, {
@@ -770,16 +901,22 @@ app.get('/api/markets/search', async (req, res) => {
 app.get('/api/markets/updown-shortcut', async (req, res) => {
   const asset = String(req.query.asset ?? '').toLowerCase().trim();
   const intervalParam = String(req.query.interval ?? '').trim().toLowerCase();
-  if (intervalParam !== '' && intervalParam !== '5m' && intervalParam !== '15m') {
-    return json(res, 400, { ok: false, error: 'bad_interval', details: { allowed: ['5m', '15m'] } });
+  const allowed = ['5m', '15m', '1h', '4h', '1d'] as const;
+  if (intervalParam !== '' && !(allowed as readonly string[]).includes(intervalParam)) {
+    return json(res, 400, { ok: false, error: 'bad_interval', details: { allowed } });
   }
-  const interval: '5m' | '15m' = intervalParam === '15m' ? '15m' : '5m';
-  const stepSec = interval === '15m' ? 900 : 300;
+  const interval: '5m' | '15m' | '1h' | '4h' | '1d' =
+    intervalParam === '15m' ? '15m' : intervalParam === '1h' ? '1h' : intervalParam === '4h' ? '4h' : intervalParam === '1d' ? '1d' : '5m';
+  const stepSec = interval === '15m' ? 900 : interval === '1h' ? 3600 : interval === '4h' ? 4 * 3600 : interval === '1d' ? 24 * 3600 : 300;
   if (asset !== 'btc' && asset !== 'eth' && asset !== 'sol') {
     return json(res, 400, { ok: false, error: 'bad_asset', details: { allowed: ['btc', 'eth', 'sol'] } });
   }
   try {
     const b = nowBucketSec(stepSec);
+    // NOTE: 1h/1d slugs are not perfectly consistent, but when the canonical
+    // `asset-updown-<interval>-<bucket>` slug exists it is the most reliable
+    // (fastest + correctly bucketed). We always try deterministic lookup first
+    // for every interval, and only fall back to Gamma search when needed.
     // IMPORTANT: Polymarket uses the slug suffix as the *window start* bucket (not end).
     // Example: `sol-updown-5m-1776528300` corresponds to a 5-minute window starting at that unix time.
     const base = b.floor;
@@ -839,14 +976,95 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
     }
 
     // Fallback to Gamma search results when deterministic lookup fails.
-    const q = interval === '15m' ? UPDOWN_15M_SEARCH[asset] : UPDOWN_5M_SEARCH[asset];
-    const raw = await gammaSearchMarkets(q, 25, 180);
+    if (interval === '1d') {
+      const q = UPDOWN_1D_SEARCH[asset];
+      const raw = await gammaSearchMarkets(q, 25, 260);
+      const rows = dedupeSearchRows(flattenSearchMarketRows(raw));
+      const best = pickBestUpdownGeneral(rows, asset, '1d');
+      if (!best) {
+        return json(res, 404, { ok: false, error: 'no_updown_1d', details: { asset, interval, q } });
+      }
+      const t0 = best.tokenIds[0];
+      if (t0 && !(await clobHasOrderbook(t0))) {
+        return json(res, 404, { ok: false, error: 'no_updown_1d_book', details: { asset, interval, slug: best.slug } });
+      }
+      return json(res, 200, {
+        ok: true,
+        data: {
+          slug: best.slug,
+          asset,
+          interval,
+          window: interval,
+          tested: true,
+          active: best.active,
+          closed: best.closed,
+          inferred_window_start_unix: best.startMs != null ? Math.floor(best.startMs / 1000) : b.floor,
+          inferred_end_unix: best.endMs != null ? Math.floor(best.endMs / 1000) : b.floor + stepSec,
+          start: best.startMs != null ? new Date(best.startMs).toISOString() : new Date(b.floor * 1000).toISOString(),
+          end: best.endMs != null ? new Date(best.endMs).toISOString() : new Date((b.floor + stepSec) * 1000).toISOString(),
+          bucket_now_unix: b.now,
+          bucket_floor_unix: b.floor,
+          bucket_ceil_unix: b.ceil,
+        },
+      });
+    }
+
+    const q =
+      interval === '15m'
+        ? UPDOWN_15M_SEARCH[asset]
+        : interval === '4h'
+          ? UPDOWN_4H_SEARCH[asset]
+          : interval === '1h'
+            ? (UPDOWN_1H_SEARCH[asset][0] ?? `${asset} hourly up or down`)
+            : UPDOWN_5M_SEARCH[asset];
+    const raw = await gammaSearchMarkets(q, 25, interval === '1h' ? 260 : 180);
     const rows = dedupeSearchRows(flattenSearchMarketRows(raw));
     const candidates = rankUpdownCandidates(rows, asset, interval);
     if (candidates.length === 0) {
+      // 1h markets sometimes don't use the canonical `asset-updown-1h-<bucket>` slug format.
+      // Fall back to a broader search and pick the best open candidate with a live book.
+      if (interval === '1h') {
+        const qs = UPDOWN_1H_SEARCH[asset];
+        let best:
+          | { slug: string; active: boolean; closed: boolean; tokenIds: string[]; startMs: number | null; endMs: number | null }
+          | null = null;
+        let qUsed = qs[0] ?? q;
+        for (const qq of qs) {
+          qUsed = qq;
+          const raw2 = await gammaSearchMarkets(qq, 25, 320);
+          const rows2 = dedupeSearchRows(flattenSearchMarketRows(raw2));
+          best = pickBestUpdownGeneral(rows2, asset, '1h');
+          if (best) break;
+        }
+        if (best) {
+          const t0 = best.tokenIds[0];
+          if (t0 && (await clobHasOrderbook(t0))) {
+            return json(res, 200, {
+              ok: true,
+              data: {
+                slug: best.slug,
+                asset,
+                interval,
+                window: interval,
+                tested: true,
+                active: best.active,
+                closed: best.closed,
+                inferred_window_start_unix: best.startMs != null ? Math.floor(best.startMs / 1000) : b.floor,
+                inferred_end_unix: best.endMs != null ? Math.floor(best.endMs / 1000) : b.floor + stepSec,
+                start: best.startMs != null ? new Date(best.startMs).toISOString() : new Date(b.floor * 1000).toISOString(),
+                end: best.endMs != null ? new Date(best.endMs).toISOString() : new Date((b.floor + stepSec) * 1000).toISOString(),
+                bucket_now_unix: b.now,
+                bucket_floor_unix: b.floor,
+                bucket_ceil_unix: b.ceil,
+                search_q: qUsed,
+              },
+            });
+          }
+        }
+      }
       return json(res, 404, {
         ok: false,
-        error: interval === '15m' ? 'no_updown_15m' : 'no_updown_5m',
+        error: interval === '15m' ? 'no_updown_15m' : interval === '4h' ? 'no_updown_4h' : interval === '1h' ? 'no_updown_1h' : 'no_updown_5m',
         details: { asset, interval, q },
       });
     }
@@ -1723,7 +1941,6 @@ function buildOrderFillIndexFromTrades(
     if (!takerIsBuy && !takerIsSell) continue;
 
     const effectiveIsBuy = isMaker ? takerIsSell : takerIsBuy;
-    const effectiveIsSell = isMaker ? takerIsBuy : takerIsSell;
     const at = tradeMatchTimeMs(trade);
 
     if (isTaker) {
@@ -1776,6 +1993,65 @@ app.get('/api/trade/avg-entry', async (req, res) => {
   if (!tokenId) return json(res, 400, { ok: false, error: 'missing_token_id' });
   const marketSlug = String(req.query.market_slug ?? '').trim();
   const outcome = String(req.query.outcome ?? '').trim();
+
+  const cacheKey = `${tokenId}`;
+  const cached = avgEntryCache.get(cacheKey);
+  // Serve cached values aggressively to keep UI instant.
+  // (We still refresh frequently elsewhere via WS triggers + manual refresh.)
+  if (cached && Date.now() - cached.at < 20_000) {
+    return json(res, 200, { ok: true, data: cached.data });
+  }
+
+  // Fast-path: Polymarket Data API positions (matches what the UI shows).
+  // This is both quicker and more accurate than reconstructing cost basis from a limited trade tape window.
+  try {
+    const cfg = getTradingConfigFromEnv();
+    if (cfg.ok) {
+      const addrs = [cfg.config.funderAddress, cfg.config.signerAddress]
+        .map((x) => String(x ?? '').trim())
+        .filter(Boolean);
+      const uniq = Array.from(new Set(addrs.map((a) => a.toLowerCase())));
+      const tryAddr = async (addr: string) => {
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), 1400);
+        try {
+          // `sizeThreshold=0` can return a huge payload (including closed positions) and be slow.
+          // Use a tiny threshold so we still include small positions but skip zeros.
+          const url = `${DATA_API}/positions?user=${encodeURIComponent(addr)}&sizeThreshold=0.0001`;
+          const r = await fetch(url, { headers: { accept: 'application/json' }, signal: controller.signal });
+          if (!r.ok) return null;
+          const rows = (await r.json()) as unknown;
+          if (!Array.isArray(rows)) return null;
+          const hit = rows.find((x) => {
+            if (!x || typeof x !== 'object') return false;
+            const o = x as Record<string, unknown>;
+            const asset = String(o.asset ?? o.asset_id ?? o.assetId ?? '').trim();
+            return asset === tokenId;
+          }) as Record<string, unknown> | undefined;
+          if (!hit) return null;
+          const avg = toPrice01Maybe(
+            hit.avgPrice ?? hit.avg_price ?? hit.avgEntry ?? hit.avg_entry ?? hit.entry_price ?? hit.entryPrice,
+          );
+          const shares = parseNumber('size', hit.size ?? hit.shares ?? hit.position ?? hit.quantity) ?? 0;
+          if (!(shares > 0)) return null;
+          return { tokenId, avgEntry: avg, shares: roundSizeShares4(shares) };
+        } catch {
+          return null;
+        } finally {
+          clearTimeout(t);
+        }
+      };
+
+      const hits = await Promise.all(uniq.map((a) => tryAddr(a)));
+      const hit = hits.find(Boolean);
+      if (hit) {
+        avgEntryCache.set(cacheKey, { at: Date.now(), data: hit });
+        return json(res, 200, { ok: true, data: hit });
+      }
+    }
+  } catch {
+    // Fall through to Bullpen/CLOB reconstruction.
+  }
 
   if (marketSlug && outcome && polymarketUseBullpen()) {
     const cached = cachedBullpenPositionsOrNull();
@@ -1890,7 +2166,9 @@ app.get('/api/trade/avg-entry', async (req, res) => {
 
     const avgEntry = pos > 0 ? roundPrice01Api(cost / pos) : null;
     const sharesOut = roundSizeShares4(pos);
-    return json(res, 200, { ok: true, data: { tokenId, avgEntry, shares: sharesOut } });
+    const data = { tokenId, avgEntry, shares: sharesOut };
+    avgEntryCache.set(cacheKey, { at: Date.now(), data });
+    return json(res, 200, { ok: true, data });
   } catch (error) {
     return json(res, 502, {
       ok: false,
@@ -2290,6 +2568,7 @@ app.post('/api/trade/create-order', async (req, res) => {
     price?: unknown;
     size?: unknown;
     side?: unknown;
+    order_type?: unknown;
     signatureType?: unknown;
     market_slug?: unknown;
     outcome?: unknown;
@@ -2376,7 +2655,10 @@ app.post('/api/trade/create-order', async (req, res) => {
       await ready.client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL });
     }
 
-    const ob = await clobOrderBuilderOptions(ready.client, token);
+    // IMPORTANT: this endpoint is **limit-only**.
+    // Even if the client asks for `FAK`, we place a normal limit (GTC) here and let the web UI
+    // implement "fill-and-kill behavior" by cancelling any remaining shares shortly after submit.
+    // Using SDK market-order helpers here can ignore the user's explicit limit and cause scary price drift.
     const parsed = await ready.client.createAndPostOrder(
       {
         tokenID: token,
@@ -2384,7 +2666,7 @@ app.post('/api/trade/create-order', async (req, res) => {
         size,
         side: side === 'buy' ? Side.BUY : Side.SELL,
       },
-      ob,
+      await clobOrderBuilderOptions(ready.client, token),
       OrderType.GTC,
     );
     const orderId = extractOrderIdFromClobPayload(parsed);

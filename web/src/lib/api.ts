@@ -272,7 +272,7 @@ export function marketsSearch(q: string, limit = 20) {
 }
 
 export type UpdownShortcutAsset = 'btc' | 'eth' | 'sol';
-export type UpdownInterval = '5m' | '15m';
+export type UpdownInterval = '5m' | '15m' | '1h' | '4h' | '1d';
 
 export function marketsUpdownShortcut(asset: UpdownShortcutAsset, interval: UpdownInterval = '5m') {
   return getJson<{
@@ -402,6 +402,7 @@ export function tradeCreateOrderWithOpts(
     side: 'buy' | 'sell';
     price: number;
     size: number;
+    orderType?: 'GTC' | 'FAK';
     signatureType?: string | null;
     marketSlug?: string;
     outcome?: string;
@@ -410,7 +411,7 @@ export function tradeCreateOrderWithOpts(
 ) {
   return postJsonWithOpts<unknown>(
     '/api/trade/create-order',
-    { ...body, market_slug: body.marketSlug ?? '', outcome: body.outcome ?? '' },
+    { ...body, order_type: body.orderType ?? 'GTC', market_slug: body.marketSlug ?? '', outcome: body.outcome ?? '' },
     opts,
   );
 }

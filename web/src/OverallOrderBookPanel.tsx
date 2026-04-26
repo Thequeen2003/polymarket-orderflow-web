@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactElement } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
 import { displayPrice, pickBookLevels, topOfBook } from './bookLevels';
 
 function fmtK(x: number): string {
@@ -62,6 +62,8 @@ export function OverallOrderBookPanel(props: {
   const bidShapeLabel =
     insights.thinBid === null ? 'no ladder' : insights.thinBid ? 'thin zone' : 'stacked depth';
 
+  const rangeAnchorRef = useRef<{ tone: 'ask' | 'bid'; priceCents: number } | null>(null);
+
   const Row = (p: { price: number; size: number; tone: 'ask' | 'bid'; max: number }) => {
     const w = Math.max(0, Math.min(1, p.size / p.max));
     const isAsk = p.tone === 'ask';
@@ -74,9 +76,25 @@ export function OverallOrderBookPanel(props: {
       <div
         role={canPrefill ? 'button' : undefined}
         tabIndex={canPrefill ? 0 : undefined}
-        onClick={() => {
+        onClick={(e) => {
           if (!canPrefill) return;
           const priceCents = Math.round(p.price * 1000) / 10; // keep 0.1¢ precision (matches other UI)
+          if (e.shiftKey) {
+            const anchor = rangeAnchorRef.current;
+            if (anchor && anchor.tone === p.tone) {
+              const loCents = Math.min(anchor.priceCents, priceCents);
+              const hiCents = Math.max(anchor.priceCents, priceCents);
+              rangeAnchorRef.current = null;
+              window.dispatchEvent(
+                new CustomEvent('bpx-trade-range-prefill', {
+                  detail: { lane: prefillLane, tone: p.tone, loCents, hiCents },
+                }),
+              );
+              return;
+            }
+            rangeAnchorRef.current = { tone: p.tone, priceCents };
+            return;
+          }
           window.dispatchEvent(
             new CustomEvent('bpx-trade-prefill', {
               detail: {

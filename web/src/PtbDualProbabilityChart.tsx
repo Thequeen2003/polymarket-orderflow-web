@@ -1234,6 +1234,40 @@ export function PtbDualProbabilityChart(props: {
                 <div>First Wall: {ptbTarget.firstWallLabel}</div>
                 <div>Reversal Risk: {ptbTarget.reversalRisk}</div>
               </div>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const loCents = Math.round(Math.max(0, Math.min(100, ptbTarget.lo01 * 100)) * 10) / 10;
+                    const hiCents = Math.round(Math.max(0, Math.min(100, ptbTarget.hi01 * 100)) * 10) / 10;
+                    window.dispatchEvent(
+                      new CustomEvent('bpx-trade-range-prefill', {
+                        detail: { lane: ptbTarget.engineLane, tone: 'ask', loCents, hiCents },
+                      }),
+                    );
+                  }}
+                  className="rounded-lg border border-emerald-800/40 bg-emerald-950/25 px-2.5 py-1 text-[10px] font-bold text-emerald-100 hover:bg-emerald-950/35"
+                  title="Prefill a BUY ladder using the PTB Target Engine range (you buy at asks)."
+                >
+                  Ladder buy range
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const loCents = Math.round(Math.max(0, Math.min(100, ptbTarget.lo01 * 100)) * 10) / 10;
+                    const hiCents = Math.round(Math.max(0, Math.min(100, ptbTarget.hi01 * 100)) * 10) / 10;
+                    window.dispatchEvent(
+                      new CustomEvent('bpx-trade-range-prefill', {
+                        detail: { lane: ptbTarget.engineLane, tone: 'bid', loCents, hiCents },
+                      }),
+                    );
+                  }}
+                  className="rounded-lg border border-rose-800/40 bg-rose-950/20 px-2.5 py-1 text-[10px] font-bold text-rose-100 hover:bg-rose-950/30"
+                  title="Prefill a SELL ladder using the PTB Target Engine range (you sell into bids)."
+                >
+                  Ladder sell range
+                </button>
+              </div>
             </div>
             <div className="flex flex-wrap items-center justify-between gap-2 border-t border-zinc-800/50 pt-2">
               <div className="flex flex-wrap gap-1.5">

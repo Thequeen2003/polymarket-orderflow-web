@@ -45,6 +45,8 @@ export function openClobMarketChannel(params: {
 }): { close: () => void } {
   const ws = new WebSocket(WS_URL);
   let closed = false;
+  let pongTimer: number | null = null;
+  let lastMsgAt = Date.now();
 
   const safeStatus = (s: { state: 'open' | 'closed' | 'error'; detail?: string }) => {
     try {
@@ -64,10 +66,25 @@ export function openClobMarketChannel(params: {
         custom_feature_enabled: true,
       }),
     );
+
+    // Keepalive: some networks/proxies silently drop idle WS.
+    // Also detect a "stalled" connection (open but no messages) and surface it.
+    if (pongTimer != null) window.clearInterval(pongTimer);
+    pongTimer = window.setInterval(() => {
+      if (closed) return;
+      try {
+        if (ws.readyState === WebSocket.OPEN) ws.send('ping');
+      } catch {
+        /* ignore */
+      }
+      const ageMs = Date.now() - lastMsgAt;
+      if (ageMs > 30_000) safeStatus({ state: 'error', detail: `ws_stalled_${ageMs}ms` });
+    }, 10_000);
   });
 
   ws.addEventListener('message', (ev) => {
     if (closed) return;
+    lastMsgAt = Date.now();
     let msg: ClobWsMsg = ev.data;
     try {
       if (typeof ev.data === 'string') msg = JSON.parse(ev.data) as ClobWsMsg;
@@ -77,6 +94,7 @@ export function openClobMarketChannel(params: {
     if (!msg || typeof msg !== 'object') return;
     const o = msg as Record<string, unknown>;
     const t = String(o.event_type ?? '');
+    if (t === 'pong') return;
     if (t === 'book') {
       const m = msg as ClobWsBookMsg;
       if (!m.asset_id) return;
@@ -108,6 +126,8 @@ export function openClobMarketChannel(params: {
   return {
     close: () => {
       closed = true;
+      if (pongTimer != null) window.clearInterval(pongTimer);
+      pongTimer = null;
       try {
         ws.close();
       } catch {

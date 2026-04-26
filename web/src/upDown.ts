@@ -13,7 +13,10 @@ export function resolveUpDownIndices(
   labels: string[],
   market?: unknown | null,
 ): { up: number; down: number } | null {
-  if (labels.length !== 2) return null;
+  if (labels.length < 2) return null;
+  // Many Polymarket markets have >2 outcomes. Most of this app is built around a 2-lane "up/down" view.
+  // In those cases, default to the first two outcomes so the rest of the UI still functions.
+  if (labels.length > 2) return { up: 0, down: 1 };
   const norm = labels.map(normLabel);
 
   // Prefer explicit Up/Down or Above/Below style labels.

@@ -207,7 +207,6 @@ export function PtbDualLineChartSvg(p: PtbDualLineChartSvgProps): ReactElement {
     counterEnter,
     upLabel,
     downLabel,
-    priceToBeatUsd: _priceToBeatUsd,
     fmtPct,
     fmtChartWindowMin,
     lastUpdateMs,

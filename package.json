@@ -10,10 +10,12 @@
     "dev": "concurrently -n api,web -c cyan,magenta \"npm run dev -w api\" \"npm run dev -w web\"",
     "build": "npm run build -w api && npm run build -w web",
     "test": "npm test -w api && npm test -w web",
-    "lint": "npm run lint -w api && npm run lint -w web"
+    "lint": "npm run lint -w api && npm run lint -w web",
+    "backtest": "tsx web/scripts/backtest.ts"
   },
   "devDependencies": {
-    "concurrently": "^9.2.0"
+    "concurrently": "^9.2.0",
+    "tsx": "^4.20.6"
   }
 }
 
