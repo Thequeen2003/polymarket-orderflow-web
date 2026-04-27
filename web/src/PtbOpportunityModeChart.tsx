@@ -62,6 +62,12 @@ function fmtUsdSigned(n: number | null): string {
   return `${n >= 0 ? '+' : '-'}$${Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
 }
 
+function fmtUsdSignedTight(n: number | null): string {
+  if (n == null || !Number.isFinite(n)) return '—';
+  const s = n >= 0 ? '+' : '-';
+  return `${s}$${Math.abs(n).toFixed(2)}`;
+}
+
 function fmtPctSigned(n: number | null): string {
   if (n == null || !Number.isFinite(n)) return '—';
   return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
@@ -165,6 +171,8 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
     upLabel = 'UP',
     downLabel = 'DOWN',
   } = props;
+  // Hide legacy mini “rules” panels; the big Trade Plan card is the primary read.
+  const showLegacyRulePanels = false;
   const gradId = useId().replace(/:/g, '');
   const [displayMode, setDisplayMode] = useState<'line' | 'ohlc'>('line');
   const [zoomWindow, setZoomWindow] = useState<60 | 120 | 300 | 900>(300);
@@ -1485,66 +1493,70 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             </div>
           </div>
         </div>
-        <div className="mt-3 grid gap-2 lg:grid-cols-2">
-          <div className={`rounded-xl border px-3 py-2 ${playbook.entryTone}`} title="Entry trigger is framed as: outside band + hold; not a prediction.">
-            <div className="text-[9px] font-extrabold uppercase tracking-[0.18em] text-inherit/90">Entry</div>
-            <div className="mt-1 text-[11px] leading-snug text-inherit/95">{playbook.entry}</div>
-            <div className="mt-1 text-[10px] font-semibold text-inherit/80">{playbook.stop}</div>
-          </div>
-          <div className={`rounded-xl border px-3 py-2 ${playbook.exitTone}`} title="Exit/invalidation is framed as: back into band or rotation; keep it mechanical.">
-            <div className="text-[9px] font-extrabold uppercase tracking-[0.18em] text-inherit/90">Exit</div>
-            <div className="mt-1 text-[11px] leading-snug text-inherit/95">{playbook.exit}</div>
-            <div className="mt-1 text-[10px] font-semibold text-inherit/85">{playbook.tp}</div>
-          </div>
-        </div>
+        {showLegacyRulePanels ? (
+          <>
+            <div className="mt-3 grid gap-2 lg:grid-cols-2">
+              <div className={`rounded-xl border px-3 py-2 ${playbook.entryTone}`} title="Entry trigger is framed as: outside band + hold; not a prediction.">
+                <div className="text-[9px] font-extrabold uppercase tracking-[0.18em] text-inherit/90">Entry</div>
+                <div className="mt-1 text-[11px] leading-snug text-inherit/95">{playbook.entry}</div>
+                <div className="mt-1 text-[10px] font-semibold text-inherit/80">{playbook.stop}</div>
+              </div>
+              <div className={`rounded-xl border px-3 py-2 ${playbook.exitTone}`} title="Exit/invalidation is framed as: back into band or rotation; keep it mechanical.">
+                <div className="text-[9px] font-extrabold uppercase tracking-[0.18em] text-inherit/90">Exit</div>
+                <div className="mt-1 text-[11px] leading-snug text-inherit/95">{playbook.exit}</div>
+                <div className="mt-1 text-[10px] font-semibold text-inherit/85">{playbook.tp}</div>
+              </div>
+            </div>
 
-        {settlementCross ? (
-          <div className="mt-3 grid gap-2 sm:grid-cols-2">
-            <div
-              className="rounded-xl border border-violet-600/40 bg-violet-950/25 px-3 py-2"
-              title={
-                `${settlementCross.blurb}\n` +
-                `50% band ${fmtUsd(settlementCross.band50Low)} – ${fmtUsd(settlementCross.band50High)} · ` +
-                `80% ${fmtUsd(settlementCross.band80Low)} – ${fmtUsd(settlementCross.band80High)}`
-              }
-            >
-              <div className="text-[9px] font-extrabold uppercase tracking-[0.18em] text-violet-200/85">Settlement (vs PTB @ end)</div>
-              <div className="mt-1 font-mono text-sm font-semibold tabular-nums text-violet-100">
-                Above {Math.round(settlementCross.pAboveAtEnd * 100)}% · Below {Math.round(settlementCross.pBelowAtEnd * 100)}%
+            {settlementCross ? (
+              <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                <div
+                  className="rounded-xl border border-violet-600/40 bg-violet-950/25 px-3 py-2"
+                  title={
+                    `${settlementCross.blurb}\n` +
+                    `50% band ${fmtUsd(settlementCross.band50Low)} – ${fmtUsd(settlementCross.band50High)} · ` +
+                    `80% ${fmtUsd(settlementCross.band80Low)} – ${fmtUsd(settlementCross.band80High)}`
+                  }
+                >
+                  <div className="text-[9px] font-extrabold uppercase tracking-[0.18em] text-violet-200/85">Settlement (vs PTB @ end)</div>
+                  <div className="mt-1 font-mono text-sm font-semibold tabular-nums text-violet-100">
+                    Above {Math.round(settlementCross.pAboveAtEnd * 100)}% · Below {Math.round(settlementCross.pBelowAtEnd * 100)}%
+                  </div>
+                  <div className="mt-0.5 text-[10px] text-violet-200/70">
+                    Confidence:{' '}
+                    <span className="font-bold uppercase text-violet-100">{settlementCross.confidence}</span>
+                    {' · '}
+                    E[close] {fmtUsd(settlementCross.expectedEndPrice)}
+                  </div>
+                </div>
+                <div
+                  className="rounded-xl border border-cyan-600/40 bg-cyan-950/20 px-3 py-2"
+                  title={
+                    `P(cross PTB within window): 30s ${Math.round(settlementCross.pCrossIn30s * 100)}%, ` +
+                    `60s ${Math.round(settlementCross.pCrossIn60s * 100)}%, 120s ${Math.round(settlementCross.pCrossIn120s * 100)}%. ` +
+                    (settlementCross.tCrossMedianSec != null
+                      ? `Rough median time to line (drift toward line): ${settlementCross.tCrossMedianSec < 60 ? `${settlementCross.tCrossMedianSec.toFixed(0)}s` : `${(settlementCross.tCrossMedianSec / 60).toFixed(1)}m`}.`
+                      : 'Median time to line: n/a (drift not toward PTB).') +
+                    `\n${settlementCross.blurb}`
+                  }
+                >
+                  <div className="text-[9px] font-extrabold uppercase tracking-[0.18em] text-cyan-200/85">Cross soon</div>
+                  <div className="mt-1 font-mono text-sm font-semibold tabular-nums text-cyan-100">
+                    60s: {Math.round(settlementCross.pCrossIn60s * 100)}%
+                    <span className="text-cyan-200/50"> · 30s {Math.round(settlementCross.pCrossIn30s * 100)}%</span>
+                    <span className="text-cyan-200/50"> · 120s {Math.round(settlementCross.pCrossIn120s * 100)}%</span>
+                  </div>
+                  <div className="mt-0.5 text-[10px] text-cyan-200/70">
+                    {settlementCross.confidence === 'low' || derivedStrip?.controlSignal === 'NO_EDGE' || derivedStrip?.structureEvent === 'chop' ? (
+                      <span>Low conf. in chop / near band — use for timing only.</span>
+                    ) : (
+                      <span>Barrier MC from drift + tick vol; hover for 30/120s + bands.</span>
+                    )}
+                  </div>
+                </div>
               </div>
-              <div className="mt-0.5 text-[10px] text-violet-200/70">
-                Confidence:{' '}
-                <span className="font-bold uppercase text-violet-100">{settlementCross.confidence}</span>
-                {' · '}
-                E[close] {fmtUsd(settlementCross.expectedEndPrice)}
-              </div>
-            </div>
-            <div
-              className="rounded-xl border border-cyan-600/40 bg-cyan-950/20 px-3 py-2"
-              title={
-                `P(cross PTB within window): 30s ${Math.round(settlementCross.pCrossIn30s * 100)}%, ` +
-                `60s ${Math.round(settlementCross.pCrossIn60s * 100)}%, 120s ${Math.round(settlementCross.pCrossIn120s * 100)}%. ` +
-                (settlementCross.tCrossMedianSec != null
-                  ? `Rough median time to line (drift toward line): ${settlementCross.tCrossMedianSec < 60 ? `${settlementCross.tCrossMedianSec.toFixed(0)}s` : `${(settlementCross.tCrossMedianSec / 60).toFixed(1)}m`}.`
-                  : 'Median time to line: n/a (drift not toward PTB).') +
-                `\n${settlementCross.blurb}`
-              }
-            >
-              <div className="text-[9px] font-extrabold uppercase tracking-[0.18em] text-cyan-200/85">Cross soon</div>
-              <div className="mt-1 font-mono text-sm font-semibold tabular-nums text-cyan-100">
-                60s: {Math.round(settlementCross.pCrossIn60s * 100)}%
-                <span className="text-cyan-200/50"> · 30s {Math.round(settlementCross.pCrossIn30s * 100)}%</span>
-                <span className="text-cyan-200/50"> · 120s {Math.round(settlementCross.pCrossIn120s * 100)}%</span>
-              </div>
-              <div className="mt-0.5 text-[10px] text-cyan-200/70">
-                {settlementCross.confidence === 'low' || derivedStrip?.controlSignal === 'NO_EDGE' || derivedStrip?.structureEvent === 'chop' ? (
-                  <span>Low conf. in chop / near band — use for timing only.</span>
-                ) : (
-                  <span>Barrier MC from drift + tick vol; hover for 30/120s + bands.</span>
-                )}
-              </div>
-            </div>
-          </div>
+            ) : null}
+          </>
         ) : null}
 
         {derivedStrip?.structureEvent === 'chop' || derivedStrip?.reaction?.kind === 'choppy_at_line' ? (
@@ -1577,10 +1589,156 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
               {projection.label} → {fmtUsd(projection.p1)}
             </span>
           ) : null}
-          <span className="rounded border border-zinc-700/60 bg-black/30 px-2 py-1 text-zinc-500">
-            {model.conviction}
-          </span>
+          <span className="rounded border border-zinc-700/60 bg-black/30 px-2 py-1 text-zinc-500">{model.conviction}</span>
         </div>
+
+        {/* Make “WEAK SEPARATION” impossible to misread: bold, actionable, not just a chip. */}
+        {priceToBeat != null && model ? (() => {
+          const band = model.band;
+          const lo = priceToBeat - band;
+          const hi = priceToBeat + band;
+          const now = model.last;
+          const d = now - priceToBeat;
+          const inBand = Math.abs(d) <= band;
+          const side = inBand ? 'IN BAND' : d > 0 ? 'ABOVE' : 'BELOW';
+          const sep = model.conviction;
+          const favorableNow = mode === 'up' ? now > hi : now < lo;
+          const edgeOk = sep !== 'WEAK SEPARATION' && favorableNow;
+
+          const entryLine = mode === 'up' ? hi : lo;
+          const stopBand = `${fmtUsd(lo)}–${fmtUsd(hi)}`;
+          const proj30s = projection?.p1 ?? null;
+          const tpLine = proj30s != null ? fmtUsd(proj30s) : '—';
+          const settlementLine = settlementCross
+            ? `Above ${Math.round(settlementCross.pAboveAtEnd * 100)}% · Below ${Math.round(settlementCross.pBelowAtEnd * 100)}%`
+            : '—';
+          const confLine = settlementCross ? `${settlementCross.confidence}` : '—';
+          const eClose = settlementCross?.expectedEndPrice ?? null;
+          const crossSoon = settlementCross
+            ? `60s: ${Math.round(settlementCross.pCrossIn60s * 100)}% · 30s ${Math.round(settlementCross.pCrossIn30s * 100)}% · 120s ${Math.round(
+                settlementCross.pCrossIn120s * 100,
+              )}%`
+            : '—';
+          const slope = derivedStrip?.slopeUsdPerMin ?? null;
+          const dist = derivedStrip?.distanceUsd ?? null;
+          const structure = derivedStrip?.structureEvent?.replaceAll('_', ' ') ?? '—';
+
+          const accentBorder =
+            inBand
+              ? 'border-amber-500/55'
+              : favorableNow
+                ? mode === 'up'
+                  ? 'border-emerald-500/45'
+                  : 'border-rose-500/45'
+                : 'border-zinc-700/60';
+          const accentBg =
+            inBand
+              ? 'from-amber-950/30'
+              : favorableNow
+                ? mode === 'up'
+                  ? 'from-emerald-950/22'
+                  : 'from-rose-950/22'
+                : 'from-zinc-900/40';
+          const headlineTone =
+            inBand ? 'text-amber-200' : favorableNow ? (mode === 'up' ? 'text-emerald-200' : 'text-rose-200') : 'text-zinc-200';
+
+          return (
+            <div className={`mt-3 rounded-2xl border-2 ${accentBorder} bg-gradient-to-br ${accentBg} via-zinc-950/60 to-black/40 p-4 ring-1 ring-white/[0.03]`}>
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <div className={`text-[11px] font-black uppercase tracking-wider ${headlineTone}`}>{sep}</div>
+                  <div className="mt-1 text-[16px] font-extrabold leading-tight text-zinc-50">
+                    {side}{inBand ? ' — wait for a clean outside + hold' : edgeOk ? ' — edge is live (don’t chase)' : ' — not your side'}
+                  </div>
+                  <div className="mt-1 text-[12px] leading-snug text-zinc-300">
+                    Band: <span className="font-mono text-zinc-100">{fmtUsd(lo)}–{fmtUsd(hi)}</span> · PTB {fmtUsd(priceToBeat)}
+                  </div>
+                </div>
+                <div className="rounded-xl border border-zinc-700/60 bg-black/25 px-3 py-2">
+                  <div className="text-[10px] font-bold uppercase tracking-wide text-zinc-500">Now</div>
+                  <div className="mt-1 font-mono text-[14px] font-extrabold text-zinc-100">
+                    {fmtUsd(now)} <span className="text-zinc-500">({fmtUsdSignedTight(now - priceToBeat)})</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-3 grid gap-2 lg:grid-cols-2">
+                <div className={`rounded-xl border px-3 py-2 ${edgeOk ? 'border-emerald-700/35 bg-emerald-950/10' : 'border-zinc-800/60 bg-black/20'}`}>
+                  <div className="text-[10px] font-black uppercase tracking-wide text-zinc-200">Entry</div>
+                  {inBand ? (
+                    <>
+                      <div className="mt-1 text-[12px] font-semibold text-zinc-100">Key levels (in band)</div>
+                      <div className="mt-1 text-[11px] leading-snug text-zinc-300">
+                        <span className="font-semibold text-emerald-200">ABOVE-confirm</span>: price holds above{' '}
+                        <span className="font-mono text-emerald-100">{fmtUsd(hi)}</span>
+                      </div>
+                      <div className="mt-1 text-[11px] leading-snug text-zinc-300">
+                        <span className="font-semibold text-rose-200">BELOW-confirm</span>: price holds below{' '}
+                        <span className="font-mono text-rose-100">{fmtUsd(lo)}</span>
+                      </div>
+                      <div className="mt-1 text-[11px] leading-snug text-zinc-400">
+                        In-band entries are low edge — use these as the “go” thresholds.
+                      </div>
+                    </>
+                  ) : edgeOk ? (
+                    <div className="mt-1 text-[12px] font-semibold text-zinc-100">
+                      ENTER on pullback that stays outside the band (holds <span className="font-mono">{fmtUsd(entryLine)}</span>).
+                    </div>
+                  ) : (
+                    <div className="mt-1 text-[12px] font-semibold text-zinc-100">NO TRADE: not outside band on your side.</div>
+                  )}
+                  <div className="mt-1 text-[11px] leading-snug text-zinc-300">
+                    Stop: back into band (<span className="font-mono">{stopBand}</span>)
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-zinc-800/60 bg-black/20 px-3 py-2">
+                  <div className="text-[10px] font-black uppercase tracking-wide text-zinc-200">Exit</div>
+                  <div className="mt-1 text-[12px] font-semibold text-zinc-100">
+                    EXIT if it re-enters the band (<span className="font-mono">{stopBand}</span>)
+                    {slope != null ? ' or flips slope.' : '.'}
+                  </div>
+                  <div className="mt-1 text-[11px] leading-snug text-zinc-300">
+                    <span className="font-semibold text-zinc-200">Reclaim / exit line</span>: {mode === 'up' ? (
+                      <>
+                        lose <span className="font-mono">{fmtUsd(hi)}</span> = exit pressure
+                      </>
+                    ) : (
+                      <>
+                        lose <span className="font-mono">{fmtUsd(lo)}</span> = exit pressure
+                      </>
+                    )}
+                  </div>
+                  <div className="mt-1 text-[11px] leading-snug text-zinc-300">
+                    TP (proj 30s): <span className="font-mono">{tpLine}</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-2 grid gap-2 md:grid-cols-2">
+                <div className="rounded-xl border border-zinc-800/60 bg-black/15 px-3 py-2">
+                  <div className="text-[10px] font-black uppercase tracking-wide text-zinc-400">Settlement (vs PTB @ end)</div>
+                  <div className="mt-1 font-mono text-[12px] font-bold text-zinc-100">{settlementLine}</div>
+                  <div className="mt-1 text-[11px] text-zinc-400">
+                    Confidence: <span className="font-semibold text-zinc-200">{confLine}</span> · E[close]{' '}
+                    <span className="font-mono text-zinc-200">{eClose != null ? fmtUsd(eClose) : '—'}</span>
+                  </div>
+                  <div className="mt-1 text-[11px] text-zinc-500">Cross soon: {crossSoon}</div>
+                </div>
+                <div className="rounded-xl border border-zinc-800/60 bg-black/15 px-3 py-2">
+                  <div className="text-[10px] font-black uppercase tracking-wide text-zinc-400">Why</div>
+                  <div className="mt-1 text-[12px] font-semibold text-zinc-100">
+                    {inBand ? 'Low edge near PTB band — timing only.' : edgeOk ? 'Separation + slope support — press only on confirmation.' : 'Outside band exists, but not aligned to this view.'}
+                  </div>
+                  <div className="mt-1 font-mono text-[11px] text-zinc-300">
+                    {structure} · Δ {dist != null ? fmtUsdSignedTight(dist) : '—'} · Slope {slope != null ? `${slope >= 0 ? '+' : ''}${slope.toFixed(3)}/m` : '—'} · Proj 30s →{' '}
+                    {proj30s != null ? fmtUsd(proj30s) : '—'}
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })() : null}
 
         {buildup && buildup.tier !== 'NONE' ? (() => {
           const tierColor = buildup.tier === 'FIRING' ? 'border-yellow-500/60 bg-yellow-950/30'

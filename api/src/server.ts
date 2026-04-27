@@ -939,10 +939,21 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
       const da = Math.abs(a - b.now);
       const dc = Math.abs(c - b.now);
       if (da !== dc) return da - dc;
+      // When equally close, prefer the current/just-started bucket over the next one.
+      // For longer windows (1h/4h/1d), opening a future bucket yields a market that may be "active"
+      // but has a PTB bucket start in the future, which breaks client PTB/spot alignment.
+      if (interval === '1h' || interval === '4h' || interval === '1d') {
+        const aFuture = a > b.now;
+        const cFuture = c > b.now;
+        if (aFuture !== cFuture) return aFuture ? 1 : -1;
+      }
       return a - c;
     });
     // First try the deterministic slug rather than Gamma search (which can lag).
     for (const ts of tryTsOrdered) {
+      // For longer windows, do not select a future bucket start. Some markets open early with a live book,
+      // but PTB/spot alignment is defined by the *current* bucket start.
+      if ((interval === '1h' || interval === '4h') && ts > b.now + 60) continue;
       const slug = `${asset}-updown-${interval}-${ts}`;
       try {
         const m = (await gammaMarketBySlugOrId(slug)) as Record<string, unknown>;
@@ -1062,6 +1073,41 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
           }
         }
       }
+      // Final fallback: scan Gamma “active markets” list and pick the best matching duration.
+      // This is slower but tends to be more reliable than search when titles/slugs vary.
+      if (interval === '1h') {
+        try {
+          const rows3 = (await gammaMarketsList(450)).map(normalizeMarket);
+          const best3 = pickBestUpdownGeneral(rows3, asset, '1h');
+          if (best3) {
+            const t0 = best3.tokenIds[0];
+            if (t0 && (await clobHasOrderbook(t0))) {
+              return json(res, 200, {
+                ok: true,
+                data: {
+                  slug: best3.slug,
+                  asset,
+                  interval,
+                  window: interval,
+                  tested: true,
+                  active: best3.active,
+                  closed: best3.closed,
+                  inferred_window_start_unix: best3.startMs != null ? Math.floor(best3.startMs / 1000) : b.floor,
+                  inferred_end_unix: best3.endMs != null ? Math.floor(best3.endMs / 1000) : b.floor + stepSec,
+                  start: best3.startMs != null ? new Date(best3.startMs).toISOString() : new Date(b.floor * 1000).toISOString(),
+                  end: best3.endMs != null ? new Date(best3.endMs).toISOString() : new Date((b.floor + stepSec) * 1000).toISOString(),
+                  bucket_now_unix: b.now,
+                  bucket_floor_unix: b.floor,
+                  bucket_ceil_unix: b.ceil,
+                  source: 'gamma_markets_list',
+                },
+              });
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+      }
       return json(res, 404, {
         ok: false,
         error: interval === '15m' ? 'no_updown_15m' : interval === '4h' ? 'no_updown_4h' : interval === '1h' ? 'no_updown_1h' : 'no_updown_5m',
@@ -1074,15 +1120,20 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
       const aDist = Math.abs(a.ts - target);
       const bDist = Math.abs(b2.ts - target);
       if (aDist !== bDist) return aDist - bDist;
-      // Prefer the bucket that is not in the past when tied (e.g. right after a boundary).
+      // When tied, prefer the current/previous bucket for longer windows to avoid selecting
+      // a future-starting market that can appear "active" but doesn't line up with the current PTB bucket.
       const aPast = a.ts < target;
       const bPast = b2.ts < target;
-      if (aPast !== bPast) return aPast ? 1 : -1;
+      if (aPast !== bPast) {
+        if (interval === '1h' || interval === '4h') return aPast ? -1 : 1;
+        return aPast ? 1 : -1;
+      }
       return b2.ts - a.ts;
     });
 
     // Prefer a candidate with an actual CLOB orderbook; test a few closest buckets.
     for (const c of ordered.slice(0, 10)) {
+      if ((interval === '1h' || interval === '4h') && c.ts > b.now + 60) continue;
       const t0 = c.tokenIds[0];
       if (!t0) continue;
       try {

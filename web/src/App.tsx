@@ -245,16 +245,35 @@ function mergeSpotHistory(
   data: { value: number; ts: number; history?: RtdsCryptoPoint[] },
 ): SpotPoint[] {
   const serverTs = Number.isFinite(data.ts) ? data.ts : Date.now();
+  const serverV = Number.isFinite(data.value) ? data.value : NaN;
   const hist = data.history;
-  const cleaned =
+  const fromHist: SpotPoint[] =
     Array.isArray(hist) && hist.length > 0
       ? hist
           .filter((q) => typeof q.t === 'number' && typeof q.v === 'number' && Number.isFinite(q.t) && Number.isFinite(q.v))
+          .map((q) => ({ t: q.t, v: q.v }))
           .sort((a, b) => a.t - b.t)
-          .slice(-600)
-      : null;
-  if (cleaned != null && cleaned.length > 0) return cleaned;
-  return [...prev, { t: serverTs, v: data.value }].slice(-600);
+      : [];
+
+  // Build a monotonic, deduped series. Prefer server-provided history for hydration,
+  // but always keep the newest tick (some backends may omit the very latest tick from `history`).
+  const merged = [...prev, ...fromHist];
+  if (Number.isFinite(serverTs) && Number.isFinite(serverV)) merged.push({ t: serverTs, v: serverV });
+  merged.sort((a, b) => a.t - b.t);
+
+  const out: SpotPoint[] = [];
+  let lastT: number | null = null;
+  for (const p of merged) {
+    if (!Number.isFinite(p.t) || !Number.isFinite(p.v)) continue;
+    if (lastT != null && p.t === lastT) {
+      // Replace same-timestamp entry with the latest observed value.
+      out[out.length - 1] = p;
+      continue;
+    }
+    out.push(p);
+    lastT = p.t;
+  }
+  return out.slice(-900);
 }
 
 function isShortcutAsset(asset: string): asset is UpdownShortcutAsset {
@@ -1061,7 +1080,7 @@ function App() {
 
     // Coalesce book updates to avoid rendering at full WS tick rate.
     // Rendering ~60fps from websocket churn can cause visible UI jank.
-    const MIN_FLUSH_MS = 120;
+    const MIN_FLUSH_MS = 60;
     let lastFlushAt = 0;
     let flushTimer: number | null = null;
 
@@ -1431,7 +1450,8 @@ function App() {
         if (!stopped) void tick();
       }, 400),
     ];
-    const intervalMs = rtdsPollFast ? 750 : 2_000;
+    // RTDS numbers feel "frozen" if we poll too slowly. Keep 1s cadence for normal mode.
+    const intervalMs = rtdsPollFast ? 750 : 1_000;
     const id = window.setInterval(() => void tick(), intervalMs);
     return () => {
       stopped = true;
@@ -1703,21 +1723,8 @@ function App() {
 
       if (isOk(first)) okRes = first;
       else {
-        // Polymarket does not always have a live 1h window market available.
-        // Fall back to 15m so the user still gets a moving market.
-        if (interval === '1h' && first.error === 'no_updown_1h') {
-          const fallback = await marketsUpdownShortcut(asset, '15m');
-          if (isOk(fallback)) {
-            setMarketsError(`${asset.toUpperCase()} 1h not available right now — opened ${asset.toUpperCase()} 15m instead.`);
-            okRes = fallback;
-          } else {
-            setMarketsError(pretty(first));
-            return;
-          }
-        } else {
-          setMarketsError(pretty(first));
-          return;
-        }
+        setMarketsError(pretty(first));
+        return;
       }
 
       if (!okRes) return;

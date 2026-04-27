@@ -128,6 +128,20 @@ function OverlayTxt(props: {
   );
 }
 
+function clamp(x: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, x));
+}
+
+function fmtSignedPpFrom50(prob01: number): string {
+  const pp = (prob01 - 0.5) * 100;
+  const s = pp >= 0 ? '+' : '';
+  return `${s}${pp.toFixed(1)}pp`;
+}
+
+function isFiniteNumber(x: unknown): x is number {
+  return typeof x === 'number' && Number.isFinite(x);
+}
+
 /** Pick Y-axis tick values so adjacent labels don’t stack (min ~14px apart in viewBox space). */
 function filterTicksByPixelGap(ticks: number[], yOf: (p: number) => number, minGapPx: number): number[] {
   const sorted = [...new Set(ticks)].sort((a, b) => yOf(a) - yOf(b));
@@ -239,6 +253,26 @@ export function PtbDualLineChartSvg(p: PtbDualLineChartSvgProps): ReactElement {
   const activePts = activeTargetLane === 'up' ? ptsU : ptsD;
   const arrows = buildArrows(activePts, speedLabel, xT, yRaw);
 
+  const activeRecent = (() => {
+    const pts = activePts;
+    if (pts.length < 3) return null;
+    const a = pts[pts.length - 3]!;
+    const b = pts[pts.length - 2]!;
+    const c = pts[pts.length - 1]!;
+    const dv1 = b.v - a.v;
+    const dv2 = c.v - b.v;
+    const accel = dv2 - dv1;
+    const dtMs = Math.max(1, c.t - b.t);
+    const ratePerSec = Math.abs(dv2) / (dtMs / 1000);
+    const jumpPp = dv2 * 100; // probability points
+    const accelPp = accel * 100;
+    // Momentum is “how hard is it moving right now”, not just tape speed.
+    const momentum01 = clamp((Math.abs(jumpPp) / 1.6) * 0.6 + speedScore01 * 0.55 + clamp(ratePerSec / 0.004, 0, 1) * 0.35, 0, 1);
+    const heading = dv2 >= 0 ? 'TOP' : 'BOTTOM';
+    const chasingRisk = speedLabel !== 'SLOW' && Math.abs(jumpPp) >= 1.2 && accelPp > 0.25;
+    return { jumpPp, accelPp, momentum01, heading, chasingRisk };
+  })();
+
   const enterLine = tradeTrigger.line;
   const counterLine = counterEnter?.line ?? null;
   const fadeLine = tradeTrigger.fadeWall;
@@ -318,10 +352,15 @@ export function PtbDualLineChartSvg(p: PtbDualLineChartSvgProps): ReactElement {
   const dotStride = (n: number) => Math.max(1, Math.floor(n / 22));
 
   const renderPolyline = (lane: 'up' | 'down', pts: PtbLinePoint[], keyP: string) => {
+    const isActiveLane = lane === activeTargetLane;
     const glow = pts.slice(1).map((b, i) => {
       const a = pts[i]!;
       const vPrev = i > 0 ? pts[i - 1]!.v : null;
       const st = segmentDualLaneStyle(lane, vPrev, a.v, b.v, a.t, b.t, speedScore01);
+      const dv = b.v - a.v;
+      const isMomentumSeg = isActiveLane && speedLabel !== 'SLOW' && Math.abs(dv) >= 0.00014;
+      const haloOpacity = isMomentumSeg ? 0.22 : 0.12;
+      const haloWidth = isMomentumSeg ? st.strokeWidth + 8.5 : st.strokeWidth + 3;
       return (
         <line
           key={`${keyP}-glow-${b.t}-${i}`}
@@ -330,9 +369,10 @@ export function PtbDualLineChartSvg(p: PtbDualLineChartSvgProps): ReactElement {
           x2={xT(b.t)}
           y2={yRaw(b.v)}
           stroke={st.stroke}
-          strokeWidth={st.strokeWidth + 3}
+          strokeWidth={haloWidth}
           strokeLinecap="round"
-          opacity={0.12}
+          opacity={haloOpacity}
+          filter={isMomentumSeg ? 'url(#ptbDualEnterGlow)' : undefined}
         />
       );
     });
@@ -623,6 +663,34 @@ export function PtbDualLineChartSvg(p: PtbDualLineChartSvgProps): ReactElement {
         Target ({activeTargetLane === 'up' ? upLabel : downLabel}) {ptbTarget.targetRangeLabel}
       </OverlayTxt>
 
+      {/* Large projected (next) value pill right of target band */}
+      {isFiniteNumber(projYLo) && isFiniteNumber(projYHi) && isFiniteNumber(ptbTarget.next01) ? (
+        <>
+          <rect
+            x={projX1 - 132}
+            y={Math.min(projYLo, projYHi) - 2}
+            width={124}
+            height={18}
+            rx={8}
+            fill="rgba(24,24,27,0.82)"
+            stroke="rgba(255,255,255,0.07)"
+            strokeWidth={1}
+            className="pointer-events-none"
+          />
+          <Txt
+            x={projX1 - 12}
+            y={Math.min(projYLo, projYHi) + 11}
+            anchor="end"
+            size={10}
+            weight={900}
+            fill={activeTargetLane === 'up' ? 'rgb(187 247 208)' : 'rgb(254 202 202)'}
+            fontFamily="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"
+          >
+            proj {fmtPct(ptbTarget.next01)} ({fmtSignedPpFrom50(ptbTarget.next01)})
+          </Txt>
+        </>
+      ) : null}
+
       <g filter="url(#ptbDualLineGlow)" className="pointer-events-none">
         {dnL.glow}
         {upL.glow}
@@ -664,6 +732,63 @@ export function PtbDualLineChartSvg(p: PtbDualLineChartSvgProps): ReactElement {
         {feedStatus}
       </Txt>
 
+      {/* Big, unmissable momentum callout (helps avoid “which side is ripping?” ambiguity). */}
+      {activeRecent ? (
+        <>
+          <rect
+            x={padL + plotW - 236}
+            y={10}
+            width={228}
+            height={34}
+            rx={12}
+            fill={activeTargetLane === 'up' ? 'rgba(16,185,129,0.12)' : 'rgba(244,63,94,0.12)'}
+            stroke={activeTargetLane === 'up' ? 'rgba(52,211,153,0.28)' : 'rgba(251,113,133,0.28)'}
+            strokeWidth={1.2}
+            className="pointer-events-none"
+          />
+          <OverlayTxt
+            x={padL + plotW - 18}
+            y={28}
+            anchor="end"
+            size={10}
+            weight={800}
+            fill={activeTargetLane === 'up' ? 'rgb(187 247 208)' : 'rgb(254 202 202)'}
+          >
+            MOMENTUM → {activeRecent.heading}
+          </OverlayTxt>
+          <Txt
+            x={padL + plotW - 18}
+            y={40}
+            anchor="end"
+            size={8}
+            weight={650}
+            fill="rgba(228,228,231,0.78)"
+            fontFamily="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"
+          >
+            jump {activeRecent.jumpPp >= 0 ? '+' : ''}
+            {activeRecent.jumpPp.toFixed(1)}pp · tape {speedLabel}
+          </Txt>
+          {activeRecent.chasingRisk ? (
+            <rect
+              x={padL + plotW - 124}
+              y={48}
+              width={116}
+              height={18}
+              rx={8}
+              fill="rgba(250,204,21,0.16)"
+              stroke="rgba(250,204,21,0.28)"
+              strokeWidth={1}
+              className="pointer-events-none"
+            />
+          ) : null}
+          {activeRecent.chasingRisk ? (
+            <Txt x={padL + plotW - 18} y={61} anchor="end" size={8} weight={800} fill="rgb(254 240 138)">
+              CHASE RISK — wait for hold
+            </Txt>
+          ) : null}
+        </>
+      ) : null}
+
       <circle
         cx={xT(lastDn.t)}
         cy={yRaw(lastDn.v)}
@@ -677,6 +802,34 @@ export function PtbDualLineChartSvg(p: PtbDualLineChartSvgProps): ReactElement {
       <OverlayTxt x={dnLabelX} y={dnLabelY} anchor={dnTa} size={9} weight={600} fill="rgb(254 202 202)">
         {downLabel} {fmtPct(lastD)}
       </OverlayTxt>
+
+      {/* Large current value pill (DOWN lane) */}
+      {isFiniteNumber(yRaw(lastDn.v)) ? (
+        <>
+          <rect
+            x={padL + 10}
+            y={yRaw(lastDn.v) - 10}
+            width={152}
+            height={20}
+            rx={10}
+            fill={activeTargetLane === 'down' ? 'rgba(244,63,94,0.18)' : 'rgba(24,24,27,0.75)'}
+            stroke={activeTargetLane === 'down' ? 'rgba(251,113,133,0.32)' : 'rgba(255,255,255,0.07)'}
+            strokeWidth={1.1}
+            className="pointer-events-none"
+          />
+          <Txt
+            x={padL + 22}
+            y={yRaw(lastDn.v) + 4.5}
+            anchor="start"
+            size={11}
+            weight={950}
+            fill="rgb(254 202 202)"
+            fontFamily="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"
+          >
+            {downLabel} now {fmtPct(lastD)} ({fmtSignedPpFrom50(lastD)})
+          </Txt>
+        </>
+      ) : null}
 
       <circle
         cx={xT(lastUp.t)}
@@ -692,14 +845,42 @@ export function PtbDualLineChartSvg(p: PtbDualLineChartSvgProps): ReactElement {
         {upLabel} {fmtPct(lastU)}
       </OverlayTxt>
 
+      {/* Large current value pill (UP lane) */}
+      {isFiniteNumber(yRaw(lastUp.v)) ? (
+        <>
+          <rect
+            x={padL + 10}
+            y={yRaw(lastUp.v) - 34}
+            width={152}
+            height={20}
+            rx={10}
+            fill={activeTargetLane === 'up' ? 'rgba(16,185,129,0.18)' : 'rgba(24,24,27,0.75)'}
+            stroke={activeTargetLane === 'up' ? 'rgba(52,211,153,0.32)' : 'rgba(255,255,255,0.07)'}
+            strokeWidth={1.1}
+            className="pointer-events-none"
+          />
+          <Txt
+            x={padL + 22}
+            y={yRaw(lastUp.v) - 19.5}
+            anchor="start"
+            size={11}
+            weight={950}
+            fill="rgb(187 247 208)"
+            fontFamily="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"
+          >
+            {upLabel} now {fmtPct(lastU)} ({fmtSignedPpFrom50(lastU)})
+          </Txt>
+        </>
+      ) : null}
+
       {centTicksRight.map((tp) => (
         <Txt
           key={`rt-${tp}`}
           x={width - padR + 4}
           y={yRaw(tp) + 3.5}
           anchor="end"
-          size={8}
-          weight={Math.abs(tp - 0.5) < 1e-6 ? 600 : 500}
+          size={9}
+          weight={Math.abs(tp - 0.5) < 1e-6 ? 800 : 600}
           fill={Math.abs(tp - 0.5) < 1e-6 ? 'rgb(250 204 21)' : 'rgb(161 161 170)'}
           fontFamily="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"
         >

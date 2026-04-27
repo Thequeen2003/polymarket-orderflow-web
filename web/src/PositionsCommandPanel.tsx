@@ -418,9 +418,16 @@ export function PositionsCommandPanel(props: PositionsCommandPanelProps): ReactE
                 const slugMatchesPage = Boolean(selectedSlug && slug && selectedSlug === slug);
                 return (
                   <li key={r.token}>
-                    <button
-                      type="button"
+                    <div
+                      role="button"
+                      tabIndex={0}
                       onClick={() => {
+                        setSelectedToken(r.token);
+                        if (slug) onNavigate(slug, laneFromLabel(r.outcomeLabel));
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key !== 'Enter' && e.key !== ' ') return;
+                        e.preventDefault();
                         setSelectedToken(r.token);
                         if (slug) onNavigate(slug, laneFromLabel(r.outcomeLabel));
                       }}
@@ -504,7 +511,7 @@ export function PositionsCommandPanel(props: PositionsCommandPanelProps): ReactE
                           </button>
                         </div>
                       </div>
-                    </button>
+                    </div>
                   </li>
                 );
               })}

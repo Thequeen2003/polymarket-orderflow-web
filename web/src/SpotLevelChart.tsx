@@ -34,6 +34,11 @@ function fmtUsd(x: number): string {
   return `$${x.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
 }
 
+function fmtUsdSigned(x: number): string {
+  const s = x >= 0 ? '+' : '';
+  return `${s}${fmtUsd(x)}`;
+}
+
 const BUCKET_N = 20;
 
 function kindLabel(k: string): string {
@@ -166,6 +171,37 @@ export function SpotLevelChart({
   const bandY0 = priceToBeat != null ? yPrice(priceToBeat + eps) : null;
   const bandY1 = priceToBeat != null ? yPrice(priceToBeat - eps) : null;
 
+  const yTicks = useMemo(() => {
+    const out: { y: number; v: number; label: string }[] = [];
+    const steps = 4;
+    for (let i = 0; i <= steps; i++) {
+      const v = scale.plotMax - ((scale.plotMax - scale.plotMin) * i) / steps;
+      out.push({ y: yPrice(v), v, label: fmtUsd(v) });
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scale.plotMax, scale.plotMin]);
+
+  const xTicks = useMemo(() => {
+    if (pts.length < 2) return [];
+    const steps = 4;
+    const out: { x: number; t: number; label: string }[] = [];
+    for (let i = 0; i <= steps; i++) {
+      const t = tMin + (tSpan * i) / steps;
+      out.push({ x: xTime(t), t, label: new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) });
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tMin, tSpan, pts.length]);
+
+  const nowSide = useMemo(() => {
+    if (last == null || priceToBeat == null) return null as null | { side: 'ABOVE' | 'BELOW' | 'AT'; dist: number };
+    const d = last - priceToBeat;
+    const e = reaction?.eps ?? Math.max(0.5, priceToBeat * 8e-5);
+    if (Math.abs(d) <= e) return { side: 'AT', dist: d };
+    return { side: d > 0 ? 'ABOVE' : 'BELOW', dist: d };
+  }, [last, priceToBeat, reaction?.eps]);
+
   return (
     <div className="rounded-2xl border border-zinc-800/50 bg-zinc-950/35 p-4 shadow-inner shadow-black/15 ring-1 ring-white/[0.02]">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -196,6 +232,20 @@ export function SpotLevelChart({
         <div className="rounded-md bg-zinc-900/50 px-2.5 py-1.5 font-mono">spot {last != null ? fmtUsd(last) : '—'}</div>
         <div className="rounded-md border border-amber-800/40 bg-amber-950/25 px-2.5 py-1.5 font-mono text-amber-100/90">
           PTB {priceToBeat != null ? fmtUsd(priceToBeat) : '—'}
+        </div>
+        <div
+          className={`rounded-md border px-2.5 py-1.5 font-mono ${
+            nowSide?.side === 'ABOVE'
+              ? 'border-emerald-800/40 bg-emerald-950/20 text-emerald-100'
+              : nowSide?.side === 'BELOW'
+                ? 'border-rose-800/40 bg-rose-950/20 text-rose-100'
+                : nowSide?.side === 'AT'
+                  ? 'border-amber-800/40 bg-amber-950/20 text-amber-100'
+                  : 'border-zinc-800/50 bg-zinc-900/40 text-zinc-300'
+          }`}
+          title="Direction is determined by last spot vs PTB (inside band = AT)"
+        >
+          now {nowSide ? `${nowSide.side} ${fmtUsdSigned(nowSide.dist)}` : '—'}
         </div>
         <div
           className="rounded-md bg-zinc-900/50 px-2.5 py-1.5 font-mono"
@@ -315,6 +365,10 @@ export function SpotLevelChart({
 
       <svg viewBox={`0 0 ${width} ${height}`} className="mt-3 h-[320px] w-full">
         <defs>
+          <linearGradient id="spotChartBg" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="rgb(9 9 11)" stopOpacity="0.55" />
+            <stop offset="100%" stopColor="rgb(0 0 0)" stopOpacity="0.35" />
+          </linearGradient>
           <linearGradient id="spotExtAbove" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor="rgb(16 185 129)" stopOpacity="0.14" />
             <stop offset="100%" stopColor="rgb(16 185 129)" stopOpacity="0.02" />
@@ -324,7 +378,30 @@ export function SpotLevelChart({
             <stop offset="100%" stopColor="rgb(244 63 94)" stopOpacity="0.14" />
           </linearGradient>
         </defs>
-        <rect x="0" y="0" width={width} height={height} rx="14" className="fill-black/25 stroke-zinc-800/40" />
+        <rect x="0" y="0" width={width} height={height} rx="14" fill="url(#spotChartBg)" className="stroke-zinc-800/50" />
+
+        {/* Plot frame */}
+        <rect x={pad} y={pad} width={innerW} height={innerH} rx="12" className="fill-transparent stroke-zinc-800/35" />
+
+        {/* Gridlines + y-axis labels */}
+        {yTicks.map((t, i) => (
+          <g key={`gy-${i}`} className="pointer-events-none">
+            <line x1={pad} x2={pad + innerW} y1={t.y} y2={t.y} className="stroke-zinc-800/30" strokeWidth={1} />
+            <text x={width - pad - 6} y={t.y - 3} textAnchor="end" className="fill-zinc-500" fontSize="10" fontFamily="ui-monospace, monospace">
+              {t.label}
+            </text>
+          </g>
+        ))}
+
+        {/* Vertical gridlines + x-axis labels */}
+        {xTicks.map((t, i) => (
+          <g key={`gx-${i}`} className="pointer-events-none">
+            <line x1={t.x} x2={t.x} y1={pad} y2={pad + innerH} className="stroke-zinc-800/20" strokeWidth={1} />
+            <text x={t.x} y={height - pad + 14} textAnchor="middle" className="fill-zinc-600" fontSize="10" fontFamily="ui-monospace, monospace">
+              {t.label}
+            </text>
+          </g>
+        ))}
 
         {reaction?.shellMarkAbove ? (
           <rect
@@ -372,14 +449,42 @@ export function SpotLevelChart({
           </>
         ) : null}
 
+        {/* Watermark labels to prevent above/below confusion (screen-space above = higher price). */}
+        {yBeat != null && priceToBeat != null ? (
+          <>
+            <text
+              x={pad + 10}
+              y={Math.max(pad + 18, yBeat - 10)}
+              fill="rgba(16,185,129,0.16)"
+              fontSize="18"
+              fontWeight={900}
+              fontFamily="ui-sans-serif, system-ui, sans-serif"
+              className="pointer-events-none select-none"
+            >
+              ABOVE PTB
+            </text>
+            <text
+              x={pad + 10}
+              y={Math.min(height - pad - 8, yBeat + 26)}
+              fill="rgba(244,63,94,0.16)"
+              fontSize="18"
+              fontWeight={900}
+              fontFamily="ui-sans-serif, system-ui, sans-serif"
+              className="pointer-events-none select-none"
+            >
+              BELOW PTB
+            </text>
+          </>
+        ) : null}
+
         {priceToBeat != null && pts.length >= 2 && bandY0 != null && bandY1 != null ? (
           <rect
             x={pad}
             y={Math.min(bandY0, bandY1)}
             width={innerW}
             height={Math.max(2, Math.abs(bandY1 - bandY0))}
-            className="fill-amber-400/[0.07] stroke-amber-400/18"
-            strokeWidth={1}
+            className="fill-amber-400/[0.10] stroke-amber-300/25"
+            strokeWidth={1.25}
           />
         ) : null}
 
@@ -397,32 +502,31 @@ export function SpotLevelChart({
           const bodyH = Math.max(3, bot - top);
           const level = priceToBeat ?? null;
           const atPtb = level != null && eps > 0 && candleStraddlesPtb(c, level, eps);
-          const bull = c.c >= c.o;
-          const above = level != null && c.c >= level;
           const wicky = c.bodyFrac < 0.22;
+          const aboveBand = level != null && eps > 0 ? c.l > level + eps : level != null ? c.c > level : false;
+          const belowBand = level != null && eps > 0 ? c.h < level - eps : level != null ? c.c < level : false;
           let stroke = 'rgb(161 161 170)';
           let fill = 'rgba(161,161,170,0.22)';
           if (atPtb) {
             stroke = wicky ? 'rgb(253 224 71 / 0.75)' : 'rgb(250 204 21 / 0.95)';
             fill = wicky ? 'rgba(250,204,21,0.14)' : 'rgba(250,204,21,0.32)';
-          } else if (bull && above) {
+          } else if (aboveBand) {
+            // Position vs PTB is the primary encoding (prevents “green candle below PTB” confusion).
             stroke = wicky ? 'rgb(52 211 153 / 0.55)' : 'rgb(52 211 153 / 0.95)';
-            fill = wicky ? 'rgba(16,185,129,0.12)' : 'rgba(16,185,129,0.38)';
-          } else if (!bull && level != null && c.c < level) {
+            fill = wicky ? 'rgba(16,185,129,0.12)' : 'rgba(16,185,129,0.34)';
+          } else if (belowBand) {
             stroke = wicky ? 'rgb(251 113 133 / 0.55)' : 'rgb(251 113 133 / 0.95)';
-            fill = wicky ? 'rgba(244,63,94,0.12)' : 'rgba(244,63,94,0.35)';
-          } else if (bull) {
-            stroke = 'rgb(129 140 248 / 0.75)';
-            fill = 'rgba(129,140,248,0.2)';
+            fill = wicky ? 'rgba(244,63,94,0.12)' : 'rgba(244,63,94,0.32)';
           } else {
-            stroke = 'rgb(244 114 182 / 0.65)';
-            fill = 'rgba(244,114,182,0.15)';
+            // Inside the band but not straddling: keep it neutral so “AT PTB” reads cleanly.
+            stroke = 'rgb(161 161 170 / 0.75)';
+            fill = 'rgba(161,161,170,0.18)';
           }
           const wickColor = atPtb ? 'rgb(250 204 21)' : stroke;
           return (
             <g key={`${c.t0}-${i}`}>
-              <line x1={xc} x2={xc} y1={yH} y2={top} stroke={wickColor} strokeWidth={1.6} />
-              <line x1={xc} x2={xc} y1={top + bodyH} y2={yL} stroke={wickColor} strokeWidth={1.6} />
+              <line x1={xc} x2={xc} y1={yH} y2={top} stroke={wickColor} strokeWidth={2.0} strokeLinecap="round" />
+              <line x1={xc} x2={xc} y1={top + bodyH} y2={yL} stroke={wickColor} strokeWidth={2.0} strokeLinecap="round" />
               <rect
                 x={xc - bw / 2}
                 y={top}
@@ -430,16 +534,22 @@ export function SpotLevelChart({
                 height={bodyH}
                 fill={fill}
                 stroke={stroke}
-                strokeWidth={1}
+                strokeWidth={1.25}
+                rx={2.5}
               />
             </g>
           );
         })}
 
         {xy.length > 1 ? (
-          <path d={toPath(xy)} className="stroke-indigo-200/35 fill-none" strokeWidth={1.4} strokeDasharray="4 3" />
+          <path d={toPath(xy)} className="stroke-indigo-100/45 fill-none" strokeWidth={1.8} strokeDasharray="5 4" />
         ) : null}
-        {xy.length > 0 ? <circle cx={xy[xy.length - 1]!.x} cy={xy[xy.length - 1]!.y} r="3.8" className="fill-indigo-200" /> : null}
+        {xy.length > 0 ? (
+          <>
+            <circle cx={xy[xy.length - 1]!.x} cy={xy[xy.length - 1]!.y} r="6.2" className="fill-indigo-200/25" />
+            <circle cx={xy[xy.length - 1]!.x} cy={xy[xy.length - 1]!.y} r="3.9" className="fill-indigo-100" />
+          </>
+        ) : null}
 
         {reaction?.shellMarkAbove ? (
           <line
@@ -464,14 +574,7 @@ export function SpotLevelChart({
           />
         ) : null}
 
-        <g opacity={0.85} fontSize="9" fontFamily="ui-monospace, monospace">
-          <text x={width - pad - 2} y={pad + 11} textAnchor="end" className="fill-zinc-500">
-            {fmtUsd(scale.plotMax)}
-          </text>
-          <text x={width - pad - 2} y={height - pad - 4} textAnchor="end" className="fill-zinc-500">
-            {fmtUsd(scale.plotMin)}
-          </text>
-        </g>
+        {/* (min/max labels are now drawn on the y-axis grid) */}
 
         {yBeat != null && priceToBeat != null ? (
           <g className="pointer-events-none" aria-label="Price to beat">
@@ -520,11 +623,31 @@ export function SpotLevelChart({
             </text>
           </g>
         ) : null}
+
+        {/* Last price label */}
+        {last != null && Number.isFinite(last) ? (
+          <g className="pointer-events-none" aria-label="Last spot price">
+            <rect x={pad + 6} y={Math.max(pad + 6, Math.min(yPrice(last) - 11, height - pad - 26))} width="112" height="22" rx="11" fill="rgba(24,24,27,0.75)" stroke="rgba(161,161,170,0.35)" />
+            <text
+              x={pad + 12}
+              y={Math.max(pad + 21, Math.min(yPrice(last) + 4.5, height - pad - 11))}
+              fill="rgb(228 228 231)"
+              fontSize="11"
+              fontWeight={700}
+              fontFamily="ui-monospace, monospace"
+            >
+              spot {fmtUsd(last)}
+            </text>
+          </g>
+        ) : null}
       </svg>
 
       <div className="mt-2 flex flex-wrap gap-3 text-[10px] leading-snug text-zinc-500">
         <span>
           <span className="text-amber-300/90">▮</span> amber band + <span className="text-amber-200/80">yellow</span> candles = overlap with PTB
+        </span>
+        <span>
+          <span className="text-emerald-400/80">▮</span>/<span className="text-rose-400/80">▮</span> candle color = position vs PTB (above/below)
         </span>
         <span>
           <span className="text-violet-300/80">▮</span> violet tint + dash = thinnest tick shell (gap / fast-move risk)
