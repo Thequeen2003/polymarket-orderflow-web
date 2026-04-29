@@ -1,0 +1,14 @@
+{
+  "v": 1,
+  "slug": "sample-slug",
+  "upTokenId": "up_token_sample",
+  "downTokenId": "down_token_sample",
+  "points": [
+    { "t": 1714086000000, "ptbUsd": 100, "spotUsd": 99, "upMid01": 0.48, "downMid01": 0.52 },
+    { "t": 1714086001000, "ptbUsd": 100, "spotUsd": 100.5, "upMid01": 0.50, "downMid01": 0.50 },
+    { "t": 1714086002000, "ptbUsd": 100, "spotUsd": 101.2, "upMid01": 0.53, "downMid01": 0.47 },
+    { "t": 1714086003000, "ptbUsd": 100, "spotUsd": 101.8, "upMid01": 0.56, "downMid01": 0.44 },
+    { "t": 1714086004000, "ptbUsd": 100, "spotUsd": 100.8, "upMid01": 0.52, "downMid01": 0.48 }
+  ]
+}
+

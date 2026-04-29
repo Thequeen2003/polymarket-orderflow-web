@@ -163,6 +163,22 @@ function fmtCents(p: number): string {
   return `${(p * 100).toFixed(1)}¢`;
 }
 
+function applyDualLaneToTradePanel(lane: 'up' | 'down'): void {
+  window.dispatchEvent(
+    new CustomEvent('bpx-trade-prefill', {
+      detail: { lane, tone: 'ask' as const },
+    }),
+  );
+}
+
+function prefillTradeLane(lane: 'up' | 'down'): void {
+  window.dispatchEvent(
+    new CustomEvent('bpx-trade-prefill', {
+      detail: { lane, tone: 'ask' as const },
+    }),
+  );
+}
+
 function fmtChartWindowMin(tMin: number, tMax: number): string {
   // Inclusive minute window. Using round() makes the label flip-flop by ~1 minute near boundaries.
   // Example: a 5m stream with ~4m20s of samples would render "4 min" which feels wrong in a 5m context.
@@ -368,6 +384,18 @@ export function PtbDualProbabilityChart(props: {
   /** Previous poll best ask sizes (for consumption proxy in preMove). */
   const lagAskRef = useRef<{ u: number | null; d: number | null }>({ u: null, d: null });
   const lastPlaybookAppendMsRef = useRef(0);
+  const laneLockRef = useRef<{ lane: 'up' | 'down' | null; streak: number }>({ lane: null, streak: 0 });
+  const [laneLock, setLaneLock] = useState<{
+    lane: 'up' | 'down' | null;
+    status: 'LOCKED' | 'FORMING' | 'WAIT';
+    confidence: 'HIGH' | 'MED' | 'LOW';
+    reason: string;
+  }>({
+    lane: null,
+    status: 'WAIT',
+    confidence: 'LOW',
+    reason: 'Waiting for a stable directional edge.',
+  });
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 2000);
     return () => window.clearInterval(id);
@@ -1044,6 +1072,122 @@ export function PtbDualProbabilityChart(props: {
     return { lane: other, line: oline };
   }, [preMove.down.trigger, preMove.up.trigger, tradeTrigger.lane, tradeTrigger.line]);
 
+  useEffect(() => {
+    const candidateLane = tradeTrigger.lane;
+    const candidateStrong =
+      displayVerdict === 'ENTER' &&
+      tradeTrigger.triggerPill === 'ARMED' &&
+      engine.enterBlockReason == null &&
+      net4cTradeability.room !== 'NO';
+    const candidateUsable =
+      (displayVerdict === 'ENTER' || displayVerdict === 'SCALP') &&
+      tradeTrigger.line != null &&
+      engine.enterBlockReason == null;
+
+    if (!candidateUsable) {
+      laneLockRef.current = { lane: null, streak: 0 };
+      const reason =
+        engine.enterBlockReason === 'dual_lane_tight'
+          ? 'Both lanes are competitive. Wait for clear separation.'
+          : 'No clean directional trigger yet.';
+      setLaneLock({ lane: null, status: 'WAIT', confidence: 'LOW', reason });
+      return;
+    }
+
+    const prev = laneLockRef.current;
+    const streak = prev.lane === candidateLane ? prev.streak + 1 : 1;
+    laneLockRef.current = { lane: candidateLane, streak };
+    const minStreak = candidateStrong ? 2 : 3;
+
+    if (streak < minStreak) {
+      setLaneLock({
+        lane: candidateLane,
+        status: 'FORMING',
+        confidence: candidateStrong ? 'MED' : 'LOW',
+        reason: `Lane consistency ${streak}/${minStreak} — holding to avoid flip noise.`,
+      });
+      return;
+    }
+
+    setLaneLock({
+      lane: candidateLane,
+      status: 'LOCKED',
+      confidence: candidateStrong ? 'HIGH' : 'MED',
+      reason: candidateStrong
+        ? `Stable ${tradeTrigger.laneTitle} edge with armed trigger.`
+        : `Stable ${tradeTrigger.laneTitle} lane; wait for stronger tape if needed.`,
+    });
+  }, [
+    displayVerdict,
+    engine.enterBlockReason,
+    net4cTradeability.room,
+    tradeTrigger.lane,
+    tradeTrigger.laneTitle,
+    tradeTrigger.line,
+    tradeTrigger.triggerPill,
+  ]);
+
+  const directionCall = useMemo(() => {
+    const lane = tradeTrigger.lane;
+    const laneLabel = tradeTrigger.laneTitle;
+    const verdict = displayVerdict;
+    const enterLine = tradeTrigger.line != null ? fmtCents(tradeTrigger.line) : null;
+    const gate = tradeTrigger.triggerPill;
+    const laneCls =
+      lane === 'up'
+        ? {
+            wrap: 'border-emerald-500/35 bg-emerald-950/18',
+            badge: 'border-emerald-500/45 bg-emerald-950/30 text-emerald-100',
+            button: 'border-emerald-700/45 bg-emerald-950/30 text-emerald-100 hover:bg-emerald-950/45',
+          }
+        : {
+            wrap: 'border-rose-500/35 bg-rose-950/14',
+            badge: 'border-rose-500/40 bg-rose-950/25 text-rose-100',
+            button: 'border-rose-700/45 bg-rose-950/25 text-rose-100 hover:bg-rose-950/35',
+          };
+
+    let headline = `Watch ${laneLabel}`;
+    let subline = tradeTrigger.triggerReason;
+    if (verdict === 'ENTER' && gate === 'ARMED' && enterLine) {
+      headline = `Enter ${laneLabel}`;
+      subline = `${laneLabel} is the clean side now. Use the trade panel on that lane and execute only through ${enterLine} with FAST tape.`;
+    } else if (verdict === 'ENTER' && enterLine) {
+      headline = `Favor ${laneLabel}`;
+      subline = `${laneLabel} has the better edge, but the gate is ${gate.replace('_', ' ')}. Stay with ${laneLabel} and wait for ${enterLine} to break cleanly.`;
+    } else if (verdict === 'SCALP' && enterLine) {
+      headline = `Lean ${laneLabel}`;
+      subline = `${laneLabel} is the active lane, but this is still scalp quality. Only arm ${laneLabel} if ${enterLine} breaks with speed.`;
+    } else if (engine.enterBlockReason === 'dual_lane_tight') {
+      headline = 'Wait for separation';
+      subline = `Do not guess between ${upLabel} and ${downLabel} yet. Let one lane break first, then use that side only.`;
+    } else if (enterLine) {
+      subline = `${laneLabel} is first on deck, but there is no clean enter yet. Keep the panel on ${laneLabel} and wait for ${enterLine}.`;
+    } else {
+      subline = `${laneLabel} is the current first-watch lane, but the enter level is still forming.`;
+    }
+
+    const badgeText =
+      verdict === 'ENTER' && gate === 'ARMED'
+        ? `PRIMARY: ENTER ${laneLabel.toUpperCase()}`
+        : verdict === 'ENTER'
+          ? `PRIMARY: ${laneLabel.toUpperCase()}`
+          : verdict === 'SCALP'
+            ? `SCALP: ${laneLabel.toUpperCase()}`
+            : `WATCH: ${laneLabel.toUpperCase()}`;
+
+    return { lane, laneLabel, verdict, enterLine, gate, laneCls, headline, subline, badgeText };
+  }, [
+    displayVerdict,
+    downLabel,
+    engine.enterBlockReason,
+    tradeTrigger.line,
+    tradeTrigger.lane,
+    tradeTrigger.laneTitle,
+    tradeTrigger.triggerPill,
+    tradeTrigger.triggerReason,
+    upLabel,
+  ]);
+
   // Live cross-side meter: Up pushing while Down reverts to PTB (and vice versa).
   const liveMeter = useMemo(() => {
     const uPrev = candlesUp.length >= 2 ? candlesUp[candlesUp.length - 2]!.c : null;
@@ -1369,6 +1513,44 @@ export function PtbDualProbabilityChart(props: {
               <div className="mt-1 text-[9px] text-zinc-500">{pathToTarget.line}</div>
             </div>
 
+            <div className={`mt-3 rounded-xl border px-3 py-3 ${directionCall.laneCls.wrap}`}>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Direction call</div>
+                <span className={`rounded-lg border px-2 py-1 text-[10px] font-black tracking-wide ${directionCall.laneCls.badge}`}>
+                  {directionCall.badgeText}
+                </span>
+              </div>
+              <div className="mt-2 text-[15px] font-semibold text-zinc-50">{directionCall.headline}</div>
+              <div className="mt-1 text-[11px] leading-relaxed text-zinc-300">{directionCall.subline}</div>
+              <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px] font-mono text-zinc-400">
+                <span className="rounded-lg border border-zinc-800/60 bg-black/20 px-2 py-1">Gate {directionCall.gate.replace('_', ' ')}</span>
+                <span className="rounded-lg border border-zinc-800/60 bg-black/20 px-2 py-1">
+                  Enter line {directionCall.enterLine ?? 'forming'}
+                </span>
+                <span className="rounded-lg border border-zinc-800/60 bg-black/20 px-2 py-1">Net +4c {net4cTradeability.room}</span>
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => prefillTradeLane(directionCall.lane)}
+                  className={`rounded-lg border px-3 py-1.5 text-[11px] font-semibold ${directionCall.laneCls.button}`}
+                  title="Set the trade panel to the current primary lane."
+                >
+                  Use trade panel for {directionCall.laneLabel}
+                </button>
+                {counterEnter ? (
+                  <button
+                    type="button"
+                    onClick={() => prefillTradeLane(counterEnter.lane)}
+                    className="rounded-lg border border-zinc-700/60 bg-zinc-950/30 px-3 py-1.5 text-[11px] font-semibold text-zinc-300 hover:bg-zinc-900/40 hover:text-zinc-100"
+                    title="Switch the trade panel to the alternate lane."
+                  >
+                    Alt lane: {counterEnter.lane === 'up' ? upLabel : downLabel}
+                  </button>
+                ) : null}
+              </div>
+            </div>
+
             {playbookSlug ? (
               <div className="mt-2 text-[9px] text-zinc-500">
                 PTB Dual log: n={playbookSummary.n} · armed/edge samples {playbookSummary.armedOrEnter}
@@ -1616,6 +1798,50 @@ export function PtbDualProbabilityChart(props: {
         )}
       </div>
       ) : null}
+
+      <div className="border-b border-zinc-800/70 bg-zinc-950/35 px-4 py-2.5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Dual PTB direction lock</div>
+          <div
+            className={`rounded-lg border px-2 py-1 text-[10px] font-extrabold tracking-wide ${
+              laneLock.status === 'LOCKED'
+                ? laneLock.lane === 'up'
+                  ? 'border-emerald-500/45 bg-emerald-950/30 text-emerald-100'
+                  : 'border-rose-500/45 bg-rose-950/25 text-rose-100'
+                : laneLock.status === 'FORMING'
+                  ? 'border-amber-500/40 bg-amber-950/20 text-amber-100'
+                  : 'border-zinc-700/70 bg-zinc-900/30 text-zinc-200'
+            }`}
+          >
+            {laneLock.status}
+            {laneLock.lane ? ` · ${laneLock.lane === 'up' ? upLabel : downLabel}` : ' · NO SIDE'}
+            {` · ${laneLock.confidence}`}
+          </div>
+        </div>
+        <div className="mt-1 text-[11px] leading-relaxed text-zinc-400">{laneLock.reason}</div>
+        <div className="mt-2 flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={() => applyDualLaneToTradePanel(laneLock.lane ?? tradeTrigger.lane)}
+            className={`rounded-lg border px-3 py-1.5 text-[11px] font-semibold ${
+              (laneLock.lane ?? tradeTrigger.lane) === 'up'
+                ? 'border-emerald-800/50 bg-emerald-950/30 text-emerald-100 hover:bg-emerald-950/45'
+                : 'border-rose-800/50 bg-rose-950/30 text-rose-100 hover:bg-rose-950/35'
+            }`}
+            title="Set trade panel to locked primary lane."
+          >
+            Use locked side → {(laneLock.lane ?? tradeTrigger.lane) === 'up' ? upLabel : downLabel}
+          </button>
+          <button
+            type="button"
+            onClick={() => applyDualLaneToTradePanel((laneLock.lane ?? tradeTrigger.lane) === 'up' ? 'down' : 'up')}
+            className="rounded-lg border border-zinc-700/60 bg-zinc-950/35 px-3 py-1.5 text-[11px] font-semibold text-zinc-200 hover:bg-zinc-900/45"
+            title="Set trade panel to alternate lane."
+          >
+            Alternate side → {(laneLock.lane ?? tradeTrigger.lane) === 'up' ? downLabel : upLabel}
+          </button>
+        </div>
+      </div>
 
       <div className="min-h-0 w-full space-y-4 overflow-x-auto overflow-y-visible px-1 pb-1 sm:px-2">
         <div className="rounded-xl border border-zinc-800/55 bg-zinc-950/50 p-1.5 shadow-inner shadow-black/30 ring-1 ring-white/[0.03]">

@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { nextUpdownSlug, parseUpdownSlug, tradingSlugFromLiveShortcut } from './sixPackUpdownSlugs';
+import {
+  inferUpdownHintFromMarketJson,
+  nextUpdownSlug,
+  parseUpdownSlug,
+  parseUpdownSlugWithHints,
+  tradingSlugFromLiveShortcut,
+} from './sixPackUpdownSlugs';
 
 describe('sixPackUpdownSlugs', () => {
   it('parses updown slugs', () => {
@@ -27,5 +33,24 @@ describe('sixPackUpdownSlugs', () => {
     const prior = nextUpdownSlug(live, -1);
     expect(prior).toBe('btc-updown-5m-0');
     expect(tradingSlugFromLiveShortcut(live, '5m')).toBe('btc-updown-5m-0');
+  });
+
+  it('infers hourly bucket from titled slug + endDate', () => {
+    const slug = 'bitcoin-up-or-down-april-27-2026-5pm-et';
+    const hint = inferUpdownHintFromMarketJson(slug, { endDate: '2026-04-27T22:00:00.000Z' });
+    expect(hint?.asset).toBe('btc');
+    expect(hint?.interval).toBe('1h');
+    expect(hint?.bucketStartSec).toBe(Math.floor(Date.parse('2026-04-27T22:00:00.000Z') / 1000) - 3600);
+  });
+
+  it('parseUpdownSlugWithHints restores parse for titled slugs', () => {
+    const slug = 'bitcoin-up-or-down-on-april-28-2026';
+    const endMs = Date.parse('2026-04-28T16:00:00.000Z');
+    const bucket = Math.floor(endMs / 1000) - 86400;
+    const p = parseUpdownSlugWithHints(slug, {
+      [slug]: { asset: 'btc', interval: '1d', bucketStartSec: bucket },
+    });
+    expect(p?.interval).toBe('1d');
+    expect(p?.ts).toBe(bucket);
   });
 });

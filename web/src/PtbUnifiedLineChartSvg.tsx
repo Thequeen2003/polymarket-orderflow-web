@@ -172,6 +172,13 @@ export function PtbUnifiedLineChartSvg(p: PtbUnifiedLineChartSvgProps): ReactEle
   const projY1 = yLine(probOnChart(ptbTarget.engineLane, ptbTarget.next01, chartLane));
   const projYLo = yLine(probOnChart(ptbTarget.engineLane, ptbTarget.lo01, chartLane));
   const projYHi = yLine(probOnChart(ptbTarget.engineLane, ptbTarget.hi01, chartLane));
+  const primaryLanePanel = tradeTrigger.lane === chartLane;
+  const laneRoleLabel = primaryLanePanel ? 'PRIMARY PANEL' : 'ALT PANEL';
+  const laneRoleTone = primaryLanePanel
+    ? chartLane === 'up'
+      ? 'rgba(16,185,129,0.95)'
+      : 'rgba(251,113,133,0.95)'
+    : 'rgba(161,161,170,0.9)';
 
   return (
     <svg
@@ -286,6 +293,17 @@ export function PtbUnifiedLineChartSvg(p: PtbUnifiedLineChartSvgProps): ReactEle
       <text x={padL + 10} y={y50 + 16} fill="rgb(161 161 170)" fontSize="9" fontFamily="ui-monospace, monospace" className="pointer-events-none">
         Anchor: {winningLabel} · {otherLabel} ≈ complement · SSR PTB{' '}
         {priceToBeatUsd != null ? `$${priceToBeatUsd.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : '—'}
+      </text>
+      <text
+        x={padL + 10}
+        y={y50 + 30}
+        fill={laneRoleTone}
+        fontSize="9"
+        fontWeight="800"
+        fontFamily="ui-monospace, monospace"
+        className="pointer-events-none"
+      >
+        {laneRoleLabel} · {tradeTrigger.lane === 'up' ? upLabel : downLabel} · {engine.verdict}
       </text>
 
       {vac.map((v, i) => {

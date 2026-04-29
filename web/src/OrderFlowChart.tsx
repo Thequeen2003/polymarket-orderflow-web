@@ -44,12 +44,15 @@ export function OrderFlowChart({
   series,
   lastUpdateMs,
   priceToBeatUsd,
+  compact = false,
 }: {
   title: string;
   series: BookSnapshot[];
   lastUpdateMs: number | null;
   /** SSR underlying level — horizontal reference (mid panel is implied price, not USD spot). */
   priceToBeatUsd?: number | null;
+  /** Slimmer chart + less chrome for Signals desk strip. */
+  compact?: boolean;
 }): ReactElement {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -59,7 +62,7 @@ export function OrderFlowChart({
   const stale = lastUpdateMs == null ? true : now - lastUpdateMs > 20_000;
 
   const width = 520;
-  const height = 220;
+  const height = compact ? 150 : 220;
   const pad = 10;
   const plotH = height - pad * 2;
   const topH = Math.floor(plotH * 0.58);
@@ -101,11 +104,15 @@ export function OrderFlowChart({
   });
 
   return (
-    <div className="rounded-2xl border border-zinc-800/50 bg-zinc-950/35 p-4 shadow-inner shadow-black/15 ring-1 ring-white/[0.02]">
+    <div
+      className={`rounded-2xl border border-zinc-800/50 bg-zinc-950/35 shadow-inner shadow-black/15 ring-1 ring-white/[0.02] ${compact ? 'p-2.5' : 'p-4'}`}
+    >
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-[15px] font-semibold tracking-wide text-zinc-200">{title}</div>
+        <div className={`font-semibold tracking-wide text-zinc-200 ${compact ? 'text-[12px]' : 'text-[15px]'}`}>{title}</div>
         <div
-          className={`rounded-full border px-3 py-1.5 text-[13px] font-semibold uppercase tracking-wide ${
+          className={`rounded-full border font-semibold uppercase tracking-wide ${
+            compact ? 'px-2 py-1 text-[10px]' : 'px-3 py-1.5 text-[13px]'
+          } ${
             stale ? 'border-zinc-700/40 bg-zinc-950/40 text-zinc-500' : 'border-emerald-700/40 bg-emerald-950/25 text-emerald-200'
           }`}
           title={lastUpdateMs ? `Last update ${new Date(lastUpdateMs).toLocaleTimeString()}` : 'No updates yet'}
@@ -114,20 +121,22 @@ export function OrderFlowChart({
         </div>
       </div>
 
-      <div className="mt-2 flex flex-wrap gap-2 text-[13px] text-zinc-300">
-        <div className="rounded-md bg-zinc-900/50 px-2.5 py-1.5 font-mono">mid {midLast != null ? displayPrice(midLast) : '—'}</div>
-        <div className="rounded-md bg-zinc-900/50 px-2.5 py-1.5 font-mono">
+      <div className={`mt-2 flex flex-wrap gap-2 text-zinc-300 ${compact ? 'gap-1.5 text-[11px]' : 'text-[13px]'}`}>
+        <div className={`rounded-md bg-zinc-900/50 font-mono ${compact ? 'px-2 py-1' : 'px-2.5 py-1.5'}`}>
+          mid {midLast != null ? displayPrice(midLast) : '—'}
+        </div>
+        <div className={`rounded-md bg-zinc-900/50 font-mono ${compact ? 'px-2 py-1' : 'px-2.5 py-1.5'}`}>
           imbalance {imbLast != null ? `${(imbLast * 100).toFixed(0)}%` : '—'}
         </div>
         <div
-          className="rounded-md bg-zinc-900/50 px-2.5 py-1.5 font-mono"
+          className={`rounded-md bg-zinc-900/50 font-mono ${compact ? 'px-2 py-1' : 'px-2.5 py-1.5'}`}
           title="Sum of absolute size changes on tracked levels — book reshuffling"
         >
           churn {churnLast != null ? churnLast.toFixed(1) : '—'}
         </div>
       </div>
 
-      <div className="mt-2 flex flex-wrap items-center gap-3 text-[12px] text-zinc-500">
+      <div className={`mt-2 flex flex-wrap items-center gap-3 text-zinc-500 ${compact ? 'hidden' : 'text-[12px]'}`}>
         <span className="flex items-center gap-1.5">
           <span className="inline-block h-3 w-2 rounded-sm bg-emerald-400/60" /> bid-heavy
         </span>
@@ -144,11 +153,15 @@ export function OrderFlowChart({
         ) : null}
       </div>
 
-      <div className="mt-2 rounded-xl border border-zinc-800/40 bg-black/20 px-3 py-2.5 text-[13px] leading-relaxed text-zinc-300">
+      <div
+        className={`mt-2 rounded-xl border border-zinc-800/40 bg-black/20 leading-relaxed text-zinc-300 ${
+          compact ? 'px-2 py-1.5 text-[11px]' : 'px-3 py-2.5 text-[13px]'
+        }`}
+      >
         <span className="font-semibold text-zinc-300">Readout:</span> {plainRead}
       </div>
 
-      <svg viewBox={`0 0 ${width} ${height}`} className="mt-3 h-[240px] w-full">
+      <svg viewBox={`0 0 ${width} ${height}`} className={`mt-2 w-full ${compact ? 'h-[150px]' : 'mt-3 h-[240px]'}`}>
         <rect x="0" y="0" width={width} height={height} rx="14" className="fill-black/25 stroke-zinc-800/40" />
 
         {/* mid plot box */}
@@ -231,7 +244,9 @@ export function OrderFlowChart({
         ) : null}
       </svg>
 
-      <details className="mt-2 rounded-xl border border-zinc-800/40 bg-zinc-900/25 px-3 py-2.5 text-[13px] text-zinc-400">
+      <details
+        className={`mt-2 rounded-xl border border-zinc-800/40 bg-zinc-900/25 px-3 py-2.5 text-[13px] text-zinc-400 ${compact ? 'hidden' : ''}`}
+      >
         <summary className="cursor-pointer font-semibold text-zinc-300">What this means for entries / exits</summary>
         <ul className="mt-2 list-inside list-disc space-y-1.5 leading-relaxed">
           <li>
@@ -249,7 +264,7 @@ export function OrderFlowChart({
         </ul>
       </details>
 
-      <p className="mt-2 text-[12px] leading-snug text-zinc-600">
+      <p className={`mt-2 text-[12px] leading-snug text-zinc-600 ${compact ? 'hidden' : ''}`}>
         Imbalance ≈ (bid depth − ask depth) / (bid depth + ask depth) on the top ~12 levels. Churn = size-change across those levels between
         snapshots (not tape/trades).
         {priceToBeatUsd != null

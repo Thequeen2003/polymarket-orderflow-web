@@ -14,7 +14,7 @@ import {
   OrderType,
   Side,
   type TradeParams,
-} from '@polymarket/clob-client';
+} from '@polymarket/clob-client-v2';
 import { extractCanonicalMarketFill } from './clobFillExtract.js';
 import { getTradingClient, getTradingConfigFromEnv } from './polymarketTrading.js';
 
@@ -574,6 +574,42 @@ function parseUpdownBucketFromSlug(slug: string): { symbol: string; bucketStartM
   return { symbol: `${asset}/usd`, bucketStartMs: startSec * 1000 };
 }
 
+/** Polymarket hourly/daily "Up or Down" markets often use titled slugs (not `btc-updown-1h-*`). */
+function titledUpdownStepSecFromSlug(slug: string): number | null {
+  const s = slug.trim().toLowerCase();
+  if (s.includes('-up-or-down-on-')) return 86400;
+  if (/-\d{1,2}(am|pm)-et$/i.test(s)) return 3600;
+  return null;
+}
+
+function titledUpdownSymbolFromSlug(slug: string): string | null {
+  const s = slug.trim().toLowerCase();
+  if (s.startsWith('bitcoin-')) return 'btc/usd';
+  if (s.startsWith('ethereum-')) return 'eth/usd';
+  if (s.startsWith('solana-')) return 'sol/usd';
+  return null;
+}
+
+async function inferBucketFromTitledUpdownSlug(slug: string): Promise<{ symbol: string; bucketStartMs: number } | null> {
+  const stepSec = titledUpdownStepSecFromSlug(slug);
+  const sym = titledUpdownSymbolFromSlug(slug);
+  if (!stepSec || !sym) return null;
+  try {
+    const m = (await gammaMarketBySlugOrId(slug)) as Record<string, unknown>;
+    const endMs = parseIsoMs(m.endDate ?? m.end_date);
+    if (endMs == null) return null;
+    const endSec = Math.floor(endMs / 1000);
+    return { symbol: sym, bucketStartMs: (endSec - stepSec) * 1000 };
+  } catch {
+    return null;
+  }
+}
+
+function inferredBucketStartSecFromEnd(endMs: number | null, stepSec: number, fallbackSec: number): number {
+  if (endMs == null || !Number.isFinite(endMs)) return fallbackSec;
+  return Math.floor(endMs / 1000) - stepSec;
+}
+
 function derivePtbFromRtdsHistory(symbol: string, bucketStartMs: number): number | null {
   const hist = rtdsHistory.get(symbol) ?? [];
   if (hist.length === 0) return null;
@@ -600,7 +636,7 @@ type RtdsHistPoint = { t: number; v: number };
 const rtdsCache = new Map<string, RtdsPrice>();
 /** Ring buffer of Chainlink ticks per symbol (WS pushes) — returned to the web client to hydrate charts. */
 const rtdsHistory = new Map<string, RtdsHistPoint[]>();
-const RTDS_HIST_CAP = 900;
+const RTDS_HIST_CAP = 2400;
 let rtdsWs: WebSocket | null = null;
 let rtdsWsStarting: Promise<void> | null = null;
 
@@ -953,7 +989,7 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
     for (const ts of tryTsOrdered) {
       // For longer windows, do not select a future bucket start. Some markets open early with a live book,
       // but PTB/spot alignment is defined by the *current* bucket start.
-      if ((interval === '1h' || interval === '4h') && ts > b.now + 60) continue;
+      if ((interval === '1h' || interval === '4h' || interval === '1d') && ts > b.now + 60) continue;
       const slug = `${asset}-updown-${interval}-${ts}`;
       try {
         const m = (await gammaMarketBySlugOrId(slug)) as Record<string, unknown>;
@@ -999,6 +1035,12 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
       if (t0 && !(await clobHasOrderbook(t0))) {
         return json(res, 404, { ok: false, error: 'no_updown_1d_book', details: { asset, interval, slug: best.slug } });
       }
+      const inferredStart = inferredBucketStartSecFromEnd(
+        best.endMs,
+        stepSec,
+        best.startMs != null ? Math.floor(best.startMs / 1000) : b.floor,
+      );
+      const inferredEndSec = best.endMs != null ? Math.floor(best.endMs / 1000) : inferredStart + stepSec;
       return json(res, 200, {
         ok: true,
         data: {
@@ -1009,10 +1051,10 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
           tested: true,
           active: best.active,
           closed: best.closed,
-          inferred_window_start_unix: best.startMs != null ? Math.floor(best.startMs / 1000) : b.floor,
-          inferred_end_unix: best.endMs != null ? Math.floor(best.endMs / 1000) : b.floor + stepSec,
-          start: best.startMs != null ? new Date(best.startMs).toISOString() : new Date(b.floor * 1000).toISOString(),
-          end: best.endMs != null ? new Date(best.endMs).toISOString() : new Date((b.floor + stepSec) * 1000).toISOString(),
+          inferred_window_start_unix: inferredStart,
+          inferred_end_unix: inferredEndSec,
+          start: new Date(inferredStart * 1000).toISOString(),
+          end: new Date(inferredEndSec * 1000).toISOString(),
           bucket_now_unix: b.now,
           bucket_floor_unix: b.floor,
           bucket_ceil_unix: b.ceil,
@@ -1050,6 +1092,12 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
         if (best) {
           const t0 = best.tokenIds[0];
           if (t0 && (await clobHasOrderbook(t0))) {
+            const inferredStart = inferredBucketStartSecFromEnd(
+              best.endMs,
+              stepSec,
+              best.startMs != null ? Math.floor(best.startMs / 1000) : b.floor,
+            );
+            const inferredEndSec = best.endMs != null ? Math.floor(best.endMs / 1000) : inferredStart + stepSec;
             return json(res, 200, {
               ok: true,
               data: {
@@ -1060,10 +1108,10 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
                 tested: true,
                 active: best.active,
                 closed: best.closed,
-                inferred_window_start_unix: best.startMs != null ? Math.floor(best.startMs / 1000) : b.floor,
-                inferred_end_unix: best.endMs != null ? Math.floor(best.endMs / 1000) : b.floor + stepSec,
-                start: best.startMs != null ? new Date(best.startMs).toISOString() : new Date(b.floor * 1000).toISOString(),
-                end: best.endMs != null ? new Date(best.endMs).toISOString() : new Date((b.floor + stepSec) * 1000).toISOString(),
+                inferred_window_start_unix: inferredStart,
+                inferred_end_unix: inferredEndSec,
+                start: new Date(inferredStart * 1000).toISOString(),
+                end: new Date(inferredEndSec * 1000).toISOString(),
                 bucket_now_unix: b.now,
                 bucket_floor_unix: b.floor,
                 bucket_ceil_unix: b.ceil,
@@ -1082,6 +1130,12 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
           if (best3) {
             const t0 = best3.tokenIds[0];
             if (t0 && (await clobHasOrderbook(t0))) {
+              const inferredStart = inferredBucketStartSecFromEnd(
+                best3.endMs,
+                stepSec,
+                best3.startMs != null ? Math.floor(best3.startMs / 1000) : b.floor,
+              );
+              const inferredEndSec = best3.endMs != null ? Math.floor(best3.endMs / 1000) : inferredStart + stepSec;
               return json(res, 200, {
                 ok: true,
                 data: {
@@ -1092,10 +1146,10 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
                   tested: true,
                   active: best3.active,
                   closed: best3.closed,
-                  inferred_window_start_unix: best3.startMs != null ? Math.floor(best3.startMs / 1000) : b.floor,
-                  inferred_end_unix: best3.endMs != null ? Math.floor(best3.endMs / 1000) : b.floor + stepSec,
-                  start: best3.startMs != null ? new Date(best3.startMs).toISOString() : new Date(b.floor * 1000).toISOString(),
-                  end: best3.endMs != null ? new Date(best3.endMs).toISOString() : new Date((b.floor + stepSec) * 1000).toISOString(),
+                  inferred_window_start_unix: inferredStart,
+                  inferred_end_unix: inferredEndSec,
+                  start: new Date(inferredStart * 1000).toISOString(),
+                  end: new Date(inferredEndSec * 1000).toISOString(),
                   bucket_now_unix: b.now,
                   bucket_floor_unix: b.floor,
                   bucket_ceil_unix: b.ceil,
@@ -1110,7 +1164,14 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
       }
       return json(res, 404, {
         ok: false,
-        error: interval === '15m' ? 'no_updown_15m' : interval === '4h' ? 'no_updown_4h' : interval === '1h' ? 'no_updown_1h' : 'no_updown_5m',
+        error:
+          interval === '15m'
+            ? 'no_updown_15m'
+            : interval === '4h'
+              ? 'no_updown_4h'
+              : interval === '1h'
+                ? 'no_updown_1h'
+                : 'no_updown_5m',
         details: { asset, interval, q },
       });
     }
@@ -1255,7 +1316,8 @@ app.get('/api/price-to-beat/:slug', async (req, res) => {
     return json(res, 200, { ok: true, data: { slug, price_to_beat: out.value, source: out.source } });
   } catch (e) {
     // Fallback for up/down shortcut slugs when Polymarket SSR endpoint format changes.
-    const b = parseUpdownBucketFromSlug(slug);
+    let b = parseUpdownBucketFromSlug(slug);
+    if (!b) b = await inferBucketFromTitledUpdownSlug(slug);
     if (b) {
       try {
         await ensureRtdsWs();
@@ -1715,6 +1777,25 @@ function parseTickSizeOrDefault(tickStr: string): number {
   return Number.isFinite(t) && t > 0 && t < 1 ? t : 0.01;
 }
 
+function parseTickSizeFromBook(book: unknown): '0.1' | '0.01' | '0.001' | '0.0001' | null {
+  if (!book || typeof book !== 'object') return null;
+  const raw = String((book as { tick_size?: unknown }).tick_size ?? '').trim();
+  if (raw === '0.1' || raw === '0.01' || raw === '0.001' || raw === '0.0001') return raw;
+  return null;
+}
+
+function parseNegRiskFromBook(book: unknown): boolean | null {
+  if (!book || typeof book !== 'object') return null;
+  const v = (book as { neg_risk?: unknown }).neg_risk;
+  return typeof v === 'boolean' ? v : null;
+}
+
+function builderCodeFromEnv(): string | undefined {
+  const raw = String(process.env.POLYMARKET_BUILDER_CODE ?? '').trim();
+  if (!raw) return undefined;
+  return /^0x[0-9a-fA-F]{64}$/.test(raw) ? raw : undefined;
+}
+
 /** When SDK-walked depth fails the matcher, cross with an explicit limit just past the touch (tick-aligned). */
 function slipExplicitBuyPrice(bestAsk: number, tick: number): number {
   const maxP = Math.min(0.99, 1 - tick);
@@ -1754,6 +1835,8 @@ type FakMarketPayload = {
   side: Side;
   orderType: typeof OrderType.FAK;
   price?: number;
+  userUSDCBalance?: number;
+  builderCode?: string;
 };
 
 /** `createAndPostOrder` / `createAndPostMarketOrder` post-options — see Polymarket `clob-client` README on GitHub. */
@@ -1761,6 +1844,14 @@ async function clobOrderBuilderOptions(
   client: ClobClient,
   tokenId: string,
 ): Promise<Pick<CreateOrderOptions, 'tickSize' | 'negRisk'>> {
+  try {
+    const book = await client.getOrderBook(tokenId);
+    const tickSize = parseTickSizeFromBook(book);
+    const negRisk = parseNegRiskFromBook(book);
+    if (tickSize != null && negRisk != null) return { tickSize, negRisk };
+  } catch {
+    /* fallback below */
+  }
   const [tickSize, negRisk] = await Promise.all([client.getTickSize(tokenId), client.getNegRisk(tokenId)]);
   return { tickSize, negRisk };
 }
@@ -1772,8 +1863,8 @@ async function clobOrderBuilderOptions(
 async function attachBookCrossPricePrefer(client: ClobClient, base: FakMarketPayload): Promise<FakMarketPayload> {
   if (base.price != null && Number.isFinite(base.price) && base.price > 0 && base.price < 1) return base;
   try {
-    const [tickStr, book] = await Promise.all([client.getTickSize(base.tokenID), client.getOrderBook(base.tokenID)]);
-    const tick = parseTickSizeOrDefault(tickStr);
+    const book = await client.getOrderBook(base.tokenID);
+    const tick = parseTickSizeOrDefault(parseTickSizeFromBook(book) ?? '0.01');
     const { bestAsk, bestBid } = bestAskBestBidFromBook(book);
     if (base.side === Side.BUY && bestAsk != null) {
       return { ...base, price: slipExplicitBuyPrice(bestAsk, tick) };
@@ -1795,9 +1886,8 @@ async function createAndPostMarketOrderWithBookSlippage(client: ClobClient, base
     const msg = first instanceof Error ? first.message : String(first);
     if (!isLiquidityClassMarketError(msg)) throw first;
 
-    const tickStr = await client.getTickSize(base.tokenID);
-    const tick = parseTickSizeOrDefault(tickStr);
     const book = await client.getOrderBook(base.tokenID);
+    const tick = parseTickSizeOrDefault(parseTickSizeFromBook(book) ?? '0.01');
     const { bestAsk, bestBid } = bestAskBestBidFromBook(book);
 
     let slip: number | null = null;
@@ -1822,7 +1912,7 @@ async function createAndPostMarketOrderWithBookSlippage(client: ClobClient, base
   }
 }
 
-/** CLOB balance + allowance for Max / Available (USDC or outcome shares). */
+/** CLOB balance + allowance for Max / Available (pUSD or outcome shares). */
 app.get('/api/trade/balance-allowance', async (req, res) => {
   const tokenId = String(req.query.token_id ?? '').trim();
   const raw = String(req.query.asset_type ?? 'conditional').trim().toLowerCase();
@@ -2446,22 +2536,22 @@ app.post('/api/trade/market-order', async (req, res) => {
   if (!token) return json(res, 400, { ok: false, error: 'missing_token' });
   if (side !== 'buy' && side !== 'sell') return json(res, 400, { ok: false, error: 'bad_side' });
   if (amount == null || amount <= 0) return json(res, 400, { ok: false, error: 'bad_amount' });
-  // Buys: `amount` is USDC. Sells: `amount` is shares (CLOB convention).
-  if (side === 'buy' && amount > 10_000) return json(res, 400, { ok: false, error: 'bad_amount', details: { max_usdc: 10_000 } });
+  // Buys: `amount` is pUSD notional. Sells: `amount` is shares (CLOB convention).
+  if (side === 'buy' && amount > 10_000) return json(res, 400, { ok: false, error: 'bad_amount', details: { max_pusd: 10_000 } });
   if (side === 'sell' && amount > 2_000_000) return json(res, 400, { ok: false, error: 'bad_amount', details: { max_shares: 2_000_000 } });
 
-  /** Polymarket CLOB rejects marketable BUY below $1 (e.g. shares×mid = 0.9988). */
-  const MIN_MARKET_BUY_USDC = 1;
+  /** Polymarket CLOB rejects marketable BUY below $1 notional. */
+  const MIN_MARKET_BUY_PUSD = 1;
   let orderAmount = amount;
-  if (side === 'buy' && amount < MIN_MARKET_BUY_USDC - 1e-9) {
+  if (side === 'buy' && amount < MIN_MARKET_BUY_PUSD - 1e-9) {
     const bumped = Math.ceil(amount * 100 - 1e-9) / 100;
-    if (bumped < MIN_MARKET_BUY_USDC - 1e-9) {
+    if (bumped < MIN_MARKET_BUY_PUSD - 1e-9) {
       return json(res, 400, {
         ok: false,
         error: 'bad_amount',
         details: {
-          message: `Market buy notional must be at least $${MIN_MARKET_BUY_USDC} USDC.`,
-          min_usdc: MIN_MARKET_BUY_USDC,
+          message: `Market buy notional must be at least $${MIN_MARKET_BUY_PUSD} pUSD.`,
+          min_pusd: MIN_MARKET_BUY_PUSD,
         },
       });
     }
@@ -2536,6 +2626,7 @@ app.post('/api/trade/market-order', async (req, res) => {
 
   try {
     // Sync CLOB balance view with chain state — often required before sells fill.
+    const builderCode = builderCodeFromEnv();
     if (side === 'sell') {
       await ready.client.updateBalanceAllowance({ asset_type: AssetType.CONDITIONAL, token_id: token });
     } else {
@@ -2553,7 +2644,17 @@ app.post('/api/trade/market-order', async (req, res) => {
        * can yield “no orders found to match with FAK order”.
        */
       orderType: OrderType.FAK,
+      ...(builderCode ? { builderCode } : {}),
     };
+    if (side === 'buy') {
+      try {
+        const bal = await ready.client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+        const usdcBal = parseFloat(String((bal as { balance?: unknown }).balance ?? ''));
+        if (Number.isFinite(usdcBal) && usdcBal > 0) baseOrder.userUSDCBalance = usdcBal;
+      } catch {
+        /* optional for V2 fee-aware sizing */
+      }
+    }
 
     const t0 = Date.now();
     let parsed: unknown;
@@ -2620,21 +2721,47 @@ app.post('/api/trade/create-order', async (req, res) => {
     size?: unknown;
     side?: unknown;
     order_type?: unknown;
+    expiration?: unknown;
+    post_only?: unknown;
+    postOnly?: unknown;
     signatureType?: unknown;
     market_slug?: unknown;
     outcome?: unknown;
   };
   const token = typeof body.token === 'string' ? body.token.trim() : '';
   const side = typeof body.side === 'string' ? body.side.trim().toLowerCase() : 'buy';
+  const orderTypeRaw = typeof body.order_type === 'string' ? body.order_type.trim().toUpperCase() : 'GTC';
   const priceRaw = parseNumber('price', body.price);
   const sizeRaw = parseNumber('size', body.size);
+  const expirationRaw = parseNumber('expiration', body.expiration);
+  const postOnlyRaw = body.post_only ?? body.postOnly;
   const marketSlug = typeof body.market_slug === 'string' ? body.market_slug.trim() : '';
   const outcome = typeof body.outcome === 'string' ? body.outcome.trim() : '';
 
   if (!token) return json(res, 400, { ok: false, error: 'missing_token' });
   if (side !== 'buy' && side !== 'sell') return json(res, 400, { ok: false, error: 'bad_side' });
+  if (orderTypeRaw !== 'GTC' && orderTypeRaw !== 'GTD') {
+    return json(res, 400, {
+      ok: false,
+      error: 'bad_order_type',
+      details: { hint: 'Limit endpoint supports GTC or GTD only. Use /api/trade/market-order for FAK/FOK.' },
+    });
+  }
   if (priceRaw == null || priceRaw <= 0 || priceRaw >= 1) return json(res, 400, { ok: false, error: 'bad_price' });
   if (sizeRaw == null || sizeRaw <= 0 || sizeRaw > 2_000_000) return json(res, 400, { ok: false, error: 'bad_size' });
+  const postOnly =
+    postOnlyRaw === true ||
+    (typeof postOnlyRaw === 'string' && ['1', 'true', 'yes', 'on'].includes(postOnlyRaw.trim().toLowerCase()));
+  if (orderTypeRaw === 'GTD') {
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (expirationRaw == null || !Number.isFinite(expirationRaw) || expirationRaw < nowSec + 60) {
+      return json(res, 400, {
+        ok: false,
+        error: 'bad_expiration',
+        details: { hint: 'GTD requires `expiration` at least 60 seconds in the future (unix seconds).' },
+      });
+    }
+  }
 
   const price = roundPrice01Api(priceRaw);
   if (price <= 0 || price >= 1) {
@@ -2706,19 +2833,20 @@ app.post('/api/trade/create-order', async (req, res) => {
       await ready.client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL });
     }
 
-    // IMPORTANT: this endpoint is **limit-only**.
-    // Even if the client asks for `FAK`, we place a normal limit (GTC) here and let the web UI
-    // implement "fill-and-kill behavior" by cancelling any remaining shares shortly after submit.
-    // Using SDK market-order helpers here can ignore the user's explicit limit and cause scary price drift.
+    const orderType = orderTypeRaw === 'GTD' ? OrderType.GTD : OrderType.GTC;
+    const builderCode = builderCodeFromEnv();
     const parsed = await ready.client.createAndPostOrder(
       {
         tokenID: token,
         price,
         size,
         side: side === 'buy' ? Side.BUY : Side.SELL,
+        ...(orderType === OrderType.GTD && expirationRaw != null ? { expiration: Math.floor(expirationRaw) } : {}),
+        ...(builderCode ? { builderCode } : {}),
       },
       await clobOrderBuilderOptions(ready.client, token),
-      OrderType.GTC,
+      orderType,
+      postOnly,
     );
     const orderId = extractOrderIdFromClobPayload(parsed);
     return json(res, 200, {
@@ -2728,6 +2856,9 @@ app.post('/api/trade/create-order', async (req, res) => {
         execution: {
           submitted_price_01: price,
           submitted_size_shares: size,
+          order_type: orderType,
+          post_only: postOnly,
+          expiration: orderType === OrderType.GTD && expirationRaw != null ? Math.floor(expirationRaw) : 0,
           order_id: orderId,
           round_trip_ms: Date.now() - t0,
         },

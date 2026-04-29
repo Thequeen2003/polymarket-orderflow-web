@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { SignatureType } from '@polymarket/clob-client';
+import { SignatureTypeV2 as SignatureType } from '@polymarket/clob-client-v2';
 import { Wallet } from 'ethers';
 import { getTradingConfigFromEnv } from './polymarketTrading.js';
 

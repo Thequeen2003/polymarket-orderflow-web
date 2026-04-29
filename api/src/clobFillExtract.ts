@@ -3,7 +3,7 @@
  * No book mid or client guesses — only payload fields and maker-order VWAP.
  */
 
-import { CONDITIONAL_TOKEN_DECIMALS } from '@polymarket/clob-client';
+import { CONDITIONAL_TOKEN_DECIMALS } from '@polymarket/clob-client-v2';
 
 export type CanonicalFillStatus = 'filled' | 'partial' | 'unknown';
 

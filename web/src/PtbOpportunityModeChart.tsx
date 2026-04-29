@@ -94,6 +94,14 @@ function pctOfTotal(part: number, total: number): string {
   return `${Math.round((part / total) * 100)}%`;
 }
 
+function applySpotSignalToTradePanel(lane: 'up' | 'down'): void {
+  window.dispatchEvent(
+    new CustomEvent('bpx-trade-prefill', {
+      detail: { lane, tone: 'ask' as const },
+    }),
+  );
+}
+
 function statusSubtitle(params: {
   control: PtbControlSignal | undefined;
   momentum: 'UP' | 'DOWN' | 'NEUTRAL' | undefined;
@@ -138,6 +146,44 @@ function buildEvenXTicks(tMin: number, tMax: number): number[] {
   const step = span / (n - 1);
   return Array.from({ length: n }, (_, i) => tMin + i * step);
 }
+
+function fmtSourceChip(s: string | null | undefined, max = 42): string | null {
+  if (s == null) return null;
+  const t = s.trim();
+  if (!t) return null;
+  return t.length <= max ? t : `${t.slice(0, max - 1)}…`;
+}
+
+/** Linear interpolate spot value at `tMs` along tick series (crosshair readout). */
+function interpolateSpotAtTime(pts: SpotPoint[], tMs: number): { t: number; v: number } | null {
+  if (pts.length === 0) return null;
+  const first = pts[0]!;
+  const last = pts[pts.length - 1]!;
+  if (tMs <= first.t) return { t: first.t, v: first.v };
+  if (tMs >= last.t) return { t: last.t, v: last.v };
+  let lo = 0;
+  let hi = pts.length - 1;
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >> 1;
+    if (pts[mid]!.t <= tMs) lo = mid;
+    else hi = mid;
+  }
+  const a = pts[lo]!;
+  const b = pts[lo + 1]!;
+  if (!(b.t > a.t)) return { t: tMs, v: b.v };
+  const w = (tMs - a.t) / (b.t - a.t);
+  return { t: tMs, v: a.v + w * (b.v - a.v) };
+}
+
+function svgClientToLocal(svg: SVGSVGElement, clientX: number, clientY: number): { x: number; y: number } | null {
+  const ctm = svg.getScreenCTM();
+  if (!ctm) return null;
+  const p = svg.createSVGPoint();
+  p.x = clientX;
+  p.y = clientY;
+  const loc = p.matrixTransform(ctm.inverse());
+  return { x: loc.x, y: loc.y };
+}
 const PAD_L = 18;
 const PAD_R = 64;
 const PAD_Y = 18;
@@ -157,6 +203,10 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
   chartTitle?: string;
   upLabel?: string;
   downLabel?: string;
+  /** API label for PTB (`priceToBeat` `source`). */
+  ptbSource?: string | null;
+  /** RTDS label for underlying spot stream (`rtdsCrypto` `source`). */
+  spotFeedSource?: string | null;
 }): ReactElement {
   const {
     mode,
@@ -170,12 +220,16 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
     chartTitle = 'Spot (USD)',
     upLabel = 'UP',
     downLabel = 'DOWN',
+    ptbSource = null,
+    spotFeedSource = null,
   } = props;
   // Hide legacy mini “rules” panels; the big Trade Plan card is the primary read.
   const showLegacyRulePanels = false;
   const gradId = useId().replace(/:/g, '');
   const [displayMode, setDisplayMode] = useState<'line' | 'ohlc'>('line');
   const [zoomWindow, setZoomWindow] = useState<60 | 120 | 300 | 900>(300);
+  type CrosshairState = { plotX: number; yOnPath: number; t: number; v: number; distPct: number };
+  const [crosshair, setCrosshair] = useState<CrosshairState | null>(null);
   const didAuto15mZoom = useRef(false);
   useEffect(() => {
     if (didAuto15mZoom.current) return;
@@ -187,13 +241,25 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
     }
   }, [endsInMs]);
 
+  useEffect(() => {
+    setCrosshair(null);
+  }, [zoomWindow, displayMode, spot, priceToBeat]);
+
   const pts = useMemo(() => {
     const all = spot.filter((p) => isFiniteNumber(p.t) && isFiniteNumber(p.v));
     if (all.length < 2) return all;
     const cutoff = all[all.length - 1]!.t - zoomWindow * 1000;
     const windowed = all.filter((p) => p.t >= cutoff);
-    return windowed.length >= 2 ? windowed.slice(-160) : all.slice(-160);
+    return windowed.length >= 2 ? windowed.slice(-280) : all.slice(-280);
   }, [spot, zoomWindow]);
+  const tickMeta = useMemo(() => {
+    const n = pts.length;
+    if (n < 2) return { n, spanSec: 0, sparse: true, zoomSec: zoomWindow };
+    const spanMs = pts[n - 1]!.t - pts[0]!.t;
+    const spanSec = spanMs / 1000;
+    const sparse = n < 8 || spanSec < zoomWindow * 0.22;
+    return { n, spanSec, sparse, zoomSec: zoomWindow };
+  }, [pts, zoomWindow]);
   const meta = MODE_META[mode];
   const stale = lastUpdateMs == null || Date.now() - lastUpdateMs > 12_000;
 
@@ -275,6 +341,62 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
       bookFlow: bookFlow ?? undefined,
     });
   }, [model, derivedStrip, priceToBeat, pts, endsInMs, lastProbUp, lastProbDown, bookFlow]);
+
+  const primaryCall = useMemo(() => {
+    if (!model || !derivedStrip || priceToBeat == null || !Number.isFinite(priceToBeat)) {
+      return {
+        lane: null as 'up' | 'down' | null,
+        status: 'WAIT' as const,
+        confidence: 'LOW' as const,
+        reason: 'Need more spot/PTB structure before a directional call.',
+      };
+    }
+
+    const band = Math.max(0.35, model.band);
+    const dist = model.last - priceToBeat;
+    const absDist = Math.abs(dist);
+    const control = derivedStrip.controlSignal;
+    const structure = derivedStrip.structureEvent;
+    const momentum = derivedStrip.momentum;
+    const chop = control === 'NO_EDGE' || structure === 'chop';
+    if (chop) {
+      return {
+        lane: null as 'up' | 'down' | null,
+        status: 'WAIT' as const,
+        confidence: 'LOW' as const,
+        reason: 'Chop / no-edge regime. Wait for clear separation and hold.',
+      };
+    }
+
+    let lane: 'up' | 'down' | null = null;
+    if (control === 'UP_CONTROL') lane = 'up';
+    else if (control === 'DOWN_CONTROL') lane = 'down';
+    else if (absDist >= band * 1.2) lane = dist >= 0 ? 'up' : 'down';
+
+    if (!lane) {
+      return {
+        lane: null as 'up' | 'down' | null,
+        status: 'WAIT' as const,
+        confidence: 'LOW' as const,
+        reason: 'No dominant side yet. Stay patient near the PTB line.',
+      };
+    }
+
+    const momentumAligned = momentum === (lane === 'up' ? 'UP' : 'DOWN');
+    const strongControl = (lane === 'up' && control === 'UP_CONTROL') || (lane === 'down' && control === 'DOWN_CONTROL');
+    const highSep = absDist >= band * 1.8;
+    const confidence = strongControl && highSep && momentumAligned ? 'HIGH' : strongControl || highSep ? 'MED' : 'LOW';
+    const status = confidence === 'HIGH' ? 'ENTER' : confidence === 'MED' ? 'PREP' : 'WAIT';
+    const laneLabel = lane === 'up' ? upLabel : downLabel;
+    const reason =
+      status === 'ENTER'
+        ? `${laneLabel} has control + separation. Enter on pullback-hold outside the band.`
+        : status === 'PREP'
+          ? `${laneLabel} is favored, but wait for a cleaner hold / momentum alignment.`
+          : `${laneLabel} has early lean only; avoid forcing entries.`;
+
+    return { lane, status, confidence, reason };
+  }, [derivedStrip, model, priceToBeat, upLabel, downLabel]);
 
   /** Key price levels — swing highs/lows from candles for S/R. */
   const priceLevels = useMemo(() => {
@@ -1047,6 +1169,59 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             </div>
           </div>
         </div>
+        {(fmtSourceChip(ptbSource) != null ||
+          fmtSourceChip(spotFeedSource) != null ||
+          tickMeta.n >= 2 ||
+          (lastProbUp != null && Number.isFinite(lastProbUp)) ||
+          (lastProbDown != null && Number.isFinite(lastProbDown))) ? (
+          <div className="mt-2 flex flex-col gap-1.5 border-t border-zinc-800/50 pt-2">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] leading-snug text-zinc-500">
+              {fmtSourceChip(ptbSource) != null ? (
+                <span title="How the venue PTB was resolved for this slug">
+                  <span className="font-semibold text-zinc-400">PTB</span>{' '}
+                  <span className="font-mono text-zinc-300">{fmtSourceChip(ptbSource)}</span>
+                </span>
+              ) : null}
+              {fmtSourceChip(spotFeedSource) != null ? (
+                <span title="Underlying spot feed label from RTDS">
+                  <span className="font-semibold text-zinc-400">Spot</span>{' '}
+                  <span className="font-mono text-zinc-300">{fmtSourceChip(spotFeedSource)}</span>
+                </span>
+              ) : null}
+              {tickMeta.n >= 2 ? (
+                <span title="Tick coverage in the current zoom strip">
+                  <span className="font-semibold text-zinc-400">Ticks</span>{' '}
+                  <span className="font-mono text-zinc-300">
+                    {tickMeta.n} pts · {tickMeta.spanSec < 120 ? `${tickMeta.spanSec.toFixed(0)}s` : `${(tickMeta.spanSec / 60).toFixed(1)}m`}{' '}
+                    span · {tickMeta.zoomSec < 120 ? `${tickMeta.zoomSec}s` : `${tickMeta.zoomSec / 60}m`} zoom
+                  </span>
+                  {tickMeta.sparse ? (
+                    <span className="ml-1 rounded border border-amber-800/50 bg-amber-950/30 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-amber-200/90">
+                      sparse
+                    </span>
+                  ) : null}
+                </span>
+              ) : null}
+            </div>
+            {(lastProbUp != null && Number.isFinite(lastProbUp)) || (lastProbDown != null && Number.isFinite(lastProbDown)) ? (
+              <div className="flex flex-wrap gap-x-4 gap-y-0.5 text-[10px] text-zinc-500">
+                <span>
+                  <span className="font-semibold text-emerald-300/90">{upLabel}</span> book mid{' '}
+                  <span className="font-mono text-zinc-200">
+                    {lastProbUp != null && Number.isFinite(lastProbUp) ? `${(lastProbUp * 100).toFixed(1)}¢` : '—'}
+                  </span>
+                </span>
+                <span>
+                  <span className="font-semibold text-rose-300/90">{downLabel}</span> book mid{' '}
+                  <span className="font-mono text-zinc-200">
+                    {lastProbDown != null && Number.isFinite(lastProbDown) ? `${(lastProbDown * 100).toFixed(1)}¢` : '—'}
+                  </span>
+                </span>
+              </div>
+            ) : null}
+            <p className="text-[9px] text-zinc-600">Hover the chart plot for time, interpolated spot, and % vs PTB.</p>
+          </div>
+        ) : null}
         <div className="mt-3 flex w-full min-w-0 flex-col gap-2 sm:flex-row sm:items-stretch sm:gap-3">
           <div
             className={`min-w-0 flex-1 rounded-xl border-2 px-3 py-2.5 shadow-md shadow-black/30 ${positionVsPtbLabel.className}`}
@@ -1069,6 +1244,49 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
           <span className="font-semibold text-zinc-500">Read</span> — how spot behaves vs the fixed PTB line ·{' '}
           <span className="text-amber-200/80">Yellow</span> = PTB · LINE = ticks · OHLC = buckets
         </p>
+        <div className="mt-2 rounded-xl border border-zinc-800/70 bg-black/25 px-3 py-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Single call</div>
+            <div
+              className={`rounded-lg border px-2 py-1 text-[10px] font-extrabold tracking-wide ${
+                primaryCall.status === 'ENTER'
+                  ? primaryCall.lane === 'up'
+                    ? 'border-emerald-500/45 bg-emerald-950/30 text-emerald-100'
+                    : 'border-rose-500/45 bg-rose-950/25 text-rose-100'
+                  : primaryCall.status === 'PREP'
+                    ? 'border-amber-500/35 bg-amber-950/20 text-amber-100'
+                    : 'border-zinc-700/70 bg-zinc-900/30 text-zinc-200'
+              }`}
+            >
+              {primaryCall.status}
+              {primaryCall.lane ? ` · ${primaryCall.lane === 'up' ? upLabel : downLabel}` : ' · NO SIDE'}
+              {` · ${primaryCall.confidence}`}
+            </div>
+          </div>
+          <p className="mt-1 text-[11px] leading-relaxed text-zinc-400">{primaryCall.reason}</p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => applySpotSignalToTradePanel(primaryCall.lane ?? mode)}
+              className={`rounded-lg border px-3 py-1.5 text-[11px] font-semibold ${
+                (primaryCall.lane ?? mode) === 'up'
+                  ? 'border-emerald-800/50 bg-emerald-950/30 text-emerald-100 hover:bg-emerald-950/45'
+                  : 'border-rose-800/50 bg-rose-950/30 text-rose-100 hover:bg-rose-950/45'
+              }`}
+              title="Set the trade panel to this chart's primary side."
+            >
+              Use recommended side → {(primaryCall.lane ?? mode) === 'up' ? upLabel : downLabel}
+            </button>
+            <button
+              type="button"
+              onClick={() => applySpotSignalToTradePanel((primaryCall.lane ?? mode) === 'up' ? 'down' : 'up')}
+              className="rounded-lg border border-zinc-700/60 bg-zinc-950/30 px-3 py-1.5 text-[11px] font-semibold text-zinc-200 hover:bg-zinc-900/40"
+              title="Set the trade panel to the opposite lane."
+            >
+              Alternate side → {(primaryCall.lane ?? mode) === 'up' ? downLabel : upLabel}
+            </button>
+          </div>
+        </div>
         <details className="mt-2 rounded-lg border border-zinc-800/70 bg-black/25 px-3 py-2 text-[10px] leading-relaxed text-zinc-500 open:bg-black/35">
           <summary className="cursor-pointer select-none font-semibold text-zinc-400 marker:text-zinc-600">
             Chart read — axis, tints, time window, momentum (tap)
@@ -1428,6 +1646,59 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             );
           })() : null}
 
+          {crosshair ? (
+            <g className="pointer-events-none">
+              <line
+                x1={crosshair.plotX}
+                x2={crosshair.plotX}
+                y1={padY}
+                y2={padY + innerH}
+                stroke="rgba(248,250,252,0.38)"
+                strokeWidth="1"
+                strokeDasharray="5 4"
+              />
+              <circle
+                cx={crosshair.plotX}
+                cy={crosshair.yOnPath}
+                r={5.5}
+                fill="rgb(250 250 250)"
+                stroke="rgb(56 189 248)"
+                strokeWidth="2"
+              />
+              {(() => {
+                const tw = 210;
+                const tx = Math.min(Math.max(padL + 6, crosshair.plotX + 10), padL + innerW - tw - 6);
+                const ty = padY + 8;
+                const tStr = new Date(crosshair.t).toLocaleTimeString(undefined, {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                  second: '2-digit',
+                });
+                const vStr = `${fmtUsd(crosshair.v)} · ${fmtPctSigned(crosshair.distPct)} vs PTB`;
+                return (
+                  <g>
+                    <rect
+                      x={tx - 5}
+                      y={ty - 3}
+                      width={tw}
+                      height={38}
+                      rx="7"
+                      fill="rgba(15,23,42,0.94)"
+                      stroke="rgba(148,163,184,0.4)"
+                      strokeWidth="1"
+                    />
+                    <text x={tx} y={ty + 11} fill="rgb(226 232 240)" fontSize="10" fontWeight="800" fontFamily="ui-monospace, monospace">
+                      {tStr}
+                    </text>
+                    <text x={tx} y={ty + 27} fill="rgb(148 163 184)" fontSize="9" fontFamily="ui-monospace, monospace">
+                      {vStr}
+                    </text>
+                  </g>
+                );
+              })()}
+            </g>
+          ) : null}
+
           {xTickTs.map((ts, i) => (
             <text
               key={`xt-${i}`}
@@ -1441,6 +1712,35 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
               {new Date(ts).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
             </text>
           ))}
+
+          <rect
+            x={padL}
+            y={padY}
+            width={innerW}
+            height={innerH}
+            fill="transparent"
+            className="cursor-crosshair"
+            onMouseMove={(e) => {
+              const svg = e.currentTarget.ownerSVGElement;
+              const ptb = priceToBeat;
+              if (!svg || ptb == null || !Number.isFinite(ptb)) return;
+              const loc = svgClientToLocal(svg, e.clientX, e.clientY);
+              if (!loc) return;
+              const { x, y } = loc;
+              if (x < padL || x > padL + innerW || y < padY || y > padY + innerH) {
+                setCrosshair(null);
+                return;
+              }
+              const tHover = model.tMin + ((x - padL) / innerW) * tSpan;
+              const iv = interpolateSpotAtTime(pts, tHover);
+              if (!iv) return;
+              const plotX = padL + ((iv.t - model.tMin) / tSpan) * innerW;
+              const yOnPath = yPrice(iv.v);
+              const distPct = ptb > 0 ? ((iv.v - ptb) / ptb) * 100 : 0;
+              setCrosshair({ plotX, yOnPath, t: iv.t, v: iv.v, distPct });
+            }}
+            onMouseLeave={() => setCrosshair(null)}
+          />
         </svg>
       </div>
 

@@ -363,7 +363,10 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       const d = ce.detail;
       if (!d) return;
 
-      if (d.lane && onLaneChange) onLaneChange(d.lane);
+      if (d.lane) {
+        if (controlledLane == null) setLaneState(d.lane);
+        onLaneChange?.(d.lane);
+      }
       if (d.tone === 'ask') setAction('buy');
       if (d.tone === 'bid') setAction('sell');
       setExecMode('limit');
@@ -384,7 +387,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
 
     window.addEventListener('bpx-trade-prefill', onPrefill as EventListener);
     return () => window.removeEventListener('bpx-trade-prefill', onPrefill as EventListener);
-  }, [onLaneChange]);
+  }, [controlledLane, onLaneChange]);
 
   useEffect(() => {
     const onRange = (ev: Event) => {
@@ -396,7 +399,10 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       }>;
       const d = ce.detail;
       if (!d) return;
-      if (d.lane && onLaneChange) onLaneChange(d.lane);
+      if (d.lane) {
+        if (controlledLane == null) setLaneState(d.lane);
+        onLaneChange?.(d.lane);
+      }
       // asks = buy range (you buy at asks), bids = sell range (you sell into bids)
       if (d.tone === 'ask') setAction('buy');
       if (d.tone === 'bid') setAction('sell');
@@ -419,7 +425,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     };
     window.addEventListener('bpx-trade-range-prefill', onRange as EventListener);
     return () => window.removeEventListener('bpx-trade-range-prefill', onRange as EventListener);
-  }, [onLaneChange]);
+  }, [controlledLane, onLaneChange]);
   const [availUsdc, setAvailUsdc] = useState<number | null>(null);
   const [balUp, setBalUp] = useState<number | null>(null);
   const [balDown, setBalDown] = useState<number | null>(null);

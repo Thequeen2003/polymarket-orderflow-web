@@ -7,6 +7,58 @@ export type ParsedUpdownSlug = {
   stepSec: number;
 };
 
+/** When Gamma returns titled hourly/daily slugs, the app stores bucket metadata from `endDate` + shortcut API. */
+export type UpdownSlugHint = {
+  asset: UpdownShortcutAsset;
+  interval: UpdownInterval;
+  bucketStartSec: number;
+};
+
+function titledHourlyOrDailyStepSec(slug: string): 3600 | 86400 | null {
+  const s = slug.trim().toLowerCase();
+  if (s.includes('-up-or-down-on-')) return 86400;
+  if (/-\d{1,2}(am|pm)-et$/i.test(s)) return 3600;
+  return null;
+}
+
+function titledShortcutAsset(slug: string): UpdownShortcutAsset | null {
+  const s = slug.trim().toLowerCase();
+  if (s.startsWith('bitcoin-')) return 'btc';
+  if (s.startsWith('ethereum-')) return 'eth';
+  if (s.startsWith('solana-')) return 'sol';
+  return null;
+}
+
+/**
+ * Infer canonical-style bucket fields from Polymarket titled Up/Down markets
+ * (`bitcoin-up-or-down-…-5pm-et`, `bitcoin-up-or-down-on-april-28-2026`, …) using `endDate`.
+ */
+export function inferUpdownHintFromMarketJson(slug: string, market: Record<string, unknown>): UpdownSlugHint | null {
+  const stepSec = titledHourlyOrDailyStepSec(slug);
+  const asset = titledShortcutAsset(slug);
+  if (!stepSec || !asset) return null;
+  const endRaw = market.endDate ?? market.end_date;
+  if (typeof endRaw !== 'string') return null;
+  const endMs = Date.parse(endRaw);
+  if (!Number.isFinite(endMs)) return null;
+  const bucketStartSec = Math.floor(endMs / 1000) - stepSec;
+  const interval: UpdownInterval = stepSec === 86400 ? '1d' : '1h';
+  return { asset, interval, bucketStartSec };
+}
+
+export function parseUpdownSlugWithHints(
+  slug: string,
+  hints?: Readonly<Record<string, UpdownSlugHint>> | null,
+): ParsedUpdownSlug | null {
+  const c = parseUpdownSlug(slug);
+  if (c) return c;
+  const h = hints?.[slug.trim().toLowerCase()];
+  if (!h) return null;
+  const stepSec =
+    h.interval === '15m' ? 900 : h.interval === '1h' ? 3600 : h.interval === '4h' ? 4 * 3600 : h.interval === '1d' ? 86400 : 300;
+  return { asset: h.asset, interval: h.interval, ts: h.bucketStartSec, stepSec };
+}
+
 export function parseUpdownSlug(slug: string): ParsedUpdownSlug | null {
   const m = slug.trim().toLowerCase().match(/^([a-z0-9]{2,10})-updown-(5m|15m|1h|4h|1d)-(\d+)$/);
   if (!m) return null;

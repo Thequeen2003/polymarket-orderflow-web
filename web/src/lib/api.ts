@@ -285,6 +285,9 @@ export function marketsUpdownShortcut(asset: UpdownShortcutAsset, interval: Updo
     closed?: boolean;
     start?: string | null;
     end?: string | null;
+    /** Window open (unix seconds), aligned to market resolution — use for titled non-`btc-updown-*` slugs. */
+    inferred_window_start_unix?: number;
+    inferred_end_unix?: number;
   }>(
     `/api/markets/updown-shortcut?asset=${encodeURIComponent(asset)}&interval=${encodeURIComponent(interval)}`,
   );

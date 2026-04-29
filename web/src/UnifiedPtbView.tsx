@@ -112,6 +112,8 @@ export function UnifiedPtbView(props: {
   spotStreamEligible?: boolean;
   uiVariant?: 'default' | 'polymarket';
   rightPanel?: ReactElement | null;
+  ptbSource?: string | null;
+  spotFeedSource?: string | null;
 }): ReactElement {
   const {
     market,
@@ -129,6 +131,8 @@ export function UnifiedPtbView(props: {
     spotStreamEligible = false,
     uiVariant = 'default',
     rightPanel = null,
+    ptbSource = null,
+    spotFeedSource = null,
   } = props;
 
   const idx = resolveUpDownIndices(outcomeLabels, market);
@@ -309,6 +313,8 @@ export function UnifiedPtbView(props: {
                   lastProbUp={upMid}
                   lastProbDown={downMid}
                   bookFlow={bookFlowForChart}
+                  ptbSource={ptbSource}
+                  spotFeedSource={spotFeedSource}
                 />
               </div>
             </div>
@@ -458,6 +464,8 @@ export function UnifiedPtbView(props: {
           lastProbUp={upMid}
           lastProbDown={downMid}
           bookFlow={bookFlowForChart}
+          ptbSource={ptbSource}
+          spotFeedSource={spotFeedSource}
         />
 
           <div className="grid gap-4 xl:grid-cols-2">

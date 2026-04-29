@@ -60,7 +60,13 @@ import {
 } from './bookIntel';
 import { outcomeEntryExitHints } from './chartReadouts';
 import { buildRollingContext, rollingContextText } from './contextSummary';
-import { nextUpdownSlug, parseUpdownSlug } from './sixPackUpdownSlugs';
+import {
+  inferUpdownHintFromMarketJson,
+  nextUpdownSlug,
+  parseUpdownSlug,
+  parseUpdownSlugWithHints,
+  type UpdownSlugHint,
+} from './sixPackUpdownSlugs';
 import { BtcSpotPaperTest } from './BtcSpotPaperTest';
 
 function pretty(value: unknown) {
@@ -670,10 +676,14 @@ function App() {
   const [flowSeriesBySlug, setFlowSeriesBySlug] = useState<Record<string, Record<string, BookSnapshot[]>>>({});
   const [flowMode, setFlowMode] = useState<'price' | 'flow'>('flow');
   const [ssrPriceToBeat, setSsrPriceToBeat] = useState<number | null>(null);
+  /** API label for last successful PTB fetch (e.g. SSR vs bucket). */
+  const [ssrPtbSource, setSsrPtbSource] = useState<string | null>(null);
   const [ptbError, setPtbError] = useState<string | null>(null);
   const [rtdsSpot, setRtdsSpot] = useState<number | null>(null);
   const [rtdsTickAt, setRtdsTickAt] = useState<number | null>(null);
   const [rtdsError, setRtdsError] = useState<string | null>(null);
+  /** RTDS `/api/rtds/crypto` `source` for the active underlying symbol (Chainlink vs fallback, etc.). */
+  const [rtdsSpotFeedSource, setRtdsSpotFeedSource] = useState<string | null>(null);
   const [spotSeriesBySlug, setSpotSeriesBySlug] = useState<Record<string, SpotPoint[]>>({});
   /** RTDS Chainlink series per `btc/usd` | `eth/usd` | `sol/usd` — drives multi-asset scan + selected slug. */
   const [spotBySymbol, setSpotBySymbol] = useState<Record<string, SpotPoint[]>>({});
@@ -689,6 +699,12 @@ function App() {
   const [positionsPanelOpen, setPositionsPanelOpen] = useState(false);
   const [globalTradeLocked, setGlobalTradeLocked] = useState(false);
   const [updownPickerOpen, setUpdownPickerOpen] = useState(false);
+  /** Titled Polymarket hourly/daily slugs: map slug → bucket start so RTDS + PTB align like `btc-updown-1h-*`. */
+  const [updownSlugHints, setUpdownSlugHints] = useState<Record<string, UpdownSlugHint>>({});
+  const updownParsed = useMemo(
+    () => parseUpdownSlugWithHints(selectedSlug, updownSlugHints),
+    [selectedSlug, updownSlugHints],
+  );
   /** Multiple trade tabs in the slide panel; switching re-loads that slug (one CLOB at a time). */
   const [tradeSessionTabs, setTradeSessionTabs] = useState<TradeSessionTab[]>([]);
   const [activeTradeSessionTabId, setActiveTradeSessionTabId] = useState<string | null>(null);
@@ -711,6 +727,19 @@ function App() {
   useEffect(() => {
     selectedSlugRef.current = selectedSlug;
   }, [selectedSlug]);
+
+  useEffect(() => {
+    if (!selectedSlug.trim() || !marketJson || typeof marketJson !== 'object') return;
+    if (parseUpdownSlug(selectedSlug)) return;
+    const hint = inferUpdownHintFromMarketJson(selectedSlug, marketJson as Record<string, unknown>);
+    if (!hint) return;
+    const k = selectedSlug.trim().toLowerCase();
+    setUpdownSlugHints((m) => {
+      const prev = m[k];
+      if (prev && prev.bucketStartSec === hint.bucketStartSec && prev.interval === hint.interval) return m;
+      return { ...m, [k]: hint };
+    });
+  }, [selectedSlug, marketJson]);
 
   useEffect(() => {
     wantSeriesRef.current =
@@ -776,8 +805,7 @@ function App() {
     const tokU = books[idx.up]?.token;
     const tokD = books[idx.down]?.token;
     const m = chartSeriesBySlug[selectedSlug] ?? {};
-    const parsed = parseUpdownSlug(selectedSlug);
-    const stepSec = parsed?.stepSec ?? 300;
+    const stepSec = updownParsed?.stepSec ?? 300;
     const clean = (arr: SeriesPoint[]): SpotPoint[] => {
       const pts = arr
         .filter((p) => typeof p.v === 'number' && Number.isFinite(p.v as number) && Number.isFinite(p.t as number))
@@ -796,7 +824,7 @@ function App() {
       up: tokU ? clean(m[tokU] ?? []) : [],
       down: tokD ? clean(m[tokD] ?? []) : [],
     };
-  }, [books, chartSeriesBySlug, marketJson, outcomeLabels, selectedSlug]);
+  }, [books, chartSeriesBySlug, marketJson, outcomeLabels, selectedSlug, updownParsed]);
 
   const tradePanelBookMids = useMemo(() => {
     if (!books || books.length < 2 || outcomeLabels.length < 2) {
@@ -1257,7 +1285,11 @@ function App() {
 
   useEffect(() => {
     const slug = selectedSlug.trim();
-    if (!slug) return;
+    if (!slug) {
+      queueMicrotask(() => setSsrPtbSource(null));
+      return;
+    }
+    queueMicrotask(() => setSsrPtbSource(null));
     let stopped = false;
     const tick = async () => {
       const ptb = await priceToBeat(slug);
@@ -1265,6 +1297,7 @@ function App() {
       // Keep last good PTB on transient fetch errors (prevents chart flicker).
       if (isOk(ptb)) {
         setSsrPriceToBeat(ptb.data.price_to_beat);
+        setSsrPtbSource(ptb.data.source);
         setPtbError(null);
       } else {
         setPtbError(pretty(ptb));
@@ -1276,6 +1309,10 @@ function App() {
       stopped = true;
       window.clearInterval(id);
     };
+  }, [selectedSlug]);
+
+  useEffect(() => {
+    setRtdsSpotFeedSource(null);
   }, [selectedSlug]);
 
   useEffect(() => {
@@ -1314,6 +1351,24 @@ function App() {
         nextSlugs[a] = slug;
       }
       setThreeUpSlugs(nextSlugs);
+      setUpdownSlugHints((prev) => {
+        const next = { ...prev };
+        for (let i = 0; i < assets.length; i++) {
+          const r = res[i]!;
+          if (!isOk(r)) continue;
+          const cur = r.data.slug;
+          const slug = threeUpInterval === '5m' ? (nextUpdownSlug(cur, -1) ?? cur) : cur;
+          if (parseUpdownSlug(slug)) continue;
+          const iw = r.data.inferred_window_start_unix;
+          if (typeof iw !== 'number') continue;
+          next[slug.trim().toLowerCase()] = {
+            asset: assets[i]!,
+            interval: threeUpInterval,
+            bucketStartSec: iw,
+          };
+        }
+        return next;
+      });
 
       const metas = await Promise.all(
         Object.entries(nextSlugs).map(async ([asset, slug]) => {
@@ -1361,13 +1416,13 @@ function App() {
   // (intentionally no second clock interval)
 
   const spotLenForRtds = spotSeriesBySlug[selectedSlug]?.length ?? 0;
-  const rtdsPollFast = parseUpdownSlug(selectedSlug) != null && spotLenForRtds < 2;
+  const rtdsPollFast = updownParsed != null && spotLenForRtds < 2;
 
   useEffect(() => {
     const symFromSlug = (slug: string): string | null => {
-      const m = slug.trim().toLowerCase().match(/^([a-z0-9]{2,10})-updown-(5m|15m|1h|4h|1d)-(\d+)$/);
-      if (!m) return null;
-      return `${m[1]!}/usd`;
+      const p = parseUpdownSlugWithHints(slug, updownSlugHints);
+      if (!p) return null;
+      return `${p.asset}/usd`;
     };
     const collect = (): string[] => {
       const s = new Set<string>(['btc/usd', 'eth/usd', 'sol/usd']);
@@ -1413,11 +1468,12 @@ function App() {
         }
         setSpotBySymbol(next);
         setRtdsError(okAny ? null : firstErr);
-        const p = parseUpdownSlug(selectedSlug);
+        const p = updownParsed;
         if (!p) {
           queueMicrotask(() => {
             setRtdsSpot(null);
             setRtdsTickAt(null);
+            setRtdsSpotFeedSource(null);
             setSpotSeriesBySlug((m) => {
               if (!selectedSlug.trim()) return m;
               const rest = { ...m };
@@ -1429,8 +1485,16 @@ function App() {
         }
         const sym = `${p.asset}/usd`;
         const series = next[sym] ?? [];
+        let spotSrc: string | null = null;
+        for (let i = 0; i < SYMS.length; i++) {
+          if (SYMS[i] !== sym) continue;
+          const res = results[i]!;
+          if (isOk(res)) spotSrc = res.data.source;
+          break;
+        }
         queueMicrotask(() => {
           setSpotSeriesBySlug((m) => ({ ...m, [selectedSlug]: series }));
+          if (spotSrc != null) setRtdsSpotFeedSource(spotSrc);
           if (series.length > 0) {
             const last = series[series.length - 1]!;
             setRtdsSpot(last.v);
@@ -1458,11 +1522,11 @@ function App() {
       window.clearInterval(id);
       for (const t of bootTimers) window.clearTimeout(t);
     };
-  }, [selectedSlug, ptbWatchSlugs, rtdsPollFast, mainTab]);
+  }, [selectedSlug, ptbWatchSlugs, rtdsPollFast, mainTab, updownParsed, updownSlugHints]);
 
   useEffect(() => {
     if (mainTab !== 'watch' && mainTab !== 'multiscan') return;
-    const slugs = [...new Set(ptbWatchSlugs.filter((s) => parseUpdownSlug(s) != null))];
+    const slugs = [...new Set(ptbWatchSlugs.filter((s) => parseUpdownSlugWithHints(s, updownSlugHints) != null))];
     if (slugs.length === 0) {
       queueMicrotask(() => setWatchMetaBySlug({}));
       return;
@@ -1501,7 +1565,7 @@ function App() {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [ptbWatchSlugs, mainTab]);
+  }, [ptbWatchSlugs, mainTab, updownSlugHints]);
 
   const marketEndsInMs = useMemo(() => {
     if (!marketJson || typeof marketJson !== 'object') return null;
@@ -1515,7 +1579,7 @@ function App() {
   const multiScanRows: PtbMultiAssetRow[] = useMemo(() => {
     return ptbWatchSlugs
       .map((slug) => {
-        const p = parseUpdownSlug(slug);
+        const p = parseUpdownSlugWithHints(slug, updownSlugHints);
         if (!p) return null;
         const sym = `${p.asset}/usd`;
         const spot = spotBySymbol[sym] ?? [];
@@ -1534,9 +1598,8 @@ function App() {
         };
       })
       .filter((x): x is PtbMultiAssetRow => x != null);
-  }, [ptbWatchSlugs, spotBySymbol, watchMetaBySlug, selectedSlug, ssrPriceToBeat, marketEndsInMs]);
+  }, [ptbWatchSlugs, spotBySymbol, watchMetaBySlug, selectedSlug, ssrPriceToBeat, marketEndsInMs, updownSlugHints]);
 
-  const updownParsed = useMemo(() => parseUpdownSlug(selectedSlug), [selectedSlug]);
   const updownPickerItems = useMemo(() => {
     const p = updownParsed;
     if (!p) return [];
@@ -1573,7 +1636,21 @@ function App() {
     const tick = async () => {
       const res = await marketsUpdownShortcut(shortcutAsset, updownParsed.interval);
       if (stopped) return;
-      if (isOk(res) && typeof res.data.slug === 'string' && res.data.slug) setUpdownLiveSlugFromApi(res.data.slug);
+      if (isOk(res) && typeof res.data.slug === 'string' && res.data.slug) {
+        const slug = res.data.slug;
+        setUpdownLiveSlugFromApi(slug);
+        const iw = res.data.inferred_window_start_unix;
+        if (typeof iw === 'number' && !parseUpdownSlug(slug)) {
+          setUpdownSlugHints((m) => ({
+            ...m,
+            [slug.trim().toLowerCase()]: {
+              asset: shortcutAsset,
+              interval: updownParsed.interval,
+              bucketStartSec: iw,
+            },
+          }));
+        }
+      }
     };
     void tick();
     const id = window.setInterval(() => void tick(), 20_000);
@@ -1586,10 +1663,10 @@ function App() {
   const updownBehindBySec = useMemo(() => {
     const p = updownParsed;
     if (!p) return null;
-    const live = updownLiveSlugFromApi ? parseUpdownSlug(updownLiveSlugFromApi) : null;
+    const live = updownLiveSlugFromApi ? parseUpdownSlugWithHints(updownLiveSlugFromApi, updownSlugHints) : null;
     if (!live || live.asset !== p.asset || live.interval !== p.interval) return null;
     return live.ts - p.ts;
-  }, [updownParsed, updownLiveSlugFromApi]);
+  }, [updownParsed, updownLiveSlugFromApi, updownSlugHints]);
 
   const assistantContext = useMemo(
     () => buildAssistantContext(selectedSlug, marketJson, books, outcomeLabels),
@@ -1630,7 +1707,7 @@ function App() {
       const ts0 = Date.now();
       pushAutoLine({ ts: ts0, kind: 'sent', text: 'sent context →' });
       try {
-        const isUpdown = parseUpdownSlug(selectedSlug) != null;
+        const isUpdown = updownParsed != null;
         const biasSpec = isUpdown ? 'BIAS: UP|DOWN|NEUTRAL' : 'BIAS: ABOVE|BELOW|NEUTRAL';
         const engineLine = isUpdown
           ? 'You are a real-time market context engine for UP/DOWN time-window markets.'
@@ -1700,7 +1777,7 @@ function App() {
       stopped = true;
       window.clearInterval(id);
     };
-  }, [autoEnabled, assistantAvailable, assistantContext, autoBusy, books, pushAutoLine, rollingCtxText, selectedSlug]);
+  }, [autoEnabled, assistantAvailable, assistantContext, autoBusy, books, pushAutoLine, rollingCtxText, selectedSlug, updownParsed]);
 
   async function openUpdownShortcut(asset: UpdownShortcutAsset, interval: UpdownInterval) {
     setError(null);
@@ -1740,6 +1817,15 @@ function App() {
       // 15m/1h/4h/1d: open the live window from the API (prior windows are often inactive/closed).
       const slugToOpen =
         interval === '5m' ? (nextUpdownSlug(okRes.data.slug, -1) ?? okRes.data.slug) : okRes.data.slug;
+      if (!parseUpdownSlug(slugToOpen)) {
+        const iw = (okRes.data as { inferred_window_start_unix?: number }).inferred_window_start_unix;
+        if (typeof iw === 'number') {
+          setUpdownSlugHints((m) => ({
+            ...m,
+            [slugToOpen.trim().toLowerCase()]: { asset, interval, bucketStartSec: iw },
+          }));
+        }
+      }
       await loadMarket(slugToOpen);
     } finally {
       setShortcutBusy(null);
@@ -2388,6 +2474,11 @@ function App() {
                   endsInMs={marketEndsInMs}
                   booksFetchedAt={booksFetchedAt}
                   spotStreamEligible={updownParsed != null}
+                  booksWsStatus={booksWsStatus}
+                  ptbError={ptbError}
+                  rtdsError={rtdsError}
+                  ptbSource={ssrPtbSource}
+                  spotFeedSource={rtdsSpotFeedSource}
                 />
                 <p className="mt-3 text-center text-[11px] text-zinc-600">
                   Book tab: order flow, ladders, and above/below context. Assistant tab: chat + digest.
@@ -2562,6 +2653,8 @@ function App() {
                   endsInMs={marketEndsInMs}
                   spotStreamEligible={updownParsed != null}
                   uiVariant={updownParsed != null ? 'polymarket' : 'default'}
+                  ptbSource={ssrPtbSource}
+                  spotFeedSource={rtdsSpotFeedSource}
                   rightPanel={
                     effectiveTradeEnabled ? (
                       updownParsed != null ? (

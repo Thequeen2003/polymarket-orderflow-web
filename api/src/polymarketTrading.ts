@@ -1,4 +1,4 @@
-import { type ApiKeyCreds, Chain, ClobClient, SignatureType } from '@polymarket/clob-client';
+import { type ApiKeyCreds, Chain, ClobClient, SignatureTypeV2 as SignatureType } from '@polymarket/clob-client-v2';
 import { Wallet } from 'ethers';
 
 export type TradingConfig = {
@@ -9,6 +9,7 @@ export type TradingConfig = {
   signatureType: SignatureType;
   funderAddress: string;
   useServerTime: boolean;
+  builderCode?: string;
 };
 
 type TradingConfigResult =
@@ -47,7 +48,14 @@ function parseSignatureType(raw: string | undefined): SignatureType | null {
   if (['2', 'safe', 'gnosis', 'gnosis_safe', 'poly_gnosis_safe'].includes(value)) {
     return SignatureType.POLY_GNOSIS_SAFE;
   }
+  if (['3', '1271', 'poly_1271', 'smart', 'contract'].includes(value)) return SignatureType.POLY_1271;
   return null;
+}
+
+function parseBuilderCode(raw: string | undefined): string | undefined {
+  const v = String(raw ?? '').trim();
+  if (!v) return undefined;
+  return /^0x[0-9a-fA-F]{64}$/.test(v) ? v : undefined;
 }
 
 export function getTradingConfigFromEnv(env: NodeJS.ProcessEnv = process.env): TradingConfigResult {
@@ -78,7 +86,7 @@ export function getTradingConfigFromEnv(env: NodeJS.ProcessEnv = process.env): T
     return {
       ok: false,
       error: 'bad_signature_type',
-      hint: 'Use POLYMARKET_SIGNATURE_TYPE=0, 1, or 2 (EOA, POLY_PROXY, or POLY_GNOSIS_SAFE).',
+      hint: 'Use POLYMARKET_SIGNATURE_TYPE=0, 1, 2, or 3 (EOA, POLY_PROXY, POLY_GNOSIS_SAFE, POLY_1271).',
     };
   }
 
@@ -115,6 +123,7 @@ export function getTradingConfigFromEnv(env: NodeJS.ProcessEnv = process.env): T
   }
 
   const host = String(env.POLYMARKET_HOST ?? DEFAULT_HOST).trim() || DEFAULT_HOST;
+  const builderCode = parseBuilderCode(env.POLYMARKET_BUILDER_CODE);
   return {
     ok: true,
     config: {
@@ -125,6 +134,7 @@ export function getTradingConfigFromEnv(env: NodeJS.ProcessEnv = process.env): T
       signatureType: inferredSignatureType,
       funderAddress,
       useServerTime: parseBoolean(env.POLYMARKET_USE_SERVER_TIME, true),
+      ...(builderCode ? { builderCode } : {}),
     },
   };
 }
@@ -146,47 +156,33 @@ function cacheKeyFor(config: TradingConfig, env: NodeJS.ProcessEnv = process.env
     config.funderAddress.toLowerCase(),
     String(config.signatureType),
     String(config.useServerTime),
+    String(config.builderCode ?? ''),
     apiCredsCacheKey(env),
   ].join('|');
 }
 
 async function buildTradingClient(config: TradingConfig): Promise<{ client: ClobClient; config: TradingConfig }> {
   const signer = new Wallet(config.privateKey);
-  const baseArgs = [
-    config.host,
-    config.chainId,
+  const baseOpts = {
+    host: config.host,
+    chain: config.chainId,
     signer,
-    undefined,
-    config.signatureType,
-    config.funderAddress,
-    undefined,
-    config.useServerTime,
-    undefined,
-    undefined,
-    true,
-    undefined,
-    true,
-  ] as const;
+    signatureType: config.signatureType,
+    funderAddress: config.funderAddress,
+    useServerTime: config.useServerTime,
+    ...(config.builderCode ? { builderConfig: { builderCode: config.builderCode } } : {}),
+    retryOnError: true,
+    throwOnError: true,
+  } as const;
 
-  const authClient = new ClobClient(...baseArgs);
+  const authClient = new ClobClient(baseOpts);
   // For trading, prefer deriving/creating creds from the signer to avoid stale/invalid env key bundles
   // breaking live execution.
   const creds = await resolveApiCreds(authClient, { preferEnv: false });
-  const client = new ClobClient(
-    config.host,
-    config.chainId,
-    signer,
+  const client = new ClobClient({
+    ...baseOpts,
     creds,
-    config.signatureType,
-    config.funderAddress,
-    undefined,
-    config.useServerTime,
-    undefined,
-    undefined,
-    true,
-    undefined,
-    true,
-  );
+  });
   return { client, config };
 }
 
@@ -202,9 +198,14 @@ async function resolveApiCreds(
   if (preferEnv && key && secret && passphrase) return { key, secret, passphrase };
 
   try {
-    return await client.deriveApiKey();
+    return await client.createOrDeriveApiKey();
   } catch {
-    return client.createApiKey();
+    try {
+      return await client.createApiKey();
+    } catch {
+      if (key && secret && passphrase) return { key, secret, passphrase };
+      throw new Error('api_creds_unavailable');
+    }
   }
 }
 

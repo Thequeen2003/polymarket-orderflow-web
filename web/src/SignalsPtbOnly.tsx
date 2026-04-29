@@ -1,10 +1,13 @@
-import { useMemo, useState, type ReactElement } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
 import type { ClobBookEntry } from './lib/api';
+import { pickConditionId } from './bookIntel';
 import { FlowZoneSignalsPanel } from './FlowZoneSignalsPanel';
+import { OrderFlowChart } from './OrderFlowChart';
 import { PtbDualProbabilityChart } from './PtbDualProbabilityChart';
 import { PtbOpportunityModeChart } from './PtbOpportunityModeChart';
 import { OverallOrderBookPanel } from './OverallOrderBookPanel';
 import type { BookSnapshot } from './orderflowMetrics';
+import { RecentPrintsPanel } from './RecentPrintsPanel';
 import type { SpotPoint } from './SpotLevelChart';
 import { SignalsTradePanel } from './SignalsTradePanel';
 import { underlyingChartTitle } from './underlyingChartTitle';
@@ -13,6 +16,26 @@ import { midPrice, topOfBook } from './bookLevels';
 import { resolveUpDownIndices } from './upDown';
 import { buildSpotCandles } from './spotVsPtb';
 import { computePtbChartDerivatives } from './ptbChartDerivatives';
+
+function fmtMarketCountdown(endsInMs: number | null): string {
+  if (endsInMs == null || !Number.isFinite(endsInMs)) return '—';
+  if (endsInMs <= 0) return 'Ended';
+  const s = Math.floor(endsInMs / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const r = s % 60;
+  if (h >= 72) return `${Math.floor(h / 24)}d ${h % 24}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m ${r}s`;
+}
+
+function applySignalToTradePanel(lane: 'up' | 'down'): void {
+  window.dispatchEvent(
+    new CustomEvent('bpx-trade-prefill', {
+      detail: { lane, tone: 'ask' as const },
+    }),
+  );
+}
 
 /**
  * Signals tab: dual implied-probability OHLC when book mids exist; else USD spot vs PTB.
@@ -33,6 +56,11 @@ export function SignalsPtbOnly(props: {
   booksFetchedAt: number | null;
   /** True when slug matches BTC/ETH/SOL Up/Down (RTDS underlying stream in App). */
   spotStreamEligible?: boolean;
+  booksWsStatus?: string | null;
+  ptbError?: string | null;
+  rtdsError?: string | null;
+  ptbSource?: string | null;
+  spotFeedSource?: string | null;
 }): ReactElement {
   const {
     market,
@@ -48,6 +76,11 @@ export function SignalsPtbOnly(props: {
     endsInMs,
     booksFetchedAt,
     spotStreamEligible = false,
+    booksWsStatus = null,
+    ptbError = null,
+    rtdsError = null,
+    ptbSource = null,
+    spotFeedSource = null,
   } = props;
 
   function clamp(v: number, lo: number, hi: number): number {
@@ -83,10 +116,54 @@ export function SignalsPtbOnly(props: {
   const upToken = idx && books ? (books[idx.up]?.token ?? '') : '';
   const downToken = idx && books ? (books[idx.down]?.token ?? '') : '';
 
+  const conditionId = useMemo(() => pickConditionId(market), [market]);
+
+  const activeOrderFlow = useMemo(() => {
+    if (!idx || !books || !flowSeriesForSlug) return null;
+    const up = books[idx.up];
+    const down = books[idx.down];
+    if (!up || !down || up.error || down.error) return null;
+    const mu = midPrice(up.book);
+    const md = midPrice(down.book);
+    if (mu == null || md == null) return null;
+    const useUp = mu >= md;
+    return {
+      token: useUp ? up.token : down.token,
+      label: useUp ? upLabel : downLabel,
+      series: (flowSeriesForSlug[useUp ? up.token : down.token] ?? []).slice(-180),
+    };
+  }, [books, downLabel, flowSeriesForSlug, idx, upLabel]);
+
+  const spotBookAlignment = useMemo(() => {
+    const spotLast = spot.length ? spot[spot.length - 1]!.v : null;
+    const mU = midPrice(bookAbove);
+    const mD = midPrice(bookBelow);
+    if (spotLast == null || priceToBeat == null || mU == null || mD == null) return null;
+    const band = Math.max(0.35, Math.abs(priceToBeat) * 0.00035);
+    const above = spotLast > priceToBeat + band;
+    const below = spotLast < priceToBeat - band;
+    const bookSkewsUp = mU > mD + 0.008;
+    const bookSkewsDown = mD > mU + 0.008;
+    let align: 'ALIGNED' | 'DIVERGENT' | 'MIXED' = 'MIXED';
+    if ((above && bookSkewsUp) || (below && bookSkewsDown)) align = 'ALIGNED';
+    else if ((above && bookSkewsDown) || (below && bookSkewsUp)) align = 'DIVERGENT';
+    return { align, spotLast, mU, mD, above, below };
+  }, [bookAbove, bookBelow, priceToBeat, spot]);
+
   const hasDual = probUp.length >= 1 && probDown.length >= 1;
   const [spotChartLane, setSpotChartLane] = useState<'up' | 'down'>('up');
   const spotChartLive = priceToBeat != null && spot.length >= 2;
   const [chartTab, setChartTab] = useState<'spot' | 'dual'>(() => (hasDual ? 'spot' : 'spot'));
+  const [flowZonesOpen, setFlowZonesOpen] = useState(true);
+  const [signalAlerts, setSignalAlerts] = useState<{ ts: number; text: string }[]>([]);
+  const lastSignalKeyRef = useRef<string | null>(null);
+  const laneStreakRef = useRef<{ lane: 'up' | 'down' | null; streak: number }>({ lane: null, streak: 0 });
+  const [lockedDirection, setLockedDirection] = useState<{
+    lane: 'up' | 'down' | null;
+    confidence: 'HIGH' | 'MED' | 'LOW';
+    status: 'ENTER' | 'PREP' | 'WAIT';
+    reason: string;
+  }>({ lane: null, confidence: 'LOW', status: 'WAIT', reason: 'Waiting for a stable directional edge.' });
 
   const ptbContext = useMemo(() => {
     if (priceToBeat == null || !Number.isFinite(priceToBeat) || spot.length < 2) return null;
@@ -225,8 +302,211 @@ export function SignalsPtbOnly(props: {
       ptbContext.bandWidthPct != null && ptbContext.bandWidthPct >= 0.06 ? 'WIDE BAND' : null,
     ].filter(Boolean) as string[];
 
-    return { score, verdict, flags, spreadCents, chaseRisk, wideSpread, chop } as const;
+    const sepAdj = clamp((sep - 0.8) * 10, -8, 10);
+    const slopeAdj = clamp((slopeN - 0.9) * 10, -10, 10);
+    const scoreReasons: string[] = ['Start from base 50.'];
+    if (ptbContext.controlSignal === 'UP_CONTROL' || ptbContext.controlSignal === 'DOWN_CONTROL') {
+      scoreReasons.push(`Control (${String(ptbContext.controlSignal).replaceAll('_', ' ')}): +12`);
+    } else {
+      scoreReasons.push('No UP/DOWN control bonus.');
+    }
+    if (regime === 'break_and_hold') scoreReasons.push('Regime break-and-hold: +16');
+    else if (regime === 'extension') scoreReasons.push('Regime extension: +8');
+    else scoreReasons.push(`Regime ${regime} (no structural bonus).`);
+    if (earlySetup.state === 'ENTER') scoreReasons.push('Entry readiness ENTER: +14');
+    else if (earlySetup.state === 'SETUP') scoreReasons.push('Entry readiness SETUP: +6');
+    else scoreReasons.push(`Entry readiness ${earlySetup.state}.`);
+    if (chop) scoreReasons.push('Chop / no-edge penalty: −28');
+    if (chaseRisk) scoreReasons.push('Chase-risk (large last move near band): −14');
+    if (wideSpread) scoreReasons.push(`Wide touch spread${spreadCents != null ? ` ~${spreadCents.toFixed(1)}¢` : ''}: −10`);
+    if (sepAdj !== 0) scoreReasons.push(`Distance vs band (normalized): ${sepAdj >= 0 ? '+' : ''}${sepAdj.toFixed(1)}`);
+    if (slopeAdj !== 0) scoreReasons.push(`Slope vs vol (normalized): ${slopeAdj >= 0 ? '+' : ''}${slopeAdj.toFixed(1)}`);
+    scoreReasons.push(`Final score ${score} → ${verdict}.`);
+
+    return { score, verdict, flags, spreadCents, chaseRisk, wideSpread, chop, scoreReasons } as const;
   }, [bookAbove, bookBelow, earlySetup, ptbContext]);
+
+  useEffect(() => {
+    const key = `${overallSignal?.verdict ?? '—'}|${overallSignal?.score ?? '—'}|${earlySetup?.state ?? '—'}|${earlySetup?.lane ?? '—'}|${(overallSignal?.flags ?? []).join(',')}`;
+    if (key === lastSignalKeyRef.current) return;
+    lastSignalKeyRef.current = key;
+    const ts = Date.now();
+    const text = [
+      overallSignal ? `${overallSignal.verdict} (${overallSignal.score})` : '—',
+      earlySetup ? `${earlySetup.state}${earlySetup.lane ? ` · ${earlySetup.lane}` : ''}` : '',
+      overallSignal?.flags?.length ? overallSignal.flags.join(', ') : '',
+    ]
+      .filter(Boolean)
+      .join(' · ');
+    setSignalAlerts((rows) => [{ ts, text }, ...rows].slice(0, 36));
+  }, [earlySetup, overallSignal]);
+
+  useEffect(() => {
+    if (!overallSignal || !earlySetup) {
+      laneStreakRef.current = { lane: null, streak: 0 };
+      setLockedDirection({
+        lane: null,
+        confidence: 'LOW',
+        status: 'WAIT',
+        reason: 'Need more PTB context before direction is actionable.',
+      });
+      return;
+    }
+
+    const divergent = spotBookAlignment?.align === 'DIVERGENT';
+    const candidateLane = earlySetup.lane;
+    const candidateReady = earlySetup.state !== 'WAIT' && candidateLane != null && overallSignal.verdict !== 'AVOID' && !divergent;
+
+    if (!candidateReady) {
+      laneStreakRef.current = { lane: null, streak: 0 };
+      const reason = divergent
+        ? 'Spot and book are divergent; wait for re-alignment.'
+        : overallSignal.verdict === 'AVOID'
+          ? 'Composite score says avoid.'
+          : 'No directional setup yet.';
+      setLockedDirection({ lane: null, confidence: 'LOW', status: 'WAIT', reason });
+      return;
+    }
+
+    const confidence: 'HIGH' | 'MED' =
+      earlySetup.state === 'ENTER' && overallSignal.verdict === 'TRADE'
+        ? 'HIGH'
+        : 'MED';
+    const prev = laneStreakRef.current;
+    const streak = prev.lane === candidateLane ? prev.streak + 1 : 1;
+    laneStreakRef.current = { lane: candidateLane, streak };
+    const minStreak = confidence === 'HIGH' ? 2 : 3;
+
+    if (streak < minStreak) {
+      setLockedDirection({
+        lane: null,
+        confidence: 'LOW',
+        status: 'WAIT',
+        reason: `Directional edge forming (${streak}/${minStreak}) — waiting to avoid flip noise.`,
+      });
+      return;
+    }
+
+    setLockedDirection({
+      lane: candidateLane,
+      confidence,
+      status: earlySetup.state === 'ENTER' ? 'ENTER' : 'PREP',
+      reason:
+        earlySetup.state === 'ENTER'
+          ? 'Stable control + slope + dwell alignment.'
+          : 'Stable setup detected; wait for final break/hold trigger.',
+    });
+  }, [earlySetup, overallSignal, spotBookAlignment]);
+
+  const signalDesk = useMemo(() => {
+    if (!books || books.length < 2 || !flowSeriesForSlug) return null;
+    const rollSoon = endsInMs != null && endsInMs > 0 && endsInMs < 5 * 60 * 1000;
+    return (
+      <div className="space-y-2 rounded-2xl border border-zinc-800/60 bg-gradient-to-b from-zinc-900/45 to-zinc-950/40 p-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Signals desk</div>
+          <div className="flex flex-wrap items-center gap-2 text-[12px] font-semibold text-zinc-200">
+            <span className="rounded-lg border border-zinc-700/60 bg-black/25 px-2.5 py-1 font-mono text-amber-100/95">
+              Ends in {fmtMarketCountdown(endsInMs)}
+            </span>
+            {booksFetchedAt != null ? (
+              <span className="text-[11px] font-medium text-zinc-500" title="Last REST book refresh in App">
+                Book REST {new Date(booksFetchedAt).toLocaleTimeString()}
+              </span>
+            ) : null}
+          </div>
+        </div>
+        {rollSoon ? (
+          <div className="rounded-xl border border-amber-600/40 bg-amber-950/25 px-3 py-2 text-[11px] font-semibold text-amber-100/95">
+            Window rolls soon — liquidity and PTB can jump at expiry; size and limits accordingly.
+          </div>
+        ) : null}
+        <div className="flex flex-wrap gap-2 text-[10px] font-semibold">
+          {booksWsStatus ? (
+            <span className="rounded-lg border border-zinc-700/60 bg-zinc-950/50 px-2 py-1 text-zinc-400" title="CLOB market WebSocket">
+              CLOB WS {booksWsStatus}
+            </span>
+          ) : (
+            <span className="rounded-lg border border-zinc-800/60 px-2 py-1 text-zinc-600">CLOB WS —</span>
+          )}
+          {ptbError ? (
+            <span className="rounded-lg border border-rose-800/50 bg-rose-950/30 px-2 py-1 text-rose-200/95">PTB {ptbError}</span>
+          ) : (
+            <span className="rounded-lg border border-emerald-900/40 bg-emerald-950/20 px-2 py-1 text-emerald-200/80">PTB ok</span>
+          )}
+          {rtdsError ? (
+            <span className="rounded-lg border border-rose-800/50 bg-rose-950/30 px-2 py-1 text-rose-200/95">RTDS {rtdsError}</span>
+          ) : spotStreamEligible ? (
+            <span className="rounded-lg border border-emerald-900/40 bg-emerald-950/20 px-2 py-1 text-emerald-200/80">RTDS ok</span>
+          ) : (
+            <span className="rounded-lg border border-zinc-800/60 px-2 py-1 text-zinc-600">RTDS n/a</span>
+          )}
+        </div>
+        {activeOrderFlow && activeOrderFlow.series.length >= 2 ? (
+          <OrderFlowChart
+            compact
+            title={`Order flow · ${activeOrderFlow.label} (higher mid)`}
+            series={activeOrderFlow.series}
+            lastUpdateMs={probLastUpdateMs}
+            priceToBeatUsd={priceToBeat}
+          />
+        ) : (
+          <div className="rounded-xl border border-zinc-800/50 bg-black/20 px-3 py-2 text-[11px] text-zinc-500">
+            Order-flow strip needs a few book snapshots on the leading side (open Book tab briefly if this stays empty).
+          </div>
+        )}
+        {spotBookAlignment ? (
+          <div className="rounded-xl border border-zinc-800/50 bg-black/20 px-3 py-2 text-[11px] leading-relaxed text-zinc-300">
+            <span className="font-semibold text-zinc-200">Spot vs book mids: </span>
+            underlying {spotBookAlignment.above ? 'above' : spotBookAlignment.below ? 'below' : 'near'} PTB · book{' '}
+            {spotBookAlignment.mU >= spotBookAlignment.mD ? 'skew UP' : 'skew DOWN'} ({(spotBookAlignment.mU * 100).toFixed(1)}¢ /{' '}
+            {(spotBookAlignment.mD * 100).toFixed(1)}¢)
+            <span
+              className={`ml-2 rounded-md border px-2 py-0.5 font-bold ${
+                spotBookAlignment.align === 'ALIGNED'
+                  ? 'border-emerald-700/50 text-emerald-200'
+                  : spotBookAlignment.align === 'DIVERGENT'
+                    ? 'border-amber-600/50 text-amber-100'
+                    : 'border-zinc-700/60 text-zinc-400'
+              }`}
+            >
+              {spotBookAlignment.align}
+            </span>
+          </div>
+        ) : null}
+        {signalAlerts.length ? (
+          <details className="rounded-xl border border-zinc-800/50 bg-black/20 px-3 py-2">
+            <summary className="cursor-pointer text-[11px] font-semibold text-zinc-400 hover:text-zinc-200">
+              Signal log ({signalAlerts.length})
+            </summary>
+            <ul className="mt-2 max-h-40 space-y-1 overflow-y-auto font-mono text-[10px] text-zinc-500">
+              {signalAlerts.map((a, i) => (
+                <li key={`${a.ts}-${i}`}>
+                  <span className="text-zinc-600">{new Date(a.ts).toLocaleTimeString()}</span> {a.text}
+                </li>
+              ))}
+            </ul>
+          </details>
+        ) : null}
+      </div>
+    );
+  }, [
+    activeOrderFlow,
+    books,
+    booksFetchedAt,
+    booksWsStatus,
+    endsInMs,
+    flowSeriesForSlug,
+    priceToBeat,
+    probLastUpdateMs,
+    ptbError,
+    rtdsError,
+    signalAlerts,
+    spotBookAlignment,
+    spotStreamEligible,
+    upLabel,
+    upToken,
+  ]);
 
   const ptbSignalCard = ptbContext ? (
     <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-3">
@@ -317,6 +597,63 @@ export function SignalsPtbOnly(props: {
                   ? 'Default: WAIT. If you trade anyway, do it small and only on confirmation (hold).'
                   : 'Avoid: this tape is built to chop you or bleed you via spread. Wait for a regime flip / cleaner hold.'}
           </p>
+          <div className="mt-2 rounded-xl border border-zinc-800/60 bg-zinc-950/25 px-3 py-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Direction call</div>
+              <div
+                className={`rounded-lg border px-2 py-1 text-[10px] font-extrabold tracking-wide ${
+                  lockedDirection.status === 'ENTER'
+                    ? lockedDirection.lane === 'up'
+                      ? 'border-emerald-500/45 bg-emerald-950/30 text-emerald-100'
+                      : 'border-rose-500/45 bg-rose-950/25 text-rose-100'
+                    : lockedDirection.status === 'PREP'
+                      ? 'border-amber-500/35 bg-amber-950/20 text-amber-100'
+                      : 'border-zinc-700/70 bg-zinc-900/30 text-zinc-200'
+                }`}
+              >
+                {lockedDirection.status}
+                {lockedDirection.lane ? ` · ${lockedDirection.lane === 'up' ? upLabel : downLabel}` : ' · NO SIDE'}
+                {` · ${lockedDirection.confidence}`}
+              </div>
+            </div>
+            <p className="mt-1 text-[11px] leading-relaxed text-zinc-400">{lockedDirection.reason}</p>
+          </div>
+          {upToken && downToken ? (
+            <div className="mt-2 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => applySignalToTradePanel(lockedDirection.lane ?? 'up')}
+                className={`rounded-lg border px-3 py-1.5 text-[11px] font-semibold ${
+                  lockedDirection.lane === 'down'
+                    ? 'border-rose-800/50 bg-rose-950/30 text-rose-100 hover:bg-rose-950/45'
+                    : 'border-emerald-800/50 bg-emerald-950/30 text-emerald-100 hover:bg-emerald-950/45'
+                }`}
+                title="Sets trade panel to UP outcome and buy (limit); refine price on the ladder."
+              >
+                {lockedDirection.lane
+                  ? `Use recommended side → ${lockedDirection.lane === 'up' ? upLabel : downLabel}`
+                  : 'Use trade panel → follow manually'}
+              </button>
+              <button
+                type="button"
+                onClick={() => applySignalToTradePanel(lockedDirection.lane === 'up' ? 'down' : 'up')}
+                className="rounded-lg border border-zinc-700/60 bg-zinc-950/30 px-3 py-1.5 text-[11px] font-semibold text-zinc-200 hover:bg-zinc-900/40"
+                title="Sets trade panel to DOWN outcome and buy (limit); refine price on the ladder."
+              >
+                Alternate side → {lockedDirection.lane === 'up' ? downLabel : upLabel}
+              </button>
+            </div>
+          ) : null}
+          <details className="mt-2 rounded-lg border border-zinc-800/50 bg-zinc-950/25 px-2 py-1.5">
+            <summary className="cursor-pointer text-[11px] font-semibold text-zinc-400 hover:text-zinc-200">
+              Why this score?
+            </summary>
+            <ul className="mt-2 list-inside list-disc space-y-1 text-[10px] leading-relaxed text-zinc-500">
+              {overallSignal.scoreReasons.map((r, j) => (
+                <li key={j}>{r}</li>
+              ))}
+            </ul>
+          </details>
         </div>
       ) : null}
       {earlySetup ? (
@@ -372,13 +709,16 @@ export function SignalsPtbOnly(props: {
 
   const ptbContextForTrade = useMemo(() => {
     if (!ptbContext) return null;
+    const effectiveReadinessState = lockedDirection.status === 'ENTER' ? 'ENTER' : earlySetup?.state ?? 'WAIT';
+    const effectiveLane = lockedDirection.lane ?? earlySetup?.lane ?? null;
+    const effectiveWhy = lockedDirection.lane ? lockedDirection.reason : earlySetup?.why ?? null;
     return {
       ...ptbContext,
-      readinessState: earlySetup?.state ?? 'WAIT',
-      readinessLane: earlySetup?.lane ?? null,
-      readinessWhy: earlySetup?.why ?? null,
+      readinessState: effectiveReadinessState,
+      readinessLane: effectiveLane,
+      readinessWhy: effectiveWhy,
     } as const;
-  }, [earlySetup, ptbContext]);
+  }, [earlySetup, lockedDirection, ptbContext]);
 
   const spotVsPtbSection = (
     <>
@@ -388,7 +728,7 @@ export function SignalsPtbOnly(props: {
           Same rules as the big chart: <span className="text-zinc-400">higher $ draws toward the top</span>; yellow PTB;
           green/red wash is <span className="text-zinc-400">above/below that line</span>, not “price good/bad”. Momentum
           badges are <span className="text-zinc-400">short-bucket candle trend</span> and can disagree with spot vs PTB on a
-          pullback. Only the last <span className="font-mono text-zinc-400">1m–5m</span> of ticks are shown.
+          pullback. The strip uses your zoom (1m–15m) and up to a few hundred recent ticks from the server buffer.
         </p>
       </div>
       <PtbOpportunityModeChart
@@ -400,6 +740,10 @@ export function SignalsPtbOnly(props: {
         chartTitle={underlyingChartTitle(market)}
         upLabel={upLabel}
         downLabel={downLabel}
+        lastProbUp={probUp.length ? (probUp[probUp.length - 1]!.v ?? null) : null}
+        lastProbDown={probDown.length ? (probDown[probDown.length - 1]!.v ?? null) : null}
+        ptbSource={ptbSource}
+        spotFeedSource={spotFeedSource}
       />
       {ptbSignalCard}
       {spotChartLive ? (
@@ -493,7 +837,11 @@ export function SignalsPtbOnly(props: {
         </div>
       </div>
 
-      <details className="rounded-2xl border border-zinc-800/60 bg-zinc-950/35" open={false}>
+      <details
+        className="rounded-2xl border border-zinc-800/60 bg-zinc-950/35"
+        open={flowZonesOpen}
+        onToggle={(e) => setFlowZonesOpen((e.target as HTMLDetailsElement).open)}
+      >
         <summary className="cursor-pointer select-none px-4 py-3 text-[11px] font-semibold text-zinc-400 hover:text-zinc-200 [&::-webkit-details-marker]:hidden">
           <span className="mr-1 text-zinc-600" aria-hidden>
             ▸
@@ -530,9 +878,24 @@ export function SignalsPtbOnly(props: {
         />
       ) : null}
       <div className="grid gap-3 lg:grid-cols-2">
-        <OverallOrderBookPanel title={`${upLabel} book`} book={bookAbove} lastUpdateMs={probLastUpdateMs} />
-        <OverallOrderBookPanel title={`${downLabel} book`} book={bookBelow} lastUpdateMs={probLastUpdateMs} />
+        <OverallOrderBookPanel
+          title={`${upLabel} book`}
+          book={bookAbove}
+          lastUpdateMs={probLastUpdateMs}
+          prefillLane="up"
+        />
+        <OverallOrderBookPanel
+          title={`${downLabel} book`}
+          book={bookBelow}
+          lastUpdateMs={probLastUpdateMs}
+          prefillLane="down"
+        />
       </div>
+      <RecentPrintsPanel
+        conditionId={conditionId}
+        activeTokenId={activeOrderFlow?.token || upToken || null}
+        outcomeLabel={activeOrderFlow?.label ?? upLabel}
+      />
     </div>
   ) : priceToBeat == null || spot.length < 2 ? (
     <div className="space-y-3">
@@ -558,6 +921,27 @@ export function SignalsPtbOnly(props: {
         </p>
       </div>
       {spotVsPtbSection}
+      {books && books.length >= 2 ? (
+        <div className="grid gap-3 lg:grid-cols-2">
+          <OverallOrderBookPanel
+            title={`${upLabel} book`}
+            book={bookAbove}
+            lastUpdateMs={probLastUpdateMs}
+            prefillLane="up"
+          />
+          <OverallOrderBookPanel
+            title={`${downLabel} book`}
+            book={bookBelow}
+            lastUpdateMs={probLastUpdateMs}
+            prefillLane="down"
+          />
+        </div>
+      ) : null}
+      <RecentPrintsPanel
+        conditionId={conditionId}
+        activeTokenId={activeOrderFlow?.token || upToken || null}
+        outcomeLabel={activeOrderFlow?.label ?? upLabel}
+      />
     </div>
   ) : (
     <div className="space-y-3">
@@ -571,11 +955,31 @@ export function SignalsPtbOnly(props: {
         booksFetchedAt={booksFetchedAt}
       />
       {spotVsPtbSection}
+      <div className="grid gap-3 lg:grid-cols-2">
+        <OverallOrderBookPanel
+          title={`${upLabel} book`}
+          book={bookAbove}
+          lastUpdateMs={probLastUpdateMs}
+          prefillLane="up"
+        />
+        <OverallOrderBookPanel
+          title={`${downLabel} book`}
+          book={bookBelow}
+          lastUpdateMs={probLastUpdateMs}
+          prefillLane="down"
+        />
+      </div>
+      <RecentPrintsPanel
+        conditionId={conditionId}
+        activeTokenId={activeOrderFlow?.token || upToken || null}
+        outcomeLabel={activeOrderFlow?.label ?? upLabel}
+      />
     </div>
   );
 
   return (
     <>
+      {signalDesk}
       {body}
     </>
   );
