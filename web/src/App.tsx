@@ -19,63 +19,76 @@ import { MomentumChart, type SeriesPoint } from './MomentumChart';
 import { resolveUpDownIndices } from './upDown';
 import { OrderFlowChart } from './OrderFlowChart';
 import { snapshotFromBook, type BookSnapshot } from './orderflowMetrics';
-const MomentumAlertsTab = lazy(() => import('./MomentumAlertsTab').then((m) => ({ default: m.MomentumAlertsTab })));
 import { AboveBelowDashboard } from './AboveBelowDashboard';
 const FlowZonesTab = lazy(() => import('./FlowZonesTab').then((m) => ({ default: m.FlowZonesTab })));
-const SignalsPtbOnly = lazy(() => import('./SignalsPtbOnly').then((m) => ({ default: m.SignalsPtbOnly })));
+import { SignalsPtbOnly } from './SignalsPtbOnly';
+import { applyPaperSettlementForLoadedMarket } from './paperTrading';
 import { SignalsTradePanel } from './SignalsTradePanel';
 import { TradeSegmentedControl } from './tradeUi';
-const PtbWatchTab = lazy(() => import('./PtbWatchTab').then((m) => ({ default: m.PtbWatchTab })));
 import { priceToBeat, rtdsCrypto, type RtdsCryptoPoint } from './lib/api';
-const WorkspaceTab = lazy(() => import('./WorkspaceTab').then((m) => ({ default: m.WorkspaceTab })));
-import { DualPtbReferenceTab } from './DualPtbReferenceTab';
-const TradeSlidePanel = lazy(() => import('./TradeSlidePanel').then((m) => ({ default: m.TradeSlidePanel })));
+import { pickMarketSlug } from './gammaMarketSlug';
+import { TradeSlidePanel } from './TradeSlidePanel';
 const PositionsCommandPanel = lazy(() =>
   import('./PositionsCommandPanel').then((m) => ({ default: m.PositionsCommandPanel })),
 );
 const TradeHistoryTab = lazy(() => import('./TradeHistoryTab').then((m) => ({ default: m.TradeHistoryTab })));
 import { shortTradeTabLabel, TradeSessionTabsBar, type TradeSessionTab } from './TradeSessionTabsBar';
+import {
+  BPX_SIGNALS_LANE_SYNC_EVENT,
+  BPX_TRADE_PANEL_OPEN_EVENT,
+  type BpxSignalsLaneSyncDetail,
+} from './takeSignalDesk';
 const PtbMultiAssetGrid = lazy(() => import('./PtbMultiAssetGrid').then((m) => ({ default: m.PtbMultiAssetGrid })));
 import type { PtbMultiAssetRow } from './PtbMultiAssetGrid';
-const UnifiedPtbView = lazy(() => import('./UnifiedPtbView').then((m) => ({ default: m.UnifiedPtbView })));
 const TrackingTab = lazy(() => import('./TrackingTab').then((m) => ({ default: m.TrackingTab })));
-const PtbThreeUp = lazy(() => import('./PtbThreeUp').then((m) => ({ default: m.PtbThreeUp })));
-const MultiMarketCommandView = lazy(() =>
-  import('./MultiMarketCommandView').then((m) => ({ default: m.MultiMarketCommandView })),
-);
-import type { MarketKey, MultiMarketRow } from './MultiMarketCommandView';
-const SmartMoneyPaperPanel = lazy(() => import('./SmartMoneyPaperPanel').then((m) => ({ default: m.SmartMoneyPaperPanel })));
 import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
-const PolySimulatorTradePanel = lazy(() =>
-  import('./PolySimulatorTradePanel').then((m) => ({ default: m.PolySimulatorTradePanel })),
-);
+import { releaseOrphanPointerCapture } from './pointerCaptureSafety';
 import type { SpotPoint } from './SpotLevelChart';
-import { openClobMarketChannel } from './clobMarketChannel';
+import { openClobMarketChannel, type ClobWsPriceChange } from './clobMarketChannel';
 import {
   bookIntelForAssistant,
   bookIntelLines,
   computeBookIntel,
   formatGammaVolumeLines,
+  pickConditionId,
   pickGammaVolumeStats,
 } from './bookIntel';
 import { outcomeEntryExitHints } from './chartReadouts';
 import { buildRollingContext, rollingContextText } from './contextSummary';
 import {
   inferUpdownHintFromMarketJson,
+  isUpdownDeskMarket,
   nextUpdownSlug,
   parseUpdownSlug,
   parseUpdownSlugWithHints,
+  titledUpdownAssetFromSlug,
   type UpdownSlugHint,
 } from './sixPackUpdownSlugs';
+import { updownSlugToOpen } from './updownSlugToOpen';
 import { BtcSpotPaperTest } from './BtcSpotPaperTest';
+import { TradingViewBtcUsdtTab } from './TradingViewBtcUsdtTab';
+import { PerpsCommandCenter } from './PerpsCommandCenter';
+import { BinanceBtcUsdtMarketView } from './BinanceBtcUsdtMarketView';
+import { useTradeAccountMode } from './useTradeAccountMode';
+import { appendLiveMidSeries, lastPointMs, maxFeedMs, normalizeEpochMs } from './feedFreshness';
 
 function pretty(value: unknown) {
   return JSON.stringify(value, null, 2);
 }
 
+function fetchFailedDetailLine(details: unknown): string {
+  if (details == null) return '';
+  if (typeof details === 'string') return details.trim();
+  if (typeof details !== 'object') return String(details);
+  const o = details as Record<string, unknown>;
+  const message = typeof o.message === 'string' ? o.message.trim() : '';
+  const hint = typeof o.hint === 'string' ? o.hint.trim() : '';
+  return [message, hint].filter(Boolean).join(' — ');
+}
+
 function apiReachabilityHint(err: ApiErr): string {
   if (err.error !== 'fetch_failed') return '';
-  const d = err.details != null ? String(err.details) : '';
+  const d = fetchFailedDetailLine(err.details);
   return (
     '\n\nCould not reach the backend. Typical fixes:\n' +
     '• From repo root: npm run dev (starts API :8787 + Vite; markets use the /api proxy).\n' +
@@ -87,7 +100,6 @@ function apiReachabilityHint(err: ApiErr): string {
 
 const PTB_WATCH_SLUGS_KEY = 'ptbWatchSlugs.v1';
 const PTB_WATCH_RECENT_KEY = 'ptbWatchRecentSlugs.v1';
-const PTB_THREE_UP_INTERVAL_KEY = 'ptbThreeUpInterval.v1';
 
 function readStringArray(key: string, max: number): string[] {
   try {
@@ -125,48 +137,6 @@ function asMarketRows(data: unknown): unknown[] {
     }
   }
   return [];
-}
-
-/** True when this object is a Gamma market row (not an event wrapper). */
-function isGammaMarketRow(m: unknown): boolean {
-  if (!m || typeof m !== 'object') return false;
-  const o = m as Record<string, unknown>;
-  if (typeof o.conditionId === 'string' && o.conditionId.startsWith('0x')) return true;
-  if (o.clobTokenIds != null || o.clob_token_ids != null) return true;
-  if (
-    typeof o.question === 'string' &&
-    (typeof o.slug === 'string' || typeof o.id === 'string' || typeof o.id === 'number')
-  )
-    return true;
-  const mk = o.markets;
-  const hasNestedMarkets = Array.isArray(mk) && mk.length > 0;
-  if (
-    !hasNestedMarkets &&
-    typeof o.slug === 'string' &&
-    o.slug.trim() &&
-    (typeof o.id === 'string' || typeof o.id === 'number')
-  )
-    return true;
-  return false;
-}
-
-function pickMarketSlug(m: unknown): string {
-  if (!m || typeof m !== 'object') return '';
-  const o = m as Record<string, unknown>;
-  if (!isGammaMarketRow(m)) {
-    const mk = o.markets;
-    if (Array.isArray(mk) && mk.length > 0) {
-      const first = mk[0];
-      if (first && isGammaMarketRow(first)) {
-        return pickMarketSlug(first);
-      }
-    }
-  }
-  if (typeof o.slug === 'string' && o.slug.trim()) return o.slug.trim();
-  if (typeof o.market_slug === 'string' && o.market_slug.trim()) return o.market_slug.trim();
-  if (typeof o.id === 'string' && o.id.trim()) return o.id.trim();
-  if (typeof o.id === 'number' && Number.isFinite(o.id)) return String(o.id);
-  return '';
 }
 
 function shortToken(id: string) {
@@ -283,7 +253,7 @@ function mergeSpotHistory(
 }
 
 function isShortcutAsset(asset: string): asset is UpdownShortcutAsset {
-  return asset === 'btc' || asset === 'eth' || asset === 'sol';
+  return asset === 'btc' || asset === 'eth' || asset === 'sol' || asset === 'hype';
 }
 
 function buildAssistantContext(
@@ -383,7 +353,7 @@ function OutcomePane({
   }, []);
 
   const ageMs = fetchedAt == null ? null : now - fetchedAt;
-  const live = ageMs != null && ageMs < 20_000;
+  const live = ageMs != null && ageMs < 60_000;
   return (
     <div className="rounded-2xl border border-zinc-800/50 bg-gradient-to-b from-zinc-900/25 to-zinc-950/40 p-4 shadow-lg shadow-black/25 ring-1 ring-white/[0.03]">
       <div className="flex flex-wrap items-baseline justify-between gap-2 border-b border-zinc-800/40 pb-3">
@@ -554,15 +524,10 @@ type MainTab =
   | 'signals'
   | 'tracking'
   | 'tradehistory'
-  | 'dualptb'
-  | 'threeup'
   | 'btc'
-  | 'command'
-  | 'unified'
+  | 'tvbtc'
+  | 'perps'
   | 'multiscan'
-  | 'momentum'
-  | 'watch'
-  | 'workspace'
   | 'assistant'
   | 'raw';
 
@@ -578,24 +543,14 @@ function mainTabTitle(tab: MainTab): string {
       return 'Tracking';
     case 'tradehistory':
       return 'Trade history';
-    case 'dualptb':
-      return 'Dual PTB';
-    case 'threeup':
-      return '3-up';
     case 'btc':
       return 'BTC (paper)';
-    case 'command':
-      return 'Command';
-    case 'unified':
-      return 'Unified';
+    case 'tvbtc':
+      return 'BTC / USDT (spot)';
+    case 'perps':
+      return 'Perps command center';
     case 'multiscan':
       return 'Multi scan';
-    case 'momentum':
-      return '+4¢ scalps';
-    case 'watch':
-      return 'Watch';
-    case 'workspace':
-      return 'Workspace';
     case 'assistant':
       return 'Assistant';
     case 'raw':
@@ -634,6 +589,7 @@ function MainTabButton({
 }
 
 function App() {
+  const tradeAccountMode = useTradeAccountMode();
   const [apiHealth, setApiHealth] = useState<string>('Checking API…');
   const [q, setQ] = useState('');
   const [markets, setMarkets] = useState<unknown[]>([]);
@@ -643,25 +599,15 @@ function App() {
   const [booksLoading, setBooksLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [marketsError, setMarketsError] = useState<string | null>(null);
+  const [marketsListLoading, setMarketsListLoading] = useState(true);
   const [slugInput, setSlugInput] = useState('');
   const [outcomeTab, setOutcomeTab] = useState(0);
   const [assistantAvailable, setAssistantAvailable] = useState(false);
   const [shortcutBusy, setShortcutBusy] = useState<{ asset: UpdownShortcutAsset; interval: UpdownInterval } | null>(null);
   const [lastShortcut, setLastShortcut] = useState<{ asset: UpdownShortcutAsset; interval: UpdownInterval } | null>(null);
-  const [mainTab, setMainTab] = useState<MainTab>('dualptb');
-  const [threeUpInterval, setThreeUpInterval] = useState<UpdownInterval>(() => {
-    if (typeof window === 'undefined') return '5m';
-    try {
-      const s = localStorage.getItem(PTB_THREE_UP_INTERVAL_KEY);
-      if (s === '5m' || s === '15m' || s === '1h' || s === '4h' || s === '1d') return s;
-    } catch {
-      /* ignore */
-    }
-    return '5m';
-  });
-  const [_threeUpSlugs, setThreeUpSlugs] = useState<Record<string, string>>({});
-  const [threeUpMeta, setThreeUpMeta] = useState<Record<string, { ptb: number | null; endsInMs: number | null }>>({});
-  const [commandSelected, setCommandSelected] = useState<MarketKey>('btc');
+  const [mainTab, setMainTab] = useState<MainTab>('signals');
+  /** Binance BTCUSDT spot — own book/flow/signals; pauses Polymarket CLOB WS/polls while active. */
+  const [binanceSpotActive, setBinanceSpotActive] = useState(false);
   const [ptbWatchSlugs, setPtbWatchSlugs] = useState<string[]>(() => readStringArray(PTB_WATCH_SLUGS_KEY, 12));
   const [ptbWatchRecentSlugs, setPtbWatchRecentSlugs] = useState<string[]>(() => readStringArray(PTB_WATCH_RECENT_KEY, 24));
   const [autoEnabled, setAutoEnabled] = useState(false);
@@ -681,20 +627,36 @@ function App() {
   const [ptbError, setPtbError] = useState<string | null>(null);
   const [rtdsSpot, setRtdsSpot] = useState<number | null>(null);
   const [rtdsTickAt, setRtdsTickAt] = useState<number | null>(null);
+  /** Wall-clock time of last successful RTDS HTTP poll (Chainlink `ts` can lag). */
+  const [rtdsReceivedAt, setRtdsReceivedAt] = useState<number | null>(null);
+  /** Last successful HTTP poll for the active RTDS symbol (WS may be quiet while polls still work). */
+  const [rtdsLastPollMs, setRtdsLastPollMs] = useState<number | null>(null);
   const [rtdsError, setRtdsError] = useState<string | null>(null);
   /** RTDS `/api/rtds/crypto` `source` for the active underlying symbol (Chainlink vs fallback, etc.). */
   const [rtdsSpotFeedSource, setRtdsSpotFeedSource] = useState<string | null>(null);
   const [spotSeriesBySlug, setSpotSeriesBySlug] = useState<Record<string, SpotPoint[]>>({});
-  /** RTDS Chainlink series per `btc/usd` | `eth/usd` | `sol/usd` — drives multi-asset scan + selected slug. */
+  /** RTDS spot: Chainlink slash-USD series plus Binance-mirrored USDT tickers (e.g. btc/usdt) — drives multi-asset scan + selected slug. */
   const [spotBySymbol, setSpotBySymbol] = useState<Record<string, SpotPoint[]>>({});
   const [watchMetaBySlug, setWatchMetaBySlug] = useState<Record<string, { ptb: number | null; endsInMs: number | null }>>({});
   const [now, setNow] = useState(() => Date.now());
   const spotBySymbolRef = useRef<Record<string, SpotPoint[]>>({});
   const selectedSlugRef = useRef<string>('');
+  /** Bumped on every `loadMarket` — stale book/PTB fetches must not apply after a newer slug load. */
+  const marketSyncGenRef = useRef(0);
+  const marketBootRef = useRef(false);
+  /** Auto-retry count when slug is set but `markets/get` failed (Gamma blip). */
+  const marketLoadRetryRef = useRef(0);
+  const bootShortcutRetryRef = useRef(0);
   const wantSeriesRef = useRef<boolean>(false);
   const wantFlowRef = useRef<boolean>(false);
+  const loadBooksRef = useRef<
+    (ids: string[], opts?: { updateSeries?: boolean; updateFlow?: boolean }) => Promise<void>
+  >(async () => {});
 
   const [globalTradeLane, setGlobalTradeLane] = useState<'up' | 'down'>('up');
+  /** Operator picked UP/DOWN on the trade panel — block card lane sync until Take signal or lock expires. */
+  const operatorTradeLaneLockRef = useRef<{ lane: 'up' | 'down'; at: number } | null>(null);
+  const OPERATOR_TRADE_LANE_LOCK_MS = 120_000;
   const [tradePanelOpen, setTradePanelOpen] = useState(false);
   const [positionsPanelOpen, setPositionsPanelOpen] = useState(false);
   const [globalTradeLocked, setGlobalTradeLocked] = useState(false);
@@ -729,6 +691,45 @@ function App() {
   }, [selectedSlug]);
 
   useEffect(() => {
+    const onOpenTrade = (ev: Event) => {
+      const d = (ev as CustomEvent<{ lane?: 'up' | 'down' }>).detail;
+      if (d?.lane === 'up' || d?.lane === 'down') setGlobalTradeLane(d.lane);
+      setTradePanelOpen(true);
+    };
+    window.addEventListener(BPX_TRADE_PANEL_OPEN_EVENT, onOpenTrade as EventListener);
+    return () => window.removeEventListener(BPX_TRADE_PANEL_OPEN_EVENT, onOpenTrade as EventListener);
+  }, []);
+
+  useEffect(() => {
+    const onLaneSync = (ev: Event) => {
+      const d = (ev as CustomEvent<BpxSignalsLaneSyncDetail>).detail;
+      if (d?.lane !== 'up' && d?.lane !== 'down') return;
+      const slug = String(d.slug ?? '').trim();
+      if (!slug) return;
+      const chartSlug = selectedSlugRef.current.trim();
+      const tradeSlug = (globalTradeLocked && globalTradeContext?.slug
+        ? globalTradeContext.slug
+        : chartSlug
+      ).trim();
+      if (!tradeSlug || slug !== tradeSlug) return;
+      const force = d.force === true;
+      const lock = operatorTradeLaneLockRef.current;
+      if (
+        !force &&
+        lock != null &&
+        Date.now() - lock.at < OPERATOR_TRADE_LANE_LOCK_MS &&
+        lock.lane !== d.lane
+      ) {
+        return;
+      }
+      if (force) operatorTradeLaneLockRef.current = null;
+      setGlobalTradeLane(d.lane);
+    };
+    window.addEventListener(BPX_SIGNALS_LANE_SYNC_EVENT, onLaneSync as EventListener);
+    return () => window.removeEventListener(BPX_SIGNALS_LANE_SYNC_EVENT, onLaneSync as EventListener);
+  }, [globalTradeLocked, globalTradeContext?.slug]);
+
+  useEffect(() => {
     if (!selectedSlug.trim() || !marketJson || typeof marketJson !== 'object') return;
     if (parseUpdownSlug(selectedSlug)) return;
     const hint = inferUpdownHintFromMarketJson(selectedSlug, marketJson as Record<string, unknown>);
@@ -742,14 +743,16 @@ function App() {
   }, [selectedSlug, marketJson]);
 
   useEffect(() => {
-    wantSeriesRef.current =
-      mainTab === 'book' ||
-      mainTab === 'flowzones' ||
-      mainTab === 'signals' ||
-      mainTab === 'unified' ||
-      mainTab === 'momentum' ||
-      mainTab === 'dualptb';
-    wantFlowRef.current = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'unified';
+    applyPaperSettlementForLoadedMarket({
+      market: marketJson,
+      slug: selectedSlug,
+      marketTitle: pickMarketQuestion(marketJson),
+    });
+  }, [marketJson, selectedSlug]);
+
+  useEffect(() => {
+    wantSeriesRef.current = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals';
+    wantFlowRef.current = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals';
   }, [mainTab]);
 
   const prevDepthMapsRef = useRef<Record<string, { bids: Map<string, number>; asks: Map<string, number> }>>({});
@@ -792,19 +795,35 @@ function App() {
     setGlobalTradeContext(currentTradeContext);
   }, [currentTradeContext, globalTradeLocked]);
 
+  /** Unpin trade panel when the chart loads a different market so Signals / positions stay aligned. */
+  useEffect(() => {
+    const chart = selectedSlug.trim();
+    const pinned = globalTradeContext?.slug?.trim() ?? '';
+    if (globalTradeLocked && chart && pinned && chart !== pinned) {
+      setGlobalTradeLocked(false);
+    }
+  }, [selectedSlug, globalTradeContext?.slug, globalTradeLocked]);
+
   const effectiveTradeContext = globalTradeLocked && globalTradeContext ? globalTradeContext : currentTradeContext;
-  const effectiveTradeReady = Boolean(effectiveTradeContext.slug) && globalTradeReady;
+  const effectiveTradeReady = Boolean(effectiveTradeContext.slug) && globalTradeReady && !binanceSpotActive;
   const effectiveTradeEnabled = Boolean(effectiveTradeContext.upToken && effectiveTradeContext.downToken);
+  const trackingConditionId = useMemo(() => pickConditionId(marketJson), [marketJson]);
 
   const signalsProbMids = useMemo(() => {
-    if (!selectedSlug || !books || books.length < 2 || outcomeLabels.length < 2) {
+    const slug = selectedSlug.trim();
+    if (!slug || !books || books.length < 2 || outcomeLabels.length < 2) {
       return { up: [] as SpotPoint[], down: [] as SpotPoint[] };
     }
     const idx = resolveUpDownIndices(outcomeLabels, marketJson);
     if (!idx) return { up: [] as SpotPoint[], down: [] as SpotPoint[] };
-    const tokU = books[idx.up]?.token;
-    const tokD = books[idx.down]?.token;
-    const m = chartSeriesBySlug[selectedSlug] ?? {};
+    const upE = books[idx.up];
+    const downE = books[idx.down];
+    const tokU = upE?.token;
+    const tokD = downE?.token;
+    const m = chartSeriesBySlug[slug] ?? {};
+    const anchorMs = booksFetchedAt ?? Date.now();
+    const upLive = upE && !upE.error ? midPrice(upE.book) : null;
+    const downLive = downE && !downE.error ? midPrice(downE.book) : null;
     const stepSec = updownParsed?.stepSec ?? 300;
     const clean = (arr: SeriesPoint[]): SpotPoint[] => {
       const pts = arr
@@ -821,10 +840,24 @@ function App() {
       return sliced.length >= 2 ? sliced : pts.slice(-220);
     };
     return {
-      up: tokU ? clean(m[tokU] ?? []) : [],
-      down: tokD ? clean(m[tokD] ?? []) : [],
+      up: tokU ? appendLiveMidSeries(clean(m[tokU] ?? []), upLive, anchorMs) : [],
+      down: tokD ? appendLiveMidSeries(clean(m[tokD] ?? []), downLive, anchorMs) : [],
     };
-  }, [books, chartSeriesBySlug, marketJson, outcomeLabels, selectedSlug, updownParsed]);
+  }, [books, booksFetchedAt, chartSeriesBySlug, marketJson, outcomeLabels, selectedSlug, updownParsed]);
+
+  /** Implied-mid charts: book poll + latest series point (not poll time alone). */
+  const signalsProbFeedLastMs = useMemo(() => {
+    const up = signalsProbMids.up;
+    const down = signalsProbMids.down;
+    return maxFeedMs(booksFetchedAt, lastPointMs(up), lastPointMs(down));
+  }, [booksFetchedAt, signalsProbMids.down, signalsProbMids.up]);
+
+  /** Spot feed freshness — RTDS tick, server receive, and last successful poll. */
+  const signalsSpotFeedLastMs = useMemo(() => {
+    const slug = selectedSlug.trim();
+    const spotPts = slug ? (spotSeriesBySlug[slug] ?? []) : [];
+    return maxFeedMs(rtdsTickAt, rtdsReceivedAt, rtdsLastPollMs, lastPointMs(spotPts));
+  }, [rtdsTickAt, rtdsReceivedAt, rtdsLastPollMs, selectedSlug, spotSeriesBySlug]);
 
   const tradePanelBookMids = useMemo(() => {
     if (!books || books.length < 2 || outcomeLabels.length < 2) {
@@ -854,27 +887,96 @@ function App() {
     };
   }, [books, marketJson, outcomeLabels]);
 
-  const loadMarket = useCallback(async (slug: string): Promise<LoadMarketResult> => {
+  const loadMarket = useCallback(async (slug: string, opts?: { market?: unknown }): Promise<LoadMarketResult> => {
+    releaseOrphanPointerCapture();
+    const syncGen = ++marketSyncGenRef.current;
+    setBinanceSpotActive(false);
     const clean = normalizeMarketLookupRef(slug);
-    queueMicrotask(() => setMainTab((tab) => (tab === 'dualptb' ? tab : 'book')));
     setSelectedSlug(clean);
+    selectedSlugRef.current = clean;
     setSlugInput(clean || slug.trim());
     setError(null);
     setMarketJson(null);
     setBooks(null);
-    if (!clean) return { ok: false };
+    setBooksFetchedAt(null);
+    setBooksLoading(Boolean(clean));
+    setGlobalTradeLocked(false);
+    setSsrPriceToBeat(null);
+    setSsrPtbSource(null);
+    setPtbError(null);
+    setRtdsSpot(null);
+    setRtdsTickAt(null);
+    setRtdsReceivedAt(null);
+    setRtdsLastPollMs(null);
+    if (clean) {
+      setChartSeriesBySlug((m) => {
+        const next = { ...m };
+        delete next[clean];
+        return next;
+      });
+      setFlowSeriesBySlug((m) => {
+        const next = { ...m };
+        delete next[clean];
+        return next;
+      });
+      setSpotSeriesBySlug((m) => {
+        const next = { ...m };
+        delete next[clean];
+        return next;
+      });
+      try {
+        const u = new URL(window.location.href);
+        u.searchParams.set('slug', clean);
+        window.history.replaceState(null, '', u.pathname + u.search + u.hash);
+      } catch {
+        /* ignore */
+      }
+    }
+    if (!clean) {
+      setBooksLoading(false);
+      return { ok: false };
+    }
+    const preloaded = opts?.market;
+    if (preloaded != null && typeof preloaded === 'object') {
+      if (syncGen !== marketSyncGenRef.current) return { ok: false };
+      setMarketJson(preloaded);
+      const ids = pickTokenIds(preloaded);
+      if (ids.length >= 2) {
+        queueMicrotask(() => {
+          void loadBooksRef.current(ids, {
+            updateSeries: wantSeriesRef.current,
+            updateFlow: wantFlowRef.current,
+          });
+        });
+      } else {
+        setBooksLoading(false);
+      }
+      return { ok: true, slug: clean, data: preloaded };
+    }
     const res = await marketsGet(clean);
+    if (syncGen !== marketSyncGenRef.current) return { ok: false };
     if (isOk(res)) {
       setMarketJson(res.data);
+      const ids = pickTokenIds(res.data);
+      if (ids.length >= 2) {
+        queueMicrotask(() => {
+          void loadBooksRef.current(ids, {
+            updateSeries: wantSeriesRef.current,
+            updateFlow: wantFlowRef.current,
+          });
+        });
+      }
       return { ok: true, slug: clean, data: res.data };
     }
     setError(pretty(res));
+    setBooksLoading(false);
     return { ok: false };
   }, []);
 
   const onGlobalTradeLaneChange = useCallback(
     (lane: 'up' | 'down') => {
       setGlobalTradeLane(lane);
+      operatorTradeLaneLockRef.current = { lane, at: Date.now() };
       if (!activeTradeSessionTabId) return;
       setTradeSessionTabs((list) => list.map((t) => (t.id === activeTradeSessionTabId ? { ...t, lane } : t)));
     },
@@ -967,59 +1069,79 @@ function App() {
     });
   }, [activeTradeSessionTabId, currentTradeContext.question, currentTradeContext.slug, selectedSlug]);
 
+  const seedBookFromPriceChange = (c: ClobWsPriceChange): { bids: { price: string; size: string }[]; asks: { price: string; size: string }[] } | null => {
+    const bidPx = c.best_bid != null && c.best_bid !== '' && c.best_bid !== '0' ? String(c.best_bid) : null;
+    const askPx = c.best_ask != null && c.best_ask !== '' && c.best_ask !== '0' ? String(c.best_ask) : null;
+    if (!bidPx && !askPx) return null;
+    return {
+      bids: bidPx ? [{ price: bidPx, size: '1' }] : [],
+      asks: askPx ? [{ price: askPx, size: '1' }] : [],
+    };
+  };
+
   const loadBooks = useCallback(async (ids: string[], opts?: { updateSeries?: boolean; updateFlow?: boolean }) => {
     if (ids.length === 0) {
       setBooks(null);
+      setBooksLoading(false);
       return;
     }
+    const syncGen = marketSyncGenRef.current;
+    const reqKey = `${selectedSlugRef.current}:${ids.join(',')}`;
     setBooksLoading(true);
     setError(null);
-    const res = await clobBooks(ids);
-    setBooksLoading(false);
-    if (isOk(res)) {
-      setBooks(res.data);
-      const ts = Date.now();
-      setBooksFetchedAt(ts);
-      const updateSeries = opts?.updateSeries === true;
-      const updateFlow = opts?.updateFlow === true;
-      if (updateSeries) {
-        // update chart series (only when user is on chart-heavy tabs)
-        setChartSeriesBySlug((m) => {
-          if (!selectedSlug) return m;
-          const existingForSlug = m[selectedSlug] ?? {};
-          const nextForSlug: Record<string, SeriesPoint[]> = { ...existingForSlug };
-          for (const e of res.data) {
-            const token = e.token;
-            const v = e.error ? null : midPrice(e.book);
-            const prev = nextForSlug[token] ?? [];
-            nextForSlug[token] = [...prev, { t: ts, v }].slice(-180);
-          }
-          return { ...m, [selectedSlug]: nextForSlug };
-        });
-      }
-
-      if (updateFlow) {
-        // update order-flow metrics series (per token)
-        setFlowSeriesBySlug((m) => {
-          if (!selectedSlug) return m;
-          const existingForSlug = m[selectedSlug] ?? {};
-          const nextForSlug: Record<string, BookSnapshot[]> = { ...existingForSlug };
-          for (const e of res.data) {
-            const token = e.token;
-            const key = `${selectedSlug}:${token}`;
-            const prevMaps = prevDepthMapsRef.current[key] ?? null;
-            const prev = nextForSlug[token] ?? [];
-            if (e.error) continue;
-            const { snap, next } = snapshotFromBook(e.book, ts, prevMaps);
-            prevDepthMapsRef.current[key] = next;
-            nextForSlug[token] = [...prev, snap].slice(-360);
-          }
-          return { ...m, [selectedSlug]: nextForSlug };
-        });
+    try {
+      const res = await clobBooks(ids);
+      if (syncGen !== marketSyncGenRef.current) return;
+      if (`${selectedSlugRef.current}:${ids.join(',')}` !== reqKey) return;
+      if (isOk(res)) {
+        setBooks(res.data);
+        const ts = Date.now();
+        setBooksFetchedAt(ts);
+        const updateSeries = opts?.updateSeries === true;
+        const updateFlow = opts?.updateFlow === true;
+        if (updateSeries) {
+          const slug = selectedSlugRef.current.trim();
+          setChartSeriesBySlug((m) => {
+            if (!slug) return m;
+            const existingForSlug = m[slug] ?? {};
+            const nextForSlug: Record<string, SeriesPoint[]> = { ...existingForSlug };
+            for (const e of res.data) {
+              const token = e.token;
+              const v = e.error ? null : midPrice(e.book);
+              const prev = nextForSlug[token] ?? [];
+              nextForSlug[token] = [...prev, { t: ts, v }].slice(-180);
+            }
+            return { ...m, [slug]: nextForSlug };
+          });
+        }
+        if (updateFlow) {
+          const slug = selectedSlugRef.current.trim();
+          setFlowSeriesBySlug((m) => {
+            if (!slug) return m;
+            const existingForSlug = m[slug] ?? {};
+            const nextForSlug: Record<string, BookSnapshot[]> = { ...existingForSlug };
+            for (const e of res.data) {
+              const token = e.token;
+              const key = `${slug}:${token}`;
+              const prevMaps = prevDepthMapsRef.current[key] ?? null;
+              const prev = nextForSlug[token] ?? [];
+              if (e.error) continue;
+              const { snap, next } = snapshotFromBook(e.book, ts, prevMaps);
+              prevDepthMapsRef.current[key] = next;
+              nextForSlug[token] = [...prev, snap].slice(-360);
+            }
+            return { ...m, [slug]: nextForSlug };
+          });
+        }
+      } else setError(pretty(res));
+    } finally {
+      if (syncGen === marketSyncGenRef.current && `${selectedSlugRef.current}:${ids.join(',')}` === reqKey) {
+        setBooksLoading(false);
       }
     }
-    else setError(pretty(res));
-  }, [selectedSlug]);
+  }, []);
+
+  loadBooksRef.current = loadBooks;
 
   // Prefer WS market channel (instant); polling remains as a fallback.
   const booksWsRef = useRef<ReturnType<typeof openClobMarketChannel> | null>(null);
@@ -1028,8 +1150,19 @@ function App() {
   const booksRafRef = useRef<number | null>(null);
   const booksDirtyRef = useRef(false);
   const [booksWsStatus, setBooksWsStatus] = useState<string | null>(null);
+  const [booksWsEpoch, setBooksWsEpoch] = useState(0);
+  const booksWsReconnectRef = useRef<number | null>(null);
 
   useEffect(() => {
+    if (binanceSpotActive) {
+      booksWsRef.current?.close();
+      booksWsRef.current = null;
+      booksCacheRef.current = new Map();
+      booksWsIdsRef.current = '';
+      setBooksWsStatus(null);
+      setBooksLoading(false);
+      return;
+    }
     const ids = tokenIds;
     const key = ids.join(',');
     const idsSet = new Set(ids);
@@ -1038,9 +1171,13 @@ function App() {
       booksWsRef.current = null;
       booksCacheRef.current = new Map();
       booksWsIdsRef.current = '';
+      setBooksLoading(false);
       return;
     }
-    if (booksWsRef.current && booksWsIdsRef.current === key) return;
+    if (booksWsRef.current && booksWsIdsRef.current === key) {
+      if (ids.some((id) => booksCacheRef.current.has(id))) setBooksLoading(false);
+      return;
+    }
 
     booksWsRef.current?.close();
     booksWsRef.current = null;
@@ -1063,6 +1200,7 @@ function App() {
     const flushBooks = () => {
       booksRafRef.current = null;
       if (!booksDirtyRef.current) return;
+      if (booksWsIdsRef.current !== key) return;
       booksDirtyRef.current = false;
       const ts = Date.now();
       const entries = toEntries();
@@ -1129,22 +1267,62 @@ function App() {
       }, waitMs);
     };
 
+    const bootstrapBooks = () => {
+      void loadBooks(ids, { updateSeries: wantSeriesRef.current, updateFlow: wantFlowRef.current });
+    };
+
     booksWsRef.current = openClobMarketChannel({
       assetIds: ids,
       onBook: (assetId, book) => {
         booksCacheRef.current.set(assetId, book);
         scheduleFlush();
       },
+      onBestBidAsk: (assetId, best) => {
+        const bidPx = best.bestBid && best.bestBid !== '0' ? String(best.bestBid) : null;
+        const askPx = best.bestAsk && best.bestAsk !== '0' ? String(best.bestAsk) : null;
+        if (!bidPx && !askPx) return;
+        booksCacheRef.current.set(assetId, {
+          bids: bidPx ? [{ price: bidPx, size: '1' }] : [],
+          asks: askPx ? [{ price: askPx, size: '1' }] : [],
+        });
+        scheduleFlush();
+      },
       onStatus: (s) => {
         setBooksWsStatus(s.state === 'open' ? 'open' : s.state === 'closed' ? 'closed' : `error:${s.detail ?? ''}`);
+        if (s.state === 'open') {
+          if (booksWsReconnectRef.current != null) {
+            window.clearTimeout(booksWsReconnectRef.current);
+            booksWsReconnectRef.current = null;
+          }
+          bootstrapBooks();
+          return;
+        }
+        if (s.state === 'error') bootstrapBooks();
+        if (s.state === 'closed' || s.state === 'error') {
+          if (booksWsReconnectRef.current != null) return;
+          booksWsReconnectRef.current = window.setTimeout(() => {
+            booksWsReconnectRef.current = null;
+            booksWsRef.current?.close();
+            booksWsRef.current = null;
+            booksWsIdsRef.current = '';
+            setBooksWsEpoch((n) => n + 1);
+          }, 2_500);
+        }
       },
       onPriceChanges: (changes) => {
         let touched = false;
         for (const c of changes) {
           const id = c.asset_id;
           if (!idsSet.has(id)) continue;
-          const book = booksCacheRef.current.get(id);
-          if (!book) continue;
+          let book = booksCacheRef.current.get(id);
+          if (!book) {
+            const seeded = seedBookFromPriceChange(c);
+            if (!seeded) continue;
+            book = seeded;
+            booksCacheRef.current.set(id, book);
+            touched = true;
+            continue;
+          }
           const side = c.side === 'BUY' ? 'bids' : 'asks';
           const px = String(c.price);
           const sz = String(c.size);
@@ -1163,7 +1341,13 @@ function App() {
       },
     });
 
+    bootstrapBooks();
+
     return () => {
+      if (booksWsReconnectRef.current != null) {
+        window.clearTimeout(booksWsReconnectRef.current);
+        booksWsReconnectRef.current = null;
+      }
       if (booksRafRef.current != null) window.cancelAnimationFrame(booksRafRef.current);
       booksRafRef.current = null;
       if (flushTimer != null) window.clearTimeout(flushTimer);
@@ -1173,27 +1357,76 @@ function App() {
       booksWsRef.current = null;
       booksCacheRef.current = new Map();
       booksWsIdsRef.current = '';
+      setBooksLoading(false);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tokenIds.join(',')]);
+  }, [tokenIds.join(','), binanceSpotActive, booksWsEpoch]);
 
-  // When enabled, poll books every 5s to drive the chart (fallback).
   useEffect(() => {
-    if (!chartEnabled) return;
-    if (mainTab !== 'book') return;
+    if (!booksLoading) return;
+    const id = window.setTimeout(() => setBooksLoading(false), 12_000);
+    return () => window.clearTimeout(id);
+  }, [booksLoading, selectedSlug, tokenIds.join(',')]);
+
+  useEffect(() => {
+    if (!shortcutBusy) return;
+    const id = window.setTimeout(() => setShortcutBusy(null), 45_000);
+    return () => window.clearTimeout(id);
+  }, [shortcutBusy]);
+
+  // REST book poll: idle markets may get no WS deltas, so `booksFetchedAt` would age out while the book is still valid.
+  useEffect(() => {
+    if (binanceSpotActive) return;
+    const pollTabs = new Set(['book', 'flowzones', 'signals', 'tracking']);
+    if (!pollTabs.has(mainTab)) return;
+    if (mainTab === 'book' && !chartEnabled) return;
     if (!tokenIds || tokenIds.length === 0) return;
     if (!selectedSlug) return;
+
     let stopped = false;
-    const tick = async () => {
+    const run = () => {
       if (stopped) return;
-      await loadBooks(tokenIds, { updateSeries: true, updateFlow: true });
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      const wantSeries = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals';
+      const wantFlow = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals';
+      void loadBooks(tokenIds, { updateSeries: wantSeries, updateFlow: wantFlow });
     };
-    const id = window.setInterval(() => void tick(), 5_000);
+
+    const intervalMs = mainTab === 'book' ? 5_000 : mainTab === 'signals' ? 4_000 : 6_500;
+    void run();
+    const id = window.setInterval(() => void run(), intervalMs);
     return () => {
       stopped = true;
       window.clearInterval(id);
     };
-  }, [chartEnabled, loadBooks, mainTab, selectedSlug, tokenIds]);
+  }, [chartEnabled, loadBooks, mainTab, selectedSlug, tokenIds, binanceSpotActive]);
+
+  /** If CLOB WS goes quiet, REST + reconnect so implied mids do not sit "stale" for minutes. */
+  useEffect(() => {
+    if (binanceSpotActive || mainTab !== 'signals') return;
+    if (!selectedSlug.trim() || tokenIds.length === 0) return;
+    const id = window.setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      const age = booksFetchedAt == null ? Number.POSITIVE_INFINITY : Date.now() - booksFetchedAt;
+      if (age < 35_000) return;
+      void loadBooks(tokenIds, { updateSeries: true, updateFlow: true });
+      if (age > 50_000) setBooksWsEpoch((n) => n + 1);
+    }, 12_000);
+    return () => window.clearInterval(id);
+  }, [binanceSpotActive, booksFetchedAt, loadBooks, mainTab, selectedSlug, tokenIds]);
+
+  useEffect(() => {
+    if (binanceSpotActive) return;
+    const onVis = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (!tokenIds || tokenIds.length === 0) return;
+      const wantSeries = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals';
+      const wantFlow = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals';
+      void loadBooks(tokenIds, { updateSeries: wantSeries, updateFlow: wantFlow });
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
+  }, [tokenIds, mainTab, loadBooks, binanceSpotActive]);
 
   useEffect(() => {
     void (async () => {
@@ -1236,11 +1469,15 @@ function App() {
       };
       defer(() => {
         void (async () => {
+          setMarketsListLoading(true);
           const list = await marketsList(25);
+          setMarketsListLoading(false);
           if (isOk(list)) {
             setMarkets(asMarketRows(list.data));
             if (asMarketRows(list.data).length === 0) {
-              setMarketsError('Markets list returned zero rows. Is the Polymarket CLI installed and on PATH? Try `Open by slug` below.');
+              setMarketsError('Markets list returned zero rows. Start the API (`npm run dev`) and hard-refresh, or open a market by slug below.');
+            } else {
+              setMarketsError(null);
             }
           } else {
             setMarkets([]);
@@ -1252,20 +1489,23 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (binanceSpotActive) return;
     if (tokenIds.length === 0) {
       queueMicrotask(() => setBooks(null));
       return;
     }
-    const wantSeries =
-      mainTab === 'book' ||
-      mainTab === 'flowzones' ||
-      mainTab === 'signals' ||
-      mainTab === 'unified' ||
-      mainTab === 'momentum' ||
-      mainTab === 'dualptb';
-    const wantFlow = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'unified';
+    const wantSeries = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals';
+    const wantFlow = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals';
     queueMicrotask(() => void loadBooks(tokenIds, { updateSeries: wantSeries, updateFlow: wantFlow }));
-  }, [tokenIds, loadBooks, mainTab]);
+  }, [tokenIds, loadBooks, mainTab, binanceSpotActive]);
+
+  /** Signals tab: immediately hydrate implied-prob + flow rings (do not wait for the 6.5s poll). */
+  useEffect(() => {
+    if (binanceSpotActive) return;
+    if (mainTab !== 'signals') return;
+    if (!selectedSlug.trim() || tokenIds.length === 0) return;
+    void loadBooks(tokenIds, { updateSeries: true, updateFlow: true });
+  }, [binanceSpotActive, loadBooks, mainTab, selectedSlug, tokenIds]);
 
   useEffect(() => {
     if (!books || books.length === 0) {
@@ -1276,40 +1516,109 @@ function App() {
     queueMicrotask(() => setOutcomeTab((t) => Math.min(Math.max(0, t), n - 1)));
   }, [books]);
 
+  /** First visit: load `?slug=` from URL, else auto-open BTC 5m so Signals is not an empty shell. */
   useEffect(() => {
+    if (marketBootRef.current) return;
+    marketBootRef.current = true;
     const params = new URLSearchParams(window.location.search);
     const slug = (params.get('slug') ?? params.get('market') ?? '').trim();
-    if (!slug) return;
-    queueMicrotask(() => void loadMarket(slug));
+    if (slug) {
+      void loadMarket(slug);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      setShortcutBusy({ asset: 'btc', interval: '5m' });
+      try {
+        const res = await marketsUpdownShortcut('btc', '5m');
+        if (cancelled) return;
+        if (!isOk(res)) {
+          setMarketsError(pretty(res));
+          marketBootRef.current = false;
+          return;
+        }
+        const slugToOpen = res.data.trading_slug?.trim() || res.data.slug.trim();
+        void loadMarket(slugToOpen, { market: res.data.market });
+      } catch (e) {
+        if (!cancelled) {
+          setMarketsError(e instanceof Error ? e.message : String(e));
+          marketBootRef.current = false;
+        }
+      } finally {
+        if (!cancelled) setShortcutBusy(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [loadMarket]);
+
+  useEffect(() => {
+    marketLoadRetryRef.current = 0;
+  }, [selectedSlug]);
+
+  /** Shortcut picked a slug but Gamma metadata failed — retry a few times before giving up. */
+  useEffect(() => {
+    const slug = selectedSlug.trim();
+    if (!slug || marketJson) return;
+    if (!error || (!error.includes('market_get_failed') && !error.includes('fetch_failed'))) return;
+    if (marketLoadRetryRef.current >= 4) return;
+    const delayMs = 800 + marketLoadRetryRef.current * 900;
+    const id = window.setTimeout(() => {
+      marketLoadRetryRef.current += 1;
+      void loadMarket(slug);
+    }, delayMs);
+    return () => window.clearTimeout(id);
+  }, [selectedSlug, marketJson, error, loadMarket]);
+
+  /** First boot failed while API was still warming — retry BTC 5m once health is OK. */
+  useEffect(() => {
+    if (selectedSlug.trim() || shortcutBusy) return;
+    if (!apiHealth.startsWith('API OK')) return;
+    if (marketBootRef.current) return;
+    if (bootShortcutRetryRef.current >= 2) return;
+    bootShortcutRetryRef.current += 1;
+    void openUpdownShortcut('btc', '5m');
+  }, [apiHealth, selectedSlug, shortcutBusy]);
 
   useEffect(() => {
     const slug = selectedSlug.trim();
     if (!slug) {
-      queueMicrotask(() => setSsrPtbSource(null));
+      queueMicrotask(() => {
+        setSsrPriceToBeat(null);
+        setSsrPtbSource(null);
+      });
       return;
     }
-    queueMicrotask(() => setSsrPtbSource(null));
+    const ptbGen = marketSyncGenRef.current;
+    queueMicrotask(() => {
+      setSsrPriceToBeat(null);
+      setSsrPtbSource(null);
+      setPtbError(null);
+    });
     let stopped = false;
     const tick = async () => {
       const ptb = await priceToBeat(slug);
       if (stopped) return;
-      // Keep last good PTB on transient fetch errors (prevents chart flicker).
+      if (ptbGen !== marketSyncGenRef.current) return;
+      if (selectedSlugRef.current.trim() !== slug) return;
       if (isOk(ptb)) {
         setSsrPriceToBeat(ptb.data.price_to_beat);
         setSsrPtbSource(ptb.data.source);
         setPtbError(null);
       } else {
+        // Keep last good PTB only when still the same market load generation.
         setPtbError(pretty(ptb));
       }
     };
     void tick();
-    const id = window.setInterval(() => void tick(), 20_000);
+    const intervalMs = ssrPriceToBeat == null ? 5_000 : 20_000;
+    const id = window.setInterval(() => void tick(), intervalMs);
     return () => {
       stopped = true;
       window.clearInterval(id);
     };
-  }, [selectedSlug]);
+  }, [selectedSlug, ssrPriceToBeat]);
 
   useEffect(() => {
     setRtdsSpotFeedSource(null);
@@ -1321,84 +1630,8 @@ function App() {
   }, []);
 
   useEffect(() => {
-    try {
-      localStorage.setItem(PTB_THREE_UP_INTERVAL_KEY, threeUpInterval);
-    } catch {
-      /* ignore */
-    }
-  }, [threeUpInterval]);
-
-  useEffect(() => {
     writeStringArray(PTB_WATCH_SLUGS_KEY, ptbWatchSlugs);
   }, [ptbWatchSlugs]);
-
-  useEffect(() => {
-    if (mainTab !== 'threeup') return;
-    let stopped = false;
-    const assets: UpdownShortcutAsset[] = ['btc', 'eth', 'sol'];
-    const tick = async () => {
-      const res = await Promise.all(assets.map((a) => marketsUpdownShortcut(a, threeUpInterval)));
-      if (stopped) return;
-      const nextSlugs: Record<string, string> = {};
-      for (let i = 0; i < assets.length; i++) {
-        const a = assets[i]!;
-        const r = res[i]!;
-        if (!isOk(r)) continue;
-        const cur = r.data.slug;
-        // 5m: prior window — PTB is previous bucket open; smoother right after a roll.
-        // 15m/1h/4h/1d: use the live window (prior windows are often inactive/closed).
-        const slug = threeUpInterval === '5m' ? (nextUpdownSlug(cur, -1) ?? cur) : cur;
-        nextSlugs[a] = slug;
-      }
-      setThreeUpSlugs(nextSlugs);
-      setUpdownSlugHints((prev) => {
-        const next = { ...prev };
-        for (let i = 0; i < assets.length; i++) {
-          const r = res[i]!;
-          if (!isOk(r)) continue;
-          const cur = r.data.slug;
-          const slug = threeUpInterval === '5m' ? (nextUpdownSlug(cur, -1) ?? cur) : cur;
-          if (parseUpdownSlug(slug)) continue;
-          const iw = r.data.inferred_window_start_unix;
-          if (typeof iw !== 'number') continue;
-          next[slug.trim().toLowerCase()] = {
-            asset: assets[i]!,
-            interval: threeUpInterval,
-            bucketStartSec: iw,
-          };
-        }
-        return next;
-      });
-
-      const metas = await Promise.all(
-        Object.entries(nextSlugs).map(async ([asset, slug]) => {
-          const [mRes, pRes] = await Promise.all([marketsGet(slug), priceToBeat(slug)]);
-          const ptb = isOk(pRes) ? pRes.data.price_to_beat : null;
-          let endsInMs: number | null = null;
-          if (isOk(mRes) && mRes.data && typeof mRes.data === 'object') {
-            const endRaw = (mRes.data as Record<string, unknown>).endDate;
-            if (typeof endRaw === 'string') {
-              const t = Date.parse(endRaw);
-              if (Number.isFinite(t)) endsInMs = t - Date.now();
-            }
-          }
-          return { asset, ptb, endsInMs };
-        }),
-      );
-      if (stopped) return;
-      setThreeUpMeta((prev) => {
-        const next = { ...prev };
-        for (const m of metas) next[m.asset] = { ptb: m.ptb, endsInMs: m.endsInMs };
-        return next;
-      });
-    };
-    void tick();
-    const id = window.setInterval(() => void tick(), 20_000);
-    return () => {
-      stopped = true;
-      window.clearInterval(id);
-    };
-  }, [mainTab, threeUpInterval]);
 
   useEffect(() => {
     writeStringArray(PTB_WATCH_RECENT_KEY, ptbWatchRecentSlugs);
@@ -1416,20 +1649,27 @@ function App() {
   // (intentionally no second clock interval)
 
   const spotLenForRtds = spotSeriesBySlug[selectedSlug]?.length ?? 0;
-  const rtdsPollFast = updownParsed != null && spotLenForRtds < 2;
+  const rtdsPollFast = isUpdownDeskMarket(selectedSlug, updownSlugHints) && spotLenForRtds < 2;
 
   useEffect(() => {
     const symFromSlug = (slug: string): string | null => {
       const p = parseUpdownSlugWithHints(slug, updownSlugHints);
-      if (!p) return null;
-      return `${p.asset}/usd`;
+      if (p) return `${p.asset}/usd`;
+      const hint = inferUpdownHintFromMarketJson(
+        slug,
+        marketJson && typeof marketJson === 'object' ? (marketJson as Record<string, unknown>) : {},
+      );
+      if (hint) return `${hint.asset}/usd`;
+      const titled = titledUpdownAssetFromSlug(slug);
+      if (titled) return `${titled}/usd`;
+      return null;
     };
     const collect = (): string[] => {
-      const s = new Set<string>(['btc/usd', 'eth/usd', 'sol/usd']);
+      const s = new Set<string>(['btc/usd', 'btc/usdt', 'eth/usd', 'sol/usd']);
       const a = symFromSlug(selectedSlug);
       if (a) s.add(a);
-      // Only fan out to watchlist when the user is on tabs that need it.
-      if (mainTab === 'watch' || mainTab === 'multiscan' || mainTab === 'threeup') {
+      // Only fan out to scan-list symbols when Multi scan is visible (avoids hammering RTDS).
+      if (mainTab === 'multiscan') {
         for (const w of ptbWatchSlugs) {
           const sym = symFromSlug(w);
           if (sym) s.add(sym);
@@ -1441,14 +1681,20 @@ function App() {
     // Fast-boot should hydrate the active chart quickly without hammering RTDS for every watched slug.
     const SYMS = rtdsPollFast
       ? selectedSym
-        ? [selectedSym]
-        : ['btc/usd', 'eth/usd', 'sol/usd']
+        ? selectedSym === 'btc/usd'
+          ? [selectedSym, 'btc/usdt']
+          : [selectedSym]
+        : ['btc/usd', 'btc/usdt', 'eth/usd', 'sol/usd']
       : collect();
     let stopped = false;
     let inflight = false;
+    let pendingTick = false;
     const tick = async () => {
       if (stopped) return;
-      if (inflight) return;
+      if (inflight) {
+        pendingTick = true;
+        return;
+      }
       inflight = true;
       try {
         const results = await Promise.all(SYMS.map((s) => rtdsCrypto(s)));
@@ -1456,6 +1702,7 @@ function App() {
         const next: Record<string, SpotPoint[]> = { ...base };
         let okAny = false;
         let firstErr: string | null = null;
+        let activeReceivedAt: number | null = null;
         for (let i = 0; i < SYMS.length; i++) {
           const sym = SYMS[i]!;
           const res = results[i]!;
@@ -1468,11 +1715,26 @@ function App() {
         }
         setSpotBySymbol(next);
         setRtdsError(okAny ? null : firstErr);
-        const p = updownParsed;
-        if (!p) {
+        const sym = symFromSlug(selectedSlug);
+        const pollAt = Date.now();
+        if (sym) {
+          for (let i = 0; i < SYMS.length; i++) {
+            if (SYMS[i] !== sym) continue;
+            const res = results[i]!;
+            if (isOk(res)) {
+              if (Number.isFinite(res.data.receivedAt) && res.data.receivedAt > 0) {
+                activeReceivedAt = res.data.receivedAt;
+              }
+              queueMicrotask(() => setRtdsLastPollMs(pollAt));
+            }
+            break;
+          }
+        }
+        if (!sym) {
           queueMicrotask(() => {
             setRtdsSpot(null);
             setRtdsTickAt(null);
+            setRtdsReceivedAt(null);
             setRtdsSpotFeedSource(null);
             setSpotSeriesBySlug((m) => {
               if (!selectedSlug.trim()) return m;
@@ -1483,7 +1745,6 @@ function App() {
           });
           return;
         }
-        const sym = `${p.asset}/usd`;
         const series = next[sym] ?? [];
         let spotSrc: string | null = null;
         for (let i = 0; i < SYMS.length; i++) {
@@ -1495,14 +1756,19 @@ function App() {
         queueMicrotask(() => {
           setSpotSeriesBySlug((m) => ({ ...m, [selectedSlug]: series }));
           if (spotSrc != null) setRtdsSpotFeedSource(spotSrc);
+          if (activeReceivedAt != null) setRtdsReceivedAt(activeReceivedAt);
           if (series.length > 0) {
             const last = series[series.length - 1]!;
             setRtdsSpot(last.v);
-            setRtdsTickAt(last.t);
+            setRtdsTickAt(normalizeEpochMs(last.t) ?? last.t);
           }
         });
       } finally {
         inflight = false;
+        if (pendingTick && !stopped) {
+          pendingTick = false;
+          void tick();
+        }
       }
     };
     void tick();
@@ -1517,15 +1783,21 @@ function App() {
     // RTDS numbers feel "frozen" if we poll too slowly. Keep 1s cadence for normal mode.
     const intervalMs = rtdsPollFast ? 750 : 1_000;
     const id = window.setInterval(() => void tick(), intervalMs);
+    const onVis = () => {
+      if (document.visibilityState !== 'visible' || stopped) return;
+      void tick();
+    };
+    document.addEventListener('visibilitychange', onVis);
     return () => {
       stopped = true;
       window.clearInterval(id);
       for (const t of bootTimers) window.clearTimeout(t);
+      document.removeEventListener('visibilitychange', onVis);
     };
-  }, [selectedSlug, ptbWatchSlugs, rtdsPollFast, mainTab, updownParsed, updownSlugHints]);
+  }, [selectedSlug, ptbWatchSlugs, rtdsPollFast, mainTab, updownParsed, updownSlugHints, marketJson]);
 
   useEffect(() => {
-    if (mainTab !== 'watch' && mainTab !== 'multiscan') return;
+    if (mainTab !== 'multiscan') return;
     const slugs = [...new Set(ptbWatchSlugs.filter((s) => parseUpdownSlugWithHints(s, updownSlugHints) != null))];
     if (slugs.length === 0) {
       queueMicrotask(() => setWatchMetaBySlug({}));
@@ -1669,8 +1941,11 @@ function App() {
   }, [updownParsed, updownLiveSlugFromApi, updownSlugHints]);
 
   const assistantContext = useMemo(
-    () => buildAssistantContext(selectedSlug, marketJson, books, outcomeLabels),
-    [selectedSlug, marketJson, books, outcomeLabels],
+    () =>
+      binanceSpotActive
+        ? `Workspace: Binance BTCUSDT spot order book (not Polymarket). Polymarket slug in sidebar: ${selectedSlug.trim() || '(none)'}.\n`
+        : buildAssistantContext(selectedSlug, marketJson, books, outcomeLabels),
+    [binanceSpotActive, selectedSlug, marketJson, books, outcomeLabels],
   );
 
   const rollingCtxText = useMemo(() => {
@@ -1780,6 +2055,7 @@ function App() {
   }, [autoEnabled, assistantAvailable, assistantContext, autoBusy, books, pushAutoLine, rollingCtxText, selectedSlug, updownParsed]);
 
   async function openUpdownShortcut(asset: UpdownShortcutAsset, interval: UpdownInterval) {
+    releaseOrphanPointerCapture();
     setError(null);
     setMarketsError(null);
     setShortcutBusy({ asset, interval });
@@ -1788,6 +2064,8 @@ function App() {
       const first = await marketsUpdownShortcut(asset, interval);
       let okRes: ApiOk<{
         slug: string;
+        trading_slug?: string;
+        market?: unknown;
         asset: string;
         interval?: string;
         window: string;
@@ -1801,10 +2079,14 @@ function App() {
       if (isOk(first)) okRes = first;
       else {
         setMarketsError(pretty(first));
+        setShortcutBusy(null);
         return;
       }
 
-      if (!okRes) return;
+      if (!okRes) {
+        setShortcutBusy(null);
+        return;
+      }
 
       if (okRes.data.start && okRes.data.end) {
         setMarketsError(
@@ -1813,21 +2095,21 @@ function App() {
       } else {
         setMarketsError(null);
       }
-      // 5m: open prior round (PTB = previous window open, less noisy at the roll).
-      // 15m/1h/4h/1d: open the live window from the API (prior windows are often inactive/closed).
-      const slugToOpen =
-        interval === '5m' ? (nextUpdownSlug(okRes.data.slug, -1) ?? okRes.data.slug) : okRes.data.slug;
-      if (!parseUpdownSlug(slugToOpen)) {
-        const iw = (okRes.data as { inferred_window_start_unix?: number }).inferred_window_start_unix;
-        if (typeof iw === 'number') {
-          setUpdownSlugHints((m) => ({
-            ...m,
-            [slugToOpen.trim().toLowerCase()]: { asset, interval, bucketStartSec: iw },
-          }));
-        }
+      let slugToOpen = okRes.data.trading_slug?.trim() || okRes.data.slug.trim();
+      if (interval === '5m' && !okRes.data.trading_slug?.trim() && !okRes.data.market) {
+        slugToOpen = await updownSlugToOpen(okRes.data, interval);
       }
-      await loadMarket(slugToOpen);
-    } finally {
+      const iw = (okRes.data as { inferred_window_start_unix?: number }).inferred_window_start_unix;
+      if (typeof iw === 'number') {
+        setUpdownSlugHints((m) => ({
+          ...m,
+          [slugToOpen.trim().toLowerCase()]: { asset, interval, bucketStartSec: iw },
+        }));
+      }
+      setShortcutBusy(null);
+      void loadMarket(slugToOpen, { market: okRes.data.market });
+    } catch (e) {
+      setMarketsError(e instanceof Error ? e.message : String(e));
       setShortcutBusy(null);
     }
   }
@@ -1837,14 +2119,17 @@ function App() {
     setMarketsError(null);
     const term = q.trim();
     if (!term) {
+      setMarketsListLoading(true);
       const list = await marketsList(25);
+      setMarketsListLoading(false);
       if (isOk(list)) {
         const rows = asMarketRows(list.data);
         setMarkets(rows);
         if (rows.length === 0) setMarketsError('No markets in this page of results.');
+        else setMarketsError(null);
       } else {
         setMarkets([]);
-        setMarketsError(pretty(list));
+        setMarketsError(pretty(list) + apiReachabilityHint(list));
       }
       return;
     }
@@ -1878,23 +2163,14 @@ function App() {
     }
   }
 
+  const tabSuspenseFallback = (
+    <div className="mt-5 rounded-2xl border border-zinc-800/50 bg-zinc-950/40 px-4 py-6 text-center text-sm text-zinc-400">
+      Loading tab…
+    </div>
+  );
+
   return (
-    <Suspense
-      fallback={
-        <div className="min-h-full bg-zinc-950 font-sans text-zinc-200 antialiased">
-          <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
-            <div className="rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-5 text-sm text-zinc-400">
-              Loading…
-            </div>
-          </div>
-        </div>
-      }
-    >
-      <div
-        className={`min-h-full bg-zinc-950 bg-[radial-gradient(100%_60%_at_50%_-10%,rgba(99,102,241,0.08),transparent_52%),linear-gradient(180deg,#0b0b0f_0%,#09090b_45%,#060608_100%)] font-sans text-zinc-200 antialiased ${
-          tradePanelOpen ? 'md:pr-[380px] 2xl:pr-[400px]' : ''
-        } transition-[padding] duration-200`}
-      >
+      <div className="min-h-full bg-zinc-950 bg-[radial-gradient(100%_60%_at_50%_-10%,rgba(99,102,241,0.08),transparent_52%),linear-gradient(180deg,#0b0b0f_0%,#09090b_45%,#060608_100%)] font-sans text-zinc-200 antialiased">
       <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
         <header className="rounded-2xl border border-zinc-800/50 bg-zinc-900/20 px-5 py-5 shadow-lg shadow-black/20 ring-1 ring-white/[0.03] backdrop-blur-sm sm:px-6">
           <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
@@ -1904,10 +2180,23 @@ function App() {
               <p className="mt-2 max-w-2xl text-[12px] leading-relaxed text-zinc-500">{STREAM_ATTRIBUTION_LINE}</p>
             </div>
             <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+              {tradeAccountMode === 'live' ? (
+                <span
+                  className="inline-flex min-h-[34px] items-center gap-1.5 rounded-full border border-rose-500/45 bg-rose-950/40 px-3 py-1.5 text-[11px] font-black uppercase tracking-[0.14em] text-rose-100 shadow-sm shadow-rose-950/30 ring-1 ring-rose-400/20"
+                  title="Trade panel is in Live mode — orders use real USDC"
+                >
+                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-rose-400" aria-hidden />
+                  Live
+                </span>
+              ) : null}
               <button
                 type="button"
                 onClick={() => setTradePanelOpen(true)}
-                className="min-h-[34px] rounded-full border border-amber-500/35 bg-zinc-950/70 px-4 text-[12px] font-black tracking-wide text-amber-100 shadow-lg shadow-black/20 ring-1 ring-white/[0.04] transition-colors hover:bg-zinc-900/80"
+                className={`min-h-[34px] rounded-full border px-4 text-[12px] font-black tracking-wide shadow-lg shadow-black/20 ring-1 ring-white/[0.04] transition-colors ${
+                  tradeAccountMode === 'live'
+                    ? 'border-rose-500/40 bg-rose-950/50 text-rose-50 hover:bg-rose-950/65'
+                    : 'border-amber-500/35 bg-zinc-950/70 text-amber-100 hover:bg-zinc-900/80'
+                }`}
                 title={
                   !effectiveTradeReady
                     ? 'Open trade (market not ready yet)'
@@ -1958,21 +2247,24 @@ function App() {
           <div className="rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-5 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm xl:col-span-3">
             <div className="mb-4 flex flex-col gap-2">
               <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Open market</div>
+              <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-amber-200/70">Polymarket · prediction</div>
               <div className="flex flex-wrap gap-2">
-                {(['btc', 'eth', 'sol'] as const).map((asset) => {
+                {(['btc', 'eth', 'sol', 'hype'] as const).map((asset) => {
                   const busy = shortcutBusy?.asset === asset && shortcutBusy.interval === '5m';
                   return (
                     <button
                       key={`5m-${asset}`}
                       type="button"
-                      disabled={shortcutBusy !== null}
+                      disabled={busy}
                       onClick={() => void openUpdownShortcut(asset, '5m')}
                       className={`min-w-[4.5rem] flex-1 rounded-xl border px-3 py-2.5 text-center text-sm font-semibold uppercase tracking-wide transition-colors disabled:cursor-wait disabled:opacity-50 sm:flex-none ${
                         asset === 'btc'
                           ? 'border-amber-700/50 bg-amber-950/30 text-amber-100 hover:bg-amber-950/50'
                           : asset === 'eth'
                             ? 'border-indigo-700/50 bg-indigo-950/30 text-indigo-100 hover:bg-indigo-950/50'
-                            : 'border-violet-700/50 bg-violet-950/30 text-violet-100 hover:bg-violet-950/50'
+                            : asset === 'sol'
+                              ? 'border-violet-700/50 bg-violet-950/30 text-violet-100 hover:bg-violet-950/50'
+                              : 'border-emerald-700/45 bg-emerald-950/20 text-emerald-100 hover:bg-emerald-950/35'
                       }`}
                     >
                       {busy ? '…' : asset}
@@ -1980,24 +2272,46 @@ function App() {
                   );
                 })}
               </div>
-              <p className="text-[10px] leading-snug text-zinc-600">5m Up/Down — taps resolve the current Gamma slug (live window).</p>
+              <p className="text-[10px] leading-snug text-zinc-600">
+                5m Up/Down — the <span className="font-medium text-zinc-400">btc</span> chip is only the Polymarket BTC 5-minute window (share prices), not Binance spot.
+              </p>
+              <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-cyan-200/75">Separate market · spot</div>
+              <div className="mt-1 rounded-xl border border-cyan-800/45 bg-cyan-950/20 p-3 ring-1 ring-cyan-500/10">
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-cyan-200/85">BTC / USDT (Binance)</div>
+                <p className="mt-1 text-[10px] leading-snug text-zinc-500">
+                  Full <span className="font-medium text-zinc-400">Book</span>, <span className="font-medium text-zinc-400">Flow</span>, and{' '}
+                  <span className="font-medium text-zinc-400">Signals</span> tabs use this feed (same layout as Polymarket). Not a Polymarket slug.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setBinanceSpotActive(true);
+                    setMainTab('book');
+                  }}
+                  className="mt-2 w-full rounded-xl border border-cyan-600/45 bg-cyan-950/35 px-3 py-2.5 text-center text-sm font-semibold tracking-tight text-cyan-50 shadow-sm transition-colors hover:border-cyan-500/55 hover:bg-cyan-950/50"
+                >
+                  Open BTC / USDT market
+                </button>
+              </div>
               {(['15m', '1h', '4h', '1d'] as const).map((interval) => (
                 <div key={interval} className="mt-2">
                   <div className="flex flex-wrap gap-2">
-                    {(['btc', 'eth', 'sol'] as const).map((asset) => {
+                    {(['btc', 'eth', 'sol', 'hype'] as const).map((asset) => {
                       const busy = shortcutBusy?.asset === asset && shortcutBusy.interval === interval;
                       return (
                         <button
                           key={`${interval}-${asset}`}
                           type="button"
-                          disabled={shortcutBusy !== null}
+                          disabled={busy}
                           onClick={() => void openUpdownShortcut(asset, interval)}
                           className={`min-w-[4.5rem] flex-1 rounded-xl border px-3 py-2.5 text-center text-sm font-semibold uppercase tracking-wide transition-colors disabled:cursor-wait disabled:opacity-50 sm:flex-none ${
                             asset === 'btc'
                               ? 'border-amber-700/50 bg-amber-950/30 text-amber-100 hover:bg-amber-950/50'
                               : asset === 'eth'
                                 ? 'border-indigo-700/50 bg-indigo-950/30 text-indigo-100 hover:bg-indigo-950/50'
-                                : 'border-violet-700/50 bg-violet-950/30 text-violet-100 hover:bg-violet-950/50'
+                                : asset === 'sol'
+                                  ? 'border-violet-700/50 bg-violet-950/30 text-violet-100 hover:bg-violet-950/50'
+                                  : 'border-emerald-700/45 bg-emerald-950/20 text-emerald-100 hover:bg-emerald-950/35'
                           }`}
                         >
                           {busy ? '…' : `${asset} ${interval}`}
@@ -2053,7 +2367,9 @@ function App() {
               <pre className="mt-3 overflow-auto rounded-xl border border-amber-800/30 bg-amber-950/15 p-3 text-xs leading-relaxed text-amber-100/90">{marketsError}</pre>
             ) : null}
             <div className="mt-3 max-h-[60vh] overflow-auto rounded-xl border border-zinc-800/50 bg-black/15 shadow-inner shadow-black/20">
-              {markets.length === 0 ? (
+              {marketsListLoading ? (
+                <div className="p-4 text-sm leading-relaxed text-zinc-400">Loading markets…</div>
+              ) : markets.length === 0 ? (
                 <div className="p-4 text-sm leading-relaxed text-zinc-500">No results yet. Search or paste a slug above.</div>
               ) : (
                 <ul className="divide-y divide-zinc-800/40">
@@ -2083,7 +2399,7 @@ function App() {
             </div>
           </div>
 
-          <div className="rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-5 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm xl:col-span-7">
+          <div className="min-w-0 max-w-full rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-4 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm sm:p-5 xl:col-span-7">
             <div className="flex flex-wrap items-center gap-2 border-b border-zinc-800/40 pb-3">
               <div className="text-[15px] font-semibold text-zinc-100">{mainTabTitle(mainTab)}</div>
               <div className="truncate rounded-md bg-zinc-900/50 px-2 py-0.5 font-mono text-xs text-zinc-400">{selectedSlug || '—'}</div>
@@ -2125,24 +2441,31 @@ function App() {
               <MainTabButton id="signals" label="Signals" active={mainTab === 'signals'} onSelect={setMainTab} />
               <MainTabButton id="tracking" label="Tracking" title="Positions + open orders + cash" active={mainTab === 'tracking'} onSelect={setMainTab} />
               <MainTabButton id="tradehistory" label="History" title="Trade history (paper + live log)" active={mainTab === 'tradehistory'} onSelect={setMainTab} />
-              <MainTabButton id="dualptb" label="Dual PTB" title="Reference PTB continuation tab" active={mainTab === 'dualptb'} onSelect={setMainTab} />
-              <MainTabButton id="threeup" label="3-up" title="BTC/ETH/SOL spot vs PTB (simultaneous)" active={mainTab === 'threeup'} onSelect={setMainTab} />
               <MainTabButton id="btc" label="BTC" title="BTC live spot + paper trading" active={mainTab === 'btc'} onSelect={setMainTab} />
-              <MainTabButton id="command" label="Command" title="Multi-market command tiles + command center" active={mainTab === 'command'} onSelect={setMainTab} />
-              <MainTabButton id="unified" label="Unified" title="Unified PTB view (chart + panel)" active={mainTab === 'unified'} onSelect={setMainTab} />
-              <MainTabButton id="multiscan" label="Multi" title="Multi-asset PTB scan" active={mainTab === 'multiscan'} onSelect={setMainTab} />
               <MainTabButton
-                id="momentum"
-                label="+4¢"
-                title="Scalps: net +4¢ long scanner, READY/WAIT/AVOID, momentum & CATCH alerts — add slugs below"
-                active={mainTab === 'momentum'}
+                id="tvbtc"
+                label="BTC/USDT"
+                title="Binance BTCUSDT spot — full dollar price & TradingView (not Polymarket share prices)"
+                active={mainTab === 'tvbtc'}
                 onSelect={setMainTab}
               />
-              <MainTabButton id="watch" label="Watch" title="PTB Watch" active={mainTab === 'watch'} onSelect={setMainTab} />
-              <MainTabButton id="workspace" label="Workspace" title="Drag + resize board" active={mainTab === 'workspace'} onSelect={setMainTab} />
+              <MainTabButton
+                id="perps"
+                label="Perps"
+                title="Perps Trade Command Center — BTC/ETH/SOL charts, bias, SL/TP, liq, funding, sizing"
+                active={mainTab === 'perps'}
+                onSelect={setMainTab}
+              />
+              <MainTabButton id="multiscan" label="Multi" title="Multi-asset PTB scan" active={mainTab === 'multiscan'} onSelect={setMainTab} />
               <MainTabButton id="assistant" label="Assistant" active={mainTab === 'assistant'} onSelect={setMainTab} />
               <MainTabButton id="raw" label="Raw" active={mainTab === 'raw'} onSelect={setMainTab} />
             </div>
+
+            {binanceSpotActive ? (
+              <div className="mt-3 rounded-xl border border-cyan-800/45 bg-cyan-950/25 px-3 py-2 text-[11px] leading-relaxed text-cyan-50/95">
+                <span className="font-semibold">Binance BTC/USDT spot market</span> — Book, Flow, and Signals use live depth and agg trades from your API. Polymarket CLOB polling is paused until you exit.
+              </div>
+            ) : null}
 
             {isMarketClosed(marketJson) ? (
               <div className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-800/25 bg-amber-950/15 px-3 py-2 text-xs text-amber-100/85">
@@ -2243,20 +2566,41 @@ function App() {
               <div className="mt-3 rounded-xl border border-zinc-800/60 bg-zinc-950/35 px-3 py-2">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="text-[11px] font-semibold text-zinc-300">
-                    5-minute markers
+                    {updownParsed.interval === '1h'
+                      ? 'Hour markers'
+                      : updownParsed.interval === '15m'
+                        ? '15-minute markers'
+                        : updownParsed.interval === '4h'
+                          ? '4-hour markers'
+                          : updownParsed.interval === '1d'
+                            ? 'Daily markers'
+                            : '5-minute markers'}
                     <span className="ml-2 font-mono text-zinc-500">({updownParsed.asset.toUpperCase()} {updownParsed.interval})</span>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => setUpdownPickerOpen((v) => !v)}
-                    className="rounded-lg border border-zinc-700/60 bg-black/20 px-2.5 py-1.5 text-[11px] font-bold text-zinc-200 hover:bg-black/30"
-                    title="Jump to an exact 5m/15m window boundary"
-                  >
-                    {updownPickerOpen ? 'Hide' : 'Choose window'}
-                  </button>
+                  {parseUpdownSlug(selectedSlug) ? (
+                    <button
+                      type="button"
+                      onClick={() => setUpdownPickerOpen((v) => !v)}
+                      className="rounded-lg border border-zinc-700/60 bg-black/20 px-2.5 py-1.5 text-[11px] font-bold text-zinc-200 hover:bg-black/30"
+                      title="Jump to an exact window boundary"
+                    >
+                      {updownPickerOpen ? 'Hide' : 'Choose window'}
+                    </button>
+                  ) : isShortcutAsset(updownParsed.asset as UpdownShortcutAsset) ? (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void openUpdownShortcut(updownParsed.asset as UpdownShortcutAsset, updownParsed.interval)
+                      }
+                      className="rounded-lg border border-zinc-700/60 bg-black/20 px-2.5 py-1.5 text-[11px] font-bold text-zinc-200 hover:bg-black/30"
+                      title="Reload the live window from Polymarket"
+                    >
+                      Live {updownParsed.interval}
+                    </button>
+                  ) : null}
                 </div>
 
-                {updownPickerOpen ? (
+                {updownPickerOpen && parseUpdownSlug(selectedSlug) ? (
                   <div className="mt-2 grid grid-cols-4 gap-2 sm:grid-cols-6">
                     {updownPickerItems.map((it) => (
                       <button
@@ -2282,10 +2626,11 @@ function App() {
             ) : null}
 
             {tokenIds.length === 0 &&
-            mainTab !== 'watch' &&
-            mainTab !== 'momentum' &&
+            !binanceSpotActive &&
             mainTab !== 'tradehistory' &&
-            mainTab !== 'btc' ? (
+            mainTab !== 'btc' &&
+            mainTab !== 'tvbtc' &&
+            mainTab !== 'perps' ? (
               <div className="mt-4 text-sm leading-relaxed text-zinc-500">Select a market to load token ids and ladders.</div>
             ) : null}
 
@@ -2293,21 +2638,22 @@ function App() {
               <pre className="mt-4 overflow-auto rounded-xl border border-red-800/30 bg-red-950/15 p-3 text-xs leading-relaxed text-red-200/90">{error}</pre>
             ) : null}
 
-            {mainTab === 'book' ? (
+            {binanceSpotActive && (mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals') ? (
+              <BinanceBtcUsdtMarketView
+                mainTab={mainTab}
+                chartEnabled={chartEnabled}
+                setChartEnabled={setChartEnabled}
+                flowMode={flowMode}
+                setFlowMode={setFlowMode}
+                onClose={() => setBinanceSpotActive(false)}
+              />
+            ) : null}
+
+            {!binanceSpotActive && mainTab === 'book' ? (
               <div className="mt-5">
                 <div className="mb-4 rounded-2xl border border-zinc-800/40 bg-zinc-900/20 p-3 ring-1 ring-white/[0.02]">
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Outcome mids</div>
-                      <button
-                        type="button"
-                        onClick={() => setMainTab('momentum')}
-                        className="rounded-md border border-amber-800/50 bg-amber-950/30 px-2 py-0.5 text-[10px] font-semibold text-amber-100 hover:bg-amber-950/50"
-                        title="Net +4¢ scalp scanner, READY/WAIT verdict, alerts"
-                      >
-                        +4¢ scalps →
-                      </button>
-                    </div>
+                    <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Outcome mids</div>
                     <div className="flex flex-wrap gap-2">
                       <TradeSegmentedControl
                         value={flowMode}
@@ -2402,83 +2748,118 @@ function App() {
               </div>
             ) : null}
 
-            {mainTab === 'momentum' ? (
-              <MomentumAlertsTab
-                currentSlug={selectedSlug}
-                priceToBeatUsd={ssrPriceToBeat}
-                onOpenInBook={(slug) => {
-                  void loadMarket(slug);
-                  setMainTab('book');
-                }}
-              />
-            ) : null}
-
             {mainTab === 'btc' ? <BtcSpotPaperTest /> : null}
 
-            {mainTab === 'watch' ? (
-              <PtbWatchTab
-                watchedSlugs={ptbWatchSlugs}
-                onChangeWatchedSlugs={setPtbWatchSlugs}
-                recentSlugs={ptbWatchRecentSlugs}
-                currentSlug={selectedSlug}
-                onOpenInBook={(slug) => {
-                  void loadMarket(slug);
-                }}
-              />
-            ) : null}
+            {mainTab === 'tvbtc' ? <TradingViewBtcUsdtTab /> : null}
 
-            {mainTab === 'workspace' ? (
-              <WorkspaceTab
-                currentSlug={selectedSlug}
-                market={marketJson}
-                books={books}
-                outcomeLabels={outcomeLabels}
-                flowSeriesForSlug={flowSeriesBySlug[selectedSlug] ?? null}
-                booksFetchedAt={booksFetchedAt}
-                priceToBeatUsd={ssrPriceToBeat}
-                endsInMs={marketEndsInMs}
-                onOpenInBook={(slug) => {
-                  void loadMarket(slug);
-                  setMainTab('book');
-                }}
-              />
-            ) : null}
+            {mainTab === 'perps' ? <PerpsCommandCenter /> : null}
 
-            {mainTab === 'flowzones' ? (
+            {!binanceSpotActive && mainTab === 'flowzones' ? (
               <div className="mt-5">
-                <FlowZonesTab
-                  market={marketJson}
-                  books={books}
-                  outcomeLabels={outcomeLabels}
-                  flowSeriesForSlug={flowSeriesBySlug[selectedSlug] ?? null}
-                  booksFetchedAt={booksFetchedAt}
-                  priceToBeatUsd={ssrPriceToBeat}
-                  endsInMs={marketEndsInMs}
-                />
+                <Suspense fallback={tabSuspenseFallback}>
+                  <FlowZonesTab
+                    key={selectedSlug ?? ''}
+                    market={marketJson}
+                    books={books}
+                    outcomeLabels={outcomeLabels}
+                    flowSeriesForSlug={flowSeriesBySlug[selectedSlug] ?? null}
+                    booksFetchedAt={booksFetchedAt}
+                    priceToBeatUsd={ssrPriceToBeat}
+                    endsInMs={marketEndsInMs}
+                  />
+                </Suspense>
               </div>
             ) : null}
 
-            {mainTab === 'signals' ? (
+            {!binanceSpotActive && mainTab === 'signals' ? (
               <div className="mt-5">
+                {shortcutBusy && !selectedSlug.trim() ? (
+                  <div className="mb-4 rounded-2xl border border-indigo-800/40 bg-indigo-950/20 px-4 py-6 text-center text-sm text-indigo-100/90">
+                    Loading {shortcutBusy.asset.toUpperCase()} {shortcutBusy.interval} market…
+                  </div>
+                ) : !selectedSlug.trim() ? (
+                  <div className="mb-4 rounded-2xl border border-amber-800/35 bg-amber-950/15 px-4 py-4 text-sm leading-relaxed text-amber-100/90">
+                    <p className="font-semibold text-amber-50">Pick a market to load signals</p>
+                    <p className="mt-2 text-amber-100/75">
+                      Tap a <span className="font-medium text-amber-50">BTC / ETH / SOL / HYPE</span> shortcut on the left (5m is fastest), or paste a slug, then stay on this tab.
+                    </p>
+                  </div>
+                ) : booksLoading && !books ? (
+                  <div className="mb-4 rounded-2xl border border-zinc-800/60 bg-zinc-950/40 px-4 py-6 text-center text-sm text-zinc-400">
+                    Loading order books for signals…
+                  </div>
+                ) : null}
+                {error && selectedSlug.trim() && !marketJson ? (
+                  <div className="mb-4 rounded-2xl border border-amber-800/40 bg-amber-950/20 px-4 py-4 text-sm leading-relaxed text-amber-100/90">
+                    <p className="font-semibold text-amber-50">Market metadata did not load</p>
+                    <p className="mt-2 text-amber-100/75">
+                      Slug <span className="font-mono text-amber-50/95">{selectedSlug}</span> is set, but the API could not
+                      fetch Gamma/CLOB details (often a brief upstream blip). Retrying automatically — or tap Retry.
+                    </p>
+                    {apiHealth.includes('Gamma unreachable') ? (
+                      <p className="mt-2 text-[12px] text-amber-200/70">
+                        Header shows Gamma unreachable — check the API terminal and your network, then retry.
+                      </p>
+                    ) : null}
+                    <button
+                      type="button"
+                      onClick={() => void loadMarket(selectedSlug.trim())}
+                      className="mt-3 rounded-xl border border-amber-600/50 bg-amber-950/40 px-4 py-2 text-xs font-semibold text-amber-50 hover:bg-amber-950/55"
+                    >
+                      Retry load
+                    </button>
+                  </div>
+                ) : null}
+                {selectedSlug.trim() && ssrPriceToBeat == null && ptbError ? (
+                  <div className="mb-4 rounded-2xl border border-amber-800/40 bg-amber-950/20 px-4 py-4 text-sm leading-relaxed text-amber-100/90">
+                    <p className="font-semibold text-amber-50">Price-to-beat (PTB) not loaded yet</p>
+                    <p className="mt-2 text-amber-100/75">
+                      The yellow PTB line and spot-vs-bell signals need SSR or Chainlink bucket price from the API.
+                      Retrying every few seconds — chart may show a placeholder scale until PTB arrives.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const slug = selectedSlug.trim();
+                        if (!slug) return;
+                        void priceToBeat(slug).then((ptb) => {
+                          if (!isOk(ptb)) {
+                            setPtbError(pretty(ptb));
+                            return;
+                          }
+                          setSsrPriceToBeat(ptb.data.price_to_beat);
+                          setSsrPtbSource(ptb.data.source);
+                          setPtbError(null);
+                        });
+                      }}
+                      className="mt-3 rounded-xl border border-amber-600/50 bg-amber-950/40 px-4 py-2 text-xs font-semibold text-amber-50 hover:bg-amber-950/55"
+                    >
+                      Retry PTB
+                    </button>
+                  </div>
+                ) : null}
                 <SignalsPtbOnly
+                  key={selectedSlug ?? ''}
+                  slug={selectedSlug}
                   market={marketJson}
                   books={books}
                   outcomeLabels={outcomeLabels}
                   priceToBeat={ssrPriceToBeat}
                   spot={spotSeriesBySlug[selectedSlug] ?? []}
-                  spotLastUpdateMs={rtdsTickAt}
+                  spotLastUpdateMs={signalsSpotFeedLastMs}
                   probUp={signalsProbMids.up}
                   probDown={signalsProbMids.down}
-                  probLastUpdateMs={booksFetchedAt}
+                  probLastUpdateMs={signalsProbFeedLastMs}
                   flowSeriesForSlug={flowSeriesBySlug[selectedSlug] ?? null}
                   endsInMs={marketEndsInMs}
                   booksFetchedAt={booksFetchedAt}
-                  spotStreamEligible={updownParsed != null}
-                  booksWsStatus={booksWsStatus}
-                  ptbError={ptbError}
-                  rtdsError={rtdsError}
+                  spotStreamEligible={isUpdownDeskMarket(selectedSlug, updownSlugHints)}
                   ptbSource={ssrPtbSource}
                   spotFeedSource={rtdsSpotFeedSource}
+                  onOpenTradeHistory={() => setMainTab('tradehistory')}
+                  tradePanelSlug={effectiveTradeContext.slug}
+                  tradePanelLane={globalTradeLane}
+                  tradePanelPinned={globalTradeLocked}
                 />
                 <p className="mt-3 text-center text-[11px] text-zinc-600">
                   Book tab: order flow, ladders, and above/below context. Assistant tab: chat + digest.
@@ -2487,248 +2868,52 @@ function App() {
             ) : null}
 
             {mainTab === 'tracking' ? (
-              <TrackingTab upToken={effectiveTradeContext.upToken} downToken={effectiveTradeContext.downToken} />
+              binanceSpotActive ? (
+                <div className="mt-5 rounded-2xl border border-zinc-800/50 bg-zinc-950/35 p-5 text-sm leading-relaxed text-zinc-400">
+                  <span className="font-semibold text-zinc-200">Tracking</span> is for Polymarket positions and open orders. Exit the Binance spot workspace (Book → Exit spot market, or load a Polymarket slug) to use Tracking for your event.
+                </div>
+              ) : (
+                <Suspense fallback={tabSuspenseFallback}>
+                <TrackingTab
+                  upToken={effectiveTradeContext.upToken}
+                  downToken={effectiveTradeContext.downToken}
+                  conditionId={trackingConditionId}
+                  upLabel={effectiveTradeContext.upLabel}
+                  downLabel={effectiveTradeContext.downLabel}
+                  slug={effectiveTradeContext.slug}
+                  upMid01={tradePanelBookMids.up}
+                  downMid01={tradePanelBookMids.down}
+                  onOpenTradeHistory={() => setMainTab('tradehistory')}
+                  onOpenSignals={() => setMainTab('signals')}
+                />
+                </Suspense>
+              )
             ) : null}
 
             {mainTab === 'tradehistory' ? (
               <div className="mt-5">
-                <TradeHistoryTab />
+                <Suspense fallback={tabSuspenseFallback}>
+                  <TradeHistoryTab />
+                </Suspense>
               </div>
             ) : null}
 
             {mainTab === 'multiscan' ? (
               <div className="mt-5">
+                <Suspense fallback={tabSuspenseFallback}>
                 <PtbMultiAssetGrid
                   rows={multiScanRows}
                   onOpenSlug={(slug) => {
                     void loadMarket(slug);
-                    setMainTab('dualptb');
+                    setMainTab('signals');
                   }}
-                  onAddMarkets={() => setMainTab('watch')}
-                />
-              </div>
-            ) : null}
-
-            {mainTab === 'threeup' ? (
-              <div className="mt-5">
-                <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-                  <div className="text-sm font-semibold text-zinc-200">BTC / ETH / SOL · spot vs PTB</div>
-                  <div className="flex gap-1 rounded-xl border border-zinc-800/60 bg-black/20 p-1">
-                    <button
-                      type="button"
-                      onClick={() => setThreeUpInterval('5m')}
-                      className={`rounded-lg px-3 py-1.5 text-[12px] font-semibold ${
-                        threeUpInterval === '5m' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
-                      }`}
-                    >
-                      5m
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setThreeUpInterval('15m')}
-                      className={`rounded-lg px-3 py-1.5 text-[12px] font-semibold ${
-                        threeUpInterval === '15m' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
-                      }`}
-                    >
-                      15m
-                    </button>
-                  </div>
-                </div>
-                <PtbThreeUp
-                  rows={[
-                    {
-                      label: 'BTC/USD',
-                      spot: spotBySymbol['btc/usd'] ?? [],
-                      ptb: threeUpMeta.btc?.ptb ?? null,
-                      endsInMs: threeUpMeta.btc?.endsInMs ?? null,
-                      lastUpdateMs: (spotBySymbol['btc/usd'] ?? []).slice(-1)[0]?.t ?? null,
-                    },
-                    {
-                      label: 'ETH/USD',
-                      spot: spotBySymbol['eth/usd'] ?? [],
-                      ptb: threeUpMeta.eth?.ptb ?? null,
-                      endsInMs: threeUpMeta.eth?.endsInMs ?? null,
-                      lastUpdateMs: (spotBySymbol['eth/usd'] ?? []).slice(-1)[0]?.t ?? null,
-                    },
-                    {
-                      label: 'SOL/USD',
-                      spot: spotBySymbol['sol/usd'] ?? [],
-                      ptb: threeUpMeta.sol?.ptb ?? null,
-                      endsInMs: threeUpMeta.sol?.endsInMs ?? null,
-                      lastUpdateMs: (spotBySymbol['sol/usd'] ?? []).slice(-1)[0]?.t ?? null,
-                    },
-                  ]}
-                />
-              </div>
-            ) : null}
-
-            {mainTab === 'command' ? (
-              <div className="mt-5 space-y-3">
-                <SmartMoneyPaperPanel />
-                <MultiMarketCommandView
-                  intervalLabel={threeUpInterval}
-                  rows={
-                    [
-                      {
-                        key: 'btc',
-                        label: `BTC ${threeUpInterval}`,
-                        slug: _threeUpSlugs.btc ?? '',
-                        spot: spotBySymbol['btc/usd'] ?? [],
-                        ptb: threeUpMeta.btc?.ptb ?? null,
-                        endsInMs: threeUpMeta.btc?.endsInMs ?? null,
-                        lastUpdateMs: (spotBySymbol['btc/usd'] ?? []).slice(-1)[0]?.t ?? null,
-                      },
-                      {
-                        key: 'eth',
-                        label: `ETH ${threeUpInterval}`,
-                        slug: _threeUpSlugs.eth ?? '',
-                        spot: spotBySymbol['eth/usd'] ?? [],
-                        ptb: threeUpMeta.eth?.ptb ?? null,
-                        endsInMs: threeUpMeta.eth?.endsInMs ?? null,
-                        lastUpdateMs: (spotBySymbol['eth/usd'] ?? []).slice(-1)[0]?.t ?? null,
-                      },
-                      {
-                        key: 'sol',
-                        label: `SOL ${threeUpInterval}`,
-                        slug: _threeUpSlugs.sol ?? '',
-                        spot: spotBySymbol['sol/usd'] ?? [],
-                        ptb: threeUpMeta.sol?.ptb ?? null,
-                        endsInMs: threeUpMeta.sol?.endsInMs ?? null,
-                        lastUpdateMs: (spotBySymbol['sol/usd'] ?? []).slice(-1)[0]?.t ?? null,
-                      },
-                      {
-                        key: 'matic',
-                        label: `MATIC ${threeUpInterval}`,
-                        slug: '',
-                        spot: [],
-                        ptb: null,
-                        endsInMs: null,
-                        lastUpdateMs: null,
-                        disabled: true,
-                      },
-                      {
-                        key: 'alt',
-                        label: `ALT ${threeUpInterval}`,
-                        slug: '',
-                        spot: [],
-                        ptb: null,
-                        endsInMs: null,
-                        lastUpdateMs: null,
-                        disabled: true,
-                      },
-                    ] as MultiMarketRow[]
-                  }
-                  selectedKey={commandSelected}
-                  onSelectKey={setCommandSelected}
-                  onFocusMarket={(slug) => {
-                    if (!slug) return;
-                    void loadMarket(slug);
-                    setMainTab('dualptb');
-                  }}
-                  onOpenTradeDock={({ slug, lane }) => {
-                    if (slug) void loadMarket(slug);
-                    // Let the panel auto-bind to the currently loaded market unless user locks manually.
-                    setGlobalTradeLocked(false);
-                    setGlobalTradeLane(lane);
-                    setTradePanelOpen(true);
+                  onAddMarkets={() => {
+                    const s = selectedSlug.trim();
+                    if (!s) return;
+                    setPtbWatchSlugs((prev) => (prev.includes(s) ? prev : [...prev, s].slice(-12)));
                   }}
                 />
-              </div>
-            ) : null}
-
-            {mainTab === 'unified' ? (
-              <div className="mt-5">
-                <UnifiedPtbView
-                  market={marketJson}
-                  books={books}
-                  outcomeLabels={outcomeLabels}
-                  priceToBeat={ssrPriceToBeat}
-                  spot={spotSeriesBySlug[selectedSlug] ?? []}
-                  spotLastUpdateMs={rtdsTickAt}
-                  probUp={signalsProbMids.up}
-                  probDown={signalsProbMids.down}
-                  probLastUpdateMs={booksFetchedAt}
-                  flowSeriesForSlug={flowSeriesBySlug[selectedSlug] ?? null}
-                  booksFetchedAt={booksFetchedAt}
-                  endsInMs={marketEndsInMs}
-                  spotStreamEligible={updownParsed != null}
-                  uiVariant={updownParsed != null ? 'polymarket' : 'default'}
-                  ptbSource={ssrPtbSource}
-                  spotFeedSource={rtdsSpotFeedSource}
-                  rightPanel={
-                    effectiveTradeEnabled ? (
-                      updownParsed != null ? (
-                        <PolySimulatorTradePanel
-                          upLabel={effectiveTradeContext.upLabel}
-                          downLabel={effectiveTradeContext.downLabel}
-                          upMid={signalsProbMids.up.length ? (signalsProbMids.up[signalsProbMids.up.length - 1]!.v ?? null) : null}
-                          downMid={signalsProbMids.down.length ? (signalsProbMids.down[signalsProbMids.down.length - 1]!.v ?? null) : null}
-                        />
-                      ) : (
-                        <div className="rounded-[28px] border border-zinc-800/70 bg-[#0d1219] p-4 shadow-[0_18px_60px_rgba(0,0,0,0.25)] ring-1 ring-white/[0.03]">
-                          <div className="flex items-center justify-between gap-3 border-b border-zinc-800/50 pb-3">
-                            <div className="min-w-0">
-                              <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Trade</div>
-                              <div className="truncate text-[13px] font-semibold text-zinc-100">
-                                {effectiveTradeContext.question || effectiveTradeContext.slug || 'Market'}
-                              </div>
-                            </div>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setTradePanelOpen(true);
-                              }}
-                              className="shrink-0 rounded-xl border border-zinc-700/60 bg-black/20 px-3 py-1.5 text-[11px] font-semibold text-zinc-200 hover:bg-black/30"
-                              title="Open full trade dock"
-                            >
-                              Dock
-                            </button>
-                          </div>
-
-                          <div className="mt-3">
-                            <SignalsTradePanel
-                              marketSlug={effectiveTradeContext.slug}
-                              marketQuestion={effectiveTradeContext.question}
-                              upLabel={effectiveTradeContext.upLabel}
-                              downLabel={effectiveTradeContext.downLabel}
-                              upToken={effectiveTradeContext.upToken}
-                              downToken={effectiveTradeContext.downToken}
-                              upMid={signalsProbMids.up.length ? (signalsProbMids.up[signalsProbMids.up.length - 1]!.v ?? null) : null}
-                              downMid={signalsProbMids.down.length ? (signalsProbMids.down[signalsProbMids.down.length - 1]!.v ?? null) : null}
-                              bookMidUp={tradePanelBookMids.up}
-                              bookMidDown={tradePanelBookMids.down}
-                              bookTouchUp={tradePanelBookTouch.up}
-                              bookTouchDown={tradePanelBookTouch.down}
-                              bookUp={books && globalUpDown ? books[globalUpDown.up]?.book ?? null : null}
-                              bookDown={books && globalUpDown ? books[globalUpDown.down]?.book ?? null : null}
-                              lane={globalTradeLane}
-                              onLaneChange={onGlobalTradeLaneChange}
-                              visualStyle="sidebar"
-                            />
-                          </div>
-                        </div>
-                      )
-                    ) : null
-                  }
-                />
-              </div>
-            ) : null}
-
-            {mainTab === 'dualptb' ? (
-              <div className="mt-5">
-                <DualPtbReferenceTab
-                  market={marketJson}
-                  books={books}
-                  outcomeLabels={outcomeLabels}
-                  priceToBeat={ssrPriceToBeat}
-                  spot={spotSeriesBySlug[selectedSlug] ?? []}
-                  spotLastUpdateMs={rtdsTickAt}
-                  probUp={signalsProbMids.up}
-                  probDown={signalsProbMids.down}
-                  probLastUpdateMs={booksFetchedAt}
-                  endsInMs={marketEndsInMs}
-                  spotStreamEligible={updownParsed != null}
-                />
+                </Suspense>
               </div>
             ) : null}
 
@@ -2808,27 +2993,6 @@ function App() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setMainTab('dualptb')}
-                  className="rounded-xl border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
-                >
-                  Dual PTB
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setMainTab('momentum')}
-                  className="rounded-xl border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
-                >
-                  +4¢ scalps
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setMainTab('watch')}
-                  className="rounded-xl border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
-                >
-                  PTB Watch
-                </button>
-                <button
-                  type="button"
                   onClick={() => setMainTab('assistant')}
                   className="rounded-xl border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
                 >
@@ -2896,12 +3060,23 @@ function App() {
               <SignalsTradePanel
                 marketSlug={effectiveTradeContext.slug}
                 marketQuestion={effectiveTradeContext.question}
+                gammaMarket={marketJson}
+                probMomentumUp={signalsProbMids.up}
+                probMomentumDown={signalsProbMids.down}
                 upLabel={effectiveTradeContext.upLabel}
                 downLabel={effectiveTradeContext.downLabel}
                 upToken={effectiveTradeContext.upToken}
                 downToken={effectiveTradeContext.downToken}
-                upMid={signalsProbMids.up.length ? (signalsProbMids.up[signalsProbMids.up.length - 1]!.v ?? null) : null}
-                downMid={signalsProbMids.down.length ? (signalsProbMids.down[signalsProbMids.down.length - 1]!.v ?? null) : null}
+                upMid={
+                  signalsProbMids.up.length
+                    ? (signalsProbMids.up[signalsProbMids.up.length - 1]!.v ?? null)
+                    : tradePanelBookMids.up
+                }
+                downMid={
+                  signalsProbMids.down.length
+                    ? (signalsProbMids.down[signalsProbMids.down.length - 1]!.v ?? null)
+                    : tradePanelBookMids.down
+                }
                 bookMidUp={tradePanelBookMids.up}
                 bookMidDown={tradePanelBookMids.down}
                 bookTouchUp={tradePanelBookTouch.up}
@@ -2935,20 +3110,23 @@ function App() {
           </div>
         </TradeSlidePanel>
 
-        <PositionsCommandPanel
-          open={positionsPanelOpen}
-          onClose={() => setPositionsPanelOpen(false)}
-          selectedSlug={selectedSlug}
-          booksFetchedAt={booksFetchedAt}
-          onNavigate={(slug, lane) => {
-            void loadMarket(slug);
-            setGlobalTradeLane(lane);
-            setMainTab('dualptb');
-          }}
-        />
+        {positionsPanelOpen ? (
+          <Suspense fallback={null}>
+            <PositionsCommandPanel
+              open={positionsPanelOpen}
+              onClose={() => setPositionsPanelOpen(false)}
+              selectedSlug={selectedSlug}
+              booksFetchedAt={booksFetchedAt}
+              onNavigate={(slug, lane) => {
+                void loadMarket(slug);
+                setGlobalTradeLane(lane);
+                setMainTab('signals');
+              }}
+            />
+          </Suspense>
+        ) : null}
       </div>
       </div>
-    </Suspense>
   );
 }
 

@@ -670,7 +670,7 @@ export function buildUpScalpVerdict(params: {
     headline = `Spread ${spreadC != null ? spreadC.toFixed(1) : '—'}¢ vs max ${settings.maxSpreadCents}¢ — AVOID.`;
   } else if (weakFollow) {
     state = 'AVOID';
-    headline = 'Weak follow-through — stand down.';
+    headline = 'Weak follow-through — wait.';
   } else {
     const anyFail = rows.some((r) => r.status === 'fail');
     const anyWarn = rows.some((r) => r.status === 'warn') || confLow;

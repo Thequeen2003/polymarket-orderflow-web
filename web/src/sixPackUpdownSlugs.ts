@@ -21,12 +21,23 @@ function titledHourlyOrDailyStepSec(slug: string): 3600 | 86400 | null {
   return null;
 }
 
-function titledShortcutAsset(slug: string): UpdownShortcutAsset | null {
+export function titledUpdownAssetFromSlug(slug: string): UpdownShortcutAsset | null {
   const s = slug.trim().toLowerCase();
   if (s.startsWith('bitcoin-')) return 'btc';
   if (s.startsWith('ethereum-')) return 'eth';
   if (s.startsWith('solana-')) return 'sol';
+  if (s.startsWith('hyperliquid-') || s.startsWith('hype-')) return 'hype';
   return null;
+}
+
+/** True when slug is canonical `*-updown-1h-*` or Polymarket titled hourly/daily Up/Down. */
+export function isUpdownDeskMarket(
+  slug: string | null | undefined,
+  hints?: Readonly<Record<string, UpdownSlugHint>> | null,
+): boolean {
+  if (slug == null || !slug.trim()) return false;
+  if (parseUpdownSlugWithHints(slug, hints)) return true;
+  return titledHourlyOrDailyStepSec(slug) != null;
 }
 
 /**
@@ -35,7 +46,7 @@ function titledShortcutAsset(slug: string): UpdownShortcutAsset | null {
  */
 export function inferUpdownHintFromMarketJson(slug: string, market: Record<string, unknown>): UpdownSlugHint | null {
   const stepSec = titledHourlyOrDailyStepSec(slug);
-  const asset = titledShortcutAsset(slug);
+  const asset = titledUpdownAssetFromSlug(slug);
   if (!stepSec || !asset) return null;
   const endRaw = market.endDate ?? market.end_date;
   if (typeof endRaw !== 'string') return null;
@@ -77,15 +88,33 @@ export function nextUpdownSlug(slug: string, dir: -1 | 1): string | null {
 }
 
 /**
- * Map live shortcut slug → slug the app trades with:
- * 15m uses the live (current) window; 5m uses the **prior** bucket (same as App Command).
+ * Map live shortcut slug → slug the app trades with (client-only fallback).
+ * Prefer `trading_slug` from `/api/markets/updown-shortcut` — it checks the prior 5m book on the server.
  */
 export function tradingSlugFromLiveShortcut(liveSlug: string, interval: UpdownInterval): string {
   if (interval !== '5m') return liveSlug;
   return nextUpdownSlug(liveSlug, -1) ?? liveSlug;
 }
 
-export type SixPackKey = 'btc-5m' | 'btc-15m' | 'eth-5m' | 'eth-15m' | 'sol-5m' | 'sol-15m';
+/** Desk slug to open after shortcut API (server picks prior 5m only when CLOB book is live). */
+export function slugFromUpdownShortcutResponse(
+  data: { slug: string; trading_slug?: string },
+  interval: UpdownInterval,
+): string {
+  const fromApi = data.trading_slug?.trim();
+  if (fromApi) return fromApi;
+  return tradingSlugFromLiveShortcut(data.slug, interval);
+}
+
+export type SixPackKey =
+  | 'btc-5m'
+  | 'btc-15m'
+  | 'eth-5m'
+  | 'eth-15m'
+  | 'sol-5m'
+  | 'sol-15m'
+  | 'hype-5m'
+  | 'hype-15m';
 
 export const SIX_PACK_ROWS: readonly { key: SixPackKey; asset: UpdownShortcutAsset; interval: UpdownInterval }[] = [
   { key: 'btc-5m', asset: 'btc', interval: '5m' },
@@ -94,6 +123,8 @@ export const SIX_PACK_ROWS: readonly { key: SixPackKey; asset: UpdownShortcutAss
   { key: 'eth-15m', asset: 'eth', interval: '15m' },
   { key: 'sol-5m', asset: 'sol', interval: '5m' },
   { key: 'sol-15m', asset: 'sol', interval: '15m' },
+  { key: 'hype-5m', asset: 'hype', interval: '5m' },
+  { key: 'hype-15m', asset: 'hype', interval: '15m' },
 ] as const;
 
 export function labelForSixPackKey(key: SixPackKey): string {

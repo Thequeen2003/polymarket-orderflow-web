@@ -100,8 +100,8 @@ export function SpotLevelChart({
     const id = window.setInterval(() => setNow(Date.now()), 1_000);
     return () => window.clearInterval(id);
   }, []);
-  const stale = lastUpdateMs == null ? true : now - lastUpdateMs > 10_000;
-  const flowStale = bookFlowAtMs == null ? true : now - bookFlowAtMs > 20_000;
+  const stale = lastUpdateMs == null ? true : now - lastUpdateMs > 30_000;
+  const flowStale = bookFlowAtMs == null ? true : now - bookFlowAtMs > 45_000;
 
   const width = 580;
   const height = 248;

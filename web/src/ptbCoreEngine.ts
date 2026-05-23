@@ -34,6 +34,9 @@ export type PtbCoreEngineInput = {
   /** Fixed price-to-beat for this market round (USD). */
   ptbUsd: number;
   bookFlow?: BookSnapshot[];
+  /** Optional CLOB mids — refine control blurbs when one leg is already priced near certainty. */
+  lastProbUp?: number | null;
+  lastProbDown?: number | null;
 };
 
 export type PtbDerivedMetrics = {
@@ -207,6 +210,8 @@ export function runPtbCoreEngine(input: PtbCoreEngineInput): PtbCoreEngineSnapsh
     dwellAtMs: dwell.atMs,
     distanceUsd,
     slopeUsdPerSec: slope.slopeUsdPerSec,
+    lastProbUp: input.lastProbUp,
+    lastProbDown: input.lastProbDown,
   });
 
   return {

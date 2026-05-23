@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   inferUpdownHintFromMarketJson,
+  isUpdownDeskMarket,
   nextUpdownSlug,
   parseUpdownSlug,
   parseUpdownSlugWithHints,
+  slugFromUpdownShortcutResponse,
   tradingSlugFromLiveShortcut,
 } from './sixPackUpdownSlugs';
 
@@ -35,12 +37,25 @@ describe('sixPackUpdownSlugs', () => {
     expect(tradingSlugFromLiveShortcut(live, '5m')).toBe('btc-updown-5m-0');
   });
 
+  it('prefers API trading_slug over client prior-bucket guess', () => {
+    const live = 'btc-updown-5m-1778940000';
+    expect(slugFromUpdownShortcutResponse({ slug: live, trading_slug: live }, '5m')).toBe(live);
+    expect(slugFromUpdownShortcutResponse({ slug: live, trading_slug: 'btc-updown-5m-1778939700' }, '5m')).toBe(
+      'btc-updown-5m-1778939700',
+    );
+  });
+
   it('infers hourly bucket from titled slug + endDate', () => {
     const slug = 'bitcoin-up-or-down-april-27-2026-5pm-et';
     const hint = inferUpdownHintFromMarketJson(slug, { endDate: '2026-04-27T22:00:00.000Z' });
     expect(hint?.asset).toBe('btc');
     expect(hint?.interval).toBe('1h');
     expect(hint?.bucketStartSec).toBe(Math.floor(Date.parse('2026-04-27T22:00:00.000Z') / 1000) - 3600);
+  });
+
+  it('isUpdownDeskMarket accepts titled hourly slugs', () => {
+    expect(isUpdownDeskMarket('bitcoin-up-or-down-may-16-2026-4pm-et')).toBe(true);
+    expect(isUpdownDeskMarket('random-market-slug')).toBe(false);
   });
 
   it('parseUpdownSlugWithHints restores parse for titled slugs', () => {

@@ -1,0 +1,2 @@
+# Polymarket CLOB v2 Python client — same REST as @polymarket/clob-client-v2 / https://github.com/Polymarket/py-clob-client-v2
+git+https://github.com/Polymarket/py-clob-client-v2.git

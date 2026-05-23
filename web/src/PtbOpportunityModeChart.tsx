@@ -1,4 +1,10 @@
-import { memo, useEffect, useId, useMemo, useRef, useState, type ReactElement } from 'react';
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, type PointerEvent, type ReactElement } from 'react';
+import {
+  BPX_BRACKET_DRAG_EVENT,
+  BPX_BRACKET_OVERLAY_EVENT,
+  type BpxBracketDragDetail,
+  type BpxBracketOverlayDetail,
+} from './bpxBracketOverlayEvent';
 import type { SpotPoint } from './SpotLevelChart';
 import type { BookSnapshot } from './orderflowMetrics';
 import { computePtbChartDerivatives, type PtbControlSignal } from './ptbChartDerivatives';
@@ -7,6 +13,66 @@ import { PTB_REACTION_DIMENSIONS, PTB_REACTION_ONE_LINER } from './ptbReactionFr
 import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
 import { buildSpotCandles, candleStraddlesPtb, ptbTouchEpsilonUsd } from './spotVsPtb';
 import { computeTickSlopeUsdPerSec } from './ptbCoreEngine';
+import {
+  buildSpotSections,
+  forecastMomentumSwitch,
+  pickSectionPlan,
+  type SpotSection,
+  type SwitchForecast,
+} from './sectionalMomentum';
+import {
+  PTB_CROSS_IMMINENT_EVENT,
+  SECTIONAL_BOOM_EVENT,
+  SECTIONAL_DECISION_EVENT,
+  type PtbCrossImminentDetail,
+  type SectionalBoomDetail,
+  type SectionalDecisionDetail,
+} from './sectionalDecisionEvent';
+import type { DualOutcomeWallFlow } from './dualOutcomeWalls';
+import { computeSpotPtbMachineReadout, type SpotPtbMachineReadout } from './spotPtbMachineSignals';
+import { computeSpotBandGaugeSnapshot, type SpotBandGaugeSnapshot } from './spotBandDeskAction';
+import {
+  estimateEndingProbability,
+  estimatePtbCrossProbability,
+  type EndingProbability,
+  type PtbCrossEstimate,
+} from './ptbCrossProbability';
+import { detectMomentumAcceleration, type MomentumAcceleration } from './momentumAcceleration';
+import { buildTradeDirective, type TradeDirective } from './tradeDirective';
+import { buildOperatorVerdict, type OperatorVerdict } from './operatorVerdict';
+import { TradeDirectiveCard } from './TradeDirectiveCard';
+import { BoomOverlay } from './BoomOverlay';
+import { SignalTruthStrip } from './SignalTruthStrip';
+import { buildMtfConsensus, type MtfConsensus } from './multiTimeframeConsensus';
+import { detectOverextension, type Overextension } from './overextensionDetector';
+import { computeLaneEdges, type LaneEdges } from './tradeEdgeCalculator';
+import { suggestLevelsForLane, resolveTradeLevelsForDirective, type TradeLevels } from './tradeLevels';
+import { updateStability, type DirectiveStability } from './directiveStability';
+import { clearTrackedPointerCapture, trackPointerCapture } from './pointerCaptureSafety';
+import { detectDirectiveDiscrepancy, type DirectiveDiscrepancy } from './directiveDiscrepancyGuard';
+import {
+  updateReEntryState,
+  checkReEntry,
+  type ReEntryState,
+  type ReEntryGuardCheck,
+} from './reEntryGuard';
+import { computeSizingMultiplier, type SizingMultiplier } from './directiveSizingMultiplier';
+import {
+  appendDirectiveToJournal,
+  resetJournal,
+  type DirectiveJournal,
+} from './directiveJournal';
+import { computeTapeVelocity, type TapePrint, type TapeVelocity } from './tapeVelocity';
+import { computeNoTradeScore, type NoTradeScore } from './noTradeScore';
+import { useFeatureFlags } from './useFeatureFlags';
+import { setFeatureFlag } from './featureFlags';
+import { useKeyboardShortcuts, SHORTCUT_HELP } from './useKeyboardShortcuts';
+import { playBoomChime, primeBoomChime } from './boomChime';
+import { downloadJournalCsv } from './directiveJournal';
+import { RoundNote } from './RoundNote';
+import { classifyExitReason, updateReEntryStateWithReason } from './reEntryGuard';
+import { SpotPriceProjectionGrid } from './SpotPriceProjectionGrid';
+import { parseUpdownSlug, titledUpdownAssetFromSlug } from './sixPackUpdownSlugs';
 
 type Mode = 'up' | 'down';
 type DominanceStatus = 'UP BIAS' | 'DOWN BIAS' | 'AT PTB';
@@ -73,8 +139,13 @@ function fmtPctSigned(n: number | null): string {
   return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
 }
 
-function fmtAxisPrice(p: number): string {
+function fmtAxisPrice(p: number, opts?: { precise?: boolean }): string {
   const a = Math.abs(p);
+  if (opts?.precise) {
+    // Wide zooms (1h / 4h): show full precision so a $40 move on $107k BTC is visible.
+    const digits = a >= 1_000 ? 2 : a >= 10 ? 3 : 4;
+    return `$${p.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
+  }
   if (a >= 1_000_000) return `$${(p / 1_000_000).toFixed(2)}M`;
   if (a >= 1_000) return `$${(p / 1_000).toFixed(2)}k`;
   return `$${p.toFixed(2)}`;
@@ -126,8 +197,9 @@ function statusFor(params: { price: number; level: number; band: number; recentM
   return 'AT PTB';
 }
 
-const W = 920;
-const H = 560;
+/** Base SVG size (USD plot); rendered size follows container min/max height below. */
+const W = 1040;
+const H = 680;
 
 /**
  * OHLC bucket count: scales with tick count but stays below ~1 bucket / 2 ticks
@@ -136,7 +208,8 @@ const H = 560;
 function candleBucketCount(ptsLen: number): number {
   if (ptsLen < 4) return Math.max(2, ptsLen - 1);
   const n = Math.floor(ptsLen * 0.22);
-  return Math.min(20, Math.max(8, n));
+  /** Fewer buckets → wider candles on the same window (readability on large chart). */
+  return Math.min(16, Math.max(8, n));
 }
 
 /** Evenly spaced time ticks (short windows get more labels, like Polymarket’s intraday strip). */
@@ -188,6 +261,139 @@ const PAD_L = 18;
 const PAD_R = 64;
 const PAD_Y = 18;
 
+/** Bottom strip height (probability ¢) below USD plot when trade bracket overlay applies. */
+const PROB_STRIP_H = 54;
+const PROB_STRIP_GAP = 6;
+
+function parseTradeBracketCents01(raw: string): number | null {
+  const n = Number(String(raw).trim());
+  if (!Number.isFinite(n) || n <= 0 || n >= 100) return null;
+  return n / 100;
+}
+
+/** Δ¢ and % vs avg entry (same convention as TradingView “vs avg price”). */
+function fmtProbPnlVsEntry(level01: number, entry01: number | null | undefined): string | null {
+  if (entry01 == null || !(entry01 > 0) || !(entry01 < 1) || !Number.isFinite(level01)) return null;
+  const d = level01 - entry01;
+  const dCents = d * 100;
+  const pct = (d / entry01) * 100;
+  const sc = dCents > 1e-6 ? '+' : dCents < -1e-6 ? '−' : '±';
+  const sp = pct > 1e-6 ? '+' : pct < -1e-6 ? '−' : '±';
+  return `${sc}${Math.abs(dCents).toFixed(1)}¢ ${sp}${Math.abs(pct).toFixed(1)}%`;
+}
+
+/**
+ * Band playbook: one “hot” card at a time — Confirm while in-band, then alternates
+ * Entry ↔ Exit when edge is live (read order: confirm → work entry → watch exit).
+ */
+function SpotBandPlayCardRow(props: {
+  inBand: boolean;
+  edgeOk: boolean;
+  confirmBody: string;
+  entryLineFmt: string;
+  stopBand: string;
+  tpLine: string;
+  reclaimFmt: string;
+  slope: number | null;
+}): ReactElement {
+  const { inBand, edgeOk, confirmBody, entryLineFmt, stopBand, tpLine, reclaimFmt, slope } = props;
+  const [pulseTick, setPulseTick] = useState(0);
+  useEffect(() => {
+    setPulseTick(0);
+  }, [inBand, edgeOk]);
+  useEffect(() => {
+    if (inBand || !edgeOk) return;
+    const id = window.setInterval(() => setPulseTick((n) => n + 1), 3600);
+    return () => window.clearInterval(id);
+  }, [inBand, edgeOk]);
+
+  const pulseConfirm = inBand;
+  const pulseEntry = edgeOk && !inBand && pulseTick % 2 === 0;
+  const pulseExit = edgeOk && !inBand && pulseTick % 2 === 1;
+
+  const dim = (lit: boolean) => ((inBand || edgeOk) && !lit ? 'opacity-[0.62]' : '');
+  const hot = 'motion-safe:animate-pulse motion-reduce:animate-none ring-2 ring-offset-2 ring-offset-zinc-950 scale-[1.02] z-[1] shadow-lg transition-shadow duration-300';
+
+  return (
+    <div className="mt-3 grid grid-cols-2 gap-2 lg:grid-cols-4">
+      <div
+        className={`rounded-xl border-l-4 px-3 py-2.5 border-y border-r border-zinc-800/60 ${
+          inBand ? 'border-amber-400 bg-amber-950/20' : edgeOk ? 'border-cyan-400 bg-cyan-950/15' : 'border-zinc-600 bg-black/25'
+        } ${pulseConfirm ? `${hot} ring-amber-300/60` : ''} ${dim(pulseConfirm)}`}
+      >
+        <div className="flex items-center justify-between gap-1">
+          <div className="text-[9px] font-black uppercase tracking-[0.18em] text-cyan-200/90">Confirm</div>
+          {inBand ? (
+            <span className="shrink-0 rounded bg-amber-500/25 px-1.5 py-px text-[8px] font-black uppercase tracking-wide text-amber-100">
+              Guide
+            </span>
+          ) : null}
+        </div>
+        <p className="mt-1 text-[11px] font-semibold leading-snug text-zinc-100">{confirmBody}</p>
+      </div>
+      <div
+        className={`rounded-xl border-l-4 px-3 py-2.5 border-y border-r border-zinc-800/60 ${
+          edgeOk ? 'border-emerald-400 bg-emerald-950/15' : 'border-zinc-600 bg-black/20'
+        } ${pulseEntry ? `${hot} ring-emerald-300/55` : ''} ${dim(pulseEntry)}`}
+      >
+        <div className="flex items-center justify-between gap-1">
+          <div className="text-[9px] font-black uppercase tracking-[0.18em] text-emerald-200/90">Entry</div>
+          {edgeOk && !inBand ? (
+            <span className="shrink-0 rounded bg-emerald-500/20 px-1.5 py-px text-[8px] font-black uppercase tracking-wide text-emerald-100">
+              Guide
+            </span>
+          ) : null}
+        </div>
+        {inBand ? (
+          <p className="mt-1 text-[11px] font-semibold leading-snug text-zinc-100">
+            In band — use ABOVE / BELOW break levels in Confirm; entries are timing-only.
+          </p>
+        ) : edgeOk ? (
+          <p className="mt-1 text-[11px] font-semibold leading-snug text-zinc-100">
+            Pullback that <span className="text-emerald-200">stays outside</span> band (holds{' '}
+            <span className="font-mono text-emerald-100">{entryLineFmt}</span>).
+          </p>
+        ) : (
+          <p className="mt-1 text-[11px] font-semibold leading-snug text-zinc-400">No entry — not on this view&apos;s side.</p>
+        )}
+        <p className="mt-1 text-[10px] leading-snug text-zinc-500">
+          Stop: back into <span className="font-mono text-zinc-300">{stopBand}</span>
+        </p>
+      </div>
+      <div
+        className={`rounded-xl border-l-4 border-rose-400 bg-rose-950/10 px-3 py-2.5 border-y border-r border-zinc-800/60 ${
+          pulseExit ? `${hot} ring-rose-300/55` : ''
+        } ${dim(pulseExit)}`}
+      >
+        <div className="flex items-center justify-between gap-1">
+          <div className="text-[9px] font-black uppercase tracking-[0.18em] text-rose-200/90">Exit</div>
+          {edgeOk && !inBand ? (
+            <span className="shrink-0 rounded bg-rose-500/20 px-1.5 py-px text-[8px] font-black uppercase tracking-wide text-rose-100">
+              Guide
+            </span>
+          ) : null}
+        </div>
+        <p className="mt-1 text-[11px] font-semibold leading-snug text-zinc-100">
+          If price <span className="text-rose-200">re-enters</span> the band <span className="font-mono text-zinc-200">{stopBand}</span>
+          {slope != null ? ' or slope flips against you.' : '.'}
+        </p>
+        <p className="mt-1 text-[10px] leading-snug text-zinc-400">
+          Reclaim: lose <span className="font-mono text-zinc-200">{reclaimFmt}</span> = exit pressure
+        </p>
+      </div>
+      <div
+        className={`rounded-xl border-l-4 border-indigo-400 bg-indigo-950/15 px-3 py-2.5 border-y border-r border-zinc-800/60 ${
+          edgeOk && !inBand ? 'opacity-80' : ''
+        }`}
+      >
+        <div className="text-[9px] font-black uppercase tracking-[0.18em] text-indigo-200/90">TP / proj</div>
+        <p className="mt-1 font-mono text-[13px] font-bold text-indigo-50">30s → {tpLine}</p>
+        <p className="mt-1 text-[10px] leading-snug text-indigo-200/70">Linear proj from slope — not a guarantee.</p>
+      </div>
+    </div>
+  );
+}
+
 export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(props: {
   mode: Mode;
   spot: SpotPoint[];
@@ -207,6 +413,46 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
   ptbSource?: string | null;
   /** RTDS label for underlying spot stream (`rtdsCrypto` `source`). */
   spotFeedSource?: string | null;
+  /** When set with down outcome token, bracket overlay + draggable ¢ strip sync with the trade panel. */
+  upOutcomeToken?: string | null;
+  downOutcomeToken?: string | null;
+  /** Taller chart area, relaxed max height — Dual PTB tab avoids clipping the plot/strip inside the card. */
+  chartAreaRoomy?: boolean;
+  /** Signals Spot vs PTB: chart first (fills viewport), controls/meta below; plot scales much larger. */
+  signalsEmbed?: boolean;
+  onPrimaryCall?: (c: {
+    lane: 'up' | 'down' | null;
+    status: 'ENTER' | 'PREP' | 'WAIT';
+    confidence: 'HIGH' | 'MED' | 'LOW';
+    reason: string;
+    enterWhen: string | null;
+  }) => void;
+  /** Active market slug — used to tag the sectional decision toast event so listeners ignore stale slugs. */
+  slug?: string | null;
+  /** Fused machine readout (agreement %, regime, …) for parent tabs — Signals / Dual PTB verdict strip. */
+  onMachineReadout?: (readout: SpotPtbMachineReadout | null) => void;
+  /** Lane the user is currently long (for HOLD / FLIP / EXIT directive branches). `null` = flat. */
+  currentPositionLane?: 'up' | 'down' | null;
+  /** Top-level directive callback — fires on every recompute so toast/notify integrations can react. */
+  onTradeDirective?: (directive: TradeDirective | null) => void;
+  /** Parent (Signals) may subscribe to sectional switch state for exit strip / playbook. */
+  onSwitchForecast?: (sf: SwitchForecast | null) => void;
+  /**
+   * Recent prints (matched trades) for the active outcome — feeds the tape-velocity
+   * sensor + the No-Trade composite. Parent fetches via `recentTrades` and
+   * normalizes to `{ ts, side, size }`. Optional — chart degrades gracefully when null.
+   */
+  recentPrints?: TapePrint[] | null;
+  /** Which outcome token `recentPrints` are for (UP vs DOWN) — required for tape→lane vote. */
+  tapeLane?: 'up' | 'down' | null;
+  /** Parent (Signals) can mirror No-Trade composite for the single Answer card below the chart. */
+  onNoTradeScore?: (score: NoTradeScore | null) => void;
+  /** Bump to clear the embedded directive mini-journal without changing slug (Signals "Reset desk"). */
+  deskResetKey?: number;
+  /** Band gauge snapshot for parent “Do this now” strip (BELOW PTB / EDGE LIVE / Step 1–3). */
+  onBandGaugeSnapshot?: (snapshot: SpotBandGaugeSnapshot | null) => void;
+  /** UP + DOWN CLOB books — bid/ask wall read for machine + Do this now (parent passes both legs). */
+  wallFlow?: DualOutcomeWallFlow | null;
 }): ReactElement {
   const {
     mode,
@@ -222,35 +468,203 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
     downLabel = 'DOWN',
     ptbSource = null,
     spotFeedSource = null,
+    upOutcomeToken = null,
+    downOutcomeToken = null,
+    chartAreaRoomy = false,
+    signalsEmbed = false,
+    onPrimaryCall,
+    slug = null,
+    onMachineReadout,
+    currentPositionLane = null,
+    onTradeDirective,
+    onSwitchForecast,
+    recentPrints = null,
+    tapeLane = null,
+    onNoTradeScore,
+    deskResetKey = 0,
+    onBandGaugeSnapshot,
+    wallFlow = null,
   } = props;
+  const featureFlags = useFeatureFlags();
+  const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
+  const [pinnedNoteVisible, setPinnedNoteVisible] = useState<boolean>(featureFlags.pinnedNote);
+  useEffect(() => {
+    setPinnedNoteVisible(featureFlags.pinnedNote);
+  }, [featureFlags.pinnedNote]);
+  const reduceMotion =
+    featureFlags.respectReducedMotion && typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia('(prefers-reduced-motion: reduce)').matches
+      : false;
   // Hide legacy mini “rules” panels; the big Trade Plan card is the primary read.
   const showLegacyRulePanels = false;
+  const chartPanelWrapSk =
+    chartAreaRoomy
+      ? signalsEmbed
+        ? 'flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-visible px-2 pt-1 sm:px-3 sm:pt-2'
+        : 'min-h-0 flex-1 overflow-x-hidden overflow-y-visible px-3 pt-2 sm:px-4'
+      : 'min-h-0 flex-1 overflow-hidden px-3 pt-2 sm:px-4';
+  const chartPanelWrapMain =
+    chartAreaRoomy
+      ? signalsEmbed
+        ? 'flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-visible px-2 pt-1 sm:px-3 sm:pt-2'
+        : 'min-h-0 flex-1 overflow-x-hidden overflow-y-visible px-3 pt-2 sm:px-4'
+      : 'min-h-0 flex-1 overflow-hidden px-3 pt-2 sm:px-4 [contain:paint]';
+  /** Dual PTB only — tall plot + high cap so the PTB chart reads at “dashboard” scale, not a card thumbnail. */
+  const chartSvgSk =
+    chartAreaRoomy
+      ? signalsEmbed
+        ? 'block h-full min-h-[min(68svh,1500px)] w-full max-w-none flex-1 rounded-[24px] bg-[#0a0f16] [contain:paint] xl:min-h-[min(74svh,1700px)]'
+        : 'block h-full min-h-[min(78vh,940px)] max-h-[min(100dvh,1720px)] w-full rounded-[24px] bg-[#0a0f16] [contain:paint] xl:min-h-[min(82vh,1020px)] xl:max-h-[min(100dvh,1800px)]'
+      : 'block h-full min-h-[min(54vh,620px)] max-h-[min(88vh,960px)] w-full rounded-[24px] bg-[#0a0f16] [contain:paint]';
+  const chartSvgMain =
+    chartAreaRoomy
+      ? signalsEmbed
+        ? 'block h-full min-h-[min(68svh,1500px)] w-full max-w-none flex-1 rounded-[24px] bg-[#0a0f16] xl:min-h-[min(74svh,1700px)] [contain:strict]'
+        : 'block h-full min-h-[min(78vh,940px)] max-h-[min(100dvh,1720px)] w-full rounded-[24px] bg-[#0a0f16] xl:min-h-[min(82vh,1020px)] xl:max-h-[min(100dvh,1800px)]'
+      : 'block h-full min-h-[min(54vh,620px)] max-h-[min(88vh,960px)] w-full rounded-[24px] bg-[#0a0f16] [contain:strict]';
   const gradId = useId().replace(/:/g, '');
   const [displayMode, setDisplayMode] = useState<'line' | 'ohlc'>('line');
-  const [zoomWindow, setZoomWindow] = useState<60 | 120 | 300 | 900>(300);
+  type ZoomSec = 60 | 120 | 300 | 900 | 1800 | 3600 | 7200 | 14400;
+  const [zoomWindow, setZoomWindowState] = useState<ZoomSec>(300);
+  const userPickedZoomRef = useRef(false);
+  const setZoomWindow = useCallback((w: ZoomSec, fromUser = true) => {
+    if (fromUser) userPickedZoomRef.current = true;
+    setZoomWindowState(w);
+  }, []);
+  const ZOOM_OPTIONS: readonly { sec: ZoomSec; label: string }[] = [
+    { sec: 60, label: '1m' },
+    { sec: 120, label: '2m' },
+    { sec: 300, label: '5m' },
+    { sec: 900, label: '15m' },
+    { sec: 1800, label: '30m' },
+    { sec: 3600, label: '1h' },
+    { sec: 7200, label: '2h' },
+    { sec: 14400, label: '4h' },
+  ];
   type CrosshairState = { plotX: number; yOnPath: number; t: number; v: number; distPct: number };
   const [crosshair, setCrosshair] = useState<CrosshairState | null>(null);
+  const spotSvgRef = useRef<SVGSVGElement | null>(null);
+  const [bracketOverlay, setBracketOverlay] = useState<BpxBracketOverlayDetail | null>(null);
+  const dragStripRef = useRef<'sl' | 'tp' | 'ref' | null>(null);
   const didAuto15mZoom = useRef(false);
+
+  useEffect(() => {
+    const fn = (ev: Event) => {
+      const d = (ev as CustomEvent<BpxBracketOverlayDetail>).detail;
+      if (d && typeof d === 'object') setBracketOverlay(d);
+    };
+    window.addEventListener(BPX_BRACKET_OVERLAY_EVENT, fn as EventListener);
+    return () => window.removeEventListener(BPX_BRACKET_OVERLAY_EVENT, fn as EventListener);
+  }, []);
   useEffect(() => {
     if (didAuto15mZoom.current) return;
     if (endsInMs == null || !Number.isFinite(endsInMs)) return;
-    // Longer windows (e.g. 15m up/down) — default to a 15m strip once we know time remaining.
-    if (endsInMs > 7 * 60_000) {
-      setZoomWindow(900);
+    // Don't override if the user already changed zoom on this chart.
+    if (userPickedZoomRef.current) {
+      didAuto15mZoom.current = true;
+      return;
+    }
+    // Pick a default window proportional to the remaining round so a 1h market
+    // doesn't show only the last 15 of 60 minutes (and vice-versa for a 5m market).
+    const minMs = endsInMs;
+    let pick: ZoomSec | null = null;
+    if (minMs > 150 * 60_000) pick = 14400; // > 2.5h → 4h view
+    else if (minMs > 70 * 60_000) pick = 7200; // > 70m → 2h view
+    else if (minMs > 30 * 60_000) pick = 3600; // > 30m → 1h view
+    else if (minMs > 14 * 60_000) pick = 1800; // > 14m → 30m view
+    else if (minMs > 7 * 60_000) pick = 900; // > 7m → 15m view
+    if (pick != null) {
+      setZoomWindow(pick, false);
       didAuto15mZoom.current = true;
     }
-  }, [endsInMs]);
+  }, [endsInMs, setZoomWindow]);
 
+  // Only clear on changes that actually invalidate the hovered point
+  // (zoom, line/ohlc, or PTB anchor). `spot` is a fresh array reference on
+  // every poll, so listing it here used to blank the crosshair every tick.
   useEffect(() => {
     setCrosshair(null);
-  }, [zoomWindow, displayMode, spot, priceToBeat]);
+  }, [zoomWindow, displayMode, priceToBeat]);
+
+  const overlayAppliesSpot = useMemo(() => {
+    const u = upOutcomeToken?.trim() ?? '';
+    const d = downOutcomeToken?.trim() ?? '';
+    if (!bracketOverlay || !u || !d) return false;
+    return bracketOverlay.upToken?.trim() === u && bracketOverlay.downToken?.trim() === d;
+  }, [bracketOverlay, upOutcomeToken, downOutcomeToken]);
+
+  const chartInnerW = W - PAD_L - PAD_R;
+
+  const emitStripDrag = useCallback(
+    (kind: 'sl' | 'tp' | 'ref', clientX: number) => {
+      if (!overlayAppliesSpot || !bracketOverlay) return;
+      const svg = spotSvgRef.current;
+      if (!svg) return;
+      const loc = svgClientToLocal(svg, clientX, 0);
+      if (!loc) return;
+      const t = (loc.x - PAD_L) / chartInnerW;
+      const p = Math.max(0.001, Math.min(0.999, t));
+      const centsStr = (Math.round(p * 1000) / 10).toFixed(1);
+      const detail: BpxBracketDragDetail = {
+        kind,
+        centsStr,
+        tradeLane: bracketOverlay.tradeLane,
+        upToken: bracketOverlay.upToken,
+        downToken: bracketOverlay.downToken,
+      };
+      window.dispatchEvent(new CustomEvent(BPX_BRACKET_DRAG_EVENT, { detail }));
+    },
+    [overlayAppliesSpot, bracketOverlay],
+  );
+
+  const onStripPointerDown = useCallback(
+    (kind: 'sl' | 'tp' | 'ref', e: PointerEvent<SVGLineElement>) => {
+      if (!overlayAppliesSpot || !bracketOverlay) return;
+      const bsl = parseTradeBracketCents01(bracketOverlay.slStopCents);
+      const btp = parseTradeBracketCents01(bracketOverlay.tpTakeCents);
+      const brf = parseTradeBracketCents01(bracketOverlay.refCents);
+      if (kind === 'sl' && bsl == null) return;
+      if (kind === 'tp' && btp == null) return;
+      if (kind === 'ref' && brf == null) return;
+      e.preventDefault();
+      e.stopPropagation();
+      dragStripRef.current = kind;
+      const el = e.currentTarget as SVGElement;
+      el.setPointerCapture(e.pointerId);
+      trackPointerCapture(el, e.pointerId);
+      emitStripDrag(kind, e.clientX);
+    },
+    [overlayAppliesSpot, bracketOverlay, emitStripDrag],
+  );
+
+  const onStripPointerMove = useCallback(
+    (e: PointerEvent<SVGLineElement>) => {
+      const k = dragStripRef.current;
+      if (!k) return;
+      e.preventDefault();
+      emitStripDrag(k, e.clientX);
+    },
+    [emitStripDrag],
+  );
+
+  const onStripPointerUp = useCallback((e: PointerEvent<SVGLineElement>) => {
+    dragStripRef.current = null;
+    clearTrackedPointerCapture(e.currentTarget as SVGElement, e.pointerId);
+  }, []);
+
+  useEffect(() => () => {
+    dragStripRef.current = null;
+  }, []);
 
   const pts = useMemo(() => {
     const all = spot.filter((p) => isFiniteNumber(p.t) && isFiniteNumber(p.v));
     if (all.length < 2) return all;
     const cutoff = all[all.length - 1]!.t - zoomWindow * 1000;
     const windowed = all.filter((p) => p.t >= cutoff);
-    return windowed.length >= 2 ? windowed.slice(-280) : all.slice(-280);
+    // Wider zooms need more headroom (4h market at ~5s polling ≈ 2880 ticks → cap 2400 to match server).
+    const cap =
+      zoomWindow >= 7200 ? 2400 : zoomWindow >= 1800 ? 900 : zoomWindow >= 900 ? 480 : 280;
+    return windowed.length >= 2 ? windowed.slice(-cap) : all.slice(-cap);
   }, [spot, zoomWindow]);
   const tickMeta = useMemo(() => {
     const n = pts.length;
@@ -261,7 +675,13 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
     return { n, spanSec, sparse, zoomSec: zoomWindow };
   }, [pts, zoomWindow]);
   const meta = MODE_META[mode];
-  const stale = lastUpdateMs == null || Date.now() - lastUpdateMs > 12_000;
+  const spotLastPointMs = pts.length ? pts[pts.length - 1]!.t : null;
+  const feedLastMs =
+    lastUpdateMs != null && spotLastPointMs != null
+      ? Math.max(lastUpdateMs, spotLastPointMs)
+      : lastUpdateMs ?? spotLastPointMs;
+  const staleAfterMs = signalsEmbed ? 90_000 : 55_000;
+  const stale = feedLastMs == null ? pts.length < 2 : Date.now() - feedLastMs > staleAfterMs;
 
   const model = useMemo(() => {
     if (priceToBeat == null || !Number.isFinite(priceToBeat) || pts.length < 2) return null;
@@ -313,10 +733,19 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
     };
   }, [mode, priceToBeat, pts, upLabel, downLabel]);
 
+  const svgHeight = H + (model != null && overlayAppliesSpot ? PROB_STRIP_GAP + PROB_STRIP_H + 12 : 0);
+
   const derivedStrip = useMemo(() => {
     if (!model || priceToBeat == null || !Number.isFinite(priceToBeat)) return null;
-    return computePtbChartDerivatives({ pts, candles: model.candles, ptb: priceToBeat, bookFlow: bookFlow ?? undefined });
-  }, [model, priceToBeat, pts, bookFlow]);
+    return computePtbChartDerivatives({
+      pts,
+      candles: model.candles,
+      ptb: priceToBeat,
+      bookFlow: bookFlow ?? undefined,
+      lastProbUp,
+      lastProbDown,
+    });
+  }, [model, priceToBeat, pts, bookFlow, lastProbUp, lastProbDown]);
 
   const settlementCross = useMemo(() => {
     if (!model || !derivedStrip || priceToBeat == null || !Number.isFinite(priceToBeat)) return null;
@@ -343,18 +772,22 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
   }, [model, derivedStrip, priceToBeat, pts, endsInMs, lastProbUp, lastProbDown, bookFlow]);
 
   const primaryCall = useMemo(() => {
+    type Gate = { k: string; ok: boolean; v: string };
     if (!model || !derivedStrip || priceToBeat == null || !Number.isFinite(priceToBeat)) {
       return {
         lane: null as 'up' | 'down' | null,
         status: 'WAIT' as const,
         confidence: 'LOW' as const,
         reason: 'Need more spot/PTB structure before a directional call.',
+        gates: [] as Gate[],
+        enterWhen: null as string | null,
       };
     }
 
     const band = Math.max(0.35, model.band);
     const dist = model.last - priceToBeat;
     const absDist = Math.abs(dist);
+    const bandX = absDist / band;
     const control = derivedStrip.controlSignal;
     const structure = derivedStrip.structureEvent;
     const momentum = derivedStrip.momentum;
@@ -365,13 +798,21 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
         status: 'WAIT' as const,
         confidence: 'LOW' as const,
         reason: 'Chop / no-edge regime. Wait for clear separation and hold.',
+        gates: [
+          {
+            k: 'Tradable regime',
+            ok: false,
+            v: `${String(structure).replaceAll('_', ' ')} · ${String(control).replaceAll('_', ' ')}`,
+          },
+        ] as Gate[],
+        enterWhen: 'Wait until structure leaves chop and control is UP_CONTROL or DOWN_CONTROL (or price holds ≥1.2× band past PTB).',
       };
     }
 
     let lane: 'up' | 'down' | null = null;
     if (control === 'UP_CONTROL') lane = 'up';
     else if (control === 'DOWN_CONTROL') lane = 'down';
-    else if (absDist >= band * 1.2) lane = dist >= 0 ? 'up' : 'down';
+    else if (absDist >= band * 1.05) lane = dist >= 0 ? 'up' : 'down';
 
     if (!lane) {
       return {
@@ -379,14 +820,33 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
         status: 'WAIT' as const,
         confidence: 'LOW' as const,
         reason: 'No dominant side yet. Stay patient near the PTB line.',
+        gates: [
+          { k: 'Tradable regime', ok: true, v: 'Not chop' },
+          {
+            k: 'Dominant side',
+            ok: false,
+            v: `Control ${String(control).replaceAll('_', ' ')} · ${bandX.toFixed(2)}× band (need 1.05× for lean-by-distance)`,
+          },
+        ] as Gate[],
+        enterWhen:
+          'Pick a side only after UP_CONTROL / DOWN_CONTROL, or after spot holds ≥1.05× the reaction band on one side of PTB.',
       };
     }
 
     const momentumAligned = momentum === (lane === 'up' ? 'UP' : 'DOWN');
     const strongControl = (lane === 'up' && control === 'UP_CONTROL') || (lane === 'down' && control === 'DOWN_CONTROL');
-    const highSep = absDist >= band * 1.8;
-    const confidence = strongControl && highSep && momentumAligned ? 'HIGH' : strongControl || highSep ? 'MED' : 'LOW';
-    const status = confidence === 'HIGH' ? 'ENTER' : confidence === 'MED' ? 'PREP' : 'WAIT';
+    const highSep = absDist >= band * 1.35;
+    const medSep = absDist >= band * 1.1;
+    const confidence: 'HIGH' | 'MED' | 'LOW' =
+      strongControl && highSep && momentumAligned ? 'HIGH' : strongControl || highSep || (medSep && momentumAligned) ? 'MED' : 'LOW';
+    const status: 'ENTER' | 'PREP' | 'WAIT' =
+      confidence === 'HIGH'
+        ? 'ENTER'
+        : confidence === 'MED' && strongControl && medSep && momentumAligned
+          ? 'ENTER'
+          : confidence === 'MED'
+            ? 'PREP'
+            : 'WAIT';
     const laneLabel = lane === 'up' ? upLabel : downLabel;
     const reason =
       status === 'ENTER'
@@ -395,8 +855,927 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
           ? `${laneLabel} is favored, but wait for a cleaner hold / momentum alignment.`
           : `${laneLabel} has early lean only; avoid forcing entries.`;
 
-    return { lane, status, confidence, reason };
+    const gates: Gate[] = [
+      { k: 'Tradable regime', ok: true, v: 'Not chop' },
+      { k: 'Favored lane', ok: true, v: laneLabel },
+      {
+        k: 'Control matches lane',
+        ok: strongControl,
+        v: strongControl ? `${control}` : `have ${String(control).replaceAll('_', ' ')} vs ${laneLabel}`,
+      },
+      {
+        k: 'Separation ≥ 1.35× band',
+        ok: highSep,
+        v: `${bandX.toFixed(2)}× band`,
+      },
+      {
+        k: 'Momentum vs lane',
+        ok: momentumAligned,
+        v: momentumAligned ? `${momentum}` : `bucket ${momentum} (want ${lane === 'up' ? 'UP' : 'DOWN'})`,
+      },
+    ];
+
+    const missing: string[] = [];
+    if (!strongControl) missing.push('UP/DOWN control on this lane');
+    if (!highSep && !medSep) missing.push('|spot−PTB| ≥ 1.1× band');
+    if (!momentumAligned) missing.push('short-bucket momentum aligned with lane');
+    const enterWhen =
+      status === 'ENTER'
+        ? 'This zoom: all listed gates pass — still use limits; invalidation is a snap back through the band.'
+        : `For ENTER on ${laneLabel}: ${missing.length ? missing.join(' · ') : 'n/a'}.`;
+
+    return { lane, status, confidence, reason, gates, enterWhen };
   }, [derivedStrip, model, priceToBeat, upLabel, downLabel]);
+
+  useEffect(() => {
+    if (!onPrimaryCall) return;
+    onPrimaryCall({
+      lane: primaryCall.lane,
+      status: primaryCall.status,
+      confidence: primaryCall.confidence,
+      reason: primaryCall.reason,
+      enterWhen: primaryCall.enterWhen ?? null,
+    });
+  }, [onPrimaryCall, primaryCall.confidence, primaryCall.enterWhen, primaryCall.lane, primaryCall.reason, primaryCall.status]);
+
+  /**
+   * Sectional breakdown for long-window markets (1h / 4h). The user wants to see the
+   * round broken into 15-minute slices and get an early heads-up when momentum is
+   * about to flip — so they can decide GO IN / STAY / EXIT before price actually
+   * crosses PTB. See `sectionalMomentum.ts` for the pure logic.
+   */
+  const sectionalPlan = useMemo(() => pickSectionPlan(zoomWindow), [zoomWindow]);
+  const sections: SpotSection[] = useMemo(() => {
+    if (!sectionalPlan || priceToBeat == null || !Number.isFinite(priceToBeat) || pts.length < 2) return [];
+    const flatBand = model ? Math.max(0.5, model.band * 0.6) : 0.5;
+    return buildSpotSections(pts, priceToBeat, sectionalPlan.sectionMs, sectionalPlan.count, flatBand);
+  }, [sectionalPlan, pts, priceToBeat, model]);
+
+  const switchForecast: SwitchForecast | null = useMemo(() => {
+    // Run without `sectionalPlan` so sub‑60s zoom still gets Answer / boom / machine row.
+    // When no slice plan, `sections` is empty and the forecaster returns WAIT until data fills.
+    if (!model || priceToBeat == null) return null;
+    const flowBias: -1 | 0 | 1 =
+      derivedStrip == null
+        ? 0
+        : derivedStrip.controlSignal === 'UP_CONTROL'
+          ? 1
+          : derivedStrip.controlSignal === 'DOWN_CONTROL'
+            ? -1
+            : 0;
+    return forecastMomentumSwitch({
+      sections,
+      microSlopeUsdPerSec: derivedStrip?.slopeUsdPerSec ?? null,
+      spot: model.last,
+      ptb: priceToBeat,
+      bandUsd: Math.max(0.5, model.band),
+      primaryLane: primaryCall.lane,
+      primaryStatus: primaryCall.status,
+      primaryConfidence: primaryCall.confidence,
+      flowBias,
+      endsInMsRemaining: endsInMs ?? null,
+    });
+  }, [sections, model, priceToBeat, derivedStrip, primaryCall.lane, primaryCall.status, primaryCall.confidence, endsInMs]);
+
+  /**
+   * Statistical estimate of P(spot crosses PTB at least once before round end).
+   * Brownian-bridge approximation using OLS drift + RMS volatility from the last
+   * 5 minutes of ticks. Refreshed on every render that updates `pts`/`endsInMs`.
+   */
+  const crossEstimate: PtbCrossEstimate | null = useMemo(() => {
+    if (!model || priceToBeat == null) return null;
+    return estimatePtbCrossProbability({
+      pts,
+      spot: model.last,
+      ptb: priceToBeat,
+      endsInMs: endsInMs ?? null,
+      bandUsd: Math.max(0.5, model.band),
+    });
+  }, [pts, model, priceToBeat, endsInMs]);
+
+  /** Late-vs-early slope thrust — flags accelerating / decelerating / reversing momentum. */
+  const acceleration: MomentumAcceleration | null = useMemo(() => {
+    if (pts.length < 8) return null;
+    return detectMomentumAcceleration(pts, { lateMs: 60_000, earlyMs: 120_000 });
+  }, [pts]);
+
+  /** Multi-timeframe drift consensus (1m/5m/15m/30m). */
+  const mtf: MtfConsensus | null = useMemo(() => {
+    if (pts.length < 8 || !model) return null;
+    return buildMtfConsensus(pts, Math.max(0.5, model.band));
+  }, [pts, model]);
+
+  /** Anti-chase overextension guard. */
+  const overextension: Overextension | null = useMemo(() => {
+    if (pts.length < 30 || !model) return null;
+    return detectOverextension(pts, {
+      windowMs: 60_000,
+      baselineCount: 10,
+      minBandUsd: Math.max(0.3, model.band * 0.5),
+    });
+  }, [pts, model]);
+
+  /** Terminal-side probability (P(spot ends above/below PTB)). */
+  const endingProb: EndingProbability | null = useMemo(() => {
+    if (!model || priceToBeat == null) return null;
+    return estimateEndingProbability({
+      pts,
+      spot: model.last,
+      ptb: priceToBeat,
+      endsInMs: endsInMs ?? null,
+      bandUsd: Math.max(0.5, model.band),
+    });
+  }, [pts, model, priceToBeat, endsInMs]);
+
+  /** Per-lane $ edge derived from terminal probability + current implied mids. */
+  const laneEdges: LaneEdges | null = useMemo(() => {
+    if (!endingProb) return null;
+    return computeLaneEdges({
+      upMid: lastProbUp,
+      downMid: lastProbDown,
+      endAboveProb: endingProb.endAboveProb,
+      modelConfidence: endingProb.confidence,
+    });
+  }, [endingProb, lastProbUp, lastProbDown]);
+
+  /**
+   * Tape velocity — aggressor flow on the desk's active outcome token.
+   * Computed before machine fusion so prints can vote in the agreement tally.
+   */
+  const [tapeNow, setTapeNow] = useState<number>(() => Date.now());
+  useEffect(() => {
+    if (!recentPrints || recentPrints.length === 0) return;
+    const id = window.setInterval(() => setTapeNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [recentPrints]);
+  const tapeVelocity: TapeVelocity | null = useMemo(() => {
+    if (!recentPrints || recentPrints.length === 0) return null;
+    return computeTapeVelocity(recentPrints, { now: tapeNow });
+  }, [recentPrints, tapeNow]);
+
+  /** Fused sensor row — spot vs PTB, implied mids, book control, dwell, sections, time pressure. */
+  const machineReadout: SpotPtbMachineReadout | null = useMemo(() => {
+    if (!model || priceToBeat == null) return null;
+    return computeSpotPtbMachineReadout({
+      sections,
+      spot: model.last,
+      ptb: priceToBeat,
+      bandUsd: Math.max(0.5, model.band),
+      lastProbUp,
+      lastProbDown,
+      controlSignal: derivedStrip?.controlSignal ?? 'NO_EDGE',
+      dwellMajoritySign: derivedStrip?.dwellMajoritySign ?? 0,
+      slopeUsdPerSec: derivedStrip?.slopeUsdPerSec ?? null,
+      primaryLane: primaryCall.lane,
+      endsInMs: endsInMs ?? null,
+      crossEstimate,
+      acceleration,
+      mtf,
+      overextension,
+      endingProb,
+      edges: laneEdges,
+      tape: tapeVelocity,
+      tapeLane: tapeLane ?? null,
+      wallFlow,
+    });
+  }, [
+    sections,
+    model,
+    priceToBeat,
+    derivedStrip?.controlSignal,
+    derivedStrip?.dwellMajoritySign,
+    derivedStrip?.slopeUsdPerSec,
+    lastProbUp,
+    lastProbDown,
+    primaryCall.lane,
+    endsInMs,
+    crossEstimate,
+    acceleration,
+    mtf,
+    overextension,
+    endingProb,
+    laneEdges,
+    tapeVelocity,
+    tapeLane,
+    wallFlow,
+  ]);
+
+  useEffect(() => {
+    onMachineReadout?.(machineReadout);
+  }, [machineReadout, onMachineReadout]);
+
+  /**
+   * Top-level "what should I actually do?" directive — fuses the machine readout
+   * with the user's current position into a single verb (INITIATE / HOLD / FLIP /
+   * TRIM / EXIT / ADD / STAND_DOWN). Pure derivation, see `tradeDirective.ts`.
+   */
+  const tradeDirective: TradeDirective | null = useMemo(() => {
+    if (!machineReadout) return null;
+    return buildTradeDirective({
+      machine: machineReadout,
+      forecast: switchForecast,
+      currentPositionLane: currentPositionLane ?? null,
+      upLabel,
+      downLabel,
+    });
+  }, [machineReadout, switchForecast, currentPositionLane, upLabel, downLabel]);
+
+  useEffect(() => {
+    onTradeDirective?.(tradeDirective);
+  }, [tradeDirective, onTradeDirective]);
+
+  useEffect(() => {
+    onSwitchForecast?.(switchForecast);
+  }, [switchForecast, onSwitchForecast]);
+
+  /** Auto-suggested take-profit / stop-loss levels for the Answer card (directive lane, else best +EV book). */
+  const tradeLevels: TradeLevels | null = useMemo(
+    () =>
+      resolveTradeLevelsForDirective({
+        directive: tradeDirective,
+        laneEdges,
+        crossProb: machineReadout?.crossProb ?? null,
+        endsInMs: endsInMs ?? null,
+      }),
+    [tradeDirective, laneEdges, machineReadout?.crossProb, endsInMs],
+  );
+
+  /** Hypothetical TP/SL for the sectional incoming lane when it differs from the card (preview only). */
+  const incomingSwitchLevels: TradeLevels | null = useMemo(() => {
+    const sf = switchForecast;
+    if (!sf || sf.status !== 'SWITCH_INCOMING' || sf.incomingLane == null || !laneEdges) return null;
+    if (tradeDirective?.lane == null || tradeDirective.lane === sf.incomingLane) return null;
+    const cp = machineReadout?.crossProb ?? crossEstimate?.prob ?? null;
+    return suggestLevelsForLane({
+      lane: sf.incomingLane,
+      laneEdges,
+      crossProb: cp,
+      endsInMs: endsInMs ?? null,
+    });
+  }, [switchForecast, tradeDirective?.lane, laneEdges, machineReadout?.crossProb, crossEstimate?.prob, endsInMs]);
+
+  /**
+   * Stability tracker — kills whipsaw trades by showing the user how long the
+   * directive has been steady. Holds state via useState so the next render gets
+   * the previous snapshot for change detection.
+   */
+  const [directiveStability, setDirectiveStability] = useState<DirectiveStability | null>(null);
+  useEffect(() => {
+    if (!tradeDirective) return;
+    setDirectiveStability((prev) => updateStability(prev, tradeDirective, Date.now()));
+  }, [tradeDirective]);
+
+  /** Sensor-vs-directive discrepancy check for the warning stripe. */
+  const directiveDiscrepancy: DirectiveDiscrepancy | null = useMemo(() => {
+    if (!tradeDirective || !machineReadout) return null;
+    return detectDirectiveDiscrepancy(tradeDirective, machineReadout);
+  }, [tradeDirective, machineReadout]);
+
+  /**
+   * Re-entry guard. Track the previous directive in a ref so transitions
+   * (EXIT / FLIP / STAND_DOWN / TRIM) stamp a cool-down on the just-vacated lane.
+   * `reEntryCheck` holds the live check used by the card to render the chip /
+   * stripe and to feed the sizing multiplier.
+   */
+  const [reEntryState, setReEntryState] = useState<ReEntryState | null>(null);
+  const previousDirectiveRef = useRef<TradeDirective | null>(null);
+  // Reason-tagged cool-downs need fresh stability/discrepancy/edge at the
+  // moment of the transition, so we read them from refs the next effect keeps
+  // current. (We can't depend on them in this effect or it would re-run too often.)
+  const stabilityRef = useRef<DirectiveStability | null>(null);
+  const discrepancyRef = useRef<DirectiveDiscrepancy | null>(null);
+  const laneEdgesRef = useRef<LaneEdges | null>(null);
+  useEffect(() => {
+    stabilityRef.current = directiveStability;
+  }, [directiveStability]);
+  useEffect(() => {
+    discrepancyRef.current = directiveDiscrepancy;
+  }, [directiveDiscrepancy]);
+  useEffect(() => {
+    laneEdgesRef.current = laneEdges;
+  }, [laneEdges]);
+  // Mirror the live verdict inputs into refs so the BOOM dispatch effect can
+  // build the operator verdict at fire time without re-subscribing to all of
+  // them (which would noisily re-run the effect on every directive tick).
+  const directiveRef = useRef<TradeDirective | null>(null);
+  const tradeLevelsRef = useRef<TradeLevels | null>(null);
+  const reEntryCheckRef = useRef<ReEntryGuardCheck | null>(null);
+  const sizingMultiplierRef = useRef<SizingMultiplier | null>(null);
+  const noTradeScoreRef = useRef<NoTradeScore | null>(null);
+  useEffect(() => {
+    if (!tradeDirective) return;
+    const prev = previousDirectiveRef.current;
+    if (featureFlags.reasonCooldowns) {
+      const exitingLane = prev?.lane ?? null;
+      const exitingLaneEdge = exitingLane && laneEdgesRef.current
+        ? exitingLane === 'up'
+          ? laneEdgesRef.current.up
+          : laneEdgesRef.current.down
+        : null;
+      const reason = classifyExitReason({
+        whipsaw: stabilityRef.current?.tier === 'whipsaw',
+        highDiscrepancy: discrepancyRef.current?.shouldBlock ?? false,
+        edgeUsd: exitingLaneEdge?.edgePerShareUsd ?? null,
+      });
+      setReEntryState((current) =>
+        updateReEntryStateWithReason(current, tradeDirective, prev, Date.now(), reason),
+      );
+    } else {
+      setReEntryState((current) => updateReEntryState(current, tradeDirective, prev, Date.now()));
+    }
+    previousDirectiveRef.current = tradeDirective;
+  }, [tradeDirective, featureFlags.reasonCooldowns]);
+  // Tick the re-entry check every second so the chip counts down even when the
+  // directive itself is steady. Cheap — just a setState with the same data.
+  const [reEntryNow, setReEntryNow] = useState<number>(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setReEntryNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+  const reEntryCheck: ReEntryGuardCheck | null = useMemo(() => {
+    if (!tradeDirective || !reEntryState) return null;
+    return checkReEntry(reEntryState, tradeDirective, reEntryNow);
+  }, [tradeDirective, reEntryState, reEntryNow]);
+
+  /** Confidence-adjusted sizing multiplier (stability × discrepancy × edge × cool-down). */
+  const sizingMultiplier: SizingMultiplier | null = useMemo(() => {
+    if (!tradeDirective) return null;
+    return computeSizingMultiplier({
+      stability: directiveStability,
+      discrepancy: directiveDiscrepancy,
+      edges: laneEdges,
+      lane: tradeDirective.lane,
+      cooldownActive: reEntryCheck?.onCooldown ?? false,
+    });
+  }, [tradeDirective, directiveStability, directiveDiscrepancy, laneEdges, reEntryCheck]);
+
+  // Keep verdict-input refs current so the BOOM dispatch effect can call
+  // buildOperatorVerdict at fire time without depending on these in its deps.
+  useEffect(() => {
+    directiveRef.current = tradeDirective;
+  }, [tradeDirective]);
+  useEffect(() => {
+    tradeLevelsRef.current = tradeLevels;
+  }, [tradeLevels]);
+  useEffect(() => {
+    reEntryCheckRef.current = reEntryCheck;
+  }, [reEntryCheck]);
+  useEffect(() => {
+    sizingMultiplierRef.current = sizingMultiplier;
+  }, [sizingMultiplier]);
+
+  /**
+   * Decision journal — rolling history of directive changes for the mini-tape
+   * on the card. Reset whenever the slug changes (new round = clean slate).
+   */
+  const [directiveJournal, setDirectiveJournal] = useState<DirectiveJournal>(() => resetJournal());
+  useEffect(() => {
+    setDirectiveJournal(resetJournal());
+  }, [slug, deskResetKey]);
+  useEffect(() => {
+    if (!tradeDirective) return;
+    setDirectiveJournal((prev) =>
+      appendDirectiveToJournal(prev, tradeDirective, machineReadout, Date.now()),
+    );
+  }, [tradeDirective, machineReadout]);
+
+  /**
+   * No-Trade composite — fuses whipsaw, discrepancy, edge, overextension,
+   * regime, settlement, cool-down, and tape into a single 0..100 stand-down score.
+   */
+  const noTradeScore: NoTradeScore | null = useMemo(() => {
+    return computeNoTradeScore({
+      stability: directiveStability,
+      discrepancy: directiveDiscrepancy,
+      edges: laneEdges,
+      lane: tradeDirective?.lane ?? null,
+      machine: machineReadout,
+      overextension,
+      reEntry: reEntryCheck,
+      tape: tapeVelocity,
+      inSettlement: machineReadout?.urgency === 'settlement',
+    });
+  }, [
+    directiveStability,
+    directiveDiscrepancy,
+    laneEdges,
+    tradeDirective?.lane,
+    machineReadout,
+    overextension,
+    reEntryCheck,
+    tapeVelocity,
+  ]);
+  useEffect(() => {
+    noTradeScoreRef.current = noTradeScore;
+  }, [noTradeScore]);
+
+  useEffect(() => {
+    onNoTradeScore?.(noTradeScore);
+  }, [onNoTradeScore, noTradeScore]);
+
+  /**
+   * Operator verdict — same fusion the trade card displays. Hoisted to the
+   * chart so the No-Trade banner can collapse to a thin strip when the verdict
+   * is already shouting STAND_DOWN (avoids two screaming red blocks).
+   */
+  const operatorVerdict = useMemo(
+    () =>
+      buildOperatorVerdict({
+        directive: tradeDirective,
+        levels: tradeLevels,
+        stability: directiveStability,
+        discrepancy: directiveDiscrepancy,
+        reEntry: reEntryCheck,
+        sizingMultiplier,
+        noTradeScore,
+      }),
+    [
+      tradeDirective,
+      tradeLevels,
+      directiveStability,
+      directiveDiscrepancy,
+      reEntryCheck,
+      sizingMultiplier,
+      noTradeScore,
+    ],
+  );
+
+  /** True when a real directive exists but operator verdict is STAND_DOWN — structural signals may still run, but execution hints should defer to the card. */
+  const executionClash = useMemo(
+    () => tradeDirective != null && operatorVerdict.isStandDown,
+    [tradeDirective, operatorVerdict.isStandDown],
+  );
+
+  /** Sectional banner is WAIT but the card already cleared GO — different scopes (slice vs full model), not a wiring bug. */
+  const tapeWaitCardGo = useMemo(
+    () =>
+      tradeDirective != null &&
+      !operatorVerdict.isStandDown &&
+      (operatorVerdict.state === 'GO_LONG' || operatorVerdict.state === 'GO_SHORT') &&
+      switchForecast != null &&
+      switchForecast.status === 'WAIT',
+    [tradeDirective, operatorVerdict.isStandDown, operatorVerdict.state, switchForecast],
+  );
+
+  // Late-binding refs so keyboard handlers can call setters/callbacks defined
+  // further down in the component body (avoid hoisting ordering issues).
+  const dismissBannersRef = useRef<() => void>(() => undefined);
+  const fireTestBoomRef = useRef<() => void>(() => undefined);
+  const lastBoomChimeKeyRef = useRef<string>('');
+  const onExportJournal = useCallback(() => {
+    downloadJournalCsv(directiveJournal, slug);
+  }, [directiveJournal, slug]);
+  const onToggleSound = useCallback(() => {
+    primeBoomChime();
+    setFeatureFlag('boomSound', !featureFlags.boomSound);
+  }, [featureFlags.boomSound]);
+  useKeyboardShortcuts(
+    {
+      onToggleHelp: () => setShortcutHelpOpen((v) => !v),
+      onDismiss: () => dismissBannersRef.current(),
+      onToggleSound,
+      onTogglePinnedNote: () => setPinnedNoteVisible((v) => !v),
+      onTestBoom: () => fireTestBoomRef.current(),
+      onExportJournal,
+    },
+    featureFlags.keyboardShortcuts,
+  );
+
+  /**
+   * Imminent PTB cross alert — fires once when cross prob crosses ≥ 70% with high
+   * confidence and re-arms only after prob falls back below 55%. This is decoupled
+   * from BOOM (which is about agreement + dwell) so the user gets a heads-up purely
+   * on barrier-crossing probability, even when sensors are split.
+   */
+  const lastCrossImminentRef = useRef<{ armed: boolean }>({ armed: true });
+  const [crossImminentBanner, setCrossImminentBanner] = useState<{
+    prob: number;
+    currentSide: 'above' | 'below' | 'at';
+    expiresAtMs: number;
+  } | null>(null);
+  useEffect(() => {
+    if (!crossEstimate || crossEstimate.confidence === 'low') return;
+    const pct = crossEstimate.prob;
+    const armed = lastCrossImminentRef.current.armed;
+    if (!armed) {
+      // Re-arm once prob settles back down so we can fire again later.
+      if (pct < 0.55) lastCrossImminentRef.current.armed = true;
+      return;
+    }
+    if (pct < 0.7) return;
+    lastCrossImminentRef.current.armed = false;
+    const dist = crossEstimate.distanceUsd;
+    const currentSide: 'above' | 'below' | 'at' =
+      Math.abs(dist) <= 0.25 ? 'at' : dist > 0 ? 'above' : 'below';
+    setCrossImminentBanner({
+      prob: pct,
+      currentSide,
+      expiresAtMs: Date.now() + 8_000,
+    });
+    try {
+      window.dispatchEvent(
+        new CustomEvent(PTB_CROSS_IMMINENT_EVENT, {
+          detail: {
+            slug: slug ?? '',
+            prob: pct,
+            currentSide,
+            distanceUsd: dist,
+            horizonSec: crossEstimate.horizonSec,
+            upLabel,
+            downLabel,
+          } satisfies PtbCrossImminentDetail,
+        }),
+      );
+    } catch {
+      /* ignore */
+    }
+  }, [crossEstimate, slug, upLabel, downLabel]);
+
+  useEffect(() => {
+    if (!crossImminentBanner) return;
+    const remain = crossImminentBanner.expiresAtMs - Date.now();
+    if (remain <= 0) {
+      setCrossImminentBanner(null);
+      return;
+    }
+    const id = window.setTimeout(() => setCrossImminentBanner(null), remain);
+    return () => window.clearTimeout(id);
+  }, [crossImminentBanner]);
+
+  /**
+   * Notify listeners (SignalsTradePanel) when the forecast status transitions —
+   * so the user gets a toast for "SWITCH INCOMING" / "EXIT" / "GO IN" without
+   * staring at the chart.
+   */
+  const lastForecastKeyRef = useRef<string>('');
+  useEffect(() => {
+    if (!switchForecast) return;
+    const entryish =
+      switchForecast.status === 'GO_IN' ||
+      switchForecast.status === 'STAY_IN' ||
+      switchForecast.status === 'SWITCH_INCOMING';
+    const guardBlocksToast = entryish && executionClash;
+    const key = `${switchForecast.status}|${switchForecast.lane ?? '-'}|${switchForecast.incomingLane ?? '-'}|${switchForecast.confidence}|${entryish ? (executionClash ? 'blk' : 'go') : 'na'}`;
+    if (key === lastForecastKeyRef.current) return;
+    lastForecastKeyRef.current = key;
+    if (switchForecast.status === 'WAIT') return;
+    // Skip LOW-confidence STAY_IN noise — that would toast on every micro tick.
+    if (switchForecast.status === 'STAY_IN' && switchForecast.confidence === 'LOW') return;
+    if (guardBlocksToast) return;
+    try {
+      window.dispatchEvent(
+        new CustomEvent(SECTIONAL_DECISION_EVENT, {
+          detail: {
+            slug: slug ?? '',
+            status: switchForecast.status,
+            lane: switchForecast.lane,
+            driftLane: switchForecast.driftLane,
+            incomingLane: switchForecast.incomingLane,
+            confidence: switchForecast.confidence,
+            etaSec: switchForecast.etaSec,
+            headline: switchForecast.headline,
+            reason: switchForecast.reason,
+          } satisfies SectionalDecisionDetail,
+        }),
+      );
+    } catch {
+      /* dispatchEvent rarely throws; ignore. */
+    }
+  }, [switchForecast, slug, executionClash]);
+
+  /**
+   * BOOM detection — when SWITCH_INCOMING / EXIT / GO_IN persists in the same
+   * direction for a few ticks (regardless of MED↔HIGH confidence flicker), or when
+   * all three signals — primary + sectional drift + book flow — agree on one tick,
+   * we treat it as *confirmed* and fire a louder event with a big in-chart overlay.
+   *
+   * Dwell tracks `(status, lane, incomingLane)` only — confidence is allowed to
+   * wobble so the boom doesn't reset every micro tick.
+   */
+  type BoomState = {
+    kind: 'OPPOSITE_INCOMING' | 'EXIT_NOW' | 'TRIPLE_CONFIRM_ENTRY';
+    lane: 'up' | 'down';
+    headline: string;
+    reason: string;
+    etaSec: number | null;
+    /** Wall-clock when the boom should fade out of the overlay. */
+    expiresAtMs: number;
+  };
+  const [boom, setBoom] = useState<BoomState | null>(null);
+  const dwellRef = useRef<{
+    key: string;
+    count: number;
+    bestConf: 'HIGH' | 'MED' | 'LOW';
+    /** Last spot series timestamp — dwell ticks only advance on fresh ticks, not on machineReadout churn. */
+    lastSpotT: number;
+  }>({ key: '', count: 0, bestConf: 'LOW', lastSpotT: 0 });
+  const lastBoomKeyRef = useRef<string>('');
+  /** Surface dwell to UI so the user can see "we're watching, 2/3 confirmed". */
+  const [dwellInfo, setDwellInfo] = useState<{ count: number; need: number } | null>(null);
+
+  /**
+   * Boom chime — play a short tone when a fresh BOOM appears, gated on the
+   * `boomSound` flag. Track the last boom key so we don't replay on tick churn.
+   */
+  useEffect(() => {
+    if (!boom || !featureFlags.boomSound) return;
+    const key = `${boom.kind}|${boom.lane}`;
+    if (lastBoomChimeKeyRef.current === key) return;
+    lastBoomChimeKeyRef.current = key;
+    try {
+      playBoomChime(boom.kind);
+    } catch {
+      /* ignore audio errors */
+    }
+  }, [boom, featureFlags.boomSound]);
+
+  /** TP/SL on the BOOM lane — uses terminal-probability lane edges (same math as trade card). */
+  const boomLevels: TradeLevels | null = useMemo(() => {
+    if (!boom) return null;
+    const cp = machineReadout?.crossProb ?? crossEstimate?.prob ?? null;
+    return suggestLevelsForLane({
+      lane: boom.lane,
+      laneEdges,
+      crossProb: cp,
+      endsInMs: endsInMs ?? null,
+    });
+  }, [boom, laneEdges, machineReadout?.crossProb, crossEstimate?.prob, endsInMs]);
+
+  const boomOppositeMid: number | null = useMemo(() => {
+    if (!boom || !laneEdges) return null;
+    return (boom.lane === 'up' ? laneEdges.down?.mid : laneEdges.up?.mid) ?? null;
+  }, [boom, laneEdges]);
+
+  const boomIncomingEdge = useMemo(() => {
+    if (!boom || !laneEdges) return null;
+    return boom.lane === 'up' ? laneEdges.up : laneEdges.down;
+  }, [boom, laneEdges]);
+
+  useEffect(() => {
+    if (!switchForecast) return;
+    const f = switchForecast;
+    const key = `${f.status}|${f.lane ?? '-'}|${f.incomingLane ?? '-'}`;
+    const lastSpotT = pts.length > 0 ? pts[pts.length - 1]!.t : 0;
+    const confRank = (c: 'HIGH' | 'MED' | 'LOW') => (c === 'HIGH' ? 2 : c === 'MED' ? 1 : 0);
+    if (dwellRef.current.key !== key) {
+      dwellRef.current = { key, count: 1, bestConf: f.confidence, lastSpotT };
+    } else if (lastSpotT > dwellRef.current.lastSpotT) {
+      dwellRef.current.lastSpotT = lastSpotT;
+      dwellRef.current.count += 1;
+      if (confRank(f.confidence) > confRank(dwellRef.current.bestConf)) {
+        dwellRef.current.bestConf = f.confidence;
+      }
+    }
+    const dwell = dwellRef.current.count;
+    const bestConf = dwellRef.current.bestConf;
+
+    /** Triple-confirm: primary call ENTER + sectional drift on same lane + flow agrees. */
+    const flowBias: -1 | 0 | 1 =
+      derivedStrip == null
+        ? 0
+        : derivedStrip.controlSignal === 'UP_CONTROL'
+          ? 1
+          : derivedStrip.controlSignal === 'DOWN_CONTROL'
+            ? -1
+            : 0;
+    const tripleEntry =
+      (f.status === 'GO_IN' || f.status === 'STAY_IN') &&
+      f.lane != null &&
+      primaryCall.status === 'ENTER' &&
+      primaryCall.lane === f.lane &&
+      ((f.lane === 'up' && flowBias >= 0) || (f.lane === 'down' && flowBias <= 0));
+
+    // Surface the dwell to the user so they can see when we're "watching".
+    let needForBoom = 0;
+    if (f.status === 'SWITCH_INCOMING' || f.status === 'EXIT') {
+      needForBoom = bestConf === 'HIGH' ? 1 : bestConf === 'MED' ? 2 : 3;
+    } else if (tripleEntry) {
+      needForBoom = bestConf === 'HIGH' ? 1 : 2;
+    }
+    const dwellBlockedByGuards =
+      executionClash && (f.status === 'SWITCH_INCOMING' || tripleEntry);
+    setDwellInfo(needForBoom > 0 && !dwellBlockedByGuards ? { count: dwell, need: needForBoom } : null);
+
+    /**
+     * SWITCH/EXIT confirmation:
+     *   HIGH conf      → fire on first tick (no dwell needed)
+     *   MED conf       → fire after 2 same-direction ticks
+     *   LOW conf       → fire after 3 same-direction ticks (still actionable structurally)
+     */
+    const switchConfirmed =
+      (f.status === 'SWITCH_INCOMING' || f.status === 'EXIT') &&
+      ((bestConf === 'HIGH' && dwell >= 1) ||
+        (bestConf === 'MED' && dwell >= 2) ||
+        (bestConf === 'LOW' && dwell >= 3));
+
+    /** Triple-entry confirmation: HIGH on first tick, MED after 2 ticks, LOW never. */
+    const tripleConfirmed = tripleEntry && ((bestConf === 'HIGH' && dwell >= 1) || (bestConf === 'MED' && dwell >= 2));
+
+    /** BOOM only fires when fused sensors mostly agree — avoids flashy noise on pure conflicts. */
+    const agree = machineReadout?.agreementScore;
+    const BOOM_MIN_SWITCH = 38;
+    const BOOM_MIN_TRIPLE = 56;
+    const switchAgreeOk =
+      machineReadout == null ||
+      agree == null ||
+      agree >= BOOM_MIN_SWITCH ||
+      bestConf === 'HIGH';
+    const tripleAgreeOk =
+      machineReadout == null ||
+      agree == null ||
+      agree >= BOOM_MIN_TRIPLE;
+
+    /**
+     * Cross-prob gates — extra check for the lane the boom is firing for:
+     *   - SWITCH/EXIT: incoming side must have ≥ 35% chance of crossing PTB before bell
+     *     (otherwise the "switch" is statistically toothless even if drift agrees).
+     *   - TRIPLE entry: must have ≥ 35% cross prob unless we're already on the right side
+     *     of PTB and aligned with the lane (then crossing isn't required to win).
+     *   - HIGH conf still bypasses for switches (urgent calls shouldn't be blocked).
+     */
+    const crossProb = crossEstimate?.prob ?? null;
+    const crossConf = crossEstimate?.confidence ?? 'low';
+    const crossOk =
+      crossProb == null ||
+      crossConf === 'low' ||
+      bestConf === 'HIGH' ||
+      crossProb >= 0.35;
+    /** Settlement window (<60s): never fire new BOOM entries — only EXIT calls can fire. */
+    const inSettlement = machineReadout?.urgency === 'settlement';
+
+    let next: BoomState | null = null;
+    if (switchConfirmed && switchAgreeOk && (crossOk || f.status === 'EXIT')) {
+      // EXIT calls always fire (preserving capital is not gated by cross-prob).
+      // SWITCH_INCOMING during settlement is suppressed — round won't have time.
+      if (f.status === 'SWITCH_INCOMING' && inSettlement) {
+        // skip
+      } else {
+        const incoming = f.incomingLane ?? (f.lane === 'up' ? 'down' : 'up');
+        const lane = (f.status === 'EXIT' ? f.lane : incoming) ?? 'up';
+        const isExit = f.status === 'EXIT';
+        const incLabel = lane === 'up' ? upLabel : downLabel;
+        const oppLabel = lane === 'up' ? downLabel : upLabel;
+        next = {
+          kind: isExit ? 'EXIT_NOW' : 'OPPOSITE_INCOMING',
+          lane,
+          headline: isExit
+            ? `EXIT ${oppLabel.toUpperCase()} — ${incLabel.toUpperCase()} TAKING OVER`
+            : `BOOM — ${incLabel.toUpperCase()} MOMENTUM INCOMING`,
+          reason: f.reason,
+          etaSec: f.etaSec,
+          expiresAtMs: Date.now() + (bestConf === 'HIGH' ? 9_000 : 7_000),
+        };
+      }
+    } else if (tripleConfirmed && tripleAgreeOk && crossOk && !inSettlement && f.lane != null) {
+      const lane = f.lane;
+      const incLabel = lane === 'up' ? upLabel : downLabel;
+      next = {
+        kind: 'TRIPLE_CONFIRM_ENTRY',
+        lane,
+        headline: `BOOM — TRIPLE CONFIRM · GO IN ${incLabel.toUpperCase()}`,
+        reason: 'Spot vs PTB, sectional drift, and book flow all agree on this lane.',
+        etaSec: null,
+        expiresAtMs: Date.now() + 7_000,
+      };
+    }
+
+    if (!next) return;
+
+    // Same inputs as TradeDirectiveCard — the operator verdict is the single "enter /
+    // don't enter" truth. BOOM used to fire purely on sectional + flow while guards
+    // could still force DON'T TRADE on the card, which read as broken UX.
+    const verdictAtFire = buildOperatorVerdict({
+      directive: directiveRef.current,
+      levels: tradeLevelsRef.current,
+      stability: stabilityRef.current,
+      discrepancy: discrepancyRef.current,
+      reEntry: reEntryCheckRef.current,
+      sizingMultiplier: sizingMultiplierRef.current,
+      noTradeScore: noTradeScoreRef.current,
+    });
+    const hasDirectiveAtFire = directiveRef.current != null;
+    const tripleMatchesVerdict =
+      (verdictAtFire.state === 'GO_LONG' && next.lane === 'up') ||
+      (verdictAtFire.state === 'GO_SHORT' && next.lane === 'down');
+    if (next.kind === 'TRIPLE_CONFIRM_ENTRY' && hasDirectiveAtFire && !tripleMatchesVerdict) return;
+    // OPPOSITE_INCOMING / EXIT_NOW: always surface — card may still say WAIT; overlay + clash copy explain the split.
+
+    const boomKey = `${next.kind}|${next.lane}`;
+    if (boomKey === lastBoomKeyRef.current) return; // already fired this exact boom; wait for state to clear
+    lastBoomKeyRef.current = boomKey;
+    setBoom(next);
+
+    const crossProbMerged = machineReadout?.crossProb ?? crossEstimate?.prob ?? null;
+    const incomingEdge = next.lane === 'up' ? laneEdges?.up : laneEdges?.down;
+    const oppMid = next.lane === 'up' ? laneEdges?.down?.mid : laneEdges?.up?.mid;
+    const lvls = incomingEdge
+      ? suggestLevelsForLane({
+          lane: next.lane,
+          laneEdges,
+          crossProb: crossProbMerged,
+          endsInMs: endsInMs ?? null,
+        })
+      : null;
+
+    try {
+      window.dispatchEvent(
+        new CustomEvent(SECTIONAL_BOOM_EVENT, {
+          detail: {
+            slug: slug ?? '',
+            kind: next.kind,
+            lane: next.lane,
+            laneLabel: next.lane === 'up' ? upLabel : downLabel,
+            oppositeLabel: next.lane === 'up' ? downLabel : upLabel,
+            etaSec: next.etaSec,
+            headline: next.headline,
+            reason: next.reason,
+            agreementScore: machineReadout?.agreementScore ?? null,
+            crossProb: crossProbMerged,
+            modelWinPct: incomingEdge ? Math.round(incomingEdge.pWin * 100) : null,
+            edgePerShareUsd: incomingEdge?.edgePerShareUsd ?? null,
+            edgeQuality: incomingEdge?.quality ?? null,
+            oppositeMid: oppMid ?? null,
+            takeProfit: lvls?.takeProfit ?? null,
+            stopLoss: lvls?.stopLoss ?? null,
+            rrRatio: lvls?.rrRatio ?? null,
+            levelsCollapsed: lvls?.collapsed ?? false,
+            verdict: {
+              state: verdictAtFire.state,
+              bigVerb: verdictAtFire.bigVerb,
+              headline: verdictAtFire.headline,
+              reason: verdictAtFire.reason,
+              confidence: verdictAtFire.confidence,
+            },
+          } satisfies SectionalBoomDetail,
+        }),
+      );
+    } catch {
+      /* ignore */
+    }
+  }, [
+    switchForecast,
+    derivedStrip,
+    primaryCall.status,
+    primaryCall.lane,
+    slug,
+    upLabel,
+    downLabel,
+    machineReadout,
+    crossEstimate,
+    laneEdges,
+    endsInMs,
+    executionClash,
+    pts,
+  ]);
+
+  /** Clear stale booms when their TTL expires or the forecast moves to WAIT. */
+  useEffect(() => {
+    if (!boom) return;
+    const remain = boom.expiresAtMs - Date.now();
+    if (remain <= 0) {
+      setBoom(null);
+      return;
+    }
+    const id = window.setTimeout(() => setBoom(null), remain);
+    return () => window.clearTimeout(id);
+  }, [boom]);
+
+  /** Allow the next boom once the forecast has actually changed away from a confirmed state. */
+  useEffect(() => {
+    if (!switchForecast) return;
+    if (switchForecast.status === 'WAIT' || switchForecast.status === 'STAY_IN') {
+      lastBoomKeyRef.current = '';
+    }
+  }, [switchForecast]);
+
+  /**
+   * Manual "test boom" — lets the user verify the overlay/animation paint without
+   * waiting for a real signal. Lane mirrors the active mode so the colors match.
+   */
+  const fireTestBoom = useCallback(() => {
+    const lane: 'up' | 'down' = mode;
+    const incLabel = lane === 'up' ? upLabel : downLabel;
+    const oppLabel = lane === 'up' ? downLabel : upLabel;
+    setBoom({
+      kind: 'OPPOSITE_INCOMING',
+      lane,
+      headline: `TEST — ${incLabel.toUpperCase()} MOMENTUM INCOMING`,
+      reason: `(Test fire — overlay preview only.) Real booms watch sectional drift vs the last 30–60s slope on ${oppLabel} → ${incLabel}.`,
+      etaSec: 30,
+      expiresAtMs: Date.now() + 6_000,
+    });
+  }, [mode, upLabel, downLabel]);
+  // Bind the keyboard-shortcut callbacks now that fireTestBoom & setCrossImminentBanner exist.
+  useEffect(() => {
+    fireTestBoomRef.current = fireTestBoom;
+  }, [fireTestBoom]);
+  useEffect(() => {
+    dismissBannersRef.current = () => {
+      setBoom(null);
+      setCrossImminentBanner(null);
+      setShortcutHelpOpen(false);
+    };
+  }, []);
 
   /** Key price levels — swing highs/lows from candles for S/R. */
   const priceLevels = useMemo(() => {
@@ -673,7 +2052,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
         const x1 = xOf(cur.t1);
         const xc = (x0 + x1) / 2;
         const slotW = x1 - x0;
-        const bodyW = Math.max(14, Math.min(slotW * 0.88, iw * 0.05));
+        const bodyW = Math.max(18, Math.min(slotW * 0.88, iw * 0.072));
         const yO = yOf(cur.o);
         const yC = yOf(cur.c);
         const bodyH = Math.max(6, Math.abs(yC - yO) * 1.12);
@@ -725,11 +2104,79 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
       if (!(tMax > tMin)) tMax = tMin + 60_000;
       return { plotMin, plotMax, band, tMin, tMax, level: priceToBeat };
     }
+    const tEnd = lastUpdateMs ?? Date.now();
+    let tMin = tEnd - 180_000;
+    let tMax = tEnd;
+    if (pts.length >= 1) {
+      tMin = pts[0]!.t;
+      tMax = pts.length >= 2 ? pts[pts.length - 1]!.t : pts[0]!.t + 90_000;
+    }
+    if (!(tMax > tMin)) tMax = tMin + 60_000;
+    if (pts.length >= 1) {
+      let spotMin = Infinity;
+      let spotMax = -Infinity;
+      for (let i = 0; i < pts.length; i++) {
+        const v = pts[i]!.v;
+        if (!Number.isFinite(v)) continue;
+        if (v < spotMin) spotMin = v;
+        if (v > spotMax) spotMax = v;
+      }
+      if (Number.isFinite(spotMin) && Number.isFinite(spotMax)) {
+        const mid = (spotMin + spotMax) / 2;
+        const halfSpan = Math.max((spotMax - spotMin) / 2, Math.abs(mid) * 3e-5, 25);
+        return {
+          plotMin: mid - halfSpan * 1.08,
+          plotMax: mid + halfSpan * 1.08,
+          band: Math.max(halfSpan * 0.08, 0.5),
+          tMin,
+          tMax,
+          level: null as number | null,
+        };
+      }
+    }
     const plotMin = 0;
     const plotMax = 1;
-    const tEnd = lastUpdateMs ?? Date.now();
-    return { plotMin, plotMax, band: 0.05, tMin: tEnd - 180_000, tMax: tEnd, level: null as number | null };
+    return { plotMin, plotMax, band: 0.05, tMin, tMax, level: null as number | null };
   }, [priceToBeat, pts, lastUpdateMs]);
+
+  const projection = useMemo(() => {
+    if (derivedStrip == null || !model) return null;
+    const slope = derivedStrip.slopeUsdPerSec;
+    if (slope == null || !Number.isFinite(slope)) return null;
+    const t1 = 30;
+    const t2 = 60;
+    const p1 = model.last + slope * t1;
+    const p2 = model.last + slope * t2;
+    const hasStreak = derivedStrip.momentumStreak >= 3;
+    return {
+      p1,
+      p2,
+      t1,
+      t2,
+      label: `Proj ${t1}s`,
+      sub: hasStreak ? `${derivedStrip.momentum} ×${derivedStrip.momentumStreak}` : null,
+    };
+  }, [derivedStrip, model]);
+
+  const bandGaugeSnapshot = useMemo(() => {
+    if (!model || priceToBeat == null || !Number.isFinite(priceToBeat)) return null;
+    return computeSpotBandGaugeSnapshot({
+      mode,
+      spot: model.last,
+      ptb: priceToBeat,
+      band: model.band,
+      conviction: model.conviction,
+      slopeUsdPerMin: derivedStrip?.slopeUsdPerMin ?? null,
+      distUsd: derivedStrip?.distanceUsd ?? null,
+      proj30s: projection?.p1 ?? null,
+      upLabel,
+      downLabel,
+    });
+  }, [model, priceToBeat, mode, derivedStrip, projection, upLabel, downLabel]);
+
+  useEffect(() => {
+    onBandGaugeSnapshot?.(bandGaugeSnapshot);
+  }, [bandGaugeSnapshot, onBandGaugeSnapshot]);
 
   if (!model) {
     const sk = skeleton;
@@ -742,11 +2189,14 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
     const skBandBottom = sk.level != null ? skY(sk.level - sk.band) : skYBeat + 40;
     const tickPricesSk = Array.from({ length: 5 }, (_, i) => sk.plotMin + ((sk.plotMax - sk.plotMin) * i) / 4);
     const xTickTsSk = buildEvenXTicks(sk.tMin, sk.tMax);
+    const isFreshSpotFeed = (spotFeedSource ?? '').toLowerCase().length > 0;
     const skeletonMsg =
       sk.level == null
         ? 'Load SSR price-to-beat — the yellow line will lock here.'
         : pts.length === 0
-          ? 'Waiting for first Chainlink spot tick…'
+          ? isFreshSpotFeed
+            ? `Waiting for first underlying tick (${spotFeedSource})…`
+            : 'No underlying spot feed wired for this slug yet — only the PTB line will draw.'
           : 'Waiting for a second tick to draw candles…';
     return (
       <div className="flex min-h-0 flex-col rounded-[30px] border border-zinc-800/90 bg-[#0b1018] shadow-[0_28px_80px_rgba(0,0,0,0.35)] ring-1 ring-zinc-700/40">
@@ -778,15 +2228,15 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
                 }`}
               >
                 <span className={`h-2 w-2 rounded-full ${stale ? 'bg-zinc-600' : 'bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.65)]'}`} />
-                Live
+                {stale ? 'Stale' : 'Live'}
               </div>
             </div>
           </div>
         </header>
-        <div className="min-h-0 flex-1 overflow-hidden px-3 pt-2 sm:px-4">
+        <div className={chartPanelWrapSk}>
           <svg
-            viewBox={`0 0 ${width} ${height}`}
-            className="block h-full min-h-[min(44vh,480px)] max-h-[min(62vh,560px)] w-full rounded-[24px] bg-[#0a0f16] [contain:paint]"
+            viewBox={`0 0 ${width} ${svgHeight}`}
+            className={chartSvgSk}
             preserveAspectRatio="xMidYMid meet"
             role="img"
             aria-label="Spot versus price to beat chart frame"
@@ -797,7 +2247,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
                 <stop offset="100%" stopColor="rgba(161, 161, 170, 0.05)" />
               </linearGradient>
             </defs>
-            <rect x="0" y="0" width={width} height={height} fill="#0a0f16" />
+            <rect x="0" y="0" width={width} height={svgHeight} fill="#0a0f16" />
             {sk.level != null ? (
               <>
                 <rect
@@ -868,7 +2318,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
               <text
                 key={`skxt-${i}`}
                 x={skX(ts)}
-                y={height - 4}
+                y={svgHeight - 4}
                 textAnchor="middle"
                 fill="rgb(113 113 122)"
                 fontSize="9"
@@ -1072,27 +2522,17 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
     };
   })();
 
-  const projection = (() => {
-    if (derivedStrip == null) return null;
-    const slope = derivedStrip.slopeUsdPerSec;
-    if (slope == null || !Number.isFinite(slope)) return null;
-    const t1 = 30;
-    const t2 = 60;
-    const p1 = model.last + slope * t1;
-    const p2 = model.last + slope * t2;
-    const hasStreak = derivedStrip.momentumStreak >= 3;
-    return {
-      p1,
-      p2,
-      t1,
-      t2,
-      label: `Proj ${t1}s`,
-      sub: hasStreak ? `${derivedStrip.momentum} ×${derivedStrip.momentumStreak}` : null,
-    };
-  })();
-
   return (
-    <div className="flex min-h-0 flex-col rounded-[30px] border border-zinc-800/90 bg-[#0b1018] shadow-[0_28px_80px_rgba(0,0,0,0.35)] ring-1 ring-zinc-700/40">
+    <div
+      className={`flex min-h-0 flex-col rounded-[30px] border border-zinc-800/90 bg-[#0b1018] shadow-[0_28px_80px_rgba(0,0,0,0.35)] ring-1 ring-zinc-700/40 ${signalsEmbed ? 'min-h-[min(94dvh,2000px)]' : ''}`}
+    >
+      <div
+        className={
+          signalsEmbed
+            ? 'flex min-h-0 w-full min-w-0 flex-1 flex-col'
+            : 'flex w-full min-h-0 min-w-0 flex-col'
+        }
+      >
       <header className="shrink-0 border-b border-zinc-800/80 bg-[#0b1018] px-4 py-3 sm:px-5">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1">
@@ -1137,7 +2577,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
               </button>
             </div>
             <div className="inline-flex flex-wrap rounded-2xl border border-zinc-800/80 bg-black/25 p-1 shadow-inner shadow-black/30">
-              {([60, 120, 300, 900] as const).map((sec) => (
+              {ZOOM_OPTIONS.map(({ sec, label }) => (
                 <button
                   key={sec}
                   type="button"
@@ -1146,7 +2586,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
                     zoomWindow === sec ? 'bg-indigo-600 text-white' : 'text-zinc-400 hover:text-zinc-200'
                   }`}
                 >
-                  {sec < 120 ? '1m' : sec < 300 ? '2m' : sec < 900 ? '5m' : '15m'}
+                  {label}
                 </button>
               ))}
             </div>
@@ -1165,7 +2605,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
               }`}
             >
               <span className={`h-2 w-2 rounded-full ${stale ? 'bg-zinc-600' : 'bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.65)]'}`} />
-              Live
+              {stale ? 'Stale' : 'Live'}
             </div>
           </div>
         </div>
@@ -1245,17 +2685,28 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
           <span className="text-amber-200/80">Yellow</span> = PTB · LINE = ticks · OHLC = buckets
         </p>
         <div className="mt-2 rounded-xl border border-zinc-800/70 bg-black/25 px-3 py-2">
+          {executionClash ? (
+            <div className="mb-2 rounded-lg border border-amber-700/45 bg-amber-950/25 px-2.5 py-2 text-[10px] font-semibold leading-snug text-amber-100/95">
+              <span className="font-extrabold uppercase tracking-wide text-amber-200">Trade card overrides · </span>
+              Spot strip can still read <span className="font-mono text-amber-50">ENTER</span> — the Answer card says{' '}
+              <span className="font-mono text-amber-50">{operatorVerdict.bigVerb}</span> until blockers clear (
+              {operatorVerdict.blockers.slice(0, 2).join(' · ') || operatorVerdict.headline}). Treat this box as{' '}
+              <span className="italic text-amber-100/85">context</span>, not permission to size in.
+            </div>
+          ) : null}
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Single call</div>
             <div
               className={`rounded-lg border px-2 py-1 text-[10px] font-extrabold tracking-wide ${
-                primaryCall.status === 'ENTER'
-                  ? primaryCall.lane === 'up'
-                    ? 'border-emerald-500/45 bg-emerald-950/30 text-emerald-100'
-                    : 'border-rose-500/45 bg-rose-950/25 text-rose-100'
-                  : primaryCall.status === 'PREP'
-                    ? 'border-amber-500/35 bg-amber-950/20 text-amber-100'
-                    : 'border-zinc-700/70 bg-zinc-900/30 text-zinc-200'
+                executionClash && primaryCall.status === 'ENTER'
+                  ? 'border-amber-600/50 bg-amber-950/30 text-amber-100'
+                  : primaryCall.status === 'ENTER'
+                    ? primaryCall.lane === 'up'
+                      ? 'border-emerald-500/45 bg-emerald-950/30 text-emerald-100'
+                      : 'border-rose-500/45 bg-rose-950/25 text-rose-100'
+                    : primaryCall.status === 'PREP'
+                      ? 'border-amber-500/35 bg-amber-950/20 text-amber-100'
+                      : 'border-zinc-700/70 bg-zinc-900/30 text-zinc-200'
               }`}
             >
               {primaryCall.status}
@@ -1264,6 +2715,26 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             </div>
           </div>
           <p className="mt-1 text-[11px] leading-relaxed text-zinc-400">{primaryCall.reason}</p>
+          {primaryCall.gates.length ? (
+            <div className="mt-2 rounded-lg border border-zinc-800/70 bg-black/30 px-2 py-2">
+              <div className="text-[9px] font-black uppercase tracking-wide text-zinc-500">Entry gates (this chart)</div>
+              <div className="mt-1.5 grid gap-x-2 gap-y-1 sm:grid-cols-2">
+                {primaryCall.gates.map((g) => (
+                  <div key={g.k} className="flex min-w-0 items-start justify-between gap-2">
+                    <span className={`text-[10px] font-semibold ${g.ok ? 'text-emerald-200' : 'text-zinc-400'}`}>
+                      {g.ok ? '✓' : '—'} {g.k}
+                    </span>
+                    <span className="min-w-0 truncate font-mono text-[9px] text-zinc-500" title={g.v}>
+                      {g.v}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              {primaryCall.enterWhen ? (
+                <p className="mt-2 border-t border-zinc-800/60 pt-2 text-[10px] leading-snug text-amber-100/90">{primaryCall.enterWhen}</p>
+              ) : null}
+            </div>
+          ) : null}
           <div className="mt-2 flex flex-wrap gap-2">
             <button
               type="button"
@@ -1317,10 +2788,203 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
         </details>
       </header>
 
-      <div className="min-h-0 flex-1 overflow-hidden px-3 pt-2 sm:px-4 [contain:paint]">
+      {switchForecast ? (
+        <div className="mx-3 mt-2 sm:mx-4">
+          {featureFlags.pinnedNote ? <RoundNote slug={slug} visible={pinnedNoteVisible} /> : null}
+          <SignalTruthStrip
+            tradeDirective={tradeDirective}
+            operatorVerdict={operatorVerdict}
+            switchForecast={switchForecast}
+            boomActive={boom != null}
+            boomKind={boom?.kind ?? null}
+            boomLane={boom?.lane ?? null}
+            upLabel={upLabel}
+            downLabel={downLabel}
+            executionClash={executionClash}
+            tapeWaitCardGo={tapeWaitCardGo}
+            machineFocusLane={machineReadout?.focusLane ?? null}
+            machineAgreementPct={machineReadout?.agreementScore ?? null}
+            inSettlement={machineReadout?.urgency === 'settlement'}
+          />
+          {featureFlags.tapeVelocity && tapeVelocity ? (
+            <TapeVelocityStrip
+              tape={tapeVelocity}
+              lane={tradeDirective?.lane ?? null}
+              upLabel={upLabel}
+              downLabel={downLabel}
+              reduceMotion={reduceMotion}
+            />
+          ) : null}
+          {boom ? (
+            <BoomOverlay
+              kind={boom.kind}
+              lane={boom.lane}
+              laneLabel={boom.lane === 'up' ? upLabel : downLabel}
+              oppositeLabel={boom.lane === 'up' ? downLabel : upLabel}
+              headline={boom.headline}
+              reason={boom.reason}
+              etaSec={boom.etaSec}
+              levels={boomLevels}
+              agreementScore={machineReadout?.agreementScore ?? null}
+              crossProb={machineReadout?.crossProb ?? crossEstimate?.prob ?? null}
+              incomingEdge={boomIncomingEdge}
+              oppositeMid={boomOppositeMid}
+              warmupNotice={tradeDirective == null && boom.kind !== 'EXIT_NOW'}
+              structuralVsCardClash={executionClash}
+              onDismiss={() => setBoom(null)}
+            />
+          ) : null}
+          {tradeDirective && !signalsEmbed ? (
+            <div className="mb-2">
+              <div className="mb-1.5 flex flex-wrap items-center gap-2">
+                <span className="rounded-md border border-emerald-500/50 bg-emerald-950/35 px-2 py-0.5 text-[9px] font-black uppercase tracking-[0.2em] text-emerald-100">
+                  Answer
+                </span>
+                <span className="text-[10px] text-zinc-500">Size · TP/SL · guards</span>
+              </div>
+              <TradeDirectiveCard
+                directive={tradeDirective}
+                levels={tradeLevels}
+                laneEdges={laneEdges}
+                tpSlHorizon={{
+                  crossProb: machineReadout?.crossProb ?? null,
+                  endsInMs,
+                }}
+                upOutcomeLabel={upLabel}
+                downOutcomeLabel={downLabel}
+                stability={directiveStability}
+                discrepancy={directiveDiscrepancy}
+                reEntry={reEntryCheck}
+                sizingMultiplier={sizingMultiplier}
+                journal={directiveJournal}
+                onExportJournal={featureFlags.journalExport ? onExportJournal : null}
+                noTradeScore={noTradeScore}
+                compact
+                executionSnapshot={{
+                  endsInMs,
+                  switchForecast,
+                  crossProb01: machineReadout?.crossProb ?? crossEstimate?.prob ?? null,
+                  upLabel,
+                  downLabel,
+                  currentPositionLane,
+                  incomingSwitchLevels,
+                }}
+              />
+            </div>
+          ) : !signalsEmbed && !tradeDirective ? (
+            <div className="mb-2 rounded-xl border border-dashed border-zinc-800/70 bg-zinc-950/25 px-3 py-2.5 text-center">
+              <span className="text-[9px] font-black uppercase tracking-[0.2em] text-zinc-500">Answer</span>
+              <p className="mt-0.5 text-[11px] font-medium leading-snug text-zinc-400">
+                No trade card yet — below is <span className="text-zinc-300">context only</span>.
+              </p>
+            </div>
+          ) : null}
+          {!signalsEmbed && featureFlags.noTradeBanner && noTradeScore && noTradeScore.tier !== 'GREEN' ? (
+            <NoTradeBanner
+              score={noTradeScore}
+              reduceMotion={reduceMotion}
+              compact={executionClash}
+            />
+          ) : null}
+          {shortcutHelpOpen ? (
+            <ShortcutHelp onClose={() => setShortcutHelpOpen(false)} />
+          ) : null}
+          {crossImminentBanner ? (
+            <div
+              className={`mb-2 flex flex-wrap items-center gap-2 rounded-2xl border-2 px-3 py-2 text-fuchsia-50 shadow-lg shadow-black/40 ${
+                executionClash
+                  ? 'border-fuchsia-500/35 bg-gradient-to-r from-fuchsia-900/40 to-indigo-950/50'
+                  : 'border-fuchsia-400/65 animate-pulse bg-gradient-to-r from-fuchsia-700/55 to-indigo-900/45'
+              }`}
+            >
+              <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-fuchsia-300 text-base font-black text-zinc-950 shadow shadow-black/40">
+                ⟂
+              </span>
+              <div className="flex min-w-0 flex-1 flex-col">
+                <span className="text-sm font-black uppercase tracking-tight">
+                  PTB cross risk · {Math.round(crossImminentBanner.prob * 100)}%
+                </span>
+                <span className="text-[11px] leading-snug text-fuchsia-100/85">
+                  {crossImminentBanner.currentSide === 'above'
+                    ? `Model: likely flips toward ${downLabel} before bell.`
+                    : crossImminentBanner.currentSide === 'below'
+                      ? `Model: likely flips toward ${upLabel} before bell.`
+                      : 'Spot on PTB — line can resolve either way.'}
+                </span>
+                {executionClash ? (
+                  <span className="mt-1 text-[10px] leading-snug text-zinc-400">
+                    Trade card says wait — <span className="font-semibold text-zinc-300">chart is context only</span>.
+                  </span>
+                ) : null}
+              </div>
+              <button
+                type="button"
+                onClick={() => setCrossImminentBanner(null)}
+                className="rounded-md border border-fuchsia-300/50 bg-fuchsia-300/15 px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wide text-fuchsia-50 hover:bg-fuchsia-300/25"
+              >
+                Dismiss
+              </button>
+            </div>
+          ) : null}
+          <div className="mb-1 flex items-center gap-2 border-b border-zinc-800/80 pb-1">
+            <span className="text-[9px] font-black uppercase tracking-[0.22em] text-zinc-600">Chart</span>
+            <span className="text-[9px] leading-none text-zinc-600">—</span>
+            <span className="text-[9px] font-semibold uppercase tracking-wide text-zinc-500">
+              {executionClash
+                ? 'Tape read · Answer block is law'
+                : tapeWaitCardGo
+                  ? 'Tape WAIT · card GO (full model)'
+                  : 'context only · card above wins'}
+            </span>
+          </div>
+          <DecisionBanner
+            forecast={switchForecast}
+            upLabel={upLabel}
+            downLabel={downLabel}
+            dwellInfo={dwellInfo}
+            onTestBoom={fireTestBoom}
+            machine={machineReadout}
+            operatorVerdict={operatorVerdict}
+            hasDirective={tradeDirective != null}
+            tapeWaitCardGo={tapeWaitCardGo}
+          />
+          {sections.length > 0 && sectionalPlan != null ? (
+            <SectionalStrip
+              sections={sections}
+              sectionMs={sectionalPlan.sectionMs}
+              upLabel={upLabel}
+              downLabel={downLabel}
+              forecast={switchForecast}
+              executionClash={executionClash}
+            />
+          ) : (
+            <div className="mt-2 rounded-xl border border-dashed border-zinc-800/80 bg-zinc-950/20 px-3 py-2.5 text-center text-[10px] leading-relaxed text-zinc-500">
+              {sectionalPlan ? (
+                <>
+                  <span className="font-semibold text-zinc-400">Round breakdown</span> — waiting for enough spot ticks to paint{' '}
+                  {sectionalPlan.count} slice{sectionalPlan.count === 1 ? '' : 's'} (
+                  {sectionalPlan.sectionMs >= 60_000
+                    ? `${Math.round(sectionalPlan.sectionMs / 60_000)}m`
+                    : `${Math.round(sectionalPlan.sectionMs / 1000)}s`}{' '}
+                  each). The strip reappears as data fills; try a wider zoom if this stays empty.
+                </>
+              ) : (
+                <>
+                  <span className="font-semibold text-zinc-400">Round breakdown</span> — set chart zoom to{' '}
+                  <strong className="text-zinc-300">≥ 1 minute</strong> for sectional slices. The Answer card, TP/SL, and
+                  boom above still use spot, book, and PTB sensors at any zoom.
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      ) : null}
+
+      <div className={chartPanelWrapMain}>
         <svg
-          viewBox={`0 0 ${width} ${height}`}
-          className="block h-full min-h-[min(44vh,480px)] max-h-[min(62vh,560px)] w-full rounded-[24px] bg-[#0a0f16] [contain:strict]"
+          ref={spotSvgRef}
+          viewBox={`0 0 ${width} ${svgHeight}`}
+          className={chartSvgMain}
           preserveAspectRatio="xMidYMid meet"
           role="img"
           aria-label="Spot price versus PTB"
@@ -1343,7 +3007,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             </marker>
           </defs>
 
-          <rect x="0" y="0" width={width} height={height} fill="#0a0f16" />
+          <rect x="0" y="0" width={width} height={svgHeight} fill="#0a0f16" />
 
           <rect x={padL} y={Math.min(yBandTop, yBandBottom)} width={innerW} height={Math.max(12, Math.abs(yBandBottom - yBandTop))} fill={`url(#ptbFocusBand-${gradId})`} />
           <g>
@@ -1377,26 +3041,39 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             />
           ) : null}
 
-          {tickPrices.map((tp, i) => (
-            <g key={`grid-${i}`}>
-              <line x1={padL} x2={padL + innerW} y1={yPrice(tp)} y2={yPrice(tp)} stroke="rgba(39,39,42,0.8)" strokeWidth="1" />
-              <text
-                x={width - padR + 6}
-                y={yPrice(tp) + 4}
-                fill="rgb(212 212 216)"
-                fontSize="11"
-                fontFamily="ui-monospace, monospace"
-                stroke="rgb(10 15 22)"
-                strokeWidth="0.6"
-                paintOrder="stroke"
-              >
-                {fmtAxisPrice(tp)}
-              </text>
-            </g>
-          ))}
+          {(() => {
+            // On 15m+ windows show full prices ($107,234.50) at a larger font so you can
+            // actually see how small the move is. Right-anchor so longer labels grow into
+            // the gutter instead of overflowing past the SVG edge.
+            const precise = zoomWindow >= 900;
+            const tickFont = precise ? 14 : 11;
+            const tickX = precise ? width - 4 : width - padR + 6;
+            const tickAnchor: 'start' | 'end' = precise ? 'end' : 'start';
+            return tickPrices.map((tp, i) => (
+              <g key={`grid-${i}`}>
+                <line x1={padL} x2={padL + innerW} y1={yPrice(tp)} y2={yPrice(tp)} stroke="rgba(39,39,42,0.8)" strokeWidth="1" />
+                <text
+                  x={tickX}
+                  y={yPrice(tp) + 4}
+                  fill="rgb(228 228 231)"
+                  fontSize={tickFont}
+                  fontFamily="ui-monospace, monospace"
+                  fontWeight={precise ? 600 : 400}
+                  textAnchor={tickAnchor}
+                  stroke="rgb(10 15 22)"
+                  strokeWidth={precise ? 2.4 : 0.6}
+                  paintOrder="stroke"
+                >
+                  {fmtAxisPrice(tp, { precise })}
+                </text>
+              </g>
+            ));
+          })()}
           <g>
+            {/* HIGHER $ / LOWER $ legends sit just past the bias meter on the left
+                (the meter bar+labels span padL+4..padL+90 at roughly padY+8..padY+8+bH). */}
             <text
-              x={padL + 6}
+              x={padL + 96}
               y={padY + 16}
               textAnchor="start"
               fontSize="12"
@@ -1411,7 +3088,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
               HIGHER $
             </text>
             <text
-              x={padL + 6}
+              x={padL + 96}
               y={padY + innerH - 3}
               textAnchor="start"
               fontSize="12"
@@ -1459,8 +3136,8 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
               return (
                 <>
                   <path d={fill_d} fill={lineFill} className="pointer-events-none" />
-                  {upD && <path d={upD} fill="none" stroke="rgb(74 222 128)" strokeWidth={2.75} strokeLinecap="round" />}
-                  {dnD && <path d={dnD} fill="none" stroke="rgb(248 113 113)" strokeWidth={2.75} strokeLinecap="round" />}
+                  {upD && <path d={upD} fill="none" stroke="rgb(74 222 128)" strokeWidth={3.35} strokeLinecap="round" />}
+                  {dnD && <path d={dnD} fill="none" stroke="rgb(248 113 113)" strokeWidth={3.35} strokeLinecap="round" />}
                 </>
               );
             })() : (
@@ -1469,7 +3146,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
               const x1 = xTime(c.t1);
               const xc = (x0 + x1) / 2;
               const slotW = x1 - x0;
-              const bodyW = Math.max(18, Math.min(slotW * 0.82, innerW * 0.07));
+              const bodyW = Math.max(24, Math.min(slotW * 0.86, innerW * 0.1));
               const yO = yPrice(c.o);
               const yC = yPrice(c.c);
               const yH = yPrice(c.h);
@@ -1478,15 +3155,15 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
               const bodyTop = Math.min(yO, yC);
               const bodyBot = Math.max(yO, yC);
               const rawBodyH = bodyBot - bodyTop;
-              const bodyH = Math.max(4, rawBodyH);
+              const bodyH = Math.max(6, rawBodyH);
               const bodyY = bodyTop - (bodyH - rawBodyH) / 2;
               const wickColor = bullish ? 'rgb(34 197 94)' : 'rgb(239 68 68)';
               const bodyFill = bullish ? 'rgb(22 163 74)' : 'rgb(220 38 38)';
               const bodyStroke = bullish ? 'rgb(74 222 128)' : 'rgb(248 113 113)';
               return (
                 <g key={`candle-${i}`}>
-                  <line x1={xc} x2={xc} y1={yH} y2={bodyY} stroke={wickColor} strokeWidth={1.6} />
-                  <line x1={xc} x2={xc} y1={bodyY + bodyH} y2={yL} stroke={wickColor} strokeWidth={1.6} />
+                  <line x1={xc} x2={xc} y1={yH} y2={bodyY} stroke={wickColor} strokeWidth={2.1} />
+                  <line x1={xc} x2={xc} y1={bodyY + bodyH} y2={yL} stroke={wickColor} strokeWidth={2.1} />
                   <rect
                     x={xc - bodyW / 2}
                     y={bodyY}
@@ -1494,7 +3171,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
                     height={bodyH}
                     fill={bodyFill}
                     stroke={bodyStroke}
-                    strokeWidth={1.2}
+                    strokeWidth={1.55}
                   />
                 </g>
               );
@@ -1578,11 +3255,16 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             );
           })() : null}
 
-          {/* Momentum buildup gauge — top-right of chart */}
+          {/* Momentum buildup gauge — top-CENTER of chart so it never overlaps with the
+              left-side bias meter or the right-side PTB price chip (which can sit anywhere
+              along the y-axis based on yBeat). */}
           {buildup && buildup.tier !== 'NONE' ? (() => {
-            const gx = width - padR - 160;
-            const gy = padY + 6;
             const barW = 100;
+            // Outer rect uses (barW + 68) wide; centre under the chart with a safe min margin
+            // away from the bias meter on the left (~padL+90) and the PTB chip on the right.
+            const totalW = barW + 68;
+            const gx = padL + Math.max(110, Math.round((innerW - totalW) / 2));
+            const gy = padY + 6;
             const barH = 8;
             const fill01 = buildup.score / 100;
             const tierColor = buildup.tier === 'FIRING' ? 'rgb(250 204 21)' :
@@ -1699,11 +3381,242 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             </g>
           ) : null}
 
+          {overlayAppliesSpot && bracketOverlay ? (() => {
+            const stripY0 = padY + innerH + PROB_STRIP_GAP;
+            const bo = bracketOverlay;
+            const bsl = parseTradeBracketCents01(bo.slStopCents);
+            const btp = parseTradeBracketCents01(bo.tpTakeCents);
+            const brf = parseTradeBracketCents01(bo.refCents);
+            const slMu = !bo.stopLossEnabled;
+            const tpMu = !bo.takeProfitEnabled;
+            const laneP = bo.tradeLane;
+            const ap = laneP === 'up' ? lastProbUp : lastProbDown;
+            const xL = ap != null && Number.isFinite(ap) ? padL + clamp01(ap) * innerW : null;
+            const xSl = bsl != null ? padL + clamp01(bsl) * innerW : null;
+            const xTp = btp != null ? padL + clamp01(btp) * innerW : null;
+            const xRf = brf != null ? padL + clamp01(brf) * innerW : null;
+            const avgE =
+              bo.avgEntry01 != null && Number.isFinite(bo.avgEntry01) && bo.avgEntry01 > 0 && bo.avgEntry01 < 1
+                ? bo.avgEntry01
+                : null;
+            const xAvg = avgE != null ? padL + clamp01(avgE) * innerW : null;
+            const pnlBits: string[] = [];
+            if (avgE != null) {
+              pnlBits.push(`My entry ${(avgE * 100).toFixed(1)}¢`);
+              if (btp != null) {
+                const s = fmtProbPnlVsEntry(btp, avgE);
+                if (s) pnlBits.push(`TP ${s}`);
+              }
+              if (bsl != null) {
+                const s = fmtProbPnlVsEntry(bsl, avgE);
+                if (s) pnlBits.push(`SL ${s}`);
+              }
+              if (brf != null) {
+                const s = fmtProbPnlVsEntry(brf, avgE);
+                if (s) pnlBits.push(`REF ${s}`);
+              }
+            }
+            const pnlSummary = pnlBits.length > 1 ? pnlBits.join(' · ') : null;
+            const stripGridY0 = stripY0 + 28;
+            return (
+              <g aria-label="Trade bracket cents strip">
+                <rect
+                  x={padL}
+                  y={stripY0}
+                  width={innerW}
+                  height={PROB_STRIP_H}
+                  rx={10}
+                  fill="rgba(15,23,42,0.92)"
+                  stroke="rgba(63,63,70,0.9)"
+                  strokeWidth={1}
+                />
+                <text
+                  x={padL + 6}
+                  y={stripY0 + 12}
+                  fill="rgb(161,161,170)"
+                  fontSize="9"
+                  fontWeight="800"
+                  className="pointer-events-none"
+                >
+                  TRADE ¢ · {laneP === 'up' ? upLabel : downLabel} (live mid + drag SL / TP / REF)
+                </text>
+                {pnlSummary ? (
+                  <text
+                    x={padL + 6}
+                    y={stripY0 + 23}
+                    fill="rgb(203,213,225)"
+                    fontSize="8"
+                    fontWeight="800"
+                    fontFamily="ui-monospace, monospace"
+                    className="pointer-events-none"
+                  >
+                    {pnlSummary.length > 118 ? `${pnlSummary.slice(0, 115)}…` : pnlSummary}
+                  </text>
+                ) : null}
+                {[0, 0.25, 0.5, 0.75, 1].map((f) => (
+                  <line
+                    key={`psg-${f}`}
+                    x1={padL + f * innerW}
+                    x2={padL + f * innerW}
+                    y1={stripGridY0}
+                    y2={stripY0 + PROB_STRIP_H - 4}
+                    stroke="rgba(255,255,255,0.06)"
+                    strokeWidth={1}
+                    className="pointer-events-none"
+                  />
+                ))}
+                {[0, 50, 100].map((c) => (
+                  <text
+                    key={`psl-${c}`}
+                    x={padL + (c / 100) * innerW}
+                    y={stripY0 + PROB_STRIP_H - 2}
+                    textAnchor="middle"
+                    fill="rgb(113,113,122)"
+                    fontSize="8"
+                    fontFamily="ui-monospace, monospace"
+                    className="pointer-events-none"
+                  >
+                    {c}¢
+                  </text>
+                ))}
+                {xL != null ? (
+                  <g className="pointer-events-none">
+                    <line
+                      x1={xL}
+                      x2={xL}
+                      y1={stripGridY0}
+                      y2={stripY0 + PROB_STRIP_H - 6}
+                      stroke="rgb(250,250,250)"
+                      strokeWidth={2}
+                      strokeLinecap="round"
+                    />
+                    <polygon
+                      points={`${xL},${stripGridY0 + 6} ${xL - 5},${stripGridY0 - 2} ${xL + 5},${stripGridY0 - 2}`}
+                      fill="rgb(250,250,250)"
+                    />
+                  </g>
+                ) : null}
+                {xAvg != null ? (
+                  <g className="pointer-events-none" opacity={0.95}>
+                    <line
+                      x1={xAvg}
+                      x2={xAvg}
+                      y1={stripGridY0}
+                      y2={stripY0 + PROB_STRIP_H - 6}
+                      stroke="rgba(167,139,250,0.85)"
+                      strokeWidth={2}
+                      strokeDasharray="3 4"
+                      strokeLinecap="round"
+                    />
+                    <rect
+                      x={xAvg - 3}
+                      y={stripGridY0 - 4}
+                      width={6}
+                      height={6}
+                      rx={1}
+                      fill="rgb(167,139,250)"
+                      stroke="rgba(0,0,0,0.45)"
+                      strokeWidth={0.5}
+                    />
+                  </g>
+                ) : null}
+                {xSl != null ? (
+                  <g opacity={slMu ? 0.48 : 1}>
+                    <line
+                      x1={xSl}
+                      x2={xSl}
+                      y1={stripGridY0}
+                      y2={stripY0 + PROB_STRIP_H - 4}
+                      stroke="rgba(251,113,133,0.45)"
+                      strokeWidth={18}
+                      strokeLinecap="round"
+                      pointerEvents="stroke"
+                      className="cursor-ew-resize touch-none"
+                      onPointerDown={(e) => onStripPointerDown('sl', e)}
+                      onPointerMove={onStripPointerMove}
+                      onPointerUp={onStripPointerUp}
+                      onPointerCancel={onStripPointerUp}
+                    />
+                    <line
+                      x1={xSl}
+                      x2={xSl}
+                      y1={stripGridY0}
+                      y2={stripY0 + PROB_STRIP_H - 4}
+                      stroke="rgb(251,113,133)"
+                      strokeWidth={2}
+                      strokeLinecap="round"
+                      className="pointer-events-none"
+                    />
+                  </g>
+                ) : null}
+                {xTp != null ? (
+                  <g opacity={tpMu ? 0.48 : 1}>
+                    <line
+                      x1={xTp}
+                      x2={xTp}
+                      y1={stripGridY0}
+                      y2={stripY0 + PROB_STRIP_H - 4}
+                      stroke="rgba(52,211,153,0.4)"
+                      strokeWidth={18}
+                      strokeLinecap="round"
+                      pointerEvents="stroke"
+                      className="cursor-ew-resize touch-none"
+                      onPointerDown={(e) => onStripPointerDown('tp', e)}
+                      onPointerMove={onStripPointerMove}
+                      onPointerUp={onStripPointerUp}
+                      onPointerCancel={onStripPointerUp}
+                    />
+                    <line
+                      x1={xTp}
+                      x2={xTp}
+                      y1={stripGridY0}
+                      y2={stripY0 + PROB_STRIP_H - 4}
+                      stroke="rgb(52,211,153)"
+                      strokeWidth={2}
+                      strokeLinecap="round"
+                      className="pointer-events-none"
+                    />
+                  </g>
+                ) : null}
+                {xRf != null ? (
+                  <g opacity={0.92}>
+                    <line
+                      x1={xRf}
+                      x2={xRf}
+                      y1={stripGridY0}
+                      y2={stripY0 + PROB_STRIP_H - 4}
+                      stroke="rgba(251,191,36,0.45)"
+                      strokeWidth={18}
+                      strokeLinecap="round"
+                      pointerEvents="stroke"
+                      className="cursor-ew-resize touch-none"
+                      onPointerDown={(e) => onStripPointerDown('ref', e)}
+                      onPointerMove={onStripPointerMove}
+                      onPointerUp={onStripPointerUp}
+                      onPointerCancel={onStripPointerUp}
+                    />
+                    <line
+                      x1={xRf}
+                      x2={xRf}
+                      y1={stripGridY0}
+                      y2={stripY0 + PROB_STRIP_H - 4}
+                      stroke="rgb(251,191,36)"
+                      strokeWidth={2}
+                      strokeDasharray="4 5"
+                      strokeLinecap="round"
+                      className="pointer-events-none"
+                    />
+                  </g>
+                ) : null}
+              </g>
+            );
+          })() : null}
+
           {xTickTs.map((ts, i) => (
             <text
               key={`xt-${i}`}
               x={xTime(ts)}
-              y={height - 4}
+              y={svgHeight - 4}
               textAnchor="middle"
               fill="rgb(113 113 122)"
               fontSize="9"
@@ -1742,6 +3655,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             onMouseLeave={() => setCrosshair(null)}
           />
         </svg>
+      </div>
       </div>
 
       <section
@@ -1892,6 +3806,19 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
           <span className="rounded border border-zinc-700/60 bg-black/30 px-2 py-1 text-zinc-500">{model.conviction}</span>
         </div>
 
+        {priceToBeat != null && model && derivedStrip ? (
+          <SpotPriceProjectionGrid
+            spotLast={model.last}
+            slopeUsdPerSec={derivedStrip.slopeUsdPerSec}
+            endsInMs={endsInMs}
+            assetLabel={
+              slug
+                ? (parseUpdownSlug(slug)?.asset ?? titledUpdownAssetFromSlug(slug) ?? undefined)?.toUpperCase()
+                : undefined
+            }
+          />
+        ) : null}
+
         {/* Make “WEAK SEPARATION” impossible to misread: bold, actionable, not just a chip. */}
         {priceToBeat != null && model ? (() => {
           const band = model.band;
@@ -1939,81 +3866,90 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
                   ? 'from-emerald-950/22'
                   : 'from-rose-950/22'
                 : 'from-zinc-900/40';
-          const headlineTone =
-            inBand ? 'text-amber-200' : favorableNow ? (mode === 'up' ? 'text-emerald-200' : 'text-rose-200') : 'text-zinc-200';
+
+          const glanceVerb =
+            inBand ? 'WAIT — CONFIRM BREAK' : edgeOk ? 'EDGE LIVE — OK TO WORK' : 'NOT THIS VIEW — STAND ASIDE';
+          const glanceGeo =
+            side === 'IN BAND' ? 'IN BAND' : side === 'ABOVE' ? 'ABOVE PTB' : 'BELOW PTB';
+          const glanceGeoClass =
+            inBand
+              ? 'text-amber-100'
+              : side === 'ABOVE'
+                ? 'text-sky-100'
+                : 'text-rose-100';
+          const glanceVerbClassFinal =
+            inBand ? 'text-amber-200/95' : edgeOk ? 'text-emerald-200' : 'text-zinc-400';
+
+          const confirmBody = inBand
+            ? `Break & hold: above ${fmtUsd(hi)} (Up lens) or below ${fmtUsd(lo)} (Down lens).`
+            : edgeOk
+              ? mode === 'up'
+                ? `Hold above ${fmtUsd(hi)} after pullbacks — stay outside band.`
+                : `Hold below ${fmtUsd(lo)} after pullbacks — stay outside band.`
+              : `Price is outside band on the other side — switch ${mode === 'up' ? downLabel : upLabel} view or wait.`;
+
+          const reclaimFmt = mode === 'up' ? fmtUsd(hi) : fmtUsd(lo);
 
           return (
             <div className={`mt-3 rounded-2xl border-2 ${accentBorder} bg-gradient-to-br ${accentBg} via-zinc-950/60 to-black/40 p-4 ring-1 ring-white/[0.03]`}>
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div>
-                  <div className={`text-[11px] font-black uppercase tracking-wider ${headlineTone}`}>{sep}</div>
-                  <div className="mt-1 text-[16px] font-extrabold leading-tight text-zinc-50">
-                    {side}{inBand ? ' — wait for a clean outside + hold' : edgeOk ? ' — edge is live (don’t chase)' : ' — not your side'}
-                  </div>
-                  <div className="mt-1 text-[12px] leading-snug text-zinc-300">
-                    Band: <span className="font-mono text-zinc-100">{fmtUsd(lo)}–{fmtUsd(hi)}</span> · PTB {fmtUsd(priceToBeat)}
-                  </div>
-                </div>
-                <div className="rounded-xl border border-zinc-700/60 bg-black/25 px-3 py-2">
-                  <div className="text-[10px] font-bold uppercase tracking-wide text-zinc-500">Now</div>
-                  <div className="mt-1 font-mono text-[14px] font-extrabold text-zinc-100">
-                    {fmtUsd(now)} <span className="text-zinc-500">({fmtUsdSignedTight(now - priceToBeat)})</span>
-                  </div>
-                </div>
-              </div>
-
-              <div className="mt-3 grid gap-2 lg:grid-cols-2">
-                <div className={`rounded-xl border px-3 py-2 ${edgeOk ? 'border-emerald-700/35 bg-emerald-950/10' : 'border-zinc-800/60 bg-black/20'}`}>
-                  <div className="text-[10px] font-black uppercase tracking-wide text-zinc-200">Entry</div>
-                  {inBand ? (
-                    <>
-                      <div className="mt-1 text-[12px] font-semibold text-zinc-100">Key levels (in band)</div>
-                      <div className="mt-1 text-[11px] leading-snug text-zinc-300">
-                        <span className="font-semibold text-emerald-200">ABOVE-confirm</span>: price holds above{' '}
-                        <span className="font-mono text-emerald-100">{fmtUsd(hi)}</span>
-                      </div>
-                      <div className="mt-1 text-[11px] leading-snug text-zinc-300">
-                        <span className="font-semibold text-rose-200">BELOW-confirm</span>: price holds below{' '}
-                        <span className="font-mono text-rose-100">{fmtUsd(lo)}</span>
-                      </div>
-                      <div className="mt-1 text-[11px] leading-snug text-zinc-400">
-                        In-band entries are low edge — use these as the “go” thresholds.
-                      </div>
-                    </>
-                  ) : edgeOk ? (
-                    <div className="mt-1 text-[12px] font-semibold text-zinc-100">
-                      ENTER on pullback that stays outside the band (holds <span className="font-mono">{fmtUsd(entryLine)}</span>).
+              {/* Glance: geographic vs PTB first — trains fast read (above / below / in-band). */}
+              <div
+                className={`rounded-xl border px-3 py-3 sm:px-4 sm:py-3.5 ${
+                  inBand
+                    ? 'border-amber-500/50 bg-amber-500/10'
+                    : edgeOk
+                      ? side === 'ABOVE'
+                        ? 'border-sky-500/45 bg-sky-500/10'
+                        : 'border-rose-500/45 bg-rose-500/10'
+                      : 'border-zinc-600/50 bg-zinc-950/40'
+                }`}
+              >
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+                  <div className="min-w-0">
+                    <div className="text-[10px] font-black uppercase tracking-[0.22em] text-white/50">Where price is</div>
+                    <div className={`mt-1 font-black leading-[1.05] tracking-tight ${glanceGeoClass} text-[clamp(1.75rem,5.5vw,2.65rem)]`}>
+                      {glanceGeo}
                     </div>
-                  ) : (
-                    <div className="mt-1 text-[12px] font-semibold text-zinc-100">NO TRADE: not outside band on your side.</div>
-                  )}
-                  <div className="mt-1 text-[11px] leading-snug text-zinc-300">
-                    Stop: back into band (<span className="font-mono">{stopBand}</span>)
+                    <div className={`mt-1 text-[13px] font-bold uppercase tracking-wide ${glanceVerbClassFinal}`}>{glanceVerb}</div>
+                  </div>
+                  <div className="flex shrink-0 flex-col items-stretch gap-2 sm:items-end">
+                    <div
+                      className={`rounded-lg border px-3 py-1.5 text-center text-[10px] font-black uppercase tracking-wide ${
+                        sep === 'STRONG SEPARATION'
+                          ? 'border-white/25 bg-white/10 text-white'
+                          : sep === 'CLEAR SEPARATION'
+                            ? 'border-white/15 bg-black/25 text-zinc-100'
+                            : 'border-zinc-600/60 bg-black/30 text-zinc-300'
+                      }`}
+                    >
+                      {sep.replace(' SEPARATION', '')}
+                      <span className="block text-[9px] font-bold normal-case tracking-normal text-white/60">separation</span>
+                    </div>
+                    <div className="rounded-lg border border-zinc-700/60 bg-black/30 px-3 py-2 text-right">
+                      <div className="text-[9px] font-bold uppercase tracking-wide text-zinc-500">Now</div>
+                      <div className="mt-0.5 font-mono text-[13px] font-extrabold tabular-nums text-zinc-50">
+                        {fmtUsd(now)} <span className="text-zinc-500">({fmtUsdSignedTight(now - priceToBeat)})</span>
+                      </div>
+                    </div>
                   </div>
                 </div>
-
-                <div className="rounded-xl border border-zinc-800/60 bg-black/20 px-3 py-2">
-                  <div className="text-[10px] font-black uppercase tracking-wide text-zinc-200">Exit</div>
-                  <div className="mt-1 text-[12px] font-semibold text-zinc-100">
-                    EXIT if it re-enters the band (<span className="font-mono">{stopBand}</span>)
-                    {slope != null ? ' or flips slope.' : '.'}
-                  </div>
-                  <div className="mt-1 text-[11px] leading-snug text-zinc-300">
-                    <span className="font-semibold text-zinc-200">Reclaim / exit line</span>: {mode === 'up' ? (
-                      <>
-                        lose <span className="font-mono">{fmtUsd(hi)}</span> = exit pressure
-                      </>
-                    ) : (
-                      <>
-                        lose <span className="font-mono">{fmtUsd(lo)}</span> = exit pressure
-                      </>
-                    )}
-                  </div>
-                  <div className="mt-1 text-[11px] leading-snug text-zinc-300">
-                    TP (proj 30s): <span className="font-mono">{tpLine}</span>
-                  </div>
+                <div className="mt-2 border-t border-white/10 pt-2 text-[11px] leading-snug text-zinc-300">
+                  Band <span className="font-mono text-zinc-100">{fmtUsd(lo)}–{fmtUsd(hi)}</span> · PTB{' '}
+                  <span className="font-mono text-zinc-100">{fmtUsd(priceToBeat)}</span> · {mode === 'up' ? upLabel : downLabel}{' '}
+                  <span className="text-zinc-500">view</span>
                 </div>
               </div>
+
+              <SpotBandPlayCardRow
+                inBand={inBand}
+                edgeOk={edgeOk}
+                confirmBody={confirmBody}
+                entryLineFmt={fmtUsd(entryLine)}
+                stopBand={stopBand}
+                tpLine={tpLine}
+                reclaimFmt={reclaimFmt}
+                slope={slope}
+              />
 
               <div className="mt-2 grid gap-2 md:grid-cols-2">
                 <div className="rounded-xl border border-zinc-800/60 bg-black/15 px-3 py-2">
@@ -2140,3 +4076,639 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
     </div>
   );
 });
+
+// =====================================================================================
+// Decision banner — big, prominent block above the chart on 1h / 4h windows.
+// =====================================================================================
+function DecisionBanner({
+  forecast,
+  upLabel,
+  downLabel,
+  dwellInfo,
+  onTestBoom,
+  machine,
+  operatorVerdict,
+  hasDirective,
+  tapeWaitCardGo = false,
+}: {
+  forecast: SwitchForecast;
+  upLabel: string;
+  downLabel: string;
+  /** When set, renders a "watching X/Y" dwell pill so the user can see the loud alert is being tracked. */
+  dwellInfo?: { count: number; need: number } | null;
+  /** Manual test-fire — proves the overlay paint without waiting for a real signal. */
+  onTestBoom?: () => void;
+  /** Fused sensors — agreement %, regime, urgency, prob↔spot. */
+  machine?: SpotPtbMachineReadout | null;
+  /** Same execution gate as the trade card — when STAND_DOWN, entry-style sectional hype is labeled non-executable. */
+  operatorVerdict: OperatorVerdict;
+  /** False until the trade engine has produced a directive — avoids treating "no signal yet" as an execution clash. */
+  hasDirective: boolean;
+  /** Sectional WAIT while Answer GO — slice has no dominant lane; card uses full model. */
+  tapeWaitCardGo?: boolean;
+}): ReactElement {
+  const { status, lane, incomingLane, confidence, etaSec } = forecast;
+  const laneLabel = lane === 'up' ? upLabel : lane === 'down' ? downLabel : '—';
+  const incomingLabel = incomingLane === 'up' ? upLabel : incomingLane === 'down' ? downLabel : null;
+
+  const structureOnly =
+    hasDirective &&
+    operatorVerdict.isStandDown &&
+    (status === 'GO_IN' || status === 'STAY_IN' || status === 'SWITCH_INCOMING' || status === 'EXIT');
+
+  const palette = (() => {
+    if (structureOnly) {
+      return {
+        bg: 'from-zinc-900/90 via-zinc-950/92 to-rose-950/35',
+        border: 'border-rose-500/50',
+        text: 'text-zinc-100',
+        dot: 'bg-rose-400',
+        icon: '⏸',
+      };
+    }
+    switch (status) {
+      case 'GO_IN':
+        return lane === 'up'
+          ? { bg: 'from-emerald-700/55 to-emerald-900/40', border: 'border-emerald-400/60', text: 'text-emerald-50', dot: 'bg-emerald-300', icon: '▲' }
+          : { bg: 'from-rose-700/55 to-rose-900/40', border: 'border-rose-400/60', text: 'text-rose-50', dot: 'bg-rose-300', icon: '▼' };
+      case 'STAY_IN':
+        return lane === 'up'
+          ? { bg: 'from-emerald-800/40 to-emerald-950/30', border: 'border-emerald-500/40', text: 'text-emerald-100', dot: 'bg-emerald-300', icon: '➤' }
+          : { bg: 'from-rose-800/40 to-rose-950/30', border: 'border-rose-500/40', text: 'text-rose-100', dot: 'bg-rose-300', icon: '➤' };
+      case 'EXIT':
+        return { bg: 'from-amber-700/55 to-rose-900/45', border: 'border-amber-400/65', text: 'text-amber-50', dot: 'bg-amber-300', icon: '✕' };
+      case 'SWITCH_INCOMING':
+        return { bg: 'from-amber-700/45 to-indigo-900/40', border: 'border-amber-300/55', text: 'text-amber-50', dot: 'bg-amber-300', icon: '⚡' };
+      default:
+        return { bg: 'from-zinc-800/40 to-zinc-900/40', border: 'border-zinc-700/60', text: 'text-zinc-200', dot: 'bg-zinc-500', icon: '⏸' };
+    }
+  })();
+
+  const confTone =
+    confidence === 'HIGH' ? 'bg-amber-300/25 text-amber-100 border-amber-300/50'
+    : confidence === 'MED' ? 'bg-indigo-300/15 text-indigo-100 border-indigo-300/40'
+    : 'bg-zinc-700/30 text-zinc-300 border-zinc-600/40';
+
+  const headline = forecast.headline.replace('UP', upLabel).replace('DOWN', downLabel);
+
+  const showIntensityBars = status === 'SWITCH_INCOMING' || status === 'EXIT';
+  const lockBarPct =
+    dwellInfo != null && dwellInfo.need > 0
+      ? Math.min(100, Math.round((dwellInfo.count / dwellInfo.need) * 100))
+      : null;
+  const crossBarPct = machine?.crossProb != null ? Math.round(machine.crossProb * 100) : null;
+  const sectionalConfPct = confidence === 'HIGH' ? 100 : confidence === 'MED' ? 66 : 33;
+
+  return (
+    <div
+      className={`flex flex-wrap items-center justify-between gap-3 rounded-2xl border-2 ${palette.border} bg-gradient-to-r ${palette.bg} px-4 py-3 shadow-lg shadow-black/40`}
+    >
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
+        <div className={`flex flex-wrap gap-2 ${structureOnly ? 'items-start' : 'items-center'}`}>
+          <span className={`inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full ${palette.dot} text-base font-black text-zinc-950 shadow shadow-black/40`}>
+            {palette.icon}
+          </span>
+          {structureOnly ? (
+            <div className="flex min-w-0 flex-1 flex-col gap-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="rounded-md border border-zinc-600/70 bg-zinc-950/60 px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wider text-zinc-400">
+                  Tape / chart
+                </span>
+                <span className={`text-sm font-bold uppercase tracking-tight ${palette.text} sm:text-base`}>{headline}</span>
+                <span className={`rounded-md border px-1.5 py-0.5 text-[10px] font-extrabold uppercase tracking-wide ${confTone}`}>
+                  {confidence}
+                </span>
+              </div>
+              <p className="text-[10px] leading-snug text-zinc-400">
+                <span className="font-semibold text-rose-200/90">Stand-down</span> on the Answer card — do not size off this
+                headline. Use the Answer block above for whipsaw, cooldown, and risk chips.
+              </p>
+            </div>
+          ) : (
+            <>
+              <span className={`text-base font-black uppercase tracking-tight ${palette.text} sm:text-lg`}>{headline}</span>
+              <span className={`rounded-md border px-1.5 py-0.5 text-[10px] font-extrabold uppercase tracking-wide ${confTone}`}>
+                {confidence}
+              </span>
+            </>
+          )}
+          {!structureOnly ? (
+            <>
+          {etaSec != null && status === 'SWITCH_INCOMING' ? (
+            <span className="rounded-md border border-amber-300/60 bg-amber-200/15 px-1.5 py-0.5 text-[10px] font-extrabold tracking-wide text-amber-100">
+              ETA ~{etaSec}s
+            </span>
+          ) : null}
+          {dwellInfo ? (
+            <span
+              className={`rounded-md border px-1.5 py-0.5 text-[10px] font-extrabold uppercase tracking-wide ${
+                dwellInfo.count >= dwellInfo.need
+                  ? 'border-amber-300/70 bg-amber-300/20 text-amber-100 animate-pulse'
+                  : 'border-zinc-700/70 bg-zinc-900/40 text-zinc-300'
+              }`}
+              title="Advances on new spot ticks while the sectional call stays the same — not every UI refresh."
+            >
+              LOCK {dwellInfo.count}/{dwellInfo.need}
+            </span>
+          ) : null}
+            </>
+          ) : null}
+          {onTestBoom ? (
+            <button
+              type="button"
+              onClick={onTestBoom}
+              className="rounded-md border border-zinc-700/70 bg-zinc-900/45 px-1.5 py-0.5 text-[10px] font-extrabold uppercase tracking-wide text-zinc-300 hover:bg-zinc-800/60 hover:text-zinc-100"
+              title="Preview the full-screen alert overlay."
+            >
+              Test alert
+            </button>
+          ) : null}
+        </div>
+        {!structureOnly ? (
+          <p className={`text-[11px] leading-relaxed ${palette.text}/85`}>{forecast.reason}</p>
+        ) : (
+          <p className="text-[10px] leading-relaxed text-zinc-500">{forecast.reason}</p>
+        )}
+        {tapeWaitCardGo && !structureOnly ? (
+          <p className="mt-1 rounded-lg border border-amber-700/45 bg-amber-950/25 px-2 py-1.5 text-[10px] leading-snug text-amber-100/95">
+            <span className="font-semibold text-amber-200">Answer card GO</span> — this line is the{' '}
+            <span className="font-semibold text-zinc-200">sectional slice</span> only (mixed buckets). The trade card also
+            uses control, book, and PTB; it can show ENTER while the slice still says WAIT.
+          </p>
+        ) : null}
+        {showIntensityBars ? (
+          <div className="mt-2 grid max-w-lg gap-2 sm:grid-cols-3">
+            {lockBarPct != null ? (
+              <div>
+                <div className={`flex justify-between text-[9px] font-bold uppercase tracking-wide ${palette.text}/70`}>
+                  <span>Alert lock</span>
+                  <span className="tabular-nums">{lockBarPct}%</span>
+                </div>
+                <div className="mt-0.5 h-2 overflow-hidden rounded-full bg-black/35 ring-1 ring-white/10">
+                  <div
+                    className={`h-full rounded-full ${lockBarPct >= 100 ? 'bg-amber-300' : 'bg-amber-400/80'}`}
+                    style={{ width: `${lockBarPct}%` }}
+                  />
+                </div>
+              </div>
+            ) : null}
+            {crossBarPct != null ? (
+              <div>
+                <div className={`flex justify-between text-[9px] font-bold uppercase tracking-wide ${palette.text}/70`}>
+                  <span>PTB cross</span>
+                  <span className="tabular-nums">{crossBarPct}%</span>
+                </div>
+                <div className="mt-0.5 h-2 overflow-hidden rounded-full bg-black/35 ring-1 ring-white/10">
+                  <div
+                    className={`h-full rounded-full ${
+                      crossBarPct >= 70 ? 'bg-fuchsia-400/90' : crossBarPct >= 40 ? 'bg-amber-300/90' : 'bg-emerald-400/85'
+                    }`}
+                    style={{ width: `${crossBarPct}%` }}
+                  />
+                </div>
+              </div>
+            ) : null}
+            <div>
+              <div className={`flex justify-between text-[9px] font-bold uppercase tracking-wide ${palette.text}/70`}>
+                <span>Sectional</span>
+                <span className="tabular-nums">{sectionalConfPct}%</span>
+              </div>
+              <div className="mt-0.5 h-2 overflow-hidden rounded-full bg-black/35 ring-1 ring-white/10">
+                <div
+                  className={`h-full rounded-full ${
+                    confidence === 'HIGH' ? 'bg-emerald-400/90' : confidence === 'MED' ? 'bg-indigo-400/90' : 'bg-zinc-500/90'
+                  }`}
+                  style={{ width: `${sectionalConfPct}%` }}
+                  title={`Forecast confidence: ${confidence}`}
+                />
+              </div>
+            </div>
+          </div>
+        ) : null}
+        {machine && !structureOnly ? (
+          <p className="mt-1.5 text-[10px] font-semibold tracking-wide text-zinc-400">
+            <span className="font-black uppercase tracking-wider text-zinc-500">Sensors</span>{' '}
+            <span className="tabular-nums text-zinc-200">{machine.agreementScore}%</span>
+            <span className="text-zinc-600"> · </span>
+            <span className="text-zinc-200">{machine.regime}</span>
+            {machine.crossProb != null ? (
+              <>
+                <span className="text-zinc-600"> · </span>
+                <span className="tabular-nums text-zinc-200">{Math.round(machine.crossProb * 100)}% cross</span>
+              </>
+            ) : null}
+            <span className="text-zinc-600"> · </span>
+            <span className="text-zinc-300">align {machine.probVsSpot}</span>
+          </p>
+        ) : machine && structureOnly ? (
+          <p className="mt-1 text-[9px] leading-snug text-zinc-500">
+            Full sensor chips are on the trade card above — expand “Why & sizes” there if you need them.
+          </p>
+        ) : null}
+      </div>
+      <div className="flex shrink-0 flex-col items-end gap-1 text-right">
+        <span className="text-[9px] font-bold uppercase tracking-[0.18em] text-zinc-300/85">
+          {status === 'SWITCH_INCOMING' ? 'Slice drift' : 'Lane'}
+        </span>
+        <span className={`text-lg font-black ${palette.text}`}>{laneLabel}</span>
+        {status === 'SWITCH_INCOMING' && incomingLabel ? (
+          structureOnly ? (
+            <span className="max-w-[10rem] text-[10px] font-semibold leading-snug text-zinc-500">
+              Model leans {incomingLabel}
+            </span>
+          ) : (
+            <span className="text-[10px] font-bold uppercase tracking-wide text-amber-200">
+              → desk tape → {incomingLabel}
+            </span>
+          )
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+// =====================================================================================
+// Sectional strip — N color-coded blocks (UP/DOWN/FLAT) for the round breakdown.
+// =====================================================================================
+function SectionalStrip({
+  sections,
+  sectionMs,
+  upLabel,
+  downLabel,
+  forecast,
+  executionClash = false,
+}: {
+  sections: SpotSection[];
+  sectionMs: number;
+  upLabel: string;
+  downLabel: string;
+  forecast: SwitchForecast | null;
+  /** Trade card STAND_DOWN while sectional still shows momentum — soften strip copy + motion. */
+  executionClash?: boolean;
+}): ReactElement {
+  const minutes = Math.round(sectionMs / 60_000);
+  const totalMin = minutes * sections.length;
+  const entryishSectional =
+    forecast != null &&
+    (forecast.status === 'GO_IN' || forecast.status === 'STAY_IN' || forecast.status === 'SWITCH_INCOMING');
+  const switchOn =
+    forecast != null && forecast.status === 'SWITCH_INCOMING' && forecast.incomingLane != null;
+  const fromLane: 'up' | 'down' | null = switchOn ? forecast.lane ?? forecast.driftLane : null;
+  const toLane: 'up' | 'down' | null = switchOn ? forecast.incomingLane : null;
+  const etaUrgencyPct = (() => {
+    if (!switchOn || forecast.etaSec == null || !Number.isFinite(forecast.etaSec) || forecast.etaSec <= 0) {
+      return null;
+    }
+    const e = Math.max(5, forecast.etaSec);
+    const urgency01 = 1 - Math.min(1, (e - 5) / 590);
+    return Math.min(100, Math.max(0, Math.round(100 * urgency01)));
+  })();
+  const evidencePick =
+    switchOn && forecast.evidence.length > 0 ? forecast.evidence.slice(0, 4) : [];
+
+  return (
+    <div className="mt-2 rounded-xl border border-zinc-800/70 bg-black/25 px-3 py-2 shadow-inner shadow-black/30">
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-[10px] font-black uppercase tracking-[0.14em] text-zinc-500">Round slices</div>
+          <div className="text-[9px] tabular-nums text-zinc-600">
+            {sections.length} × {minutes}m · {totalMin}m
+          </div>
+        </div>
+        <div className="flex items-center gap-2 text-[9px] uppercase tracking-wide text-zinc-500">
+          <span className="inline-flex items-center gap-1"><span className="h-2 w-3 rounded-sm bg-emerald-500" /> {upLabel}</span>
+          <span className="inline-flex items-center gap-1"><span className="h-2 w-3 rounded-sm bg-rose-500" /> {downLabel}</span>
+          <span className="inline-flex items-center gap-1"><span className="h-2 w-3 rounded-sm bg-zinc-600" /> flat</span>
+        </div>
+      </div>
+      {switchOn && fromLane && toLane ? (
+        <div className="mt-1.5 flex flex-wrap items-center gap-2 rounded-lg border border-amber-500/30 bg-gradient-to-r from-amber-950/40 to-indigo-950/30 px-2.5 py-1.5">
+          <span className="text-[9px] font-black uppercase tracking-wider text-amber-200/90">Tape vs slices</span>
+          <span
+            className={`rounded-md px-2 py-0.5 text-[10px] font-black uppercase tracking-wide ${
+              fromLane === 'up'
+                ? 'bg-emerald-500/35 text-emerald-100 ring-1 ring-emerald-400/40'
+                : 'bg-rose-500/35 text-rose-100 ring-1 ring-rose-400/40'
+            }`}
+          >
+            {fromLane === 'up' ? upLabel : downLabel}
+          </span>
+          <span className="text-[11px] font-black text-amber-200/80">→</span>
+          <span
+            className={`rounded-md px-2 py-0.5 text-[10px] font-black uppercase tracking-wide ${
+              toLane === 'up'
+                ? 'bg-emerald-400/45 text-emerald-50 ring-1 ring-amber-300/45'
+                : 'bg-rose-400/45 text-rose-50 ring-1 ring-amber-300/45'
+            }`}
+          >
+            {toLane === 'up' ? upLabel : downLabel}
+          </span>
+          <span className="ml-auto max-w-[11rem] text-right text-[8px] font-semibold uppercase leading-snug tracking-wide text-zinc-500">
+            {executionClash ? 'View only' : 'Rightmost slice = live tape'}
+          </span>
+        </div>
+      ) : null}
+      <div className="mt-1.5 flex h-9 w-full overflow-hidden rounded-lg border border-zinc-900/60 bg-black/40">
+        {sections.map((s, i) => {
+          const isLast = i === sections.length - 1;
+          const baseColor =
+            s.direction === 'UP' ? 'bg-emerald-600' : s.direction === 'DOWN' ? 'bg-rose-600' : 'bg-zinc-700';
+          const opacity = 0.45 + Math.min(0.55, s.intensity01 * 0.55);
+          const moveLabel = `${s.netUsd >= 0 ? '+' : ''}${s.netUsd.toFixed(s.netUsd < 100 ? 2 : 1)}`;
+          const slopeLabel = `${s.slopeUsdPerMin >= 0 ? '+' : ''}${s.slopeUsdPerMin.toFixed(2)}/m`;
+          const tip =
+            `${s.direction} · net ${moveLabel} · slope ${slopeLabel}` +
+            (s.ptbCrosses > 0 ? ` · ${s.ptbCrosses} PTB cross${s.ptbCrosses === 1 ? '' : 'es'}` : '');
+          const lastSegSwitch = isLast && switchOn && !executionClash;
+          const pulseClass = lastSegSwitch
+            ? 'ring-2 ring-inset ring-amber-300/55 shadow-[0_0_14px_rgba(251,191,36,0.28)] z-[1]'
+            : isLast && !executionClash && !switchOn
+              ? 'animate-pulse'
+              : '';
+          return (
+            <div
+              key={i}
+              className={`relative min-w-0 flex-1 ${baseColor} ${pulseClass}`}
+              style={{ opacity }}
+              title={tip}
+            >
+              {sections.length <= 8 ? (
+                <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center px-1 text-[9px] font-bold leading-tight text-white/95 [text-shadow:0_1px_2px_rgba(0,0,0,0.55)]">
+                  <span className="truncate">{moveLabel}</span>
+                  <span className="truncate text-[8px] font-semibold opacity-80">{slopeLabel}</span>
+                </div>
+              ) : null}
+              {i < sections.length - 1 ? (
+                <span className="absolute inset-y-0 right-0 w-px bg-black/40" />
+              ) : null}
+            </div>
+          );
+        })}
+      </div>
+      {forecast && forecast.status === 'SWITCH_INCOMING' && forecast.incomingLane ? (
+        executionClash ? (
+          <p className="mt-1.5 text-[10px] leading-snug text-zinc-500">
+            <span className="font-bold text-zinc-300">Chart:</span> leaning {forecast.incomingLane === 'up' ? upLabel : downLabel}
+            {forecast.etaSec != null ? <> · ~{forecast.etaSec}s</> : null}.{' '}
+            <span className="font-bold text-rose-200/90">Do not size</span> — trade card says wait.
+          </p>
+        ) : (
+          <>
+            <p className="mt-1.5 text-[10px] leading-snug text-amber-200/90">
+              <span className="font-bold text-amber-100">Switch watch:</span> desk tape toward{' '}
+              <strong className="text-amber-50">{forecast.incomingLane === 'up' ? upLabel : downLabel}</strong>
+              {forecast.etaSec != null ? (
+                <>
+                  {' '}
+                  · model ETA <span className="font-mono font-bold tabular-nums">~{forecast.etaSec}s</span> vs PTB
+                </>
+              ) : (
+                '.'
+              )}
+            </p>
+            {etaUrgencyPct != null ? (
+              <div className="mt-2">
+                <div className="flex justify-between text-[8px] font-bold uppercase tracking-wide text-zinc-500">
+                  <span>ETA pressure</span>
+                  <span className="tabular-nums text-amber-200/90">{etaUrgencyPct}%</span>
+                </div>
+                <div
+                  className="mt-0.5 h-1.5 overflow-hidden rounded-full bg-black/45 ring-1 ring-amber-500/20"
+                  title="Fills as the model ETA gets shorter (5s–10m band)."
+                >
+                  <div
+                    className="h-full rounded-full bg-gradient-to-r from-amber-400/90 to-orange-400/85"
+                    style={{ width: `${etaUrgencyPct}%` }}
+                  />
+                </div>
+              </div>
+            ) : null}
+            {evidencePick.length > 0 ? (
+              <ul className="mt-2 space-y-0.5 border-t border-amber-500/15 pt-1.5 text-[9px] leading-snug text-zinc-400">
+                {evidencePick.map((line, j) => (
+                  <li key={j} className="flex gap-1.5">
+                    <span className="shrink-0 font-black text-amber-500/80">·</span>
+                    <span className="min-w-0">{line}</span>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </>
+        )
+      ) : null}
+      {executionClash && entryishSectional && forecast && forecast.status !== 'SWITCH_INCOMING' ? (
+        <p className="mt-1.5 text-[10px] leading-snug text-zinc-500">
+          <span className="font-bold text-zinc-300">Chart:</span> {forecast.status.replace('_', ' ')} on{' '}
+          {forecast.lane === 'up' ? upLabel : forecast.lane === 'down' ? downLabel : '—'}.{' '}
+          <span className="font-bold text-rose-200/90">Do not trade</span> — trade card says wait.
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+// =====================================================================================
+// TapeVelocityStrip — buyer/seller pressure + burst chip on the active outcome.
+// Driven by `computeTapeVelocity`. Renders nothing until the tape has prints.
+// =====================================================================================
+function TapeVelocityStrip({
+  tape,
+  lane,
+  upLabel,
+  downLabel,
+  reduceMotion,
+}: {
+  tape: TapeVelocity;
+  lane: 'up' | 'down' | null;
+  upLabel: string;
+  downLabel: string;
+  reduceMotion: boolean;
+}): ReactElement | null {
+  if (tape.recent.count === 0) return null;
+  const dom = tape.dominance;
+  const fightsLane =
+    lane != null && ((lane === 'up' && dom === 'sell') || (lane === 'down' && dom === 'buy'));
+  const burstColor =
+    tape.burst === 'extreme'
+      ? 'border-fuchsia-400/60 bg-fuchsia-950/40 text-fuchsia-100'
+      : tape.burst === 'aggressive'
+        ? 'border-amber-400/55 bg-amber-950/40 text-amber-100'
+        : 'border-zinc-700/60 bg-zinc-900/40 text-zinc-300';
+  const domColor =
+    dom === 'buy'
+      ? 'border-emerald-400/55 bg-emerald-950/35 text-emerald-100'
+      : dom === 'sell'
+        ? 'border-rose-400/55 bg-rose-950/35 text-rose-100'
+        : 'border-zinc-700/60 bg-zinc-900/40 text-zinc-300';
+  const pulse = !reduceMotion && (tape.burst === 'extreme' || tape.burst === 'aggressive') ? 'animate-pulse' : '';
+  // Net-pressure mini bar: -100..100 → 0..100% of half-bar width on the matching side.
+  const pct = Math.min(100, Math.abs(tape.netPressure));
+  return (
+    <div
+      className={`mb-2 flex flex-wrap items-center gap-2 rounded-xl border border-zinc-800/70 bg-zinc-950/35 px-2.5 py-1.5 text-[10px] ${pulse}`}
+      title={tape.summary}
+    >
+      <span className="font-black uppercase tracking-wider text-zinc-500" title="Recent CLOB prints — desk context, not the trade card">
+        Desk tape
+      </span>
+      <span className={`rounded-md border px-1.5 py-0.5 font-extrabold uppercase ${domColor}`}>
+        {dom === 'buy' ? 'BUYERS' : dom === 'sell' ? 'SELLERS' : dom === 'mixed' ? 'mixed' : 'idle'}
+        <span className="ml-1 tabular-nums opacity-85">
+          {tape.netPressure >= 0 ? '+' : ''}
+          {tape.netPressure.toFixed(0)}
+        </span>
+      </span>
+      <span className={`rounded-md border px-1.5 py-0.5 font-extrabold uppercase ${burstColor}`}>
+        {tape.burst === 'extreme' ? '⚡ extreme' : tape.burst === 'aggressive' ? '⚡ aggressive' : tape.burst}
+        <span className="ml-1 tabular-nums opacity-85">×{tape.burstRatio.toFixed(1)}</span>
+      </span>
+      <span className="rounded-md border border-zinc-700/55 bg-zinc-900/40 px-1.5 py-0.5 tabular-nums text-zinc-300">
+        {tape.recent.count} prints / 30s
+      </span>
+      {fightsLane ? (
+        <span
+          className={`rounded-md border border-rose-400/65 bg-rose-950/40 px-1.5 py-0.5 font-black uppercase text-rose-100 ${pulse}`}
+          title="Tape pressure opposes the lane your card is sized for — re-check before adding."
+        >
+          ⚠ tape vs {lane === 'up' ? upLabel : downLabel}
+        </span>
+      ) : null}
+      <div className="ml-auto flex h-2 w-32 overflow-hidden rounded-full border border-zinc-800 bg-zinc-950/60">
+        <div className="flex-1 flex justify-end">
+          {tape.netPressure < 0 ? (
+            <div
+              className="h-full bg-rose-400/80"
+              style={{ width: `${pct}%` }}
+              aria-label={`Sell pressure ${pct.toFixed(0)}%`}
+            />
+          ) : null}
+        </div>
+        <span className="h-full w-px bg-zinc-700" />
+        <div className="flex-1 flex justify-start">
+          {tape.netPressure >= 0 ? (
+            <div
+              className="h-full bg-emerald-400/80"
+              style={{ width: `${pct}%` }}
+              aria-label={`Buy pressure ${pct.toFixed(0)}%`}
+            />
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// =====================================================================================
+// NoTradeBanner — single composite risk banner. Renders when score is YELLOW or RED.
+//
+// In `compact` mode it collapses to a thin one-line strip. The chart sets compact
+// when the operator-verdict band is already showing wait / pause — the verdict is
+// the dominant signal and we don't want two screaming red blocks fighting for
+// attention. The strip still surfaces the score + top reason as a hoverable summary.
+// =====================================================================================
+function NoTradeBanner({
+  score,
+  reduceMotion,
+  compact = false,
+}: {
+  score: NoTradeScore;
+  reduceMotion: boolean;
+  compact?: boolean;
+}): ReactElement {
+  const palette =
+    score.tier === 'RED'
+      ? 'border-rose-400/65 bg-rose-950/40 text-rose-50'
+      : 'border-amber-400/55 bg-amber-950/35 text-amber-50';
+  // In compact mode, never pulse — the verdict band is already pulling focus.
+  const pulse = !reduceMotion && !compact && score.tier === 'RED' ? 'animate-pulse' : '';
+
+  if (compact) {
+    const topReasons = score.contributions
+      .slice(0, 3)
+      .map((c) => c.reason.replace(/_/g, ' '))
+      .join(', ');
+    return (
+      <div
+        role="status"
+        aria-live="polite"
+        className={`mb-2 flex items-center gap-2 rounded-lg border px-2.5 py-1 text-[11px] ${palette}`}
+        title={score.summary}
+      >
+        <span className="text-sm">{score.tier === 'RED' ? '⛔' : '⚠'}</span>
+        <span className="font-bold uppercase tracking-wider">
+          Risk {score.score}
+        </span>
+        <span className="truncate text-[10px] opacity-85">
+          {topReasons || score.summary}
+        </span>
+        <span className="ml-auto text-[9px] uppercase tracking-wider opacity-60">↑ answer</span>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      role={score.tier === 'RED' ? 'alert' : 'status'}
+      aria-live="polite"
+      className={`mb-2 flex flex-wrap items-start gap-2 rounded-2xl border-2 px-3 py-2 ${palette} ${pulse}`}
+      title={score.summary}
+    >
+      <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-white/10 text-base font-black">
+        {score.tier === 'RED' ? '⛔' : '⚠'}
+      </span>
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span className="text-sm font-black uppercase tracking-tight">
+          {score.tier === 'RED' ? 'High no-trade risk' : 'Elevated risk'} · {score.score}/100
+        </span>
+        <ul className="mt-1 grid grid-cols-1 gap-x-3 gap-y-0.5 text-[11px] leading-snug sm:grid-cols-2">
+          {score.contributions.slice(0, 2).map((c) => (
+            <li key={c.reason} className="flex items-start gap-1.5">
+              <span className="mt-0.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-white/65" aria-hidden />
+              <span>
+                <strong className="font-bold uppercase tracking-wide">
+                  {c.reason.replace(/_/g, ' ')} (+{c.weight})
+                </strong>{' '}
+                — {c.message}
+              </span>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+// =====================================================================================
+// ShortcutHelp — small dismissible dialog listing keyboard shortcuts.
+// =====================================================================================
+function ShortcutHelp({ onClose }: { onClose: () => void }): ReactElement {
+  return (
+    <div className="mb-2 flex flex-wrap items-start gap-3 rounded-2xl border border-zinc-700/70 bg-zinc-900/85 px-3 py-2 text-[11px] text-zinc-100 shadow-lg shadow-black/40">
+      <span className="text-base">⌨</span>
+      <div className="min-w-0 flex-1">
+        <div className="mb-1 flex items-center justify-between">
+          <span className="text-[11px] font-black uppercase tracking-[0.2em] text-zinc-300">
+            Keyboard shortcuts
+          </span>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border border-zinc-700/70 bg-zinc-800/40 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide hover:bg-zinc-800"
+          >
+            Close
+          </button>
+        </div>
+        <ul className="grid grid-cols-2 gap-x-4 gap-y-0.5 sm:grid-cols-3">
+          {SHORTCUT_HELP.map((s) => (
+            <li key={s.key} className="flex items-center gap-2">
+              <kbd className="inline-flex min-w-[1.6em] items-center justify-center rounded border border-zinc-700/70 bg-zinc-950/50 px-1.5 py-0.5 font-mono text-[10px] font-bold text-zinc-200">
+                {s.key}
+              </kbd>
+              <span className="text-[11px] text-zinc-300">{s.description}</span>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  );
+}

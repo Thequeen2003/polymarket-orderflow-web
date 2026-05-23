@@ -8,12 +8,7 @@ import {
   type TradeHistoryRow,
 } from './tradeHistory';
 import { loadPaperAccount, undoPaperFilledBuy } from './paperTrading';
-import type { ApiErr, ApiOk } from './lib/api';
-import { tradeCancelOrder } from './lib/api';
-
-function isOk<T>(r: ApiOk<T> | ApiErr): r is ApiOk<T> {
-  return r.ok === true;
-}
+import { cancelOneLiveOrder } from './liveOrderCancel';
 
 function fmtUsdCents(v: number | null): string {
   if (v == null) return '—';
@@ -359,10 +354,8 @@ export function TradeHistoryTab(): ReactElement {
                           onClick={async () => {
                             const oid = r.orderId;
                             if (!oid) return;
-                            const res = await tradeCancelOrder(oid);
-                            if (!isOk(res)) {
-                              window.alert(`${res.error}${res.details ? ` · ${JSON.stringify(res.details)}` : ''}`);
-                            }
+                            const res = await cancelOneLiveOrder(oid);
+                            if (!res.ok) window.alert(res.message);
                             reload();
                           }}
                         >
@@ -381,7 +374,13 @@ export function TradeHistoryTab(): ReactElement {
                               window.alert('Cannot undo: there are later filled paper trades on this outcome.');
                               return;
                             }
-                            if (r.shares == null || r.fillAvgPrice01 == null || r.usdCents == null) {
+                            const px =
+                              r.fillAvgPrice01 != null && Number.isFinite(r.fillAvgPrice01)
+                                ? r.fillAvgPrice01
+                                : r.price01 != null && Number.isFinite(Number(r.price01))
+                                  ? Number(r.price01)
+                                  : null;
+                            if (r.shares == null || px == null || px <= 0 || px >= 1 || r.usdCents == null) {
                               window.alert('Cannot undo: missing shares/price/usd on this row.');
                               return;
                             }
@@ -390,7 +389,7 @@ export function TradeHistoryTab(): ReactElement {
                               account: acct,
                               tokenId: r.token,
                               shares: r.shares,
-                              price01: r.fillAvgPrice01,
+                              price01: px,
                               usdCents: Math.abs(r.usdCents),
                             });
                             if (!u.ok) {

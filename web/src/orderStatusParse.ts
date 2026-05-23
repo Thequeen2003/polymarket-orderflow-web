@@ -107,26 +107,30 @@ export function parseRestingOrderSnapshot(raw: unknown, assetIdFilter?: string):
   const originalShares = pickNum(o, ['original_size', 'originalSize', 'original', 'total_size', 'size']);
   const vwap = vwap01FromMakerOrders(o, assetIdFilter);
   const avgFillOnly = pickNum(o, ['avg_fill_price', 'avgFillPrice', 'avg_fill_price_01', 'mean_execution_price', 'meanExecutionPrice']);
-  const avgLoose = pickNum(o, ['average_price', 'averagePrice', 'avg_price', 'avgPrice', 'price']);
+  /** Never use `price` — on resting orders that is the limit, not the execution average. */
+  const avgLoose = pickNum(o, ['average_price', 'averagePrice', 'avg_price', 'avgPrice']);
   const avgPrice01 =
-    vwap ??
-    (avgFillOnly != null ? toPrice01(avgFillOnly) : null) ??
-    (avgLoose != null ? toPrice01(avgLoose) : null);
+    vwap ?? (avgFillOnly != null ? toPrice01(avgFillOnly) : null) ?? (avgLoose != null ? toPrice01(avgLoose) : null);
 
-  const isCancelled = u.includes('CANCEL');
+  const isCancelled =
+    u === 'CANCELLED' ||
+    u === 'CANCELED' ||
+    /\bCANCEL(L)?ED\b/.test(u);
+  const isFilledStatus =
+    u === 'FILLED' ||
+    u === 'MATCHED' ||
+    u === 'EXECUTED' ||
+    u === 'COMPLETE' ||
+    u === 'COMPLETED' ||
+    /\bFILLED\b/.test(u) ||
+    /\bMATCHED\b/.test(u);
   const fullyMatched =
     matchedShares != null &&
     originalShares != null &&
     matchedShares > 0 &&
     originalShares > 0 &&
     matchedShares >= originalShares - 5e-5;
-  const isTerminal =
-    isCancelled ||
-    fullyMatched ||
-    u === 'FILLED' ||
-    u === 'MATCHED' ||
-    u.includes('FILLED') ||
-    u.includes('EXECUTED');
+  const isTerminal = isCancelled || isFilledStatus || fullyMatched;
 
   return { statusRaw, matchedShares, originalShares, limitPrice01, avgPrice01, isTerminal, isCancelled };
 }

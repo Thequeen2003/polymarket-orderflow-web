@@ -13,7 +13,8 @@ import {
   stepPaperMarketWithOrders,
   tapeLean,
 } from './smartMoneyPaperEngine';
-import { SIX_PACK_ROWS, type SixPackKey, labelForSixPackKey, tradingSlugFromLiveShortcut } from './sixPackUpdownSlugs';
+import { SIX_PACK_ROWS, type SixPackKey, labelForSixPackKey } from './sixPackUpdownSlugs';
+import { updownSlugToOpen } from './updownSlugToOpen';
 import { resolveUpDownIndices } from './upDown';
 
 const LS_ENABLED = 'bp_paper_smart_money_enabled.v1';
@@ -164,7 +165,7 @@ export function useSmartMoneyPaperBot(): {
     for (const row of SIX_PACK_ROWS) {
       const r = await marketsUpdownShortcut(row.asset, row.interval);
       if (isOk(r)) {
-        next[row.key] = tradingSlugFromLiveShortcut(r.data.slug, row.interval);
+        next[row.key] = await updownSlugToOpen(r.data, row.interval);
       }
     }
     if (mounted.current) {
@@ -184,7 +185,7 @@ export function useSmartMoneyPaperBot(): {
     for (const row of SIX_PACK_ROWS) {
       if (!currentSlugs[row.key]?.trim()) {
         const r = await marketsUpdownShortcut(row.asset, row.interval);
-        if (isOk(r)) currentSlugs[row.key] = tradingSlugFromLiveShortcut(r.data.slug, row.interval);
+        if (isOk(r)) currentSlugs[row.key] = await updownSlugToOpen(r.data, row.interval);
       }
     }
     if (mounted.current) {

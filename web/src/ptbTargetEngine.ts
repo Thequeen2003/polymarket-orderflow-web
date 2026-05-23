@@ -95,9 +95,14 @@ export function pickWinningChartLane(params: {
   if (Math.abs(du - dd) < 0.018) {
     const su = (gapU?.strength10 ?? 0) + (gapU?.active ? 2 : 0) + (upRising ? 1.2 : 0);
     const sd = (gapD?.strength10 ?? 0) + (gapD?.active ? 2 : 0) + (dnRising ? 1.2 : 0);
-    return su >= sd ? 'up' : 'down';
+    if (Math.abs(su - sd) >= 0.12) return su > sd ? 'up' : 'down';
+    if (lastU > lastD + 1e-6) return 'up';
+    if (lastD > lastU + 1e-6) return 'down';
+    if (gapU?.active && !gapD?.active) return 'up';
+    if (gapD?.active && !gapU?.active) return 'down';
+    return du > dd ? 'up' : du < dd ? 'down' : 'up';
   }
-  return du >= dd ? 'up' : 'down';
+  return du > dd ? 'up' : du < dd ? 'down' : lastU >= lastD ? 'up' : 'down';
 }
 
 function momentumTier(params: {

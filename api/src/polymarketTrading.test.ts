@@ -37,4 +37,22 @@ describe('getTradingConfigFromEnv', () => {
     if (res.ok) return;
     expect(res.error).toBe('bad_signature_type');
   });
+
+  it('defaults to v2 SDK flavor when POLYMARKET_CLOB_SDK is unset', () => {
+    const res = getTradingConfigFromEnv({ POLYMARKET_PRIVATE_KEY: TEST_KEY });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.config.sdk).toBe('v2');
+  });
+
+  it('rejects legacy SDK with POLY_1271 signature type', () => {
+    const res = getTradingConfigFromEnv({
+      POLYMARKET_PRIVATE_KEY: TEST_KEY,
+      POLYMARKET_CLOB_SDK: 'legacy',
+      POLYMARKET_SIGNATURE_TYPE: '3',
+    });
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.error).toBe('legacy_sdk_signature_unsupported');
+  });
 });

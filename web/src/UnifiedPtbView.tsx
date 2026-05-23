@@ -161,8 +161,14 @@ export function UnifiedPtbView(props: {
       .map((p) => ({ t: p.t, v: p.v }));
     if (pts.length < 2) return null;
     const candles = buildSpotCandles(pts, candleBucketCount(pts.length));
-    return computePtbChartDerivatives({ pts, candles, ptb });
-  }, [priceToBeat, spot]);
+    return computePtbChartDerivatives({
+      pts,
+      candles,
+      ptb,
+      lastProbUp: upMid,
+      lastProbDown: downMid,
+    });
+  }, [priceToBeat, spot, upMid, downMid]);
 
   const activeLane = useMemo<'up' | 'down'>(() => {
     if (!derivedBase) return 'up';
@@ -186,8 +192,15 @@ export function UnifiedPtbView(props: {
       .map((p) => ({ t: p.t, v: p.v }));
     if (pts.length < 2) return null;
     const candles = buildSpotCandles(pts, candleBucketCount(pts.length));
-    return computePtbChartDerivatives({ pts, candles, ptb, bookFlow: bookFlowForChart ?? undefined });
-  }, [priceToBeat, spot, bookFlowForChart]);
+    return computePtbChartDerivatives({
+      pts,
+      candles,
+      ptb,
+      bookFlow: bookFlowForChart ?? undefined,
+      lastProbUp: upMid,
+      lastProbDown: downMid,
+    });
+  }, [priceToBeat, spot, bookFlowForChart, upMid, downMid]);
 
   const spotLast = spot.length ? spot[spot.length - 1]!.v : null;
   const spotPrev = spot.length >= 2 ? spot[spot.length - 2]!.v : null;

@@ -1,6 +1,6 @@
 export type TradeHistoryMode = 'paper' | 'live';
 export type TradeHistorySide = 'buy' | 'sell';
-export type TradeHistoryExec = 'touch' | 'market' | 'limit';
+export type TradeHistoryExec = 'touch' | 'market' | 'limit' | 'settlement';
 
 /** Live order lifecycle; legacy rows may still read `submitted` / `error` until re-saved. */
 export type TradeHistoryOrderStatus =
@@ -68,14 +68,24 @@ export type TradeHistoryRow = {
 
 const STORAGE_KEY = 'pmof.tradeHistory.v2';
 const LEGACY_STORAGE_KEY = 'pmof.tradeHistory.v1';
-const MAX_ROWS = 250;
+export const TRADE_HISTORY_MAX_ROWS = 250;
+const MAX_ROWS = TRADE_HISTORY_MAX_ROWS;
 
 /** Fired after local trade history storage changes (any writer). */
 export const TRADE_HISTORY_CHANGED_EVENT = 'pmof:trade-history-changed';
 
 function notifyTradeHistoryChanged(): void {
   try {
-    window.dispatchEvent(new Event(TRADE_HISTORY_CHANGED_EVENT));
+    // Defer so writers never synchronously re-enter other components' setState during a
+    // React render/update (e.g. `setHistoryRows(prev => updateTradeHistoryRow(...))` in
+    // SignalsTradePanel would otherwise fire TrackingTab listeners mid-commit).
+    queueMicrotask(() => {
+      try {
+        window.dispatchEvent(new Event(TRADE_HISTORY_CHANGED_EVENT));
+      } catch {
+        /* ignore */
+      }
+    });
   } catch {
     /* ignore */
   }
@@ -125,7 +135,7 @@ function rowFromPartial(r: Partial<TradeHistoryRow>): TradeHistoryRow {
     mode: String(r.mode ?? '').toLowerCase() === 'live' ? 'live' : 'paper',
     exec: (() => {
       const v = String(r.exec ?? '').toLowerCase();
-      return v === 'market' || v === 'limit' || v === 'touch' ? (v as TradeHistoryExec) : 'touch';
+      return v === 'market' || v === 'limit' || v === 'touch' || v === 'settlement' ? (v as TradeHistoryExec) : 'touch';
     })(),
     side: String(r.side ?? '').toLowerCase() === 'sell' ? 'sell' : 'buy',
     token: String(r.token ?? ''),
@@ -237,8 +247,11 @@ export function appendTradeHistory(row: Omit<TradeHistoryRow, 'id' | 'ts'> & { i
     auditNote: row.auditNote,
     error: row.error,
   };
-  const rows = loadTradeHistory();
-  const merged = [next, ...rows].slice(0, MAX_ROWS);
+  const tailA = loadTradeHistory();
+  const tailB = loadTradeHistory();
+  const tail =
+    tailB.length !== tailA.length || (tailB[0] && tailA[0] && tailB[0].id !== tailA[0].id) ? tailB : tailA;
+  const merged = [next, ...tail].slice(0, MAX_ROWS);
   saveTradeHistory(merged);
   return merged;
 }
@@ -274,14 +287,15 @@ export function updateTradeHistoryRow(
     >
   >,
 ): TradeHistoryRow[] {
-  const rows = loadTradeHistory();
-  let changed = false;
-  const next = rows.map((r) => {
-    if (r.id !== id) return r;
-    changed = true;
-    return { ...r, ...patch };
-  });
-  if (changed) saveTradeHistory(next);
+  const rid = String(id ?? '').trim();
+  if (!rid) return loadTradeHistory();
+  /** Re-read immediately before write so a concurrent `appendTradeHistory` isn’t overwritten. */
+  const latest = loadTradeHistory();
+  const j = latest.findIndex((r) => r.id === rid);
+  if (j < 0) return latest;
+  const next = [...latest];
+  next[j] = { ...latest[j]!, ...patch };
+  saveTradeHistory(next.slice(0, MAX_ROWS));
   return next;
 }
 

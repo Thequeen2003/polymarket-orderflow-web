@@ -8,6 +8,17 @@
   </head>
   <body>
     <div id="root"></div>
+    <!-- Must run before any module loads react-dom: React 19.2+ dev "performance tracks"
+         deep-clone props into performance.measure — large market JSON + live charts →
+         DataCloneError / RAM blowups / follow-on scheduler crashes. React gates this on
+         console.timeStamp; see facebook/react#34770 and related issues. -->
+    <script>
+      try {
+        if (typeof console !== 'undefined') console.timeStamp = undefined;
+      } catch {
+        /* ignore */
+      }
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

@@ -90,4 +90,13 @@ describe('ptbProjection', () => {
     expect(b).not.toBeNull();
     expect(b!.expectedEndPrice).toBeGreaterThan(a!.expectedEndPrice);
   });
+
+  it('treats single-sided implied mid as complement for drift agreement (matches dual-mid)', () => {
+    const onlyUp = baseProj({ lastProbUp: 0.35, lastProbDown: null });
+    const both = baseProj({ lastProbUp: 0.35, lastProbDown: 0.65 });
+    expect(onlyUp).not.toBeNull();
+    expect(both).not.toBeNull();
+    expect(onlyUp!.confidence).toBe(both!.confidence);
+    expect(Math.abs(onlyUp!.pAboveAtEnd - both!.pAboveAtEnd)).toBeLessThan(0.02);
+  });
 });

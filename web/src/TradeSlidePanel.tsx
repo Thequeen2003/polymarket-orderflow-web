@@ -35,7 +35,7 @@ export function TradeSlidePanel(props: TradeSlidePanelProps): ReactElement {
         title="Close"
       />
       <div
-        className={`fixed inset-y-0 right-0 z-[135] flex w-[min(380px,100vw)] flex-col border-l border-zinc-700/80 bg-zinc-950 shadow-[-12px_0_40px_rgba(0,0,0,0.45)] transition-transform duration-200 ease-out ${
+        className={`fixed inset-y-0 right-0 z-[135] flex w-[min(380px,100vw)] flex-col border-l border-zinc-700/80 bg-zinc-950 shadow-[-12px_0_40px_rgba(0,0,0,0.45)] will-change-transform transition-transform duration-200 ease-out ${
           open ? 'translate-x-0' : 'translate-x-full pointer-events-none'
         }`}
         aria-hidden={!open}

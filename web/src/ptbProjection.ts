@@ -139,15 +139,27 @@ function structureIsChop(structureEventLabel: string, reactionKind: PtbReactionK
   return s.includes('chop') || reactionKind === 'choppy_at_line';
 }
 
+/** Align with machine implied logic: infer missing binary mid from the other side. */
+function normalizeBinaryProbPair(probUp: number | null, probDown: number | null): { u: number; d: number } | null {
+  let u = probUp != null && Number.isFinite(probUp) ? probUp : null;
+  let d = probDown != null && Number.isFinite(probDown) ? probDown : null;
+  if (u != null && d == null) d = 1 - u;
+  else if (d != null && u == null) u = 1 - d;
+  if (u == null || d == null) return null;
+  u = Math.max(0.001, Math.min(0.999, u));
+  d = Math.max(0.001, Math.min(0.999, d));
+  return { u, d };
+}
+
 function impliedAgreesDrift(
   probUp: number | null,
   probDown: number | null,
   mu: number,
 ): { agree: boolean; weight: number } {
-  if (probUp == null || probDown == null || !Number.isFinite(probUp) || !Number.isFinite(probDown)) {
-    return { agree: true, weight: 0 };
-  }
-  const net = probUp - probDown;
+  const pair = normalizeBinaryProbPair(probUp, probDown);
+  if (pair == null) return { agree: true, weight: 0 };
+  const { u: probUpN, d: probDownN } = pair;
+  const net = probUpN - probDownN;
   if (Math.abs(net) < 0.04) return { agree: true, weight: 0 };
   const impliedUp = net > 0;
   const driftUp = mu > 1e-9;

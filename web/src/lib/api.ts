@@ -1,20 +1,77 @@
+import { roundPriceCentTick } from '../tradingRound';
+
 export type ApiOk<T> = { ok: true; data: T };
 export type ApiErr = { ok: false; error: string; details?: unknown; raw?: string };
+
+/** Snap limit prices to 1¢ ticks before Bullpen/CLOB (avoids 0.545-style rejections). */
+function normalizeLimitPrice01(price: number): number {
+  if (!Number.isFinite(price) || price <= 0) return price;
+  return roundPriceCentTick(price);
+}
 
 type JsonOpts = {
   signal?: AbortSignal;
   timeoutMs?: number;
 };
 
-/** When set (e.g. `http://127.0.0.1:8787`), all `/api/...` calls go there — needed for `vite preview` or web-only dev without the Vite proxy. */
-function apiBase(): string {
-  const raw = import.meta.env.VITE_API_BASE;
-  if (typeof raw === 'string') {
-    const v = raw.trim().replace(/\/+$/, '');
-    if (v) return v;
+type JsonRetryOpts = JsonOpts & {
+  retries?: number;
+  retryDelayMs?: number;
+};
+
+function fetchFailureCause(e: unknown, timedOut: boolean): 'timeout' | 'aborted' | 'network' {
+  if (timedOut) return 'timeout';
+  if (e instanceof Error && e.name === 'AbortError') return 'aborted';
+  return 'network';
+}
+
+function isRetryableFetchFailure(err: ApiErr): boolean {
+  if (err.error !== 'fetch_failed') return false;
+  const d = err.details as { cause?: string; name?: string; message?: string } | undefined;
+  if (d?.cause === 'timeout' || d?.cause === 'network' || d?.cause === 'aborted') return true;
+  if (d?.name === 'AbortError') return true;
+  const msg = String(d?.message ?? '').toLowerCase();
+  return msg.includes('failed to fetch') || msg.includes('network') || msg.includes('econnrefused');
+}
+
+/** Transient upstream failures (Gamma warming up, brief 502s) — safe to retry market loads. */
+function isRetryableApiErr(err: ApiErr): boolean {
+  if (
+    err.error === 'market_get_failed' ||
+    err.error === 'updown_shortcut_failed' ||
+    err.error === 'price_to_beat_failed'
+  ) {
+    return true;
   }
-  // Vite dev uses the proxy (same-origin `/api/*`) to avoid CORS; preview/static hosting does not.
-  // When running a production build on localhost, default to the local API port so fetch works without extra env setup.
+  return isRetryableFetchFailure(err);
+}
+
+function devFetchHint(mixedContent: boolean, cause: 'timeout' | 'aborted' | 'network'): string {
+  if (mixedContent) {
+    return 'This looks like mixed-content (HTTPS page trying to call an HTTP API). Use an HTTPS API URL or serve the web app over HTTP for local dev.';
+  }
+  if (cause === 'timeout') {
+    return 'The API took too long — check the api terminal for stalls (Bullpen CLI / CLOB). Retry or hard-refresh.';
+  }
+  if (cause === 'aborted') {
+    return 'Request was cancelled (tab refresh, HMR, or a new market load). Hard-refresh if books stay empty.';
+  }
+  return 'Start the API on port 8787 (`npm run dev` from repo root — web waits for `/api/health`), then hard-refresh. Or set `VITE_API_BASE=http://127.0.0.1:8787` in `web/.env.development`.';
+}
+
+async function getJsonWithRetry<T>(path: string, opts?: JsonRetryOpts): Promise<ApiOk<T> | ApiErr> {
+  const retries = Math.max(0, opts?.retries ?? 0);
+  const delay = opts?.retryDelayMs ?? 400;
+  let last: ApiOk<T> | ApiErr = { ok: false, error: 'fetch_failed' };
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    last = await getJson<T>(path, opts);
+    if (last.ok || !isRetryableApiErr(last)) return last;
+    if (attempt < retries) await new Promise((r) => setTimeout(r, delay * (attempt + 1)));
+  }
+  return last;
+}
+
+function localhostApiBase(): string | null {
   try {
     const loc = window.location;
     const isLocalhost =
@@ -22,10 +79,25 @@ function apiBase(): string {
       loc.hostname === '127.0.0.1' ||
       loc.hostname === '0.0.0.0' ||
       loc.hostname === '::1';
-    if (isLocalhost && import.meta.env.PROD) return 'http://127.0.0.1:8787';
+    if (!isLocalhost) return null;
+    const port = String(import.meta.env.VITE_API_PORT ?? '8787').trim() || '8787';
+    return `http://127.0.0.1:${port}`;
   } catch {
-    /* ignore */
+    return null;
   }
+}
+
+/** When set (e.g. `http://127.0.0.1:8787`), all `/api/...` calls go there. */
+function apiBase(): string {
+  const raw = import.meta.env.VITE_API_BASE;
+  if (typeof raw === 'string') {
+    const v = raw.trim().replace(/\/+$/, '');
+    if (v) return v;
+  }
+  // Local dev: same-origin `/api` via Vite proxy (one connection pool; avoids starving direct :8787).
+  if (import.meta.env.DEV) return '';
+  const previewLocal = localhostApiBase();
+  if (previewLocal) return previewLocal;
   return '';
 }
 
@@ -136,9 +208,11 @@ async function getJson<T>(path: string, opts?: JsonOpts): Promise<ApiOk<T> | Api
   let text = '';
   const timeoutMs = opts?.timeoutMs;
   const controller = timeoutMs ? new AbortController() : null;
+  let timedOut = false;
   const t =
     timeoutMs && controller
       ? window.setTimeout(() => {
+          timedOut = true;
           try {
             controller.abort();
           } catch {
@@ -164,12 +238,20 @@ async function getJson<T>(path: string, opts?: JsonOpts): Promise<ApiOk<T> | Api
     } catch {
       mixedContent = false;
     }
+    const cause = fetchFailureCause(e, timedOut);
+    const message =
+      cause === 'timeout' && timeoutMs
+        ? `Request timed out after ${timeoutMs}ms`
+        : e instanceof Error
+          ? e.message
+          : String(e);
     return {
       ok: false,
       error: 'fetch_failed',
       details: {
-        message: e instanceof Error ? e.message : String(e),
+        message,
         name: e instanceof Error ? e.name : typeof e,
+        cause,
         url,
         apiBase: apiBase() || null,
         origin: (() => {
@@ -180,9 +262,7 @@ async function getJson<T>(path: string, opts?: JsonOpts): Promise<ApiOk<T> | Api
           }
         })(),
         timeoutMs: timeoutMs ?? null,
-        hint: mixedContent
-          ? 'This looks like mixed-content (HTTPS page trying to call an HTTP API). Use an HTTPS API URL or serve the web app over HTTP for local dev.'
-          : 'If the web app is not running via the Vite dev server proxy, set `VITE_API_BASE` to your API URL (e.g. http://127.0.0.1:8787) and ensure the API is running.',
+        hint: devFetchHint(mixedContent, cause),
       },
     };
   } finally {
@@ -251,27 +331,75 @@ export async function postJsonWithOpts<T>(path: string, body: unknown, opts?: Js
 }
 
 export function health() {
-  return getJson<{
+  return getJsonWithRetry<{
     polymarket: string | null;
     note: string;
     gamma_reachable?: boolean;
     trading_ready?: boolean;
+    trading_live_orders_via?: 'bullpen' | 'clob';
+    enable_live_trading?: boolean;
+    live_trading_confirmed?: boolean;
+    clob_config_ready?: boolean;
     trading_backend?: string | null;
     assistant_available?: boolean;
     assistant_provider?: string | null;
     assistant_model?: string | null;
-  }>('/api/health');
+  }>('/api/health', { timeoutMs: 15_000, retries: 2, retryDelayMs: 400 });
+}
+
+/** Live Polymarket HTTP reachability (Gamma + CLOB + Data) via our API proxy. */
+export type PolymarketLiveStatus = {
+  checkedAt: string;
+  bases: {
+    documentation: string;
+    gamma: string;
+    clob: string;
+    data: string;
+    web: string;
+    bridge: string;
+  };
+  services: {
+    name: 'gamma' | 'clob' | 'data';
+    url: string;
+    ok: boolean;
+    status: number | null;
+    latencyMs: number;
+    note: string | null;
+  }[];
+  allPublicOk: boolean;
+};
+
+export function polymarketLiveStatus() {
+  return getJson<PolymarketLiveStatus>('/api/polymarket/live/status', { timeoutMs: 20_000 });
+}
+
+/** Gamma market JSON (always live HTTP — no CLI fallback on this route). */
+export function polymarketLiveMarket(slugOrId: string) {
+  return getJson<{ slug: string; market: unknown; source: 'gamma_live' }>(
+    `/api/polymarket/live/market/${encodeURIComponent(slugOrId)}`,
+  );
+}
+
+export function polymarketLiveClobBook(tokenId: string) {
+  const q = new URLSearchParams();
+  q.set('token_id', tokenId);
+  return getJson<{ token_id: string; book: unknown; source: 'clob_live' }>(
+    `/api/polymarket/live/clob/book?${q.toString()}`,
+  );
 }
 
 export function marketsList(limit = 20) {
-  return getJson<unknown[]>(`/api/markets?limit=${encodeURIComponent(String(limit))}`);
+  return getJson<unknown[]>(`/api/markets?limit=${encodeURIComponent(String(limit))}`, { timeoutMs: 12_000 });
 }
 
 export function marketsSearch(q: string, limit = 20) {
-  return getJson<unknown[]>(`/api/markets/search?q=${encodeURIComponent(q)}&limit=${encodeURIComponent(String(limit))}`);
+  return getJson<unknown[]>(
+    `/api/markets/search?q=${encodeURIComponent(q)}&limit=${encodeURIComponent(String(limit))}`,
+    { timeoutMs: 12_000 },
+  );
 }
 
-export type UpdownShortcutAsset = 'btc' | 'eth' | 'sol';
+export type UpdownShortcutAsset = 'btc' | 'eth' | 'sol' | 'hype';
 export type UpdownInterval = '5m' | '15m' | '1h' | '4h' | '1d';
 
 export function marketsUpdownShortcut(asset: UpdownShortcutAsset, interval: UpdownInterval = '5m') {
@@ -288,17 +416,29 @@ export function marketsUpdownShortcut(asset: UpdownShortcutAsset, interval: Updo
     /** Window open (unix seconds), aligned to market resolution — use for titled non-`btc-updown-*` slugs. */
     inferred_window_start_unix?: number;
     inferred_end_unix?: number;
-  }>(
-    `/api/markets/updown-shortcut?asset=${encodeURIComponent(asset)}&interval=${encodeURIComponent(interval)}`,
-  );
+    /** US/Eastern grid floor used for 1h/4h/1d shortcut search (may differ from UTC `bucket_floor_unix`). */
+    bucket_floor_et_unix?: number;
+    /** Slug to load in the UI — for 5m, prior bucket when its CLOB book is live, else `slug`. */
+    trading_slug?: string;
+    /** Gamma market payload when shortcut already resolved it — skips a second `/api/markets/get`. */
+    market?: unknown;
+  }>(`/api/markets/updown-shortcut?asset=${encodeURIComponent(asset)}&interval=${encodeURIComponent(interval)}`, {
+    timeoutMs: 18_000,
+    retries: 2,
+    retryDelayMs: 500,
+  });
 }
 
-export function marketsGet(slugOrId: string) {
-  return getJson<unknown>(`/api/markets/get/${encodeURIComponent(slugOrId)}`);
+export async function marketsGet(slugOrId: string) {
+  const path = `/api/markets/get/${encodeURIComponent(slugOrId)}`;
+  return getJsonWithRetry<unknown>(path, { timeoutMs: 14_000, retries: 3, retryDelayMs: 500 });
 }
 
 export function priceToBeat(slugOrId: string) {
-  return getJson<{ slug: string; price_to_beat: number; source: string }>(`/api/price-to-beat/${encodeURIComponent(slugOrId)}`);
+  return getJsonWithRetry<{ slug: string; price_to_beat: number; source: string }>(
+    `/api/price-to-beat/${encodeURIComponent(slugOrId)}`,
+    { timeoutMs: 22_000, retries: 2, retryDelayMs: 600 },
+  );
 }
 
 export type RtdsCryptoPoint = { t: number; v: number };
@@ -324,7 +464,36 @@ export type ClobBookEntry = { token: string; book: unknown; error: string | null
 
 export function clobBooks(tokenIds: string[]) {
   const q = tokenIds.join(',');
-  return getJson<ClobBookEntry[]>(`/api/clob/books?tokens=${encodeURIComponent(q)}`);
+  return getJsonWithRetry<ClobBookEntry[]>(`/api/clob/books?tokens=${encodeURIComponent(q)}`, {
+    timeoutMs: 24_000,
+    retries: 1,
+    retryDelayMs: 600,
+  });
+}
+
+export type BinanceDepthRow = { price: number; size: number };
+
+export type BinanceDepthData = {
+  symbol: string;
+  lastUpdateId: number | null;
+  bids: BinanceDepthRow[];
+  asks: BinanceDepthRow[];
+};
+
+export function binanceDepth(symbol: string, limit = 100) {
+  const q = new URLSearchParams();
+  q.set('symbol', symbol);
+  q.set('limit', String(limit));
+  return getJson<BinanceDepthData>(`/api/binance/depth?${q.toString()}`);
+}
+
+export type BinanceAggTrade = { id: number; time: number; price: number; qty: number; buyerMaker: boolean };
+
+export function binanceAggTrades(symbol: string, limit = 80) {
+  const q = new URLSearchParams();
+  q.set('symbol', symbol);
+  q.set('limit', String(limit));
+  return getJson<BinanceAggTrade[]>(`/api/binance/agg-trades?${q.toString()}`);
 }
 
 export type DataTradeRow = {
@@ -381,10 +550,15 @@ export function tradeMarketOrderWithOpts(
     signatureType?: string | null;
     marketSlug?: string;
     outcome?: string;
+    lane?: 'up' | 'down';
   },
   opts?: JsonOpts,
 ) {
-  return postJsonWithOpts<unknown>('/api/trade/market-order', { ...body, market_slug: body.marketSlug ?? '', outcome: body.outcome ?? '' }, opts);
+  return postJsonWithOpts<unknown>(
+    '/api/trade/market-order',
+    { ...body, market_slug: body.marketSlug ?? '', outcome: body.outcome ?? '', lane: body.lane },
+    opts,
+  );
 }
 
 export function tradeCreateOrder(body: {
@@ -396,7 +570,12 @@ export function tradeCreateOrder(body: {
   marketSlug?: string;
   outcome?: string;
 }) {
-  return postJson<unknown>('/api/trade/create-order', { ...body, market_slug: body.marketSlug ?? '', outcome: body.outcome ?? '' });
+  return postJson<unknown>('/api/trade/create-order', {
+    ...body,
+    price: normalizeLimitPrice01(body.price),
+    market_slug: body.marketSlug ?? '',
+    outcome: body.outcome ?? '',
+  });
 }
 
 export function tradeCreateOrderWithOpts(
@@ -409,12 +588,21 @@ export function tradeCreateOrderWithOpts(
     signatureType?: string | null;
     marketSlug?: string;
     outcome?: string;
+    /** Desk lane — API uses this + token to pick the Bullpen Up/Down outcome. */
+    lane?: 'up' | 'down';
   },
   opts?: JsonOpts,
 ) {
   return postJsonWithOpts<unknown>(
     '/api/trade/create-order',
-    { ...body, order_type: body.orderType ?? 'GTC', market_slug: body.marketSlug ?? '', outcome: body.outcome ?? '' },
+    {
+      ...body,
+      price: normalizeLimitPrice01(body.price),
+      order_type: body.orderType ?? 'GTC',
+      market_slug: body.marketSlug ?? '',
+      outcome: body.outcome ?? '',
+      lane: body.lane,
+    },
     opts,
   );
 }
@@ -455,9 +643,10 @@ export function tradeGetOrder(orderId: string, opts?: JsonOpts) {
 }
 
 /** CLOB trades tape keyed by order id — same source as Polymarket fills; used to reconcile local history. */
-export function tradeOrderFillIndex(params: { tokenId: string }, opts?: JsonOpts) {
+export function tradeOrderFillIndex(params: { tokenId: string; force?: boolean }, opts?: JsonOpts) {
   const q = new URLSearchParams();
   q.set('token_id', params.tokenId);
+  if (params.force) q.set('force', '1');
   return getJson<{
     token_id: string;
     by_order_id: Record<string, { shares: number; avg_price_01: number; side: string; updated_at_ms: number }>;

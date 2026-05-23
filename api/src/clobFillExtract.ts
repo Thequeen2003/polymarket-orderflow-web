@@ -81,6 +81,32 @@ function firstNum(containers: Record<string, unknown>[], keys: string[]): number
   return null;
 }
 
+function firstStr(containers: Record<string, unknown>[], keys: string[]): string | null {
+  for (const c of containers) {
+    for (const k of keys) {
+      const v = c[k];
+      if (typeof v === 'string' && v.trim()) return v.trim();
+    }
+  }
+  return null;
+}
+
+/** Open/resting orders must not be reported as market fills (avoids size/price mistaken for fill). */
+function statusBlocksFillClaim(statusUpper: string): boolean {
+  if (!statusUpper) return false;
+  if (statusUpper.includes('CANCEL')) return true;
+  return (
+    statusUpper === 'LIVE' ||
+    statusUpper === 'OPEN' ||
+    statusUpper === 'ACTIVE' ||
+    statusUpper === 'UNFILLED' ||
+    statusUpper === 'PENDING' ||
+    statusUpper === 'RESTING' ||
+    statusUpper === 'SUBMITTED' ||
+    statusUpper === 'PLACED'
+  );
+}
+
 function makerOrderAssetId(mo: Record<string, unknown>): string {
   return String(mo.asset_id ?? mo.assetId ?? mo.token_id ?? mo.tokenID ?? mo.asset ?? '').trim();
 }
@@ -203,13 +229,6 @@ export function extractCanonicalMarketFill(
   const containers = collectContainers(parsed);
   const w = weightedAvgFromMakerOrders(containers, ctx.tokenID);
 
-  const avgExplicit = firstNum(containers, [...STRICT_AVG_KEYS]);
-  const avg01FromExplicit = avgExplicit != null ? toPrice01(avgExplicit) : null;
-
-  const sizeRaw = firstNum(containers, [...SIZE_KEYS]);
-  const filledFromTop =
-    sizeRaw != null ? (normalizeConditionalSizeUnknown(sizeRaw) ?? (plausibleOutcomeShares(sizeRaw) ? sizeRaw : null)) : null;
-
   let filledShares: number | null = null;
   let avg01: number | null = null;
 
@@ -221,10 +240,12 @@ export function extractCanonicalMarketFill(
     if (sc != null) {
       filledShares = sc.shares;
       avg01 = sc.price01;
-    } else if (filledFromTop != null && plausibleOutcomeShares(filledFromTop)) {
-      filledShares = roundShares4(filledFromTop);
-      avg01 = avg01FromExplicit;
     }
+  }
+
+  const statusUpper = String(firstStr(containers, ['status', 'order_status', 'state']) ?? '').toUpperCase();
+  if (statusBlocksFillClaim(statusUpper)) {
+    return { filled_shares: null, avg_fill_price_01: null, status: 'unknown' };
   }
 
   if (filledShares == null || filledShares <= 0 || avg01 == null || avg01 <= 0 || avg01 >= 1) {

@@ -16,6 +16,7 @@ body,
 html {
   color-scheme: dark;
   overflow-anchor: none;
+  overflow-x: clip;
 }
 
 body {
@@ -25,6 +26,11 @@ body {
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
   overflow-anchor: none;
+  overflow-x: clip;
+}
+
+#root {
+  overflow-x: clip;
 }
 
 ::selection {

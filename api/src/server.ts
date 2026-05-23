@@ -1,13 +1,12 @@
-import dotenv from 'dotenv';
-import { resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import './appEnv.js';
 import { spawn } from 'node:child_process';
 import http from 'node:http';
 import express from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
+import { ClobClient as LegacyClobClient } from '@polymarket/clob-client';
 import {
   AssetType,
-  type ClobClient,
+  ClobClient as V2ClobClient,
   type CreateOrderOptions,
   COLLATERAL_TOKEN_DECIMALS,
   CONDITIONAL_TOKEN_DECIMALS,
@@ -15,22 +14,73 @@ import {
   Side,
   type TradeParams,
 } from '@polymarket/clob-client-v2';
+import {
+  avgEntryFromBullpenTrades,
+  bullpenCancelAllOrders,
+  bullpenCancelOrder,
+  bullpenClobBalance,
+  bullpenCollateralBalanceHuman,
+  bullpenLookupOrder,
+  bullpenOpenOrders,
+  bullpenSessionReady,
+  bullpenTradeHistory,
+  cachedBullpenPositions,
+  findBullpenPositionRow,
+  bullpenExecuteMarketOrder,
+  interpretBullpenTradeCli,
+  myFillsFromBullpenTrades,
+  parseJsonMaybe,
+  positionAvgEntry01,
+  positionSize,
+  refreshBullpenPositions,
+  runBullpen,
+} from './bullpenCli.js';
+import { parseOrderLane, resolveBullpenOutcomeForOrder } from './bullpenGammaMarket.js';
+import { formatBullpenPriceArg, roundPriceToTick } from './priceTick.js';
 import { extractCanonicalMarketFill } from './clobFillExtract.js';
-import { getTradingClient, getTradingConfigFromEnv } from './polymarketTrading.js';
+import { shouldSkipFutureUpdownBucketStart, updownBucketContainsNow, updownShortcutAnchorFloors } from './updownBucketEt.js';
+import { clobHasBookCached, gammaMarketCached, resolveCanonicalUpdownSlug } from './updownCanonicalProbe.js';
+import { resolveUpdownTradingSlug } from './updownTradingSlug.js';
+import {
+  buildTitledHourlySlug,
+  currentEtHourEndUnixSec,
+  isUpdownWindowOpen,
+  titledUpdownAssetFromSlug,
+  titledUpdownStepSecFromSlug,
+  updown1hEtSearchQueries,
+} from './updownMarketLive.js';
+import {
+  getTradingClient,
+  getTradingConfigFromEnv,
+  type PolymarketClobClient,
+  type TradingSdkFlavor,
+} from './polymarketTrading.js';
+import { clobApiUrl, dataApiUrl, gammaApiUrl, polymarketWebUrl } from './polymarketApiUrls.js';
+import {
+  clobBookHttp,
+  clobHasOrderbook,
+  clobOkJsonProbe,
+  dedupeSearchRows,
+  flattenSearchMarketRows,
+  gammaMarketsList,
+  gammaMarketBySlugOrId,
+  gammaSearchMarkets,
+  normalizeMarket,
+  parseClobTokenIds,
+  polymarketGetJson,
+} from './polymarket/index.js';
+import { registerPolymarketLiveRoutes } from './polymarketRoutes.js';
+import {
+  liveOrdersViaBullpen,
+  liveTradingEnvSummary,
+  liveTradingGate,
+  polymarketUseBullpen,
+} from './liveTradingPolicy.js';
 
-// Load env: monorepo root `.env` first, then `api/.env` (overrides) so keys work from either location.
-{
-  const here = fileURLToPath(import.meta.url);
-  const apiRoot = resolve(here, '..', '..'); // api/src/server.ts -> api/
-  const repoRoot = resolve(apiRoot, '..');
-  dotenv.config({ path: resolve(repoRoot, '.env') });
-  dotenv.config({ path: resolve(apiRoot, '.env'), override: true });
-}
-
-const GAMMA = 'https://gamma-api.polymarket.com';
-const CLOB = 'https://clob.polymarket.com';
-const DATA_API = 'https://data-api.polymarket.com';
-const POLYMARKET_WEB = 'https://polymarket.com';
+const GAMMA = gammaApiUrl();
+const CLOB = clobApiUrl();
+const DATA_API = dataApiUrl();
+const POLYMARKET_WEB = polymarketWebUrl();
 
 // Hot-path cache to keep the UI "instant" during rapid trading.
 // We keep this very short to avoid stale positions, while preventing repeated slow remote calls.
@@ -76,123 +126,129 @@ function runCli(args: string[], opts?: { timeoutMs?: number }): Promise<CliResul
   });
 }
 
-function runBullpen(args: string[], opts?: { timeoutMs?: number }): Promise<CliResult> {
-  const bin = process.env.BULLPEN_BIN || 'bullpen';
-  const timeoutMs = opts?.timeoutMs ?? 35_000;
-  return new Promise((resolve) => {
-    const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    let done = false;
-    const finish = (r: CliResult) => {
-      if (done) return;
-      done = true;
-      resolve(r);
-    };
-    const t = setTimeout(() => {
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        /* ignore */
-      }
-    }, timeoutMs);
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (d) => (stdout += String(d)));
-    child.stderr.on('data', (d) => (stderr += String(d)));
-    child.on('error', () => {
-      clearTimeout(t);
-      finish({ ok: false, stdout, stderr, code: null, signal: null });
-    });
-    child.on('close', (code, signal) => {
-      clearTimeout(t);
-      if (code === 0) finish({ ok: true, stdout });
-      else finish({ ok: false, stdout, stderr, code, signal });
-    });
-  });
+/** When unset, Gamma/CLOB HTTP is tried before the Polymarket CLI (avoids 20s stalls when CLI is missing or slow). */
+const FAST_CLI_MS = 4_000;
+
+function preferCliFirst(): boolean {
+  const v = (process.env.POLYMARKET_PREFER_CLI ?? '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
 }
 
-function parseJsonMaybe(text: string): unknown | null {
-  const t = text.trim();
-  if (!t) return null;
+const MARKET_GET_CACHE_TTL_MS = 60_000;
+const marketBySlugCache = new Map<string, CacheEntry<unknown>>();
+
+async function gammaMarketGet(slug: string): Promise<unknown | null> {
+  const deadlineMs = 8_000;
+  const started = Date.now();
+  const remaining = () => Math.max(400, deadlineMs - (Date.now() - started));
+
   try {
-    return JSON.parse(t) as unknown;
+    return normalizeMarket(await gammaMarketBySlugOrId(slug, { timeoutMs: remaining() }));
+  } catch {
+    try {
+      const ev = (await polymarketGetJson(`${GAMMA}/events/slug/${encodeURIComponent(slug)}`, {
+        timeoutMs: remaining(),
+      })) as Record<string, unknown>;
+      const mk = Array.isArray(ev.markets) ? (ev.markets as unknown[])[0] : null;
+      if (mk) return normalizeMarket(mk);
+    } catch {
+      /* event slug miss */
+    }
+    return null;
+  }
+}
+
+async function cliMarketGet(slug: string): Promise<unknown | null> {
+  const out = await runCli(['--output', 'json', 'markets', 'get', slug], { timeoutMs: FAST_CLI_MS });
+  if (!out.ok) return null;
+  try {
+    return normalizeMarket(JSON.parse(out.stdout));
   } catch {
     return null;
   }
 }
 
-function envFlagTrue(raw: string | undefined): boolean {
-  const v = String(raw ?? '').trim().toLowerCase();
-  return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+async function resolveMarketBySlug(slug: string): Promise<unknown> {
+  const gamma = await gammaMarketGet(slug);
+  if (gamma) return gamma;
+  const cli = await cliMarketGet(slug);
+  if (cli) return cli;
+  throw new Error('market_get_failed');
 }
 
-/** When false (default), slug+outcome do not route through Bullpen; use CLOB only. Set POLYMARKET_USE_BULLPEN=true for legacy Bullpen execution + position reads. */
-function polymarketUseBullpen(): boolean {
-  return envFlagTrue(process.env.POLYMARKET_USE_BULLPEN);
-}
+const CLOB_BOOK_HTTP_MS = 10_000;
+const CLOB_BOOK_CLI_MS = 2_500;
+const CLOB_BOOK_CACHE_TTL_MS = 2_500;
+type ClobBookCacheEntry = { token: string; book: unknown; error: string | null };
+const clobBookCache = new Map<string, { at: number; entry: ClobBookCacheEntry }>();
+const clobBookInflight = new Map<string, Promise<ClobBookCacheEntry>>();
 
-type BullpenPositionsCache = {
-  fetchedAtMs: number;
-  // The raw parsed JSON root (whatever Bullpen returns).
-  parsed: unknown;
-  // Best-effort normalized array of position objects.
-  positions: Record<string, unknown>[];
-};
+/** Hot path for Signals — HTTP first (fast); CLI only as a short fallback when HTTP fails. */
+async function fetchClobBookEntry(token: string): Promise<ClobBookCacheEntry> {
+  const cached = clobBookCache.get(token);
+  if (cached && Date.now() - cached.at < CLOB_BOOK_CACHE_TTL_MS) return cached.entry;
+  const inFlight = clobBookInflight.get(token);
+  if (inFlight) return inFlight;
 
-const bullpenPositionsCache: { value: BullpenPositionsCache | null; inflight: Promise<void> | null } = {
-  value: null,
-  inflight: null,
-};
-
-function positionsArrayFromBullpenParsed(parsed: unknown): Record<string, unknown>[] {
-  if (!parsed) return [];
-  if (Array.isArray(parsed)) return parsed.filter((x) => x && typeof x === 'object') as Record<string, unknown>[];
-  if (typeof parsed !== 'object') return [];
-  const root = parsed as Record<string, unknown>;
-  const maybe = (root.positions ?? root.data ?? root.result) as unknown;
-  if (Array.isArray(maybe)) return maybe.filter((x) => x && typeof x === 'object') as Record<string, unknown>[];
-  return [];
-}
-
-async function refreshBullpenPositions(opts?: { force?: boolean }): Promise<void> {
-  const now = Date.now();
-  const ttlMs = 250; // keep UI feeling "live" despite CLI latency
-  if (!opts?.force && bullpenPositionsCache.value && now - bullpenPositionsCache.value.fetchedAtMs < ttlMs) return;
-  if (bullpenPositionsCache.inflight) return;
-  const env = String(process.env.BULLPEN_ENV ?? 'production').trim() || 'production';
-  bullpenPositionsCache.inflight = (async () => {
+  const pending = (async (): Promise<ClobBookCacheEntry> => {
     try {
-      const r = await runBullpen(['polymarket', 'positions', '--env', env, '--output', 'json'], { timeoutMs: 25_000 });
-      if (!r.ok) return;
-      const parsed = parseJsonMaybe(r.stdout);
-      if (parsed == null) return;
-      bullpenPositionsCache.value = {
-        fetchedAtMs: Date.now(),
-        parsed,
-        positions: positionsArrayFromBullpenParsed(parsed),
+      const entry: ClobBookCacheEntry = { token, book: await clobBookHttp(token, { timeoutMs: CLOB_BOOK_HTTP_MS }), error: null };
+      clobBookCache.set(token, { at: Date.now(), entry });
+      return entry;
+    } catch (httpErr) {
+      const out = await runCli(['--output', 'json', 'clob', 'book', token], { timeoutMs: CLOB_BOOK_CLI_MS });
+      if (out.ok) {
+        try {
+          const entry: ClobBookCacheEntry = { token, book: JSON.parse(out.stdout) as unknown, error: null };
+          clobBookCache.set(token, { at: Date.now(), entry });
+          return entry;
+        } catch {
+          /* fall through */
+        }
+      }
+      const entry: ClobBookCacheEntry = {
+        token,
+        book: null,
+        error: String(httpErr instanceof Error ? httpErr.message : httpErr).slice(0, 800),
       };
+      clobBookCache.set(token, { at: Date.now(), entry });
+      return entry;
     } finally {
-      bullpenPositionsCache.inflight = null;
+      clobBookInflight.delete(token);
     }
   })();
-  await bullpenPositionsCache.inflight;
+  clobBookInflight.set(token, pending);
+  return pending;
 }
 
-function cachedBullpenPositionsOrNull(): BullpenPositionsCache | null {
-  return bullpenPositionsCache.value;
+function cachedBullpenPositionsOrNull() {
+  return cachedBullpenPositions();
 }
 
-async function httpGetJson(url: string): Promise<unknown> {
-  const r = await fetch(url, { headers: { accept: 'application/json' } });
-  const text = await r.text();
-  if (!r.ok) throw new Error(`http_${r.status}: ${text.slice(0, 240)}`);
-  return JSON.parse(text) as unknown;
-}
-
-async function httpGetJsonWithHeaders(url: string, headers?: Record<string, string>): Promise<unknown> {
-  const r = await fetch(url, { headers: { accept: 'application/json', ...(headers ?? {}) } });
-  const text = await r.text();
-  if (!r.ok) throw new Error(`http_${r.status}: ${text.slice(0, 240)}`);
-  return JSON.parse(text) as unknown;
+/** Bullpen CLI ran but returned non-zero — tailor hints past generic "install/login". */
+function bullpenCliFailureHint(cliOutput: string): string {
+  const c = cliOutput.toLowerCase();
+  if (c.includes('session expired') || c.includes('login session expired')) {
+    return 'Bullpen login expired — on the API host run `bullpen login`, then retry the trade.';
+  }
+  if (c.includes('outcome') && c.includes('not found')) {
+    return [
+      'Outcome name does not match this market (e.g. BTC 5m Up/Down markets need "Up" or "Down", not "Yes"/"No").',
+      'Reload the market in the app and retry; the server now normalizes common labels automatically.',
+    ].join(' ');
+  }
+  if (c.includes('turnkey') || c.includes('sign_raw_payload') || c.includes('failed to sign')) {
+    return [
+      'Order signing failed inside Bullpen (Turnkey remote signer), not missing CLI auth.',
+      'On the API host: run `bullpen upgrade`, then `bullpen logout` and `bullpen login` again.',
+      'Retry the trade; if it still fails, wait and retry (Turnkey/Bullpen incident) or ask Bullpen support.',
+      'App fallback without Bullpen signer: set POLYMARKET_LIVE_ORDERS_VIA=clob and use Polymarket CLOB keys on the API.',
+    ].join(' ');
+  }
+  if (c.includes('not logged') || c.includes('unauthorized') || c.includes(' 401 ') || c.includes('"401"')) {
+    return 'Bullpen session invalid — run `bullpen login` on the same machine (and user) that runs the API.';
+  }
+  return 'Ensure `bullpen` is installed and authenticated (`bullpen status`, `bullpen login`) on the machine running the API.';
 }
 
 /** Accept raw slug or full `polymarket.com/event/...` / `.../market/...` URLs from users pasting links. */
@@ -233,130 +289,6 @@ function marketsArrayFromStdout(stdout: string): unknown[] {
     }
   }
   return [];
-}
-
-function parseClobTokenIds(raw: unknown): string[] {
-  if (Array.isArray(raw)) return raw.map(String).filter(Boolean);
-  if (typeof raw === 'string') {
-    const t = raw.trim();
-    if (!t) return [];
-    if (t.startsWith('[')) {
-      try {
-        const p = JSON.parse(t) as unknown;
-        if (Array.isArray(p)) return p.map(String).filter(Boolean);
-      } catch {
-        /* fall through */
-      }
-    }
-    return t
-      .split(',')
-      .map((s) => s.replace(/^["'\s]+|["'\s]+$/g, '').trim())
-      .filter(Boolean);
-  }
-  return [];
-}
-
-/** Gamma often returns `clobTokenIds` as a JSON string; normalize for the web client. */
-function normalizeMarket(m: unknown): unknown {
-  if (!m || typeof m !== 'object') return m;
-  const o = m as Record<string, unknown>;
-  const ids = parseClobTokenIds(o.clobTokenIds ?? o.clob_token_ids);
-  return { ...o, clob_token_ids: ids };
-}
-
-async function gammaMarketsList(limit: number): Promise<unknown[]> {
-  // Gamma supports different sort keys over time; try "most active" first, then fall back.
-  const base = `${GAMMA}/markets?limit=${limit}&active=true&closed=false`;
-  const tryUrls = [
-    `${base}&archived=false&order=volume24hr&ascending=false`,
-    `${base}&archived=false&order=volume&ascending=false`,
-    `${base}&archived=false`,
-    base,
-  ];
-  let lastErr: unknown = null;
-  for (const url of tryUrls) {
-    try {
-      const data = await httpGetJson(url);
-      if (Array.isArray(data)) return data;
-      lastErr = new Error('gamma_bad_shape');
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
-}
-
-function isGammaMarketShape(o: Record<string, unknown>): boolean {
-  if (typeof o.conditionId === 'string' && o.conditionId.startsWith('0x')) return true;
-  if (o.clobTokenIds != null || o.clob_token_ids != null) return true;
-  if (
-    typeof o.question === 'string' &&
-    (typeof o.slug === 'string' || typeof o.id === 'string' || typeof o.id === 'number')
-  )
-    return true;
-  const mk = o.markets;
-  const hasNestedMarkets = Array.isArray(mk) && mk.length > 0;
-  if (
-    !hasNestedMarkets &&
-    typeof o.slug === 'string' &&
-    o.slug.trim() &&
-    (typeof o.id === 'string' || typeof o.id === 'number')
-  )
-    return true;
-  return false;
-}
-
-/** Search / CLI may return events with nested `markets`; `/markets/slug/:eventSlug` 404s — expand to child markets only when the row is not already a market. */
-function flattenSearchMarketRows(rows: unknown[]): unknown[] {
-  const out: unknown[] = [];
-  for (const row of rows) {
-    if (!row || typeof row !== 'object') {
-      out.push(row);
-      continue;
-    }
-    const o = row as Record<string, unknown>;
-    if (isGammaMarketShape(o)) {
-      out.push(row);
-      continue;
-    }
-    const mk = o.markets;
-    if (Array.isArray(mk) && mk.length > 0) {
-      const first = mk[0];
-      const fo = first && typeof first === 'object' ? (first as Record<string, unknown>) : null;
-      if (fo && isGammaMarketShape(fo)) {
-        for (const m of mk) {
-          if (m && typeof m === 'object') out.push(m);
-        }
-        continue;
-      }
-    }
-    out.push(row);
-  }
-  return out;
-}
-
-function dedupeSearchRows(rows: unknown[]): unknown[] {
-  const seen = new Set<string>();
-  const out: unknown[] = [];
-  for (const r of rows) {
-    if (!r || typeof r !== 'object') {
-      out.push(r);
-      continue;
-    }
-    const o = r as Record<string, unknown>;
-    const id = o.id;
-    const slug = o.slug;
-    const key =
-      typeof id === 'string' || typeof id === 'number'
-        ? `id:${String(id)}`
-        : typeof slug === 'string' && slug.trim()
-          ? `slug:${slug.trim()}`
-          : `anon:${seen.size}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(r);
-  }
-  return out;
 }
 
 const UPDOWN_5M_SEARCH: Record<string, string> = {
@@ -421,31 +353,11 @@ function rankUpdownCandidates(
   return found;
 }
 
-async function clobHasOrderbook(tokenId: string): Promise<boolean> {
-  const url = `${CLOB}/book?token_id=${encodeURIComponent(tokenId)}`;
-  const r = await fetch(url, { headers: { accept: 'application/json' } });
-  if (r.status === 404) return false;
-  return r.ok;
-}
-
 function nowBucketSec(stepSec: number): { now: number; floor: number; ceil: number } {
   const now = Math.floor(Date.now() / 1000);
   const floor = Math.floor(now / stepSec) * stepSec;
   const ceil = Math.ceil(now / stepSec) * stepSec;
   return { now, floor, ceil };
-}
-
-async function gammaSearchMarkets(q: string, limitPerType: number, maxResults: number): Promise<unknown[]> {
-  const url = `${GAMMA}/public-search?q=${encodeURIComponent(q)}&limit_per_type=${limitPerType}`;
-  const body = (await httpGetJson(url)) as Record<string, unknown>;
-  const events = Array.isArray(body.events) ? body.events : [];
-  const topMarkets = Array.isArray(body.markets) ? body.markets : [];
-  const fromEvents = events.flatMap((e) => {
-    const ev = e as Record<string, unknown>;
-    return Array.isArray(ev.markets) ? ev.markets : [];
-  });
-  const combined = [...topMarkets, ...fromEvents];
-  return combined.slice(0, maxResults);
 }
 
 function parseIsoMs(raw: unknown): number | null {
@@ -458,7 +370,9 @@ function assetSearchNeedle(asset: string): { slugNeedle: string; textNeedles: st
   const a = asset.toLowerCase().trim();
   if (a === 'btc') return { slugNeedle: 'btc', textNeedles: ['btc', 'bitcoin'] };
   if (a === 'eth') return { slugNeedle: 'eth', textNeedles: ['eth', 'ethereum'] };
-  return { slugNeedle: 'sol', textNeedles: ['sol', 'solana'] };
+  if (a === 'sol') return { slugNeedle: 'sol', textNeedles: ['sol', 'solana'] };
+  if (a === 'hype') return { slugNeedle: 'hype', textNeedles: ['hype', 'hyperliquid'] };
+  return { slugNeedle: a, textNeedles: [a] };
 }
 
 function pickBestUpdownGeneral(
@@ -495,52 +409,55 @@ function pickBestUpdownGeneral(
 
     const active = o.active === true;
     const closed = o.closed === true;
-    // Closed markets are never useful as a "shortcut".
-    if (closed) continue;
     const startMs = parseIsoMs(o.startDate ?? o.start_date);
     const endMs = parseIsoMs(o.endDate ?? o.end_date);
+    if (!isUpdownWindowOpen({ active, closed, endMs })) continue;
 
-    // Prefer open, active, and nearer-expiring markets.
     const now = Date.now();
-    const endDelta = endMs != null ? Math.abs(endMs - now) : 9e15;
     const durMs = startMs != null && endMs != null ? Math.max(0, endMs - startMs) : null;
     let score = 0;
     if (active && !closed) score += 5;
     if (!closed) score += 2;
     if (slug.includes(`${slugNeedle}-updown-`)) score += 2;
-    // Strongly prefer candidates whose window duration matches the requested interval.
+    if (interval === '1h' && titledUpdownStepSecFromSlug(slug) === 3600) score += 4;
+    if (interval === '1d' && titledUpdownStepSecFromSlug(slug) === 86400) score += 4;
     if (durMs != null && durMs > 0) {
-      const ratio = Math.abs(durMs - targetDurMs) / targetDurMs; // 0 is perfect
-      // within 10% => big boost; within 25% => medium; else penalize.
+      const ratio = Math.abs(durMs - targetDurMs) / targetDurMs;
       if (ratio <= 0.1) score += 6;
       else if (ratio <= 0.25) score += 3;
       else score -= Math.min(6, ratio * 6);
     } else {
-      // Unknown duration: mild penalty (still allow).
       score -= 1;
     }
-    // nearer is better
-    score += Math.max(0, 3 - Math.min(3, endDelta / (6 * 60 * 60 * 1000))); // within ~6h gets boost
+    // 1h: the *current* hour is the open window whose end is soonest in the future (not abs nearest to now).
+    if (interval === '1h' && endMs != null && endMs > now) {
+      const minsToEnd = (endMs - now) / 60_000;
+      if (minsToEnd <= 65) score += 12;
+      else score += Math.max(0, 6 - minsToEnd / 60);
+    }
 
     scored.push({ slug: slugRaw, active, closed, tokenIds, startMs, endMs, score });
   }
 
+  if (interval === '1h') {
+    const now = Date.now();
+    const live = scored.filter((s) => s.endMs != null && s.endMs > now);
+    if (live.length > 0) {
+      live.sort((a, b) => a.endMs! - b.endMs!);
+      const best = live[0]!;
+      return {
+        slug: best.slug,
+        active: best.active,
+        closed: best.closed,
+        tokenIds: best.tokenIds,
+        startMs: best.startMs,
+        endMs: best.endMs,
+      };
+    }
+  }
+
   scored.sort((a, b) => b.score - a.score);
   return scored[0] ?? null;
-}
-
-async function gammaMarketBySlugOrId(slugOrId: string): Promise<unknown> {
-  const numeric = /^\d+$/.test(slugOrId);
-  const path = numeric ? `/markets/${slugOrId}` : `/markets/slug/${encodeURIComponent(slugOrId)}`;
-  return httpGetJson(`${GAMMA}${path}`);
-}
-
-async function clobBookHttp(tokenId: string): Promise<unknown> {
-  const url = `${CLOB}/book?token_id=${encodeURIComponent(tokenId)}`;
-  const r = await fetch(url, { headers: { accept: 'application/json' } });
-  const text = await r.text();
-  if (!r.ok) throw new Error(`clob_${r.status}: ${text.slice(0, 240)}`);
-  return JSON.parse(text) as unknown;
 }
 
 async function tryPriceToBeat(slug: string): Promise<{ value: number; source: string }> {
@@ -549,9 +466,9 @@ async function tryPriceToBeat(slug: string): Promise<{ value: number; source: st
   let lastErr: unknown = null;
   for (const p of paths) {
     try {
-      const data = (await httpGetJsonWithHeaders(`${POLYMARKET_WEB}${p}`, {
-        // some endpoints are picky about UA
-        'user-agent': 'polymarket-orderflow-web/1.0',
+      const data = (await polymarketGetJson(`${POLYMARKET_WEB}${p}`, {
+        headers: { 'user-agent': 'polymarket-orderflow-web/1.0' },
+        timeoutMs: 8_000,
       })) as Record<string, unknown>;
       const vRaw = data.priceToBeat ?? data.price_to_beat ?? data.value ?? data.price ?? data;
       const v = typeof vRaw === 'number' ? vRaw : Number(vRaw);
@@ -574,20 +491,10 @@ function parseUpdownBucketFromSlug(slug: string): { symbol: string; bucketStartM
   return { symbol: `${asset}/usd`, bucketStartMs: startSec * 1000 };
 }
 
-/** Polymarket hourly/daily "Up or Down" markets often use titled slugs (not `btc-updown-1h-*`). */
-function titledUpdownStepSecFromSlug(slug: string): number | null {
-  const s = slug.trim().toLowerCase();
-  if (s.includes('-up-or-down-on-')) return 86400;
-  if (/-\d{1,2}(am|pm)-et$/i.test(s)) return 3600;
-  return null;
-}
-
 function titledUpdownSymbolFromSlug(slug: string): string | null {
-  const s = slug.trim().toLowerCase();
-  if (s.startsWith('bitcoin-')) return 'btc/usd';
-  if (s.startsWith('ethereum-')) return 'eth/usd';
-  if (s.startsWith('solana-')) return 'sol/usd';
-  return null;
+  const asset = titledUpdownAssetFromSlug(slug);
+  if (!asset) return null;
+  return `${asset}/usd`;
 }
 
 async function inferBucketFromTitledUpdownSlug(slug: string): Promise<{ symbol: string; bucketStartMs: number } | null> {
@@ -659,18 +566,15 @@ function canonicalCryptoSpotSymbol(raw: string): string | null {
   return binanceToSlash[s] ?? null;
 }
 
-function recordRtdsTick(symbol: string, value: number, tsRaw: number, source: RtdsPrice['source']): void {
-  const sym = canonicalCryptoSpotSymbol(symbol);
-  if (!sym) return;
-  const tsMs = normalizeChainlinkTsMs(tsRaw);
-  rtdsCache.set(sym, {
-    symbol: sym,
+function pushRtdsHistPoint(symbol: string, value: number, tsMs: number, source: RtdsPrice['source']): void {
+  rtdsCache.set(symbol, {
+    symbol,
     value,
     ts: tsMs,
     receivedAt: Date.now(),
     source,
   });
-  const arr = rtdsHistory.get(sym) ?? [];
+  const arr = rtdsHistory.get(symbol) ?? [];
   const last = arr[arr.length - 1];
   if (last && last.t === tsMs) {
     last.v = value;
@@ -678,17 +582,47 @@ function recordRtdsTick(symbol: string, value: number, tsRaw: number, source: Rt
     arr.push({ t: tsMs, v: value });
     if (arr.length > RTDS_HIST_CAP) arr.splice(0, arr.length - RTDS_HIST_CAP);
   }
-  rtdsHistory.set(sym, arr);
+  rtdsHistory.set(symbol, arr);
 }
+
+function recordRtdsTick(symbol: string, value: number, tsRaw: number, source: RtdsPrice['source']): void {
+  const sym = canonicalCryptoSpotSymbol(symbol);
+  if (!sym) return;
+  const tsMs = normalizeChainlinkTsMs(tsRaw);
+  pushRtdsHistPoint(sym, value, tsMs, source);
+  // Binance USDT-margined spot stream: expose an explicit `*/usdt` series (Chainlink stays `*/usd` only).
+  if (source === 'binance' && sym.endsWith('/usd')) {
+    const base = sym.slice(0, -'/usd'.length);
+    if (base === 'btc' || base === 'eth' || base === 'sol') {
+      pushRtdsHistPoint(`${base}/usdt`, value, tsMs, source);
+    }
+  }
+}
+
+const RTDS_WS_OPEN_TIMEOUT_MS = 8_000;
 
 async function ensureRtdsWs(): Promise<void> {
   if (rtdsWs && rtdsWs.readyState === WebSocket.OPEN) return;
-  if (rtdsWsStarting) return rtdsWsStarting;
+  if (rtdsWsStarting) {
+    await Promise.race([
+      rtdsWsStarting,
+      new Promise<void>((_, reject) =>
+        setTimeout(() => reject(new Error('rtds_ws_open_timeout')), RTDS_WS_OPEN_TIMEOUT_MS),
+      ),
+    ]);
+    if (rtdsWs?.readyState === WebSocket.OPEN) return;
+    throw new Error('rtds_ws_open_timeout');
+  }
   if (typeof WebSocket === 'undefined') throw new Error('websocket_unavailable_in_node');
-  rtdsWsStarting = new Promise<void>((resolve) => {
+  rtdsWsStarting = new Promise<void>((resolve, reject) => {
+    const openTimer = setTimeout(() => {
+      rtdsWsStarting = null;
+      reject(new Error('rtds_ws_open_timeout'));
+    }, RTDS_WS_OPEN_TIMEOUT_MS);
     const ws = new WebSocket('wss://ws-live-data.polymarket.com');
     rtdsWs = ws;
     ws.onopen = () => {
+      clearTimeout(openTimer);
       // Chainlink (slash symbols) + Binance (concat symbols) — both map into `btc/usd`, `eth/usd`, `sol/usd`.
       const chainlinkSubs = ['btc/usd', 'eth/usd', 'sol/usd'].map((symbol) => ({
         topic: 'crypto_prices_chainlink',
@@ -756,11 +690,13 @@ async function ensureRtdsWs(): Promise<void> {
       }
     };
     ws.onerror = () => {
+      clearTimeout(openTimer);
       stopPing();
-      // allow restart
       rtdsWsStarting = null;
+      reject(new Error('rtds_ws_error'));
     };
     ws.onclose = () => {
+      clearTimeout(openTimer);
       stopPing();
       rtdsWsStarting = null;
     };
@@ -768,17 +704,32 @@ async function ensureRtdsWs(): Promise<void> {
   return rtdsWsStarting;
 }
 
+async function tryRtdsBucketPtb(bucket: { symbol: string; bucketStartMs: number }): Promise<{ value: number; source: string } | null> {
+  try {
+    await ensureRtdsWs();
+  } catch {
+    /* may still have cache from a prior connection */
+  }
+  ensureRtdsSubscribed(bucket.symbol);
+  await waitForRtdsPrice(bucket.symbol, 32, 100);
+  const v = derivePtbFromRtdsHistory(bucket.symbol, bucket.bucketStartMs);
+  if (v != null) return { value: v, source: 'rtds_chainlink_bucket_floor' };
+  return null;
+}
+
 const rtdsSubscribed = new Set<string>(['btc/usd', 'eth/usd', 'sol/usd']);
 
 function normalizeRtdsSymbol(s: string): string | null {
   const sym = s.trim().toLowerCase();
-  if (!/^[a-z0-9]{2,12}\/usd$/.test(sym)) return null;
-  return sym;
+  if (/^[a-z0-9]{2,12}\/usd$/.test(sym)) return sym;
+  if (/^(btc|eth|sol)\/usdt$/.test(sym)) return sym;
+  return null;
 }
 
 function ensureRtdsSubscribed(symbol: string): void {
   const sym = normalizeRtdsSymbol(symbol);
   if (!sym) return;
+  if (sym.endsWith('/usdt')) return;
   if (rtdsSubscribed.has(sym)) return;
   rtdsSubscribed.add(sym);
   try {
@@ -795,7 +746,18 @@ function ensureRtdsSubscribed(symbol: string): void {
   }
 }
 
+async function waitForRtdsPrice(symbol: string, attempts = 16, sleepMs = 75): Promise<RtdsPrice | null> {
+  let v = rtdsCache.get(symbol) ?? null;
+  if (v || !rtdsWs || rtdsWs.readyState !== WebSocket.OPEN) return v;
+  for (let i = 0; i < attempts && !v; i++) {
+    await new Promise<void>((resolve) => setTimeout(resolve, sleepMs));
+    v = rtdsCache.get(symbol) ?? null;
+  }
+  return v;
+}
+
 const app = express();
+registerPolymarketLiveRoutes(app);
 /** Allow browser → API on another origin (e.g. `VITE_API_BASE=http://127.0.0.1:8787` with Vite preview). */
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -807,6 +769,7 @@ app.use((req, res, next) => {
   }
   next();
 });
+app.disable('x-powered-by');
 app.use(express.json({ limit: '256kb' }));
 
 const ASSISTANT_SYSTEM =
@@ -845,34 +808,69 @@ function assistantConfig(): { ok: true; provider: string; baseUrl: string; apiKe
 }
 
 app.get('/api/health', async (_req, res) => {
-  const version = await runCli(['--version'], { timeoutMs: 5_000 });
-  const cachedGamma = cacheGet(gammaReachableCache, 30_000);
-  let gammaOk = cachedGamma ?? false;
-  if (cachedGamma == null) {
-    try {
-      const r = await fetch(`${GAMMA}/markets?limit=1`, { headers: { accept: 'application/json' } });
-      gammaOk = r.ok;
-    } catch {
-      gammaOk = false;
-    }
-    gammaReachableCache = cacheSet(gammaOk);
-  }
   const a = assistantConfig();
   const trading = getTradingConfigFromEnv();
+  const liveEnv = liveTradingEnvSummary();
+  const useBullpenReads = polymarketUseBullpen();
+
+  const cachedGamma = cacheGet(gammaReachableCache, 30_000);
+  const gammaProbe =
+    cachedGamma != null
+      ? Promise.resolve(cachedGamma)
+      : fetch(`${GAMMA}/markets?limit=1`, {
+          headers: { accept: 'application/json' },
+          signal: AbortSignal.timeout(4_000),
+        })
+          .then((r) => r.ok)
+          .catch(() => false);
+
+  const versionProbe = runCli(['--version'], { timeoutMs: 800 }).then((r) =>
+    r.ok ? r.stdout.trim() : null,
+  );
+  const clobProbeP =
+    trading.ok ? clobOkJsonProbe(trading.config.host) : Promise.resolve(null);
+  const bullpenProbeP = useBullpenReads
+    ? Promise.race([
+        bullpenSessionReady(),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 4_000)),
+      ])
+    : Promise.resolve(null);
+
+  const [gammaOk, version, clobProbe, bullpenReady] = await Promise.all([
+    gammaProbe,
+    versionProbe,
+    clobProbeP,
+    bullpenProbeP,
+  ]);
+  if (cachedGamma == null) gammaReachableCache = cacheSet(gammaOk);
+
   json(res, 200, {
     ok: true,
     data: {
-      polymarket: version.ok ? version.stdout.trim() : null,
+      polymarket: version,
       gamma_reachable: gammaOk,
-      trading_ready: trading.ok,
+      /** CLOB keys valid, or Bullpen logged in when live reads/orders use Bullpen. */
+      trading_ready: trading.ok || bullpenReady === true,
+      trading_bullpen_ready: bullpenReady,
+      trading_balance_source: useBullpenReads ? 'bullpen' : 'clob',
+      /** Private key + funder present in env (`getTradingConfigFromEnv`). */
+      trading_clob_configured: trading.ok,
+      /** This host can reach Polymarket CLOB `/ok` without a Cloudflare block page. */
+      trading_clob_reachable: clobProbe?.ok ?? null,
+      trading_clob_probe_note: clobProbe && !clobProbe.ok ? clobProbe.note : null,
       trading_backend: 'polymarket_clob_api',
       trading_signer_address: trading.ok ? trading.config.signerAddress : null,
       trading_funder_address: trading.ok ? trading.config.funderAddress : null,
+      trading_clob_sdk: trading.ok ? trading.config.sdk : null,
+      trading_live_orders_via: liveEnv.live_orders_via,
+      ...liveEnv,
       assistant_available: a.ok,
       assistant_provider: a.ok ? a.provider : null,
       assistant_model: a.ok ? a.model : null,
       note: trading.ok
-        ? 'Polymarket CLOB API trading is configured on the backend.'
+        ? clobProbe?.ok
+          ? 'Polymarket CLOB env is set and `/ok` returned OK from this host.'
+          : 'Polymarket CLOB credentials are set in env, but `/ok` did not succeed from this host — live orders may fail until network access works (e.g. Cloudflare blocks on some VPN/datacenter IPs).'
         : 'Set POLYMARKET_PRIVATE_KEY and POLYMARKET_FUNDER on the API server to enable live CLOB trading.',
     },
   });
@@ -883,7 +881,39 @@ app.get('/api/markets', async (req, res) => {
   const cached = cacheGet(marketsListCache.get(limit) ?? null, 15_000);
   if (cached) return json(res, 200, { ok: true, data: cached });
 
-  const out = await runCli(['--output', 'json', 'markets', 'list', '--limit', String(limit)]);
+  const fromGamma = async () => {
+    const rows = (await gammaMarketsList(limit)).map(normalizeMarket);
+    marketsListCache.set(limit, cacheSet(rows));
+    return json(res, 200, { ok: true, data: rows });
+  };
+
+  if (!preferCliFirst()) {
+    try {
+      return await fromGamma();
+    } catch (e) {
+      const out = await runCli(['--output', 'json', 'markets', 'list', '--limit', String(limit)], {
+        timeoutMs: FAST_CLI_MS,
+      });
+      if (out.ok) {
+        try {
+          const rows = marketsArrayFromStdout(out.stdout).map(normalizeMarket);
+          marketsListCache.set(limit, cacheSet(rows));
+          return json(res, 200, { ok: true, data: rows });
+        } catch {
+          /* */
+        }
+      }
+      return json(res, 502, {
+        ok: false,
+        error: 'markets_failed',
+        details: { cli: out.ok ? 'bad_json' : out.stderr || out.stdout, http: String(e) },
+      });
+    }
+  }
+
+  const out = await runCli(['--output', 'json', 'markets', 'list', '--limit', String(limit)], {
+    timeoutMs: FAST_CLI_MS,
+  });
   if (out.ok) {
     try {
       const rows = marketsArrayFromStdout(out.stdout).map(normalizeMarket);
@@ -894,9 +924,7 @@ app.get('/api/markets', async (req, res) => {
     }
   }
   try {
-    const rows = (await gammaMarketsList(limit)).map(normalizeMarket);
-    marketsListCache.set(limit, cacheSet(rows));
-    return json(res, 200, { ok: true, data: rows });
+    return await fromGamma();
   } catch (e) {
     return json(res, 502, {
       ok: false,
@@ -910,7 +938,40 @@ app.get('/api/markets/search', async (req, res) => {
   const q = String(req.query.q ?? '').trim();
   const limit = Math.max(1, Math.min(50, Number(req.query.limit ?? 20) || 20));
   if (!q) return json(res, 400, { ok: false, error: 'missing_q' });
-  const out = await runCli(['--output', 'json', 'markets', 'search', q, '--limit', String(limit)]);
+
+  const fromGamma = async () => {
+    const raw = await gammaSearchMarkets(q, limit, Math.max(50, limit * 5));
+    const rows = dedupeSearchRows(flattenSearchMarketRows(raw)).map(normalizeMarket);
+    return json(res, 200, { ok: true, data: rows });
+  };
+
+  if (!preferCliFirst()) {
+    try {
+      return await fromGamma();
+    } catch (e) {
+      const out = await runCli(['--output', 'json', 'markets', 'search', q, '--limit', String(limit)], {
+        timeoutMs: FAST_CLI_MS,
+      });
+      if (out.ok) {
+        try {
+          const raw = marketsArrayFromStdout(out.stdout);
+          const rows = dedupeSearchRows(flattenSearchMarketRows(raw)).map(normalizeMarket);
+          return json(res, 200, { ok: true, data: rows });
+        } catch {
+          /* */
+        }
+      }
+      return json(res, 502, {
+        ok: false,
+        error: 'search_failed',
+        details: { cli: out.ok ? 'bad_json' : out.stderr || out.stdout, http: String(e) },
+      });
+    }
+  }
+
+  const out = await runCli(['--output', 'json', 'markets', 'search', q, '--limit', String(limit)], {
+    timeoutMs: FAST_CLI_MS,
+  });
   if (out.ok) {
     try {
       const raw = marketsArrayFromStdout(out.stdout);
@@ -921,9 +982,7 @@ app.get('/api/markets/search', async (req, res) => {
     }
   }
   try {
-    const raw = await gammaSearchMarkets(q, limit, Math.max(50, limit * 5));
-    const rows = dedupeSearchRows(flattenSearchMarketRows(raw)).map(normalizeMarket);
-    return json(res, 200, { ok: true, data: rows });
+    return await fromGamma();
   } catch (e) {
     return json(res, 502, {
       ok: false,
@@ -933,7 +992,42 @@ app.get('/api/markets/search', async (req, res) => {
   }
 });
 
-/** Resolve latest Polymarket Up/Down market slug for BTC / ETH / SOL (5m or 15m windows; Gamma + CLOB). */
+const UPDOWN_SHORTCUT_CACHE_MS = 8_000;
+const updownShortcutCache = new Map<string, CacheEntry<Record<string, unknown>>>();
+
+function shortcutCacheKey(asset: string, interval: string) {
+  return `${asset}:${interval}`;
+}
+
+async function replyUpdownShortcut(
+  res: express.Response,
+  interval: string,
+  data: Record<string, unknown>,
+  market?: Record<string, unknown> | null,
+) {
+  const live = String(data.slug ?? '').trim();
+  const trading_slug = await resolveUpdownTradingSlug(live, interval);
+  let marketOut: unknown | undefined;
+  if (market) {
+    const norm = normalizeMarket(market) as Record<string, unknown>;
+    marketOut = norm;
+    const liveKey = live.toLowerCase();
+    const tradeKey = trading_slug.trim().toLowerCase();
+    marketBySlugCache.set(liveKey, cacheSet(norm));
+    if (tradeKey && tradeKey !== liveKey) marketBySlugCache.set(tradeKey, cacheSet(norm));
+  }
+  const payload: Record<string, unknown> = {
+    ...data,
+    slug: live,
+    trading_slug,
+    ...(marketOut != null ? { market: marketOut } : {}),
+  };
+  const asset = String(data.asset ?? '').toLowerCase().trim();
+  if (asset) updownShortcutCache.set(shortcutCacheKey(asset, interval), cacheSet(payload));
+  return json(res, 200, { ok: true, data: payload });
+}
+
+/** Resolve latest Polymarket Up/Down market slug for BTC / ETH / SOL / HYPE (5m+ windows; Gamma + CLOB). */
 app.get('/api/markets/updown-shortcut', async (req, res) => {
   const asset = String(req.query.asset ?? '').toLowerCase().trim();
   const intervalParam = String(req.query.interval ?? '').trim().toLowerCase();
@@ -944,82 +1038,99 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
   const interval: '5m' | '15m' | '1h' | '4h' | '1d' =
     intervalParam === '15m' ? '15m' : intervalParam === '1h' ? '1h' : intervalParam === '4h' ? '4h' : intervalParam === '1d' ? '1d' : '5m';
   const stepSec = interval === '15m' ? 900 : interval === '1h' ? 3600 : interval === '4h' ? 4 * 3600 : interval === '1d' ? 24 * 3600 : 300;
-  if (asset !== 'btc' && asset !== 'eth' && asset !== 'sol') {
-    return json(res, 400, { ok: false, error: 'bad_asset', details: { allowed: ['btc', 'eth', 'sol'] } });
+  if (asset !== 'btc' && asset !== 'eth' && asset !== 'sol' && asset !== 'hype') {
+    return json(res, 400, { ok: false, error: 'bad_asset', details: { allowed: ['btc', 'eth', 'sol', 'hype'] } });
   }
+  const cachedShortcut = cacheGet(updownShortcutCache.get(shortcutCacheKey(asset, interval)) ?? null, UPDOWN_SHORTCUT_CACHE_MS);
+  if (cachedShortcut) return json(res, 200, { ok: true, data: cachedShortcut });
   try {
     const b = nowBucketSec(stepSec);
-    // NOTE: 1h/1d slugs are not perfectly consistent, but when the canonical
-    // `asset-updown-<interval>-<bucket>` slug exists it is the most reliable
-    // (fastest + correctly bucketed). We always try deterministic lookup first
-    // for every interval, and only fall back to Gamma search when needed.
-    // IMPORTANT: Polymarket uses the slug suffix as the *window start* bucket (not end).
-    // Example: `sol-updown-5m-1776528300` corresponds to a 5-minute window starting at that unix time.
-    const base = b.floor;
-    const tryTs: number[] = [];
-    for (let i = 0; i <= 8; i++) {
-      if (i === 0) tryTs.push(base);
-      else {
-        tryTs.push(base - i * stepSec);
-        tryTs.push(base + i * stepSec);
-      }
-    }
-    if (stepSec === 900) {
-      for (const o of [300, -300, 600, -600, 1500, -1500, 30 * 60, -30 * 60, 15 * 60, -15 * 60, 5 * 60, -5 * 60]) {
-        for (const t0 of [base, base - 900, base + 900, base - 2 * 900, base + 2 * 900]) {
-          tryTs.push(t0 + o);
-        }
-      }
-    }
-    const tryTsOrdered = Array.from(new Set(tryTs)).sort((a, c) => {
-      const da = Math.abs(a - b.now);
-      const dc = Math.abs(c - b.now);
-      if (da !== dc) return da - dc;
-      // When equally close, prefer the current/just-started bucket over the next one.
-      // For longer windows (1h/4h/1d), opening a future bucket yields a market that may be "active"
-      // but has a PTB bucket start in the future, which breaks client PTB/spot alignment.
-      if (interval === '1h' || interval === '4h' || interval === '1d') {
-        const aFuture = a > b.now;
-        const cFuture = c > b.now;
-        if (aFuture !== cFuture) return aFuture ? 1 : -1;
-      }
-      return a - c;
-    });
-    // First try the deterministic slug rather than Gamma search (which can lag).
-    for (const ts of tryTsOrdered) {
-      // For longer windows, do not select a future bucket start. Some markets open early with a live book,
-      // but PTB/spot alignment is defined by the *current* bucket start.
-      if ((interval === '1h' || interval === '4h' || interval === '1d') && ts > b.now + 60) continue;
-      const slug = `${asset}-updown-${interval}-${ts}`;
+
+    // 1h: Polymarket uses titled slugs (`bitcoin-up-or-down-may-16-2026-8pm-et`) — resolve the
+    // current ET clock hour first so 8:30pm opens 8pm–9pm, not an older search hit.
+    if (interval === '1h') {
+      const titledSlug = buildTitledHourlySlug(asset, b.now);
       try {
-        const m = (await gammaMarketBySlugOrId(slug)) as Record<string, unknown>;
+        const m = await gammaMarketCached(titledSlug);
+        if (!m) throw new Error('no_titled_market');
         const tokenIds = parseClobTokenIds(m.clobTokenIds ?? m.clob_token_ids);
         const t0 = tokenIds[0];
-        if (t0 && (await clobHasOrderbook(t0))) {
-          return json(res, 200, {
-            ok: true,
-            data: {
-              slug,
+        const bookOk = t0 && (m.active === true && m.closed !== true ? true : await clobHasBookCached(t0));
+        if (bookOk) {
+          const endMs = parseIsoMs(m.endDate ?? m.end_date);
+          const inferredEndSec =
+            endMs != null ? Math.floor(endMs / 1000) : currentEtHourEndUnixSec(b.now);
+          const inferredStart = inferredEndSec - stepSec;
+          return replyUpdownShortcut(
+            res,
+            interval,
+            {
+              slug: titledSlug,
               asset,
               interval,
               window: interval,
               tested: true,
               active: m.active === true,
               closed: m.closed === true,
-              inferred_window_start_unix: ts,
-              inferred_end_unix: ts + stepSec,
-              start: new Date(ts * 1000).toISOString(),
-              end: new Date((ts + stepSec) * 1000).toISOString(),
+              inferred_window_start_unix: inferredStart,
+              inferred_end_unix: inferredEndSec,
+              start: new Date(inferredStart * 1000).toISOString(),
+              end: new Date(inferredEndSec * 1000).toISOString(),
               bucket_now_unix: b.now,
               bucket_floor_unix: b.floor,
+              bucket_floor_et_unix: updownShortcutAnchorFloors(stepSec, b.now).et,
               bucket_ceil_unix: b.ceil,
+              source: 'titled_et_hour',
             },
-          });
+            m,
+          );
         }
-        // Market exists but no book; keep searching nearby windows.
       } catch {
-        // Market slug doesn't exist yet.
+        /* fall through to canonical + search */
       }
+    }
+
+    // NOTE: 1h/1d slugs are not perfectly consistent, but when the canonical
+    // `asset-updown-<interval>-<bucket>` slug exists it is the most reliable
+    // (fastest + correctly bucketed). We always try deterministic lookup first
+    // for every interval, and only fall back to Gamma search when needed.
+    // IMPORTANT: Polymarket uses the slug suffix as the *window start* bucket (not end).
+    // Example: `sol-updown-5m-1776528300` corresponds to a 5-minute window starting at that unix time.
+    //
+    // 1h · 4h · 1d windows follow US/Eastern bucket edges in practice; naive UTC `floor(now/step)*step`
+    // often misses the live slug — search both ET + UTC anchors (see `updownShortcutAnchorFloors`).
+    const { et: etAnchor } = updownShortcutAnchorFloors(stepSec, b.now);
+    const canonical = await resolveCanonicalUpdownSlug({
+      asset,
+      interval,
+      stepSec,
+      nowSec: b.now,
+      floorSec: b.floor,
+    });
+    if (canonical) {
+      const { slug, ts, market: m, tested } = canonical;
+      return replyUpdownShortcut(
+        res,
+        interval,
+        {
+          slug,
+          asset,
+          interval,
+          window: interval,
+          tested,
+          active: m.active === true,
+          closed: m.closed === true,
+          inferred_window_start_unix: ts,
+          inferred_end_unix: ts + stepSec,
+          start: new Date(ts * 1000).toISOString(),
+          end: new Date((ts + stepSec) * 1000).toISOString(),
+          bucket_now_unix: b.now,
+          bucket_floor_unix: b.floor,
+          bucket_floor_et_unix: etAnchor,
+          bucket_ceil_unix: b.ceil,
+        },
+        m,
+      );
     }
 
     // Fallback to Gamma search results when deterministic lookup fails.
@@ -1032,7 +1143,7 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
         return json(res, 404, { ok: false, error: 'no_updown_1d', details: { asset, interval, q } });
       }
       const t0 = best.tokenIds[0];
-      if (t0 && !(await clobHasOrderbook(t0))) {
+      if (t0 && !(await clobHasBookCached(t0))) {
         return json(res, 404, { ok: false, error: 'no_updown_1d_book', details: { asset, interval, slug: best.slug } });
       }
       const inferredStart = inferredBucketStartSecFromEnd(
@@ -1041,24 +1152,21 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
         best.startMs != null ? Math.floor(best.startMs / 1000) : b.floor,
       );
       const inferredEndSec = best.endMs != null ? Math.floor(best.endMs / 1000) : inferredStart + stepSec;
-      return json(res, 200, {
-        ok: true,
-        data: {
-          slug: best.slug,
-          asset,
-          interval,
-          window: interval,
-          tested: true,
-          active: best.active,
-          closed: best.closed,
-          inferred_window_start_unix: inferredStart,
-          inferred_end_unix: inferredEndSec,
-          start: new Date(inferredStart * 1000).toISOString(),
-          end: new Date(inferredEndSec * 1000).toISOString(),
-          bucket_now_unix: b.now,
-          bucket_floor_unix: b.floor,
-          bucket_ceil_unix: b.ceil,
-        },
+      return replyUpdownShortcut(res, interval, {
+        slug: best.slug,
+        asset,
+        interval,
+        window: interval,
+        tested: true,
+        active: best.active,
+        closed: best.closed,
+        inferred_window_start_unix: inferredStart,
+        inferred_end_unix: inferredEndSec,
+        start: new Date(inferredStart * 1000).toISOString(),
+        end: new Date(inferredEndSec * 1000).toISOString(),
+        bucket_now_unix: b.now,
+        bucket_floor_unix: b.floor,
+        bucket_ceil_unix: b.ceil,
       });
     }
 
@@ -1077,7 +1185,7 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
       // 1h markets sometimes don't use the canonical `asset-updown-1h-<bucket>` slug format.
       // Fall back to a broader search and pick the best open candidate with a live book.
       if (interval === '1h') {
-        const qs = UPDOWN_1H_SEARCH[asset];
+        const qs = [...UPDOWN_1H_SEARCH[asset], ...updown1hEtSearchQueries(asset)];
         let best:
           | { slug: string; active: boolean; closed: boolean; tokenIds: string[]; startMs: number | null; endMs: number | null }
           | null = null;
@@ -1091,32 +1199,29 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
         }
         if (best) {
           const t0 = best.tokenIds[0];
-          if (t0 && (await clobHasOrderbook(t0))) {
+          if (t0 && (await clobHasBookCached(t0))) {
             const inferredStart = inferredBucketStartSecFromEnd(
               best.endMs,
               stepSec,
               best.startMs != null ? Math.floor(best.startMs / 1000) : b.floor,
             );
             const inferredEndSec = best.endMs != null ? Math.floor(best.endMs / 1000) : inferredStart + stepSec;
-            return json(res, 200, {
-              ok: true,
-              data: {
-                slug: best.slug,
-                asset,
-                interval,
-                window: interval,
-                tested: true,
-                active: best.active,
-                closed: best.closed,
-                inferred_window_start_unix: inferredStart,
-                inferred_end_unix: inferredEndSec,
-                start: new Date(inferredStart * 1000).toISOString(),
-                end: new Date(inferredEndSec * 1000).toISOString(),
-                bucket_now_unix: b.now,
-                bucket_floor_unix: b.floor,
-                bucket_ceil_unix: b.ceil,
-                search_q: qUsed,
-              },
+            return replyUpdownShortcut(res, interval, {
+              slug: best.slug,
+              asset,
+              interval,
+              window: interval,
+              tested: true,
+              active: best.active,
+              closed: best.closed,
+              inferred_window_start_unix: inferredStart,
+              inferred_end_unix: inferredEndSec,
+              start: new Date(inferredStart * 1000).toISOString(),
+              end: new Date(inferredEndSec * 1000).toISOString(),
+              bucket_now_unix: b.now,
+              bucket_floor_unix: b.floor,
+              bucket_ceil_unix: b.ceil,
+              search_q: qUsed,
             });
           }
         }
@@ -1129,32 +1234,29 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
           const best3 = pickBestUpdownGeneral(rows3, asset, '1h');
           if (best3) {
             const t0 = best3.tokenIds[0];
-            if (t0 && (await clobHasOrderbook(t0))) {
+            if (t0 && (await clobHasBookCached(t0))) {
               const inferredStart = inferredBucketStartSecFromEnd(
                 best3.endMs,
                 stepSec,
                 best3.startMs != null ? Math.floor(best3.startMs / 1000) : b.floor,
               );
               const inferredEndSec = best3.endMs != null ? Math.floor(best3.endMs / 1000) : inferredStart + stepSec;
-              return json(res, 200, {
-                ok: true,
-                data: {
-                  slug: best3.slug,
-                  asset,
-                  interval,
-                  window: interval,
-                  tested: true,
-                  active: best3.active,
-                  closed: best3.closed,
-                  inferred_window_start_unix: inferredStart,
-                  inferred_end_unix: inferredEndSec,
-                  start: new Date(inferredStart * 1000).toISOString(),
-                  end: new Date(inferredEndSec * 1000).toISOString(),
-                  bucket_now_unix: b.now,
-                  bucket_floor_unix: b.floor,
-                  bucket_ceil_unix: b.ceil,
-                  source: 'gamma_markets_list',
-                },
+              return replyUpdownShortcut(res, interval, {
+                slug: best3.slug,
+                asset,
+                interval,
+                window: interval,
+                tested: true,
+                active: best3.active,
+                closed: best3.closed,
+                inferred_window_start_unix: inferredStart,
+                inferred_end_unix: inferredEndSec,
+                start: new Date(inferredStart * 1000).toISOString(),
+                end: new Date(inferredEndSec * 1000).toISOString(),
+                bucket_now_unix: b.now,
+                bucket_floor_unix: b.floor,
+                bucket_ceil_unix: b.ceil,
+                source: 'gamma_markets_list',
               });
             }
           }
@@ -1178,6 +1280,11 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
     const target = b.floor;
 
     const ordered = [...candidates].sort((a, b2) => {
+      if (interval === '15m') {
+        const aLive = updownBucketContainsNow(a.ts, stepSec, b.now);
+        const bLive = updownBucketContainsNow(b2.ts, stepSec, b.now);
+        if (aLive !== bLive) return aLive ? -1 : 1;
+      }
       const aDist = Math.abs(a.ts - target);
       const bDist = Math.abs(b2.ts - target);
       if (aDist !== bDist) return aDist - bDist;
@@ -1186,37 +1293,34 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
       const aPast = a.ts < target;
       const bPast = b2.ts < target;
       if (aPast !== bPast) {
-        if (interval === '1h' || interval === '4h') return aPast ? -1 : 1;
+        if (interval === '15m' || interval === '1h' || interval === '4h') return aPast ? -1 : 1;
         return aPast ? 1 : -1;
       }
       return b2.ts - a.ts;
     });
 
     // Prefer a candidate with an actual CLOB orderbook; test a few closest buckets.
-    for (const c of ordered.slice(0, 10)) {
-      if ((interval === '1h' || interval === '4h') && c.ts > b.now + 60) continue;
+    for (const c of ordered.slice(0, 5)) {
+      if (shouldSkipFutureUpdownBucketStart(interval, c.ts, b.now)) continue;
       const t0 = c.tokenIds[0];
       if (!t0) continue;
       try {
-        if (await clobHasOrderbook(t0)) {
-          return json(res, 200, {
-            ok: true,
-            data: {
-              slug: c.slug,
-              asset,
-              interval,
-              window: interval,
-              tested: true,
-              active: c.active,
-              closed: c.closed,
-              inferred_window_start_unix: c.ts,
-              inferred_end_unix: c.ts + stepSec,
-              start: new Date(c.ts * 1000).toISOString(),
-              end: new Date((c.ts + stepSec) * 1000).toISOString(),
-              bucket_now_unix: b.now,
-              bucket_floor_unix: b.floor,
-              bucket_ceil_unix: b.ceil,
-            },
+        if (await clobHasBookCached(t0)) {
+          return replyUpdownShortcut(res, interval, {
+            slug: c.slug,
+            asset,
+            interval,
+            window: interval,
+            tested: true,
+            active: c.active,
+            closed: c.closed,
+            inferred_window_start_unix: c.ts,
+            inferred_end_unix: c.ts + stepSec,
+            start: new Date(c.ts * 1000).toISOString(),
+            end: new Date((c.ts + stepSec) * 1000).toISOString(),
+            bucket_now_unix: b.now,
+            bucket_floor_unix: b.floor,
+            bucket_ceil_unix: b.ceil,
           });
         }
       } catch {
@@ -1225,24 +1329,21 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
     }
 
     const best = ordered[0]!;
-    return json(res, 200, {
-      ok: true,
-      data: {
-        slug: best.slug,
-        asset,
-        interval,
-        window: interval,
-        tested: false,
-        active: best.active,
-        closed: best.closed,
-        inferred_window_start_unix: best.ts,
-        inferred_end_unix: best.ts + stepSec,
-        start: new Date(best.ts * 1000).toISOString(),
-        end: new Date((best.ts + stepSec) * 1000).toISOString(),
-        bucket_now_unix: b.now,
-        bucket_floor_unix: b.floor,
-        bucket_ceil_unix: b.ceil,
-      },
+    return replyUpdownShortcut(res, interval, {
+      slug: best.slug,
+      asset,
+      interval,
+      window: interval,
+      tested: false,
+      active: best.active,
+      closed: best.closed,
+      inferred_window_start_unix: best.ts,
+      inferred_end_unix: best.ts + stepSec,
+      start: new Date(best.ts * 1000).toISOString(),
+      end: new Date((best.ts + stepSec) * 1000).toISOString(),
+      bucket_now_unix: b.now,
+      bucket_floor_unix: b.floor,
+      bucket_ceil_unix: b.ceil,
     });
   } catch (e) {
     return json(res, 502, { ok: false, error: 'updown_shortcut_failed', details: { asset, interval, http: String(e) } });
@@ -1253,33 +1354,17 @@ app.get('/api/markets/get/:slug', async (req, res) => {
   const raw = String(req.params.slug ?? '').trim();
   const slug = normalizeMarketLookupRef(raw);
   if (!slug) return json(res, 400, { ok: false, error: 'missing_slug' });
-  const out = await runCli(['--output', 'json', 'markets', 'get', slug]);
-  if (out.ok) {
-    try {
-      const data = normalizeMarket(JSON.parse(out.stdout));
-      return json(res, 200, { ok: true, data });
-    } catch {
-      /* HTTP */
-    }
-  }
+  const cached = cacheGet(marketBySlugCache.get(slug) ?? null, MARKET_GET_CACHE_TTL_MS);
+  if (cached) return json(res, 200, { ok: true, data: cached });
   try {
-    const data = normalizeMarket(await gammaMarketBySlugOrId(slug));
+    const data = await resolveMarketBySlug(slug);
+    marketBySlugCache.set(slug, cacheSet(data));
     return json(res, 200, { ok: true, data });
   } catch (e) {
-    try {
-      const ev = (await httpGetJson(`${GAMMA}/events/slug/${encodeURIComponent(slug)}`)) as Record<string, unknown>;
-      const mk = Array.isArray(ev.markets) ? (ev.markets as unknown[])[0] : null;
-      if (mk) {
-        const data = normalizeMarket(mk);
-        return json(res, 200, { ok: true, data });
-      }
-    } catch {
-      /* final */
-    }
     return json(res, 502, {
       ok: false,
       error: 'market_get_failed',
-      details: { raw, slug, cli: out.ok ? 'bad_json' : out.stderr || out.stdout, http: String(e) },
+      details: { raw, slug, http: String(e) },
     });
   }
 });
@@ -1287,54 +1372,57 @@ app.get('/api/markets/get/:slug', async (req, res) => {
 app.get('/api/clob/book/:token', async (req, res) => {
   const token = String(req.params.token ?? '').trim();
   if (!token) return json(res, 400, { ok: false, error: 'missing_token' });
-  const out = await runCli(['--output', 'json', 'clob', 'book', token]);
-  if (out.ok) {
-    try {
-      return json(res, 200, { ok: true, data: JSON.parse(out.stdout) });
-    } catch {
-      /* HTTP */
-    }
-  }
-  try {
-    const data = await clobBookHttp(token);
-    return json(res, 200, { ok: true, data });
-  } catch (e) {
+  const entry = await fetchClobBookEntry(token);
+  if (entry.error || entry.book == null) {
     return json(res, 502, {
       ok: false,
       error: 'book_failed',
-      details: { token, cli: out.ok ? 'bad_json' : out.stderr || out.stdout, http: String(e) },
+      details: { token, http: entry.error },
     });
   }
+  return json(res, 200, { ok: true, data: entry.book });
 });
+
+const PTB_BY_SLUG_CACHE_MS = 90_000;
+const ptbBySlugCache = new Map<string, CacheEntry<{ price_to_beat: number; source: string }>>();
 
 app.get('/api/price-to-beat/:slug', async (req, res) => {
   const raw = String(req.params.slug ?? '').trim();
   const slug = normalizeMarketLookupRef(raw);
   if (!slug) return json(res, 400, { ok: false, error: 'missing_slug' });
-  try {
-    const out = await tryPriceToBeat(slug);
-    return json(res, 200, { ok: true, data: { slug, price_to_beat: out.value, source: out.source } });
-  } catch (e) {
-    // Fallback for up/down shortcut slugs when Polymarket SSR endpoint format changes.
-    let b = parseUpdownBucketFromSlug(slug);
-    if (!b) b = await inferBucketFromTitledUpdownSlug(slug);
-    if (b) {
-      try {
-        await ensureRtdsWs();
-        const v = derivePtbFromRtdsHistory(b.symbol, b.bucketStartMs);
-        if (v != null) {
-          return json(res, 200, { ok: true, data: { slug, price_to_beat: v, source: 'rtds_chainlink_bucket_floor' } });
-        }
-        const cached = rtdsCache.get(b.symbol);
-        if (cached && Number.isFinite(cached.value)) {
-          return json(res, 200, { ok: true, data: { slug, price_to_beat: cached.value, source: 'rtds_chainlink_latest' } });
-        }
-      } catch {
-        // fallthrough to error
-      }
+  const cacheKey = slug.trim().toLowerCase();
+  const cached = cacheGet(ptbBySlugCache.get(cacheKey) ?? null, PTB_BY_SLUG_CACHE_MS);
+  if (cached) return json(res, 200, { ok: true, data: { slug, ...cached } });
+
+  let bucket = parseUpdownBucketFromSlug(slug);
+  if (!bucket) {
+    try {
+      bucket = await inferBucketFromTitledUpdownSlug(slug);
+    } catch {
+      bucket = null;
     }
-    return json(res, 502, { ok: false, error: 'price_to_beat_failed', details: { slug, err: String(e) } });
   }
+
+  let ssrErr: unknown = null;
+  const ssrP = tryPriceToBeat(slug).catch((e) => {
+    ssrErr = e;
+    return null;
+  });
+  const rtdsP = bucket ? tryRtdsBucketPtb(bucket) : Promise.resolve(null);
+
+  const [ssrOut, rtdsOut] = await Promise.all([ssrP, rtdsP]);
+  const chosen = ssrOut ?? rtdsOut;
+  if (chosen) {
+    const payload = { price_to_beat: chosen.value, source: chosen.source };
+    ptbBySlugCache.set(cacheKey, cacheSet(payload));
+    return json(res, 200, { ok: true, data: { slug, ...payload } });
+  }
+
+  return json(res, 502, {
+    ok: false,
+    error: 'price_to_beat_failed',
+    details: { slug, err: String(ssrErr ?? 'no_ssr_or_rtds_ptb') },
+  });
 });
 
 /** Public Polymarket Data API — recent matched trades for a condition (no CLOB keys). */
@@ -1349,6 +1437,44 @@ app.get('/api/data/recent-trades', async (req, res) => {
   }
   const limit = Math.max(1, Math.min(200, Number(req.query.limit ?? 50) || 50));
   const asset = String(req.query.asset ?? '').trim();
+  const tapeSource = String(process.env.POLYMARKET_RECENT_TRADES_SOURCE ?? 'data')
+    .trim()
+    .toLowerCase();
+
+  if (tapeSource === 'clob' && asset) {
+    const ready = await getTradingClient();
+    if (!ready.ok) {
+      return json(res, ready.error === 'trading_auth_failed' ? 502 : 503, {
+        ok: false,
+        error: ready.error,
+        details: { hint: ready.hint, reason: ready.details },
+      });
+    }
+    try {
+      const maxPages = Math.min(36, Math.max(2, Math.ceil(limit / 12) + 2));
+      const items = await clobListTradesForAssetId(ready.client, ready.sdk, asset, maxPages);
+      const out: {
+        timestamp: number;
+        side: string;
+        price: number | null;
+        size: number | null;
+        outcome: string | null;
+        asset: string;
+        transactionHash: string | null;
+        pseudonym: string | null;
+      }[] = [];
+      for (const tr of items) {
+        if (String(tr.asset_id ?? '').trim() !== asset) continue;
+        const row = clobTapeTradeToDataRow(tr, asset);
+        if (row) out.push(row);
+      }
+      out.sort((a, b) => b.timestamp - a.timestamp);
+      return json(res, 200, { ok: true, data: out.slice(0, limit) });
+    } catch (e) {
+      return json(res, 502, { ok: false, error: 'clob_tape_failed', details: String(e) });
+    }
+  }
+
   const url = `${DATA_API}/trades?limit=${limit}&market=${encodeURIComponent(market)}`;
   try {
     const r = await fetch(url, { headers: { accept: 'application/json' } });
@@ -1413,54 +1539,137 @@ app.get('/api/clob/last-trade-price', async (req, res) => {
 app.get('/api/rtds/crypto', async (req, res) => {
   const raw = String(req.query.symbol ?? '');
   const symbol = normalizeRtdsSymbol(raw);
-  if (!symbol) return json(res, 400, { ok: false, error: 'bad_symbol', details: { hint: 'expected e.g. btc/usd', symbol: raw } });
+  if (!symbol)
+    return json(res, 400, { ok: false, error: 'bad_symbol', details: { hint: 'expected e.g. btc/usd or btc/usdt', symbol: raw } });
   try {
     await ensureRtdsWs();
     ensureRtdsSubscribed(symbol);
   } catch (e) {
     return json(res, 502, { ok: false, error: 'rtds_unavailable', details: String(e) });
   }
-  let v = rtdsCache.get(symbol);
   // First ticks can lag a few hundred ms after subscribe; short wait avoids empty charts on cold load.
-  if (!v && rtdsWs && rtdsWs.readyState === WebSocket.OPEN) {
-    for (let i = 0; i < 16 && !v; i++) {
-      await new Promise<void>((r) => setTimeout(r, 75));
-      v = rtdsCache.get(symbol);
-    }
-  }
+  const v = await waitForRtdsPrice(symbol);
   if (!v) return json(res, 404, { ok: false, error: 'no_price_yet', details: { symbol } });
+  // HTTP poll counts as a fresh read — otherwise `receivedAt` only moves on WS ticks and the UI
+  // marks spot "stale" while the client polls every second.
+  const fresh = { ...v, receivedAt: Date.now() };
+  rtdsCache.set(symbol, fresh);
   const history = rtdsHistory.get(symbol) ?? [];
-  return json(res, 200, { ok: true, data: { ...v, history } });
+  return json(res, 200, { ok: true, data: { ...fresh, history } });
 });
 
-/** Parallel order books (CLI first, HTTP fallback per token). */
+function normalizeBinanceDepthSide(rows: unknown): { price: number; size: number }[] {
+  if (!Array.isArray(rows)) return [];
+  const out: { price: number; size: number }[] = [];
+  for (const row of rows) {
+    if (!Array.isArray(row) || row.length < 2) continue;
+    const price = Number(row[0]);
+    const size = Number(row[1]);
+    if (Number.isFinite(price) && Number.isFinite(size) && size > 0) out.push({ price, size });
+  }
+  return out;
+}
+
+/** Public Binance depth — normalized to CLOB-style `{ bids, asks }` level objects for the web book stack. */
+app.get('/api/binance/depth', async (req, res) => {
+  const rawSym = String(req.query.symbol ?? 'BTCUSDT').trim().toUpperCase();
+  if (!/^[A-Z0-9]{6,24}$/.test(rawSym)) {
+    return json(res, 400, { ok: false, error: 'bad_symbol', details: { symbol: rawSym } });
+  }
+  const lim = Number(req.query.limit ?? '100');
+  const limit = Number.isFinite(lim) ? Math.min(1000, Math.max(5, Math.floor(lim))) : 100;
+  try {
+    const url = `https://api.binance.com/api/v3/depth?symbol=${encodeURIComponent(rawSym)}&limit=${limit}`;
+    const r = await fetch(url);
+    if (!r.ok) {
+      const t = await r.text();
+      return json(res, 502, { ok: false, error: 'binance_depth_failed', details: t.slice(0, 500) });
+    }
+    const j = (await r.json()) as { bids?: unknown; asks?: unknown; lastUpdateId?: unknown };
+    return json(res, 200, {
+      ok: true,
+      data: {
+        symbol: rawSym,
+        lastUpdateId: typeof j.lastUpdateId === 'number' ? j.lastUpdateId : null,
+        bids: normalizeBinanceDepthSide(j.bids),
+        asks: normalizeBinanceDepthSide(j.asks),
+      },
+    });
+  } catch (e) {
+    return json(res, 502, { ok: false, error: 'binance_depth_failed', details: String(e) });
+  }
+});
+
+/** Recent Binance agg trades (public) — for spot tape / flow context. */
+app.get('/api/binance/agg-trades', async (req, res) => {
+  const rawSym = String(req.query.symbol ?? 'BTCUSDT').trim().toUpperCase();
+  if (!/^[A-Z0-9]{6,24}$/.test(rawSym)) {
+    return json(res, 400, { ok: false, error: 'bad_symbol', details: { symbol: rawSym } });
+  }
+  const lim = Number(req.query.limit ?? '80');
+  const limit = Number.isFinite(lim) ? Math.min(1000, Math.max(1, Math.floor(lim))) : 80;
+  try {
+    const url = `https://api.binance.com/api/v3/aggTrades?symbol=${encodeURIComponent(rawSym)}&limit=${limit}`;
+    const r = await fetch(url);
+    if (!r.ok) {
+      const t = await r.text();
+      return json(res, 502, { ok: false, error: 'binance_agg_trades_failed', details: t.slice(0, 500) });
+    }
+    const raw = (await r.json()) as unknown;
+    if (!Array.isArray(raw)) return json(res, 200, { ok: true, data: [] });
+    const out: { id: number; time: number; price: number; qty: number; buyerMaker: boolean }[] = [];
+    for (const row of raw) {
+      if (!row || typeof row !== 'object') continue;
+      const o = row as Record<string, unknown>;
+      const id = Number(o.a);
+      const time = Number(o.T ?? o.E);
+      const price = Number(o.p);
+      const qty = Number(o.q);
+      const buyerMaker = o.m === true;
+      if (!Number.isFinite(id) || !Number.isFinite(time) || !Number.isFinite(price) || !Number.isFinite(qty)) continue;
+      out.push({ id, time, price, qty, buyerMaker });
+    }
+    return json(res, 200, { ok: true, data: out });
+  } catch (e) {
+    return json(res, 502, { ok: false, error: 'binance_agg_trades_failed', details: String(e) });
+  }
+});
+
+/** Parallel order books — HTTP-first per token (2.5s cache; bounded per-token timeouts). */
 app.get('/api/clob/books', async (req, res) => {
   const raw = String(req.query.tokens ?? '').trim();
   if (!raw) return json(res, 400, { ok: false, error: 'missing_tokens' });
   const tokens = raw.split(',').map((t) => t.trim()).filter(Boolean).slice(0, 4);
   if (tokens.length === 0) return json(res, 400, { ok: false, error: 'missing_tokens' });
 
-  const books = await Promise.all(
-    tokens.map(async (token) => {
-      const out = await runCli(['--output', 'json', 'clob', 'book', token]);
-      if (out.ok) {
-        try {
-          return { token, book: JSON.parse(out.stdout) as unknown, error: null as string | null };
-        } catch {
-          /* try HTTP */
-        }
-      }
-      try {
-        return { token, book: await clobBookHttp(token), error: null as string | null };
-      } catch (e) {
-        return {
-          token,
-          book: null,
-          error: String(e instanceof Error ? e.message : e).slice(0, 800),
-        };
-      }
-    }),
-  );
+  // Browser-side `/api/clob/books` aborts at 24s; return a soft timeout sooner so Signals can degrade gracefully.
+  const routeDeadlineMs = 15_000;
+  const books = await new Promise<ClobBookCacheEntry[]>((resolve) => {
+    const timer = setTimeout(() => {
+      resolve(
+        tokens.map((token) => {
+          const hit = clobBookCache.get(token);
+          if (hit) return hit.entry;
+          return { token, book: null, error: 'books_route_timeout' };
+        }),
+      );
+    }, routeDeadlineMs);
+    void Promise.all(tokens.map((token) => fetchClobBookEntry(token)))
+      .then((rows) => {
+        clearTimeout(timer);
+        resolve(rows);
+      })
+      .catch(() => {
+        clearTimeout(timer);
+        resolve(
+          tokens.map((token) => ({
+            token,
+            book: null,
+            error: 'books_fetch_failed',
+          })),
+        );
+      });
+  });
 
   return json(res, 200, { ok: true, data: books });
 });
@@ -1722,6 +1931,14 @@ function normalizeAmountMaybe(raw: unknown, decimals: number, _kind: 'collateral
   return toHumanAmount(n, decimals) ?? String(n);
 }
 
+function parseConditionalSharesHuman(raw: unknown): number {
+  const norm =
+    normalizeAmountMaybe(raw, CONDITIONAL_TOKEN_DECIMALS, 'conditional') ??
+    (raw == null ? '' : String(raw));
+  const n = parseNumber('shares', norm.trim() === '' ? null : norm);
+  return n != null && n > 0 ? roundSizeShares4(n) : 0;
+}
+
 type ClobBookLevel = { price?: string; size?: string };
 
 function bestAskBestBidFromBook(book: unknown): { bestAsk: number | null; bestBid: number | null } {
@@ -1839,9 +2056,37 @@ type FakMarketPayload = {
   builderCode?: string;
 };
 
+/** Market IOC payload (FAK primary; FOK used only after liquidity-class retries). */
+type IocMarketPayload = Omit<FakMarketPayload, 'orderType'> & {
+  orderType: OrderType.FAK | OrderType.FOK;
+};
+
+async function sdkCreateAndPostLimitOrder(
+  client: PolymarketClobClient,
+  sdk: TradingSdkFlavor,
+  userOrder: {
+    tokenID: string;
+    price: number;
+    size: number;
+    side: Side;
+    expiration?: number;
+    builderCode?: string;
+  },
+  opts: Pick<CreateOrderOptions, 'tickSize' | 'negRisk'>,
+  orderType: typeof OrderType.GTC | typeof OrderType.GTD,
+  postOnly: boolean,
+): Promise<unknown> {
+  if (sdk === 'legacy') {
+    const L = client as LegacyClobClient;
+    return L.createAndPostOrder(userOrder, opts, orderType, false, postOnly);
+  }
+  const V = client as V2ClobClient;
+  return V.createAndPostOrder(userOrder, opts, orderType, postOnly);
+}
+
 /** `createAndPostOrder` / `createAndPostMarketOrder` post-options — see Polymarket `clob-client` README on GitHub. */
 async function clobOrderBuilderOptions(
-  client: ClobClient,
+  client: PolymarketClobClient,
   tokenId: string,
 ): Promise<Pick<CreateOrderOptions, 'tickSize' | 'negRisk'>> {
   try {
@@ -1860,7 +2105,7 @@ async function clobOrderBuilderOptions(
  * Prefer an explicit tick-aligned cross price from the live book on every market order.
  * Skips SDK-only `calculateMarketPrice` when possible — that path often disagrees with the matcher by a tick.
  */
-async function attachBookCrossPricePrefer(client: ClobClient, base: FakMarketPayload): Promise<FakMarketPayload> {
+async function attachBookCrossPricePrefer(client: PolymarketClobClient, base: FakMarketPayload): Promise<FakMarketPayload> {
   if (base.price != null && Number.isFinite(base.price) && base.price > 0 && base.price < 1) return base;
   try {
     const book = await client.getOrderBook(base.tokenID);
@@ -1878,10 +2123,37 @@ async function attachBookCrossPricePrefer(client: ClobClient, base: FakMarketPay
   return base;
 }
 
-async function createAndPostMarketOrderWithBookSlippage(client: ClobClient, base: FakMarketPayload): Promise<unknown> {
+function fakPayloadForSdk(base: IocMarketPayload, sdk: TradingSdkFlavor): Record<string, unknown> {
+  if (sdk !== 'legacy') return base as Record<string, unknown>;
+  const out = { ...base } as Record<string, unknown>;
+  delete out.userUSDCBalance;
+  return out;
+}
+
+async function sdkCreateAndPostMarketOrder(
+  client: PolymarketClobClient,
+  sdk: TradingSdkFlavor,
+  payload: IocMarketPayload,
+  ob: Pick<CreateOrderOptions, 'tickSize' | 'negRisk'>,
+  ot: OrderType.FAK | OrderType.FOK,
+): Promise<unknown> {
+  const body = fakPayloadForSdk(payload, sdk);
+  if (sdk === 'legacy') {
+    const L = client as LegacyClobClient;
+    return L.createAndPostMarketOrder(body as never, ob, ot);
+  }
+  const V = client as V2ClobClient;
+  return V.createAndPostMarketOrder(payload, ob, ot);
+}
+
+async function createAndPostMarketOrderWithBookSlippage(
+  client: PolymarketClobClient,
+  sdk: TradingSdkFlavor,
+  base: FakMarketPayload,
+): Promise<unknown> {
   const ob = await clobOrderBuilderOptions(client, base.tokenID);
   try {
-    return await client.createAndPostMarketOrder(base, ob, OrderType.FAK);
+    return await sdkCreateAndPostMarketOrder(client, sdk, base, ob, OrderType.FAK);
   } catch (first) {
     const msg = first instanceof Error ? first.message : String(first);
     if (!isLiquidityClassMarketError(msg)) throw first;
@@ -1899,11 +2171,13 @@ async function createAndPostMarketOrderWithBookSlippage(client: ClobClient, base
       slip = slipExplicitSellPrice(bestBid, tick);
     }
 
-    const slipped = { ...base, price: slip, orderType: OrderType.FAK as const };
+    const slipped: IocMarketPayload = { ...base, price: slip, orderType: OrderType.FAK };
     try {
-      return await client.createAndPostMarketOrder(slipped, ob, OrderType.FAK);
+      return await sdkCreateAndPostMarketOrder(client, sdk, slipped, ob, OrderType.FAK);
     } catch {
-      return await client.createAndPostMarketOrder(
+      return await sdkCreateAndPostMarketOrder(
+        client,
+        sdk,
         { ...slipped, orderType: OrderType.FOK as const },
         ob,
         OrderType.FOK,
@@ -1923,26 +2197,60 @@ app.get('/api/trade/balance-allowance', async (req, res) => {
     return json(res, 400, { ok: false, error: 'missing_token_id', details: { hint: 'Pass token_id for outcome (conditional) balance.' } });
   }
 
-  // Optional: when POLYMARKET_USE_BULLPEN=true, Bullpen positions for slug+outcome (must hit a row or we fall through to CLOB).
-  if (assetType === AssetType.CONDITIONAL && marketSlug && outcome && polymarketUseBullpen()) {
-    const cached = cachedBullpenPositionsOrNull();
-    if (!cached) await refreshBullpenPositions({ force: true });
-    else void refreshBullpenPositions();
-
-    const arr = (cachedBullpenPositionsOrNull()?.positions ?? []) as Record<string, unknown>[];
-    const norm = (s: unknown) => String(s ?? '').trim().toLowerCase();
-    const hit = arr.find((p) => {
-      if (!p || typeof p !== 'object') return false;
-      const o = p as Record<string, unknown>;
-      const slug = norm(o.slug ?? o.market_slug ?? o.marketSlug ?? o.market);
-      const out = norm(o.outcome ?? o.outcome_name ?? o.outcomeName);
-      return slug === norm(marketSlug) && out === norm(outcome);
-    }) as Record<string, unknown> | undefined;
-    if (hit) {
-      const size = parseNumber('size', hit.size ?? hit.shares ?? hit.position ?? hit.quantity) ?? 0;
-      return json(res, 200, { ok: true, data: { balance: String(size), allowance: '' } });
+  // Live account reads via Bullpen CLI (`polymarket positions`, `clob balance`, `portfolio balances`).
+  if (polymarketUseBullpen()) {
+    if (!(await bullpenSessionReady())) {
+      return json(res, 503, {
+        ok: false,
+        error: 'bullpen_not_logged_in',
+        details: {
+          hint: 'Run `bullpen login` on the machine that runs the API, then `bullpen status` (should show Logged in).',
+        },
+      });
     }
-    // No matching Bullpen row — use CLOB balance (avoids false zero vs Polymarket).
+    void refreshBullpenPositions();
+
+    const clobKind = assetType === AssetType.COLLATERAL ? 'collateral' : 'conditional';
+    const clobBal = await bullpenClobBalance(clobKind, tokenId);
+
+    if (assetType === AssetType.COLLATERAL) {
+      const cash = await bullpenCollateralBalanceHuman();
+      if (cash != null) {
+        return json(res, 200, {
+          ok: true,
+          data: { balance: String(cash), allowance: '', source: 'bullpen' },
+        });
+      }
+      return json(res, 503, {
+        ok: false,
+        error: 'bullpen_balance_unavailable',
+        details: {
+          hint: 'Could not read USDC via Bullpen (`polymarket clob balance`, `positions`, `portfolio balances`).',
+        },
+      });
+    }
+
+    await refreshBullpenPositions({ force: true });
+    const arr = (cachedBullpenPositionsOrNull()?.positions ?? []) as Record<string, unknown>[];
+    const hit = findBullpenPositionRow(arr, { marketSlug, outcome, tokenId });
+    const posSize = hit ? positionSize(hit) : 0;
+    const clobSize =
+      clobBal?.balance != null && clobBal.balance.trim() !== ''
+        ? parseNumber('balance', clobBal.balance) ?? 0
+        : 0;
+    const effective = Math.max(posSize, clobSize);
+    const source =
+      posSize > clobSize + 1e-6 ? 'bullpen_positions' : clobBal ? 'bullpen_clob' : 'bullpen_positions';
+    return json(res, 200, {
+      ok: true,
+      data: {
+        balance: String(effective),
+        allowance: clobBal?.allowance ?? '',
+        source,
+        clob_balance: clobBal?.balance ?? null,
+        positions_balance: posSize > 0 ? String(posSize) : null,
+      },
+    });
   }
 
   const ready = await getTradingClient();
@@ -1989,6 +2297,54 @@ function tradeMatchTimeMs(trade: Record<string, unknown>): number {
   return 0;
 }
 
+/** Normalize CLOB `getTradesPaginated` row → same shape as Polymarket Data API tape (`DataTradeRow`). `timestamp` is unix seconds (web multiplies by 1000 for charts). */
+function clobTapeTradeToDataRow(
+  tr: Record<string, unknown>,
+  asset: string,
+): {
+  timestamp: number;
+  side: string;
+  price: number | null;
+  size: number | null;
+  outcome: string | null;
+  asset: string;
+  transactionHash: string | null;
+  pseudonym: string | null;
+} | null {
+  const aid = String(tr.asset_id ?? '').trim();
+  if (aid !== asset) return null;
+  const price = toPrice01Maybe(tr.price);
+  if (price == null) return null;
+  const tradeSideRaw = String(tr.side ?? '').trim().toUpperCase();
+  const side =
+    tradeSideRaw === 'SELL' || tradeSideRaw === 'S' ? 'sell' : tradeSideRaw === 'BUY' || tradeSideRaw === 'B' ? 'buy' : '';
+  if (side !== 'buy' && side !== 'sell') return null;
+  const sizeRaw = tr.size ?? tr.amount ?? tr.quantity;
+  const sizeNorm = normalizeAmountMaybe(sizeRaw, CONDITIONAL_TOKEN_DECIMALS, 'conditional');
+  const size = parseNumber('size', sizeNorm ?? sizeRaw);
+  if (size == null || size <= 0) return null;
+  const tRaw = tradeMatchTimeMs(tr);
+  if (!Number.isFinite(tRaw) || tRaw <= 0) return null;
+  const timestamp = tRaw > 10_000_000_000 ? Math.round(tRaw / 1000) : Math.round(tRaw);
+  const tx =
+    tr.transaction_hash ??
+    tr.transactionHash ??
+    tr.tx_hash ??
+    tr.id ??
+    tr.trade_id ??
+    null;
+  return {
+    timestamp,
+    side,
+    price,
+    size,
+    outcome: null,
+    asset,
+    transactionHash: tx != null ? String(tx) : null,
+    pseudonym: null,
+  };
+}
+
 function tradeInvolvesAddresses(trade: Record<string, unknown>, addrs: Set<string>): boolean {
   const owner = typeof trade.owner === 'string' ? trade.owner.toLowerCase() : '';
   const makerRoot = typeof trade.maker_address === 'string' ? trade.maker_address.toLowerCase() : '';
@@ -2008,15 +2364,24 @@ function tradeInvolvesAddresses(trade: Record<string, unknown>, addrs: Set<strin
 }
 
 /** Paginated CLOB trades for one outcome token (same tape Polymarket uses for fills / profile). */
-async function clobListTradesForAssetId(client: ClobClient, tokenId: string, maxPages: number): Promise<Record<string, unknown>[]> {
+async function clobListTradesForAssetId(
+  client: PolymarketClobClient,
+  sdk: TradingSdkFlavor,
+  tokenId: string,
+  maxPages: number,
+): Promise<Record<string, unknown>[]> {
   const params: TradeParams = { asset_id: tokenId };
   const items: Record<string, unknown>[] = [];
   let cursor: string | undefined = undefined;
   for (let page = 0; page < maxPages; page++) {
-    const batch = await client.getTradesPaginated(params as never, cursor);
-    for (const tr of batch.trades) items.push(tr as unknown as Record<string, unknown>);
-    const next = batch.next_cursor;
-    if (!next || next === 'LTE=' || batch.trades.length === 0) break;
+    const batch =
+      sdk === 'legacy'
+        ? await (client as LegacyClobClient).getTradesPaginated(params as never, cursor)
+        : await (client as V2ClobClient).getTradesPaginated(params as never, cursor);
+    const trades = batch.trades as unknown[];
+    for (const tr of trades) items.push(tr as Record<string, unknown>);
+    const next: string = batch.next_cursor;
+    if (!next || next === 'LTE=' || trades.length === 0) break;
     cursor = next;
   }
   items.sort((a, b) => tradeMatchTimeMs(a) - tradeMatchTimeMs(b));
@@ -2143,6 +2508,37 @@ app.get('/api/trade/avg-entry', async (req, res) => {
     return json(res, 200, { ok: true, data: cached.data });
   }
 
+  if (polymarketUseBullpen()) {
+    if (!(await bullpenSessionReady())) {
+      return json(res, 503, {
+        ok: false,
+        error: 'bullpen_not_logged_in',
+        details: { hint: 'Run `bullpen login` on the API host.' },
+      });
+    }
+    await refreshBullpenPositions({ force: !cachedBullpenPositionsOrNull() });
+    const arr = (cachedBullpenPositionsOrNull()?.positions ?? []) as Record<string, unknown>[];
+    const hit = findBullpenPositionRow(arr, { marketSlug, outcome, tokenId });
+    if (hit && positionSize(hit) > 0) {
+      const data = {
+        tokenId,
+        avgEntry: positionAvgEntry01(hit),
+        shares: roundSizeShares4(positionSize(hit)),
+      };
+      avgEntryCache.set(cacheKey, { at: Date.now(), data });
+      return json(res, 200, { ok: true, data });
+    }
+    const trades = await bullpenTradeHistory();
+    const fromTape = avgEntryFromBullpenTrades(trades, tokenId);
+    const data = {
+      tokenId,
+      avgEntry: fromTape.avgEntry,
+      shares: roundSizeShares4(fromTape.shares),
+    };
+    avgEntryCache.set(cacheKey, { at: Date.now(), data });
+    return json(res, 200, { ok: true, data });
+  }
+
   // Fast-path: Polymarket Data API positions (matches what the UI shows).
   // This is both quicker and more accurate than reconstructing cost basis from a limited trade tape window.
   try {
@@ -2191,31 +2587,7 @@ app.get('/api/trade/avg-entry', async (req, res) => {
       }
     }
   } catch {
-    // Fall through to Bullpen/CLOB reconstruction.
-  }
-
-  if (marketSlug && outcome && polymarketUseBullpen()) {
-    const cached = cachedBullpenPositionsOrNull();
-    if (!cached) await refreshBullpenPositions({ force: true });
-    else void refreshBullpenPositions();
-
-    const arr = (cachedBullpenPositionsOrNull()?.positions ?? []) as Record<string, unknown>[];
-    if (arr.length > 0) {
-      const norm = (s: unknown) => String(s ?? '').trim().toLowerCase();
-      const hit = arr.find((p) => {
-        if (!p || typeof p !== 'object') return false;
-        const o = p as Record<string, unknown>;
-        const slug = norm(o.slug ?? o.market_slug ?? o.marketSlug ?? o.market);
-        const out = norm(o.outcome ?? o.outcome_name ?? o.outcomeName);
-        return slug === norm(marketSlug) && out === norm(outcome);
-      }) as Record<string, unknown> | undefined;
-      if (hit) {
-        const avg = toPrice01Maybe(hit.avg_entry ?? hit.avgEntry ?? hit.entry_price ?? hit.entryPrice ?? hit.avg_price ?? hit.avgPrice);
-        const shares = parseNumber('size', hit.size ?? hit.shares ?? hit.position ?? hit.quantity) ?? 0;
-        return json(res, 200, { ok: true, data: { tokenId, avgEntry: avg, shares: roundSizeShares4(shares) } });
-      }
-    }
-    // fall through to CLOB-derived avg when Bullpen off, empty, or no matching row
+    // Fall through to CLOB reconstruction.
   }
 
   const ready = await getTradingClient();
@@ -2232,7 +2604,7 @@ app.get('/api/trade/avg-entry', async (req, res) => {
     const signer = ready.config.signerAddress.toLowerCase();
     const myAddrs = new Set([funder, signer].filter(Boolean));
 
-    const items = await clobListTradesForAssetId(ready.client, tokenId, 24);
+    const items = await clobListTradesForAssetId(ready.client, ready.sdk, tokenId, 24);
 
     const anyAddrHit = items.some((t) => String(t.asset_id ?? '') === tokenId && tradeInvolvesAddresses(t, myAddrs));
 
@@ -2326,6 +2698,56 @@ app.get('/api/trade/avg-entry', async (req, res) => {
 app.get('/api/trade/order-fill-index', async (req, res) => {
   const tokenId = String(req.query.token_id ?? '').trim();
   if (!tokenId) return json(res, 400, { ok: false, error: 'missing_token_id' });
+  const force = String(req.query.force ?? '') === '1' || String(req.query.force ?? '').toLowerCase() === 'true';
+
+  if (polymarketUseBullpen()) {
+    if (!(await bullpenSessionReady())) {
+      return json(res, 503, {
+        ok: false,
+        error: 'bullpen_not_logged_in',
+        details: { hint: 'Run `bullpen login` on the API host.' },
+      });
+    }
+    const trades = await bullpenTradeHistory({ force });
+    const by_order_id: Record<string, OrderFillIndexEntry> = {};
+    for (const t of trades) {
+      const asset = String(t.asset ?? t.asset_id ?? t.assetId ?? '').trim();
+      if (asset !== tokenId) continue;
+      const oid = String(t.order_id ?? t.orderID ?? t.orderId ?? t.id ?? '').trim();
+      if (!oid) continue;
+      const sideRaw = String(t.side ?? '').toUpperCase();
+      const side: 'buy' | 'sell' = sideRaw === 'SELL' || sideRaw === 'S' ? 'sell' : 'buy';
+      let price = parseNumber('price', t.price) ?? 0;
+      if (price > 1.0001 && price <= 100) price /= 100;
+      if (!(price > 0) || price >= 1) continue;
+      const sz = parseNumber('size', t.size) ?? 0;
+      if (sz <= 0) continue;
+      const at =
+        typeof t.timestamp === 'string'
+          ? Date.parse(t.timestamp)
+          : typeof t.timestamp === 'number'
+            ? t.timestamp
+            : Date.now();
+      const prev = by_order_id[oid];
+      if (!prev) {
+        by_order_id[oid] = {
+          shares: roundSizeShares4(sz),
+          avg_price_01: roundPrice01Api(price),
+          side,
+          updated_at_ms: Number.isFinite(at) ? at : Date.now(),
+        };
+      } else {
+        const totalSz = prev.shares + sz;
+        by_order_id[oid] = {
+          shares: roundSizeShares4(totalSz),
+          avg_price_01: roundPrice01Api((prev.avg_price_01 * prev.shares + price * sz) / totalSz),
+          side: prev.side,
+          updated_at_ms: Math.max(prev.updated_at_ms, Number.isFinite(at) ? at : 0),
+        };
+      }
+    }
+    return json(res, 200, { ok: true, data: { token_id: tokenId, by_order_id } });
+  }
 
   const ready = await getTradingClient();
   if (!ready.ok) {
@@ -2340,7 +2762,7 @@ app.get('/api/trade/order-fill-index', async (req, res) => {
     const funder = ready.config.funderAddress.toLowerCase();
     const signer = ready.config.signerAddress.toLowerCase();
     const myAddrs = new Set([funder, signer].filter(Boolean));
-    const items = await clobListTradesForAssetId(ready.client, tokenId, 28);
+    const items = await clobListTradesForAssetId(ready.client, ready.sdk, tokenId, 28);
     const by_order_id = buildOrderFillIndexFromTrades(items, tokenId, myAddrs);
     return json(res, 200, { ok: true, data: { token_id: tokenId, by_order_id } });
   } catch (error) {
@@ -2371,6 +2793,19 @@ app.get('/api/trade/my-fills', async (req, res) => {
   if (!tokenId) return json(res, 400, { ok: false, error: 'missing_token_id' });
   const limit = Math.max(1, Math.min(200, parseInt(String(req.query.limit ?? '40'), 10) || 40));
 
+  if (polymarketUseBullpen()) {
+    if (!(await bullpenSessionReady())) {
+      return json(res, 503, {
+        ok: false,
+        error: 'bullpen_not_logged_in',
+        details: { hint: 'Run `bullpen login` on the API host.' },
+      });
+    }
+    const trades = await bullpenTradeHistory();
+    const fills = myFillsFromBullpenTrades(trades, tokenId, limit);
+    return json(res, 200, { ok: true, data: { token_id: tokenId, fills } });
+  }
+
   const ready = await getTradingClient();
   if (!ready.ok) {
     return json(res, ready.error === 'trading_auth_failed' ? 502 : 503, {
@@ -2385,7 +2820,7 @@ app.get('/api/trade/my-fills', async (req, res) => {
     const signer = ready.config.signerAddress.toLowerCase();
     const myAddrs = new Set([funder, signer].filter(Boolean));
 
-    const items = await clobListTradesForAssetId(ready.client, tokenId, 28);
+    const items = await clobListTradesForAssetId(ready.client, ready.sdk, tokenId, 28);
     const out: MyFillRow[] = [];
 
     for (const trade of items) {
@@ -2490,6 +2925,11 @@ app.post('/api/trade/update-balance-allowance', async (req, res) => {
     return json(res, 400, { ok: false, error: 'missing_token_id' });
   }
 
+  if (polymarketUseBullpen()) {
+    await refreshBullpenPositions({ force: true });
+    return json(res, 200, { ok: true, data: { updated: true, source: 'bullpen' } });
+  }
+
   const ready = await getTradingClient();
   if (!ready.ok) {
     return json(res, ready.error === 'trading_auth_failed' ? 502 : 503, {
@@ -2519,6 +2959,11 @@ app.post('/api/trade/update-balance-allowance', async (req, res) => {
  * Use FAK so available liquidity can fill partially instead of killing the whole order.
  */
 app.post('/api/trade/market-order', async (req, res) => {
+  const liveGate = liveTradingGate();
+  if (!liveGate.ok) {
+    return json(res, 403, { ok: false, error: liveGate.error, details: { hint: liveGate.hint } });
+  }
+
   const body = req.body as {
     token?: unknown;
     amount?: unknown;
@@ -2526,12 +2971,15 @@ app.post('/api/trade/market-order', async (req, res) => {
     signatureType?: unknown;
     market_slug?: unknown;
     outcome?: unknown;
+    lane?: unknown;
+    outcome_lane?: unknown;
   };
   const token = typeof body.token === 'string' ? body.token.trim() : '';
   const side = typeof body.side === 'string' ? body.side.trim().toLowerCase() : 'buy';
   const amount = parseNumber('amount', body.amount);
   const marketSlug = typeof body.market_slug === 'string' ? body.market_slug.trim() : '';
   const outcome = typeof body.outcome === 'string' ? body.outcome.trim() : '';
+  const orderLane = parseOrderLane(body as Record<string, unknown>);
 
   if (!token) return json(res, 400, { ok: false, error: 'missing_token' });
   if (side !== 'buy' && side !== 'sell') return json(res, 400, { ok: false, error: 'bad_side' });
@@ -2572,27 +3020,42 @@ app.post('/api/trade/market-order', async (req, res) => {
     }
   }
 
-  // Optional: slug+outcome + POLYMARKET_USE_BULLPEN=true routes execution through Bullpen CLI.
-  if (marketSlug && outcome && polymarketUseBullpen()) {
-    const env = String(process.env.BULLPEN_ENV ?? 'production').trim() || 'production';
+  if (liveOrdersViaBullpen()) {
+    if (!marketSlug || !outcome) {
+      return json(res, 400, {
+        ok: false,
+        error: 'bullpen_requires_slug_outcome',
+        details: {
+          hint: 'Live orders use the Bullpen CLI by default. Send `market_slug` and `outcome` with each request, or set POLYMARKET_LIVE_ORDERS_VIA=clob on the API server for direct CLOB execution.',
+        },
+      });
+    }
+    const resolved = await resolveBullpenOutcomeForOrder({ token, marketSlug, outcome, lane: orderLane });
+    if (!resolved.ok) {
+      return json(res, 400, { ok: false, error: resolved.error, details: resolved.details });
+    }
+    const outcomeArg = resolved.outcome;
     const t0 = Date.now();
-    const args =
-      side === 'buy'
-        ? ['polymarket', 'buy', '--env', env, '--output', 'json', '--yes', marketSlug, outcome, String(orderAmount)]
-        : ['polymarket', 'sell', '--env', env, '--output', 'json', '--yes', marketSlug, outcome, String(orderAmount)];
-    const r = await runBullpen(args, { timeoutMs: 45_000 });
-    if (!r.ok) {
+    const { r, trade, fakFallback } = await bullpenExecuteMarketOrder({
+      marketSlug,
+      outcomeArg,
+      side: side as 'buy' | 'sell',
+      amount: orderAmount,
+      tokenId: token,
+      timeoutMs: 45_000,
+    });
+    if (!trade.ok) {
       return json(res, 502, {
         ok: false,
         error: 'bullpen_trade_failed',
         details: {
-          message: (r.stderr || r.stdout || '').trim().slice(0, 1200) || 'Bullpen CLI failed.',
+          message: trade.message,
           code: r.code,
-          hint: 'Ensure `bullpen` is installed and authenticated (`bullpen status`, `bullpen login`).',
+          hint: trade.hint,
         },
       });
     }
-    const parsed = parseJsonMaybe(r.stdout) ?? { stdout: r.stdout.trim() };
+    const parsed = trade.parsed ?? { stdout: r.stdout.trim() };
     const asObj = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null;
     const orderId = asObj ? extractOrderIdFromClobPayload(asObj) : null;
     const fillPrice01 = asObj ? (typeof asObj.price01 === 'number' ? asObj.price01 : typeof asObj.price === 'number' ? asObj.price : null) : null;
@@ -2605,6 +3068,7 @@ app.post('/api/trade/market-order', async (req, res) => {
           submitted_price_01: typeof fillPrice01 === 'number' && Number.isFinite(fillPrice01) ? fillPrice01 : null,
           order_id: orderId,
           round_trip_ms: Date.now() - t0,
+          bullpen_fak_fallback: fakFallback === true,
           fill: {
             filled_shares: fill.filled_shares,
             avg_fill_price_01: fill.avg_fill_price_01,
@@ -2665,7 +3129,7 @@ app.post('/api/trade/market-order', async (req, res) => {
         priced.price != null && Number.isFinite(priced.price) && priced.price > 0 && priced.price < 1
           ? priced.price
           : null;
-      parsed = await createAndPostMarketOrderWithBookSlippage(ready.client, priced);
+      parsed = await createAndPostMarketOrderWithBookSlippage(ready.client, ready.sdk, priced);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (isLiquidityClassMarketError(msg)) {
@@ -2715,6 +3179,11 @@ app.post('/api/trade/market-order', async (req, res) => {
 
 /** Real-money trading via the Polymarket CLOB API: limit orders (shares size + price). */
 app.post('/api/trade/create-order', async (req, res) => {
+  const liveGate = liveTradingGate();
+  if (!liveGate.ok) {
+    return json(res, 403, { ok: false, error: liveGate.error, details: { hint: liveGate.hint } });
+  }
+
   const body = req.body as {
     token?: unknown;
     price?: unknown;
@@ -2727,6 +3196,8 @@ app.post('/api/trade/create-order', async (req, res) => {
     signatureType?: unknown;
     market_slug?: unknown;
     outcome?: unknown;
+    lane?: unknown;
+    outcome_lane?: unknown;
   };
   const token = typeof body.token === 'string' ? body.token.trim() : '';
   const side = typeof body.side === 'string' ? body.side.trim().toLowerCase() : 'buy';
@@ -2737,14 +3208,22 @@ app.post('/api/trade/create-order', async (req, res) => {
   const postOnlyRaw = body.post_only ?? body.postOnly;
   const marketSlug = typeof body.market_slug === 'string' ? body.market_slug.trim() : '';
   const outcome = typeof body.outcome === 'string' ? body.outcome.trim() : '';
+  const orderLane = parseOrderLane(body as Record<string, unknown>);
 
   if (!token) return json(res, 400, { ok: false, error: 'missing_token' });
   if (side !== 'buy' && side !== 'sell') return json(res, 400, { ok: false, error: 'bad_side' });
-  if (orderTypeRaw !== 'GTC' && orderTypeRaw !== 'GTD') {
+  if (orderTypeRaw !== 'GTC' && orderTypeRaw !== 'GTD' && orderTypeRaw !== 'FAK') {
     return json(res, 400, {
       ok: false,
       error: 'bad_order_type',
-      details: { hint: 'Limit endpoint supports GTC or GTD only. Use /api/trade/market-order for FAK/FOK.' },
+      details: { hint: 'Limit endpoint supports GTC, GTD, or FAK (FAK via Bullpen limit --expiration fak).' },
+    });
+  }
+  if (orderTypeRaw === 'FAK' && !liveOrdersViaBullpen()) {
+    return json(res, 400, {
+      ok: false,
+      error: 'fak_requires_bullpen',
+      details: { hint: 'FAK limit orders use Bullpen CLI. Set POLYMARKET_LIVE_ORDERS_VIA=bullpen or use GTC / market-order.' },
     });
   }
   if (priceRaw == null || priceRaw <= 0 || priceRaw >= 1) return json(res, 400, { ok: false, error: 'bad_price' });
@@ -2764,6 +3243,7 @@ app.post('/api/trade/create-order', async (req, res) => {
   }
 
   const price = roundPrice01Api(priceRaw);
+  const priceForBullpen = roundPriceToTick(price);
   if (price <= 0 || price >= 1) {
     return json(res, 400, {
       ok: false,
@@ -2780,26 +3260,55 @@ app.post('/api/trade/create-order', async (req, res) => {
     });
   }
 
-  if (marketSlug && outcome && polymarketUseBullpen()) {
+  if (liveOrdersViaBullpen()) {
+    if (!marketSlug || !outcome) {
+      return json(res, 400, {
+        ok: false,
+        error: 'bullpen_requires_slug_outcome',
+        details: {
+          hint: 'Live orders use the Bullpen CLI by default. Send `market_slug` and `outcome` with each request, or set POLYMARKET_LIVE_ORDERS_VIA=clob on the API server for direct CLOB execution.',
+        },
+      });
+    }
     const env = String(process.env.BULLPEN_ENV ?? 'production').trim() || 'production';
+    const resolved = await resolveBullpenOutcomeForOrder({ token, marketSlug, outcome, lane: orderLane });
+    if (!resolved.ok) {
+      return json(res, 400, { ok: false, error: resolved.error, details: resolved.details });
+    }
+    const outcomeArg = resolved.outcome;
     const t0 = Date.now();
-    const cmd =
-      side === 'buy'
-        ? ['polymarket', 'limit-buy', '--env', env, '--output', 'json', '--yes', '--price', String(price), '--shares', String(size), marketSlug, outcome]
-        : ['polymarket', 'limit-sell', '--env', env, '--output', 'json', '--yes', '--price', String(price), '--shares', String(size), marketSlug, outcome];
+    const priceArg = formatBullpenPriceArg(priceForBullpen);
+    const limitCmd = side === 'buy' ? 'limit-buy' : 'limit-sell';
+    const cmd = [
+      'polymarket',
+      limitCmd,
+      '--env',
+      env,
+      '--output',
+      'json',
+      '--yes',
+      '--price',
+      priceArg,
+      '--shares',
+      String(size),
+      ...(orderTypeRaw === 'FAK' ? ['--expiration', 'fak'] : []),
+      marketSlug,
+      outcomeArg,
+    ];
     const r = await runBullpen(cmd, { timeoutMs: 45_000 });
-    if (!r.ok) {
+    const trade = interpretBullpenTradeCli(r.stdout, r.stderr, r.code);
+    if (!trade.ok) {
       return json(res, 502, {
         ok: false,
         error: 'bullpen_trade_failed',
         details: {
-          message: (r.stderr || r.stdout || '').trim().slice(0, 1200) || 'Bullpen CLI failed.',
+          message: trade.message,
           code: r.code,
-          hint: 'Ensure `bullpen` is installed and authenticated (`bullpen status`, `bullpen login`).',
+          hint: trade.hint,
         },
       });
     }
-    const parsed = parseJsonMaybe(r.stdout) ?? { stdout: r.stdout.trim() };
+    const parsed = trade.parsed ?? { stdout: r.stdout.trim() };
     const asObj = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null;
     const orderId = asObj ? extractOrderIdFromClobPayload(asObj) : null;
     return json(res, 200, {
@@ -2835,7 +3344,9 @@ app.post('/api/trade/create-order', async (req, res) => {
 
     const orderType = orderTypeRaw === 'GTD' ? OrderType.GTD : OrderType.GTC;
     const builderCode = builderCodeFromEnv();
-    const parsed = await ready.client.createAndPostOrder(
+    const parsed = await sdkCreateAndPostLimitOrder(
+      ready.client,
+      ready.sdk,
       {
         tokenID: token,
         price,
@@ -2878,6 +3389,25 @@ app.get('/api/trade/order', async (req, res) => {
   const orderId = String(req.query.order_id ?? '').trim();
   if (!orderId) return json(res, 400, { ok: false, error: 'missing_order_id' });
 
+  if (polymarketUseBullpen()) {
+    if (!(await bullpenSessionReady())) {
+      return json(res, 503, {
+        ok: false,
+        error: 'bullpen_not_logged_in',
+        details: { hint: 'Run `bullpen login` on the API host.' },
+      });
+    }
+    const data = await bullpenLookupOrder(orderId);
+    if (data == null) {
+      return json(res, 502, {
+        ok: false,
+        error: 'get_order_failed',
+        details: { hint: 'Bullpen `polymarket clob order` returned no data for this id.' },
+      });
+    }
+    return json(res, 200, { ok: true, data });
+  }
+
   const ready = await getTradingClient();
   if (!ready.ok) {
     return json(res, ready.error === 'trading_auth_failed' ? 502 : 503, {
@@ -2902,6 +3432,24 @@ app.get('/api/trade/order', async (req, res) => {
 /** List open orders (resting) for the authenticated trader. Optional `token_id` filters one market/outcome. */
 app.get('/api/trade/open-orders', async (req, res) => {
   const tokenId = String(req.query.token_id ?? '').trim();
+
+  if (polymarketUseBullpen()) {
+    if (!(await bullpenSessionReady())) {
+      return json(res, 503, {
+        ok: false,
+        error: 'bullpen_not_logged_in',
+        details: { hint: 'Run `bullpen login` on the API host.' },
+      });
+    }
+    let orders = await bullpenOpenOrders();
+    if (tokenId) {
+      orders = orders.filter((o) => {
+        const aid = String(o.asset_id ?? o.asset ?? o.token_id ?? o.tokenId ?? '').trim();
+        return aid === tokenId;
+      });
+    }
+    return json(res, 200, { ok: true, data: { token_id: tokenId || null, orders, source: 'bullpen' } });
+  }
 
   const ready = await getTradingClient();
   if (!ready.ok) {
@@ -2940,6 +3488,45 @@ app.post('/api/trade/cancel-order', async (req, res) => {
     '';
   if (!orderId) return json(res, 400, { ok: false, error: 'missing_order_id' });
 
+  if (polymarketUseBullpen()) {
+    if (!(await bullpenSessionReady())) {
+      return json(res, 503, {
+        ok: false,
+        error: 'bullpen_not_logged_in',
+        details: { hint: 'Run `bullpen login` on the API host.' },
+      });
+    }
+    const r = await bullpenCancelOrder(orderId);
+    if (!r.ok) {
+      const ready = await getTradingClient();
+      if (ready.ok) {
+        try {
+          await ready.client.cancelOrder({ orderID: orderId } as { orderID: string });
+          return json(res, 200, {
+            ok: true,
+            data: { cancelled: true, order_id: orderId, source: 'clob_fallback' },
+          });
+        } catch {
+          /* fall through */
+        }
+      }
+      return json(res, 502, {
+        ok: false,
+        error: 'cancel_order_failed',
+        details: { message: r.output, hint: bullpenCliFailureHint(r.output) },
+      });
+    }
+    return json(res, 200, {
+      ok: true,
+      data: {
+        cancelled: true,
+        order_id: orderId,
+        source: 'bullpen',
+        idempotent: r.idempotent === true,
+      },
+    });
+  }
+
   const ready = await getTradingClient();
   if (!ready.ok) {
     return json(res, ready.error === 'trading_auth_failed' ? 502 : 503, {
@@ -2951,12 +3538,19 @@ app.post('/api/trade/cancel-order', async (req, res) => {
 
   try {
     await ready.client.cancelOrder({ orderID: orderId } as { orderID: string });
-    return json(res, 200, { ok: true, data: { cancelled: true, order_id: orderId } });
+    return json(res, 200, { ok: true, data: { cancelled: true, order_id: orderId, source: 'clob' } });
   } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (/already canceled|already cancelled|not found|can't be found/i.test(msg)) {
+      return json(res, 200, {
+        ok: true,
+        data: { cancelled: true, order_id: orderId, source: 'clob', idempotent: true },
+      });
+    }
     return json(res, 502, {
       ok: false,
       error: 'cancel_order_failed',
-      details: { message: error instanceof Error ? error.message : String(error) },
+      details: { message: msg },
     });
   }
 });
@@ -2973,6 +3567,25 @@ app.post('/api/trade/cancel-all', async (req, res) => {
       error: 'confirm_required',
       details: { hint: 'Send JSON body { "confirm": true } to cancel every open order.' },
     });
+  }
+
+  if (polymarketUseBullpen()) {
+    if (!(await bullpenSessionReady())) {
+      return json(res, 503, {
+        ok: false,
+        error: 'bullpen_not_logged_in',
+        details: { hint: 'Run `bullpen login` on the API host.' },
+      });
+    }
+    const r = await bullpenCancelAllOrders();
+    if (!r.ok) {
+      return json(res, 502, {
+        ok: false,
+        error: 'cancel_all_failed',
+        details: { message: r.output, hint: bullpenCliFailureHint(r.output) },
+      });
+    }
+    return json(res, 200, { ok: true, data: r.data ?? { source: 'bullpen' } });
   }
 
   const ready = await getTradingClient();
@@ -3007,7 +3620,41 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
   });
 });
 
+process.on('unhandledRejection', (reason) => {
+  console.error('[api] unhandled_rejection', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[api] uncaught_exception', err);
+});
+
 const port = Number(process.env.PORT ?? 8787);
+const host = String(process.env.HOST ?? process.env.BIND ?? '127.0.0.1').trim() || '127.0.0.1';
+
+app.get('/api/ready', async (_req, res) => {
+  const trading = getTradingConfigFromEnv();
+  const a = assistantConfig();
+  const clobProbe = trading.ok ? await clobOkJsonProbe(trading.config.host) : null;
+  const liveEnv = liveTradingEnvSummary();
+  const gateOk = liveTradingGate().ok;
+  const ok = gateOk && trading.ok && (clobProbe?.ok ?? false);
+  return json(res, ok ? 200 : 503, {
+    ok: true,
+    data: {
+      ready: ok,
+      trading_ready: trading.ok,
+      trading_clob_reachable: clobProbe?.ok ?? null,
+      trading_clob_probe_note: clobProbe && !clobProbe.ok ? clobProbe.note : null,
+      trading_live_orders_via: liveEnv.live_orders_via,
+      ...liveEnv,
+      assistant_available: a.ok,
+      assistant_provider: a.ok ? a.provider : null,
+      assistant_model: a.ok ? a.model : null,
+      note: ok
+        ? 'Trading env is set and CLOB /ok is reachable from this host.'
+        : 'Not ready for live trading: missing trading env and/or CLOB /ok not reachable from this host.',
+    },
+  });
+});
 
 function safeJsonStringify(obj: unknown): string {
   try {
@@ -3212,8 +3859,14 @@ wss.on('connection', async (client) => {
   });
 });
 
-server.listen(port, () => {
-  console.log(`[api] listening on http://127.0.0.1:${port}`);
+server.listen(port, host, () => {
+  const a = assistantConfig();
+  const trading = getTradingConfigFromEnv();
+  console.log(
+    `[api] listening on http://${host}:${port} (trading_ready=${trading.ok ? 'yes' : 'no'} live_orders_via=${
+      liveOrdersViaBullpen() ? 'bullpen' : 'clob'
+    } assistant=${a.ok ? `${a.provider}/${a.model}` : 'off'})`,
+  );
   void ensureRtdsWs().catch(() => {
     /* RTDS warms on first /api/rtds/crypto request if this fails */
   });

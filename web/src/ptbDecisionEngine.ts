@@ -294,7 +294,12 @@ export function computePtbSystemDecision(params: {
 
   let highlightGap: 'up' | 'down' | null = null;
   const gapScore = (g: Exclude<GapLite, null>) => g.strength10 + (g.active ? 0.8 : 0);
-  if (gapU && gapD) highlightGap = gapScore(gapU) >= gapScore(gapD) ? 'up' : 'down';
+  if (gapU && gapD) {
+    const su = gapScore(gapU);
+    const sd = gapScore(gapD);
+    if (Math.abs(su - sd) > 0.08) highlightGap = su > sd ? 'up' : 'down';
+    else highlightGap = null;
+  }
   else if (gapU) highlightGap = 'up';
   else if (gapD) highlightGap = 'down';
   else if (pathUpActive && pathDnActive) highlightGap = lastU >= lastD ? 'up' : 'down';

@@ -21,3 +21,11 @@ export function roundPrice01(n: number): number {
   if (!Number.isFinite(n) || n <= 0) return n;
   return Math.round(n * 1_000_000) / 1_000_000;
 }
+
+/** Standard Polymarket 1¢ tick — use before live limit prices hit Bullpen/CLOB. */
+export function roundPriceCentTick(n: number, tickSize = 0.01): number {
+  if (!Number.isFinite(n) || n <= 0) return n;
+  const dp = Math.max(0, Math.round(-Math.log10(tickSize)));
+  const ticks = Math.round(n / tickSize);
+  return Number((ticks * tickSize).toFixed(dp));
+}

@@ -1,5 +1,8 @@
 /** Server-attached fields for trade API responses (market + limit). */
 
+import { bestEffortMarketFill } from './marketOrderFill';
+import { roundShares4 } from './tradingRound';
+
 export type TradeFillEnvelope = {
   filled_shares: number | null;
   avg_fill_price_01: number | null;
@@ -65,10 +68,21 @@ export function extractOrderIdFromClobPayload(obj: unknown): string | null {
   return null;
 }
 
-/** Use server `execution.fill` only — no client-side fill guessing. */
+/** When HTTP succeeded but `execution.fill` is empty (Bullpen/CLOB shape drift). */
+export type LiveMarketSellFillFallbackCtx = {
+  requestedShares: number;
+  mid01?: number | null;
+};
+
+/**
+ * Prefer server `execution.fill`.
+ * Live mode should pass `allowBestEffort: false` so rows stay `sent` until CLOB tape reconcile.
+ */
 export function liveMarketOrderFillFromExecution(
   execution: TradeExecutionMeta | undefined,
   parsed: unknown,
+  sellFallback?: LiveMarketSellFillFallbackCtx,
+  opts?: { allowBestEffort?: boolean },
 ):
   | { ok: true; shares: number; avg01: number; rowStatus: 'filled' | 'partial' }
   | { ok: false; orderId: string | null } {
@@ -80,6 +94,7 @@ export function liveMarketOrderFillFromExecution(
     fill.avg_fill_price_01 != null &&
     Number.isFinite(fill.filled_shares) &&
     fill.filled_shares > 0 &&
+    fill.status !== 'unknown' &&
     Number.isFinite(fill.avg_fill_price_01) &&
     fill.avg_fill_price_01 > 0 &&
     fill.avg_fill_price_01 < 1
@@ -87,5 +102,35 @@ export function liveMarketOrderFillFromExecution(
     const rowStatus: 'filled' | 'partial' = fill.status === 'partial' ? 'partial' : 'filled';
     return { ok: true, shares: fill.filled_shares, avg01: fill.avg_fill_price_01, rowStatus };
   }
+
+  if (opts?.allowBestEffort !== true) {
+    return { ok: false, orderId: oid };
+  }
+
+  const reqShares =
+    sellFallback != null && Number.isFinite(sellFallback.requestedShares) && sellFallback.requestedShares > 0
+      ? roundShares4(sellFallback.requestedShares)
+      : null;
+  if (reqShares != null && reqShares > 0) {
+    const be = bestEffortMarketFill(parsed, {
+      kind: 'sell',
+      requestedShares: reqShares,
+      mid01: sellFallback?.mid01 ?? null,
+    });
+    const px = be.price01;
+    const sz = be.shares;
+    if (
+      px != null &&
+      sz != null &&
+      Number.isFinite(sz) &&
+      sz > 0 &&
+      px > 0 &&
+      px < 1
+    ) {
+      const rowStatus: 'filled' | 'partial' = sz < reqShares - 1e-3 ? 'partial' : 'filled';
+      return { ok: true, shares: sz, avg01: px, rowStatus };
+    }
+  }
+
   return { ok: false, orderId: oid };
 }

@@ -47,12 +47,16 @@ export function computePtbChartDerivatives(params: {
   candles: SpotCandle[];
   ptb: number;
   bookFlow?: BookSnapshot[];
+  lastProbUp?: number | null;
+  lastProbDown?: number | null;
 }): PtbChartDerivatives {
   const snap = runPtbCoreEngine({
     ticks: params.pts,
     candles: params.candles,
     ptbUsd: params.ptb,
     bookFlow: params.bookFlow,
+    lastProbUp: params.lastProbUp,
+    lastProbDown: params.lastProbDown,
   });
   const d = snap.derived;
   return {

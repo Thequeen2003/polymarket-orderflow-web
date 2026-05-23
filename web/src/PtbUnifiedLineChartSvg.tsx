@@ -1,7 +1,16 @@
-import type { ReactElement } from 'react';
+import { useCallback, useEffect, useRef, useState, type PointerEvent, type ReactElement } from 'react';
+import {
+  BPX_BRACKET_ARM_REQUEST_EVENT,
+  BPX_BRACKET_DRAG_EVENT,
+  BPX_BRACKET_OVERLAY_EVENT,
+  type BpxBracketArmRequestDetail,
+  type BpxBracketDragDetail,
+  type BpxBracketOverlayDetail,
+} from './bpxBracketOverlayEvent';
 import type { PtbSystemDecision } from './ptbDecisionEngine';
 import type { PtbTargetEngineCard } from './ptbTargetEngine';
 import { downsampleLinePoints, segmentMomentumStyle, type PtbLinePoint } from './ptbLineChart';
+import { clearTrackedPointerCapture, trackPointerCapture } from './pointerCaptureSafety';
 
 type GapBlock = {
   a: number;
@@ -56,10 +65,23 @@ export type PtbUnifiedLineChartSvgProps = {
   fmtChartWindowMin: (tMin: number, tMax: number) => string;
   onTapProb?: (p: number, ctx?: { lane: 'up' | 'down' }) => void;
   emitGap: (side: 'up' | 'down', g: GapBlock | null, entryNow: number) => void;
+  /** CLOB token for this panel — when set, bracket overlay must match event tokens (same market). */
+  bracketOutcomeToken?: string | null;
 };
 
 function clamp01(x: number): number {
+  if (!Number.isFinite(x)) return 0.5;
   return Math.max(0, Math.min(1, x));
+}
+
+function svgClientToLocal(svg: SVGSVGElement, clientX: number, clientY: number): { x: number; y: number } | null {
+  const ctm = svg.getScreenCTM();
+  if (!ctm) return null;
+  const p = svg.createSVGPoint();
+  p.x = clientX;
+  p.y = clientY;
+  const loc = p.matrixTransform(ctm.inverse());
+  return { x: loc.x, y: loc.y };
 }
 
 /** Map a probability expressed on `lane` into the chart’s anchored lane. */
@@ -69,6 +91,23 @@ function probOnChart(lane: 'up' | 'down', p: number, chartLane: 'up' | 'down'): 
 
 const GAP_Q = 0.38;
 const BIN_N = 28;
+
+function parseTradeBracketCents(raw: string): number | null {
+  const n = Number(String(raw).trim());
+  if (!Number.isFinite(n) || n <= 0 || n >= 100) return null;
+  return n / 100;
+}
+
+/** TradingView-style move vs avg entry on the same outcome (¢ and % of entry). */
+function fmtPnlVsAvgEntry(level01: number, entry01: number | null | undefined): string | null {
+  if (entry01 == null || !(entry01 > 0) || !(entry01 < 1) || !Number.isFinite(level01)) return null;
+  const d = level01 - entry01;
+  const dC = d * 100;
+  const pct = (d / entry01) * 100;
+  const sc = dC > 1e-6 ? '+' : dC < -1e-6 ? '−' : '±';
+  const sp = pct > 1e-6 ? '+' : pct < -1e-6 ? '−' : '±';
+  return `vs avg ${sc}${Math.abs(dC).toFixed(1)}¢ (${sp}${Math.abs(pct).toFixed(1)}%)`;
+}
 
 export function PtbUnifiedLineChartSvg(p: PtbUnifiedLineChartSvgProps): ReactElement {
   const {
@@ -106,7 +145,20 @@ export function PtbUnifiedLineChartSvg(p: PtbUnifiedLineChartSvgProps): ReactEle
     fmtChartWindowMin,
     onTapProb,
     emitGap,
+    bracketOutcomeToken = null,
   } = p;
+
+  const [bracketOverlay, setBracketOverlay] = useState<BpxBracketOverlayDetail | null>(null);
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const dragBracketRef = useRef<'sl' | 'tp' | 'ref' | null>(null);
+  useEffect(() => {
+    const fn = (ev: Event) => {
+      const d = (ev as CustomEvent<BpxBracketOverlayDetail>).detail;
+      if (d && typeof d === 'object') setBracketOverlay(d);
+    };
+    window.addEventListener(BPX_BRACKET_OVERLAY_EVENT, fn as EventListener);
+    return () => window.removeEventListener(BPX_BRACKET_OVERLAY_EVENT, fn as EventListener);
+  }, []);
 
   const tSpan = Math.max(1, tMax - tMin);
   const xT = (t: number) => padL + ((t - tMin) / tSpan) * plotW;
@@ -180,10 +232,120 @@ export function PtbUnifiedLineChartSvg(p: PtbUnifiedLineChartSvgProps): ReactEle
       : 'rgba(251,113,133,0.95)'
     : 'rgba(161,161,170,0.9)';
 
+  const tok = bracketOutcomeToken?.trim() ?? '';
+  const overlayApplies =
+    bracketOverlay &&
+    bracketOverlay.tradeLane === chartLane &&
+    (!tok || (chartLane === 'up' ? bracketOverlay.upToken === tok : bracketOverlay.downToken === tok));
+
+  const brSl = overlayApplies && bracketOverlay ? parseTradeBracketCents(bracketOverlay.slStopCents) : null;
+  const brTp = overlayApplies && bracketOverlay ? parseTradeBracketCents(bracketOverlay.tpTakeCents) : null;
+  const brRef = overlayApplies && bracketOverlay ? parseTradeBracketCents(bracketOverlay.refCents) : null;
+  const brAvgEntry =
+    overlayApplies &&
+    bracketOverlay?.avgEntry01 != null &&
+    Number.isFinite(bracketOverlay.avgEntry01) &&
+    bracketOverlay.avgEntry01 > 0 &&
+    bracketOverlay.avgEntry01 < 1
+      ? clamp01(bracketOverlay.avgEntry01)
+      : null;
+  const entryForPnl =
+    overlayApplies && bracketOverlay?.avgEntry01 != null && bracketOverlay.avgEntry01 > 0 && bracketOverlay.avgEntry01 < 1
+      ? bracketOverlay.avgEntry01
+      : null;
+  const slMuted = !!(bracketOverlay && !bracketOverlay.stopLossEnabled);
+  const tpMuted = !!(bracketOverlay && !bracketOverlay.takeProfitEnabled);
+
+  const probFromLocalY = useCallback(
+    (y: number) => {
+      const span = Math.max(1e-9, scaleMax - scaleMin);
+      const rel = (y - topY0) / plotH;
+      const raw = scaleMin + (1 - rel) * span;
+      const p = clamp01(raw);
+      return Math.max(0.001, Math.min(0.999, p));
+    },
+    [scaleMin, scaleMax, topY0, plotH],
+  );
+
+  const emitBracketDrag = useCallback(
+    (kind: 'sl' | 'tp' | 'ref', clientX: number, clientY: number) => {
+      if (!overlayApplies || !bracketOverlay) return;
+      const svg = svgRef.current;
+      if (!svg) return;
+      const loc = svgClientToLocal(svg, clientX, clientY);
+      if (!loc) return;
+      const p = probFromLocalY(loc.y);
+      const centsStr = (Math.round(p * 1000) / 10).toFixed(1);
+      const detail: BpxBracketDragDetail = {
+        kind,
+        centsStr,
+        tradeLane: bracketOverlay.tradeLane,
+        upToken: bracketOverlay.upToken,
+        downToken: bracketOverlay.downToken,
+      };
+      window.dispatchEvent(new CustomEvent(BPX_BRACKET_DRAG_EVENT, { detail }));
+    },
+    [overlayApplies, bracketOverlay, probFromLocalY],
+  );
+
+  const requestBracketArm = useCallback((kind: 'sl' | 'tp') => {
+    const detail: BpxBracketArmRequestDetail = { kind };
+    window.dispatchEvent(new CustomEvent(BPX_BRACKET_ARM_REQUEST_EVENT, { detail }));
+  }, []);
+
+  const onBracketPointerDown = useCallback(
+    (kind: 'sl' | 'tp' | 'ref', e: PointerEvent<SVGLineElement>) => {
+      if (!overlayApplies) return;
+      if (kind === 'sl' && brSl == null) return;
+      if (kind === 'tp' && brTp == null) return;
+      if (kind === 'ref' && brRef == null) return;
+      if (kind === 'sl' && slMuted) {
+        e.preventDefault();
+        e.stopPropagation();
+        requestBracketArm('sl');
+        return;
+      }
+      if (kind === 'tp' && tpMuted) {
+        e.preventDefault();
+        e.stopPropagation();
+        requestBracketArm('tp');
+        return;
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      dragBracketRef.current = kind;
+      const el = e.currentTarget as SVGElement;
+      el.setPointerCapture(e.pointerId);
+      trackPointerCapture(el, e.pointerId);
+      emitBracketDrag(kind, e.clientX, e.clientY);
+    },
+    [overlayApplies, brSl, brTp, brRef, emitBracketDrag, requestBracketArm, slMuted, tpMuted],
+  );
+
+  const onBracketPointerMove = useCallback(
+    (e: PointerEvent<SVGLineElement>) => {
+      const k = dragBracketRef.current;
+      if (!k) return;
+      e.preventDefault();
+      emitBracketDrag(k, e.clientX, e.clientY);
+    },
+    [emitBracketDrag],
+  );
+
+  const onBracketPointerUp = useCallback((e: PointerEvent<SVGLineElement>) => {
+    dragBracketRef.current = null;
+    clearTrackedPointerCapture(e.currentTarget as SVGElement, e.pointerId);
+  }, []);
+
+  useEffect(() => () => {
+    dragBracketRef.current = null;
+  }, []);
+
   return (
     <svg
+      ref={svgRef}
       viewBox={`0 0 ${width} ${height}`}
-      className="block h-auto min-h-0 w-full max-w-full max-h-[min(420px,52vh)] rounded-lg bg-[#070709] md:max-h-[min(480px,55vh)]"
+      className="block h-auto min-h-0 w-full max-w-full rounded-lg bg-[#070709]"
       style={{ aspectRatio: `${width} / ${height}` }}
       preserveAspectRatio="xMidYMid meet"
     >
@@ -529,6 +691,17 @@ export function PtbUnifiedLineChartSvg(p: PtbUnifiedLineChartSvgProps): ReactEle
       <text x={padL + 10} y={topY0 + 32} fill="rgb(161 161 170)" fontSize="9" fontWeight="600">
         Chart anchored on {winningLabel} · {otherLabel} is the other side · line tracks live PTB (no smoothing)
       </text>
+      {entryForPnl != null ? (
+        <g className="pointer-events-none">
+          <title>
+            Bracket levels are measured from your average entry. The yellow enter line is the strategy trigger (PTB engine), not your
+            break-even.
+          </title>
+          <text x={padL + 10} y={topY0 + 46} fill="rgb(196 181 253)" fontSize="9" fontWeight="700">
+            Brackets vs avg {(entryForPnl * 100).toFixed(1)}¢ — trigger line is yellow (not cost basis)
+          </text>
+        </g>
+      ) : null}
 
       <circle
         cx={xT(lastSample.t)}
@@ -585,18 +758,37 @@ export function PtbUnifiedLineChartSvg(p: PtbUnifiedLineChartSvgProps): ReactEle
             className="cursor-pointer"
             onClick={() => onTapProb?.(tradeTrigger.line!, { lane: tradeTrigger.lane })}
           />
-          <text
-            x={padL + 12}
-            y={yRaw(enterLine) - 6}
-            fill="rgb(254 240 138)"
-            fontSize="11"
-            fontWeight="900"
-            textAnchor="start"
-            className="pointer-events-none"
-            style={{ paintOrder: 'stroke', stroke: 'rgba(0,0,0,0.55)', strokeWidth: 3 }}
-          >
-            ENTER LINE · {tradeTrigger.lane === 'up' ? upLabel : downLabel}
-          </text>
+          <g className="pointer-events-none">
+            <title>
+              {primaryLanePanel
+                ? `Strategy enter level for ${tradeTrigger.lane === 'up' ? upLabel : downLabel}.`
+                : `Same enter level as the other panel — strategy favors ${tradeTrigger.lane === 'up' ? upLabel : downLabel}; this chart is ${winningLabel}.`}
+            </title>
+            <text
+              x={padL + 12}
+              y={yRaw(enterLine) - 12}
+              fill="rgb(254 240 138)"
+              fontSize="11"
+              fontWeight="900"
+              textAnchor="start"
+              style={{ paintOrder: 'stroke', stroke: 'rgba(0,0,0,0.55)', strokeWidth: 3 }}
+            >
+              ENTER LINE
+            </text>
+            <text
+              x={padL + 12}
+              y={yRaw(enterLine) + 2}
+              fill="rgb(253 224 71)"
+              fontSize="8.5"
+              fontWeight="700"
+              textAnchor="start"
+              style={{ paintOrder: 'stroke', stroke: 'rgba(0,0,0,0.5)', strokeWidth: 2 }}
+            >
+              {primaryLanePanel
+                ? `Strategy · ${tradeTrigger.lane === 'up' ? upLabel : downLabel}`
+                : `Strategy · ${tradeTrigger.lane === 'up' ? upLabel : downLabel} · viewing ${winningLabel}`}
+            </text>
+          </g>
         </g>
       ) : null}
 
@@ -660,6 +852,217 @@ export function PtbUnifiedLineChartSvg(p: PtbUnifiedLineChartSvgProps): ReactEle
           >
             WALL · FADE
           </text>
+        </g>
+      ) : null}
+
+      {overlayApplies && (brSl != null || brTp != null || brRef != null || brAvgEntry != null) ? (
+        <g aria-label="Trade bracket levels">
+          {brAvgEntry != null ? (
+            <g opacity={0.92} className="pointer-events-none">
+              <line
+                x1={padL}
+                x2={padL + plotW}
+                y1={yRaw(brAvgEntry)}
+                y2={yRaw(brAvgEntry)}
+                stroke="rgba(167,139,250,0.28)"
+                strokeWidth={12}
+                strokeLinecap="round"
+              />
+              <line
+                x1={padL}
+                x2={padL + plotW}
+                y1={yRaw(brAvgEntry)}
+                y2={yRaw(brAvgEntry)}
+                stroke="rgb(196,181,253)"
+                strokeWidth={2}
+                strokeDasharray="6 5"
+                strokeLinecap="round"
+              />
+              <text
+                x={padL + plotW - 10}
+                y={yRaw(brAvgEntry) - 6}
+                textAnchor="end"
+                fill="rgb(221,214,254)"
+                fontSize="11"
+                fontWeight="900"
+                fontFamily="ui-monospace, monospace"
+                style={{ paintOrder: 'stroke', stroke: 'rgba(0,0,0,0.65)', strokeWidth: 3 }}
+              >
+                MY AVG ENTRY {(brAvgEntry * 100).toFixed(1)}¢
+              </text>
+            </g>
+          ) : null}
+          {brSl != null ? (
+            <g opacity={slMuted ? 0.48 : 1}>
+              <line
+                x1={padL}
+                x2={padL + plotW}
+                y1={yRaw(brSl)}
+                y2={yRaw(brSl)}
+                stroke="rgba(251,113,133,0.4)"
+                strokeWidth={14}
+                strokeLinecap="round"
+                pointerEvents="stroke"
+                className="cursor-ns-resize touch-none"
+                onPointerDown={(e) => onBracketPointerDown('sl', e)}
+                onPointerMove={onBracketPointerMove}
+                onPointerUp={onBracketPointerUp}
+                onPointerCancel={onBracketPointerUp}
+              />
+              <line
+                x1={padL}
+                x2={padL + plotW}
+                y1={yRaw(brSl)}
+                y2={yRaw(brSl)}
+                stroke="rgb(251,113,133)"
+                strokeWidth={2.4}
+                strokeDasharray="10 7"
+                className="pointer-events-none"
+              />
+              <text
+                x={padL + plotW - 10}
+                y={yRaw(brSl) - 6}
+                textAnchor="end"
+                fill="rgb(254,205,211)"
+                fontSize="12"
+                fontWeight="900"
+                fontFamily="ui-monospace, monospace"
+                style={{ paintOrder: 'stroke', stroke: 'rgba(0,0,0,0.65)', strokeWidth: 3 }}
+                className="pointer-events-none"
+              >
+                TRADE SL {(brSl * 100).toFixed(1)}¢{slMuted ? ' · off' : ''}
+              </text>
+              {fmtPnlVsAvgEntry(brSl, entryForPnl) ? (
+                <text
+                  x={padL + plotW - 10}
+                  y={yRaw(brSl) + 12}
+                  textAnchor="end"
+                  fill="rgba(254,205,211,0.92)"
+                  fontSize="10"
+                  fontWeight="800"
+                  fontFamily="ui-monospace, monospace"
+                  style={{ paintOrder: 'stroke', stroke: 'rgba(0,0,0,0.55)', strokeWidth: 2.5 }}
+                  className="pointer-events-none"
+                >
+                  {fmtPnlVsAvgEntry(brSl, entryForPnl)}
+                </text>
+              ) : null}
+            </g>
+          ) : null}
+          {brTp != null ? (
+            <g opacity={tpMuted ? 0.48 : 1}>
+              <line
+                x1={padL}
+                x2={padL + plotW}
+                y1={yRaw(brTp)}
+                y2={yRaw(brTp)}
+                stroke="rgba(52,211,153,0.35)"
+                strokeWidth={14}
+                strokeLinecap="round"
+                pointerEvents="stroke"
+                className="cursor-ns-resize touch-none"
+                onPointerDown={(e) => onBracketPointerDown('tp', e)}
+                onPointerMove={onBracketPointerMove}
+                onPointerUp={onBracketPointerUp}
+                onPointerCancel={onBracketPointerUp}
+              />
+              <line
+                x1={padL}
+                x2={padL + plotW}
+                y1={yRaw(brTp)}
+                y2={yRaw(brTp)}
+                stroke="rgb(52,211,153)"
+                strokeWidth={2.4}
+                strokeDasharray="10 7"
+                className="pointer-events-none"
+              />
+              <text
+                x={padL + 12}
+                y={yRaw(brTp) - 6}
+                textAnchor="start"
+                fill="rgb(167,243,208)"
+                fontSize="12"
+                fontWeight="900"
+                fontFamily="ui-monospace, monospace"
+                style={{ paintOrder: 'stroke', stroke: 'rgba(0,0,0,0.65)', strokeWidth: 3 }}
+                className="pointer-events-none"
+              >
+                TRADE TP {(brTp * 100).toFixed(1)}¢{tpMuted ? ' · off' : ''}
+              </text>
+              {fmtPnlVsAvgEntry(brTp, entryForPnl) ? (
+                <text
+                  x={padL + 12}
+                  y={yRaw(brTp) + 12}
+                  textAnchor="start"
+                  fill="rgba(167,243,208,0.95)"
+                  fontSize="10"
+                  fontWeight="800"
+                  fontFamily="ui-monospace, monospace"
+                  style={{ paintOrder: 'stroke', stroke: 'rgba(0,0,0,0.55)', strokeWidth: 2.5 }}
+                  className="pointer-events-none"
+                >
+                  {fmtPnlVsAvgEntry(brTp, entryForPnl)}
+                </text>
+              ) : null}
+            </g>
+          ) : null}
+          {brRef != null ? (
+            <g opacity={0.92}>
+              <line
+                x1={padL}
+                x2={padL + plotW}
+                y1={yRaw(brRef)}
+                y2={yRaw(brRef)}
+                stroke="rgba(251,191,36,0.45)"
+                strokeWidth={14}
+                strokeLinecap="round"
+                pointerEvents="stroke"
+                className="cursor-ns-resize touch-none"
+                onPointerDown={(e) => onBracketPointerDown('ref', e)}
+                onPointerMove={onBracketPointerMove}
+                onPointerUp={onBracketPointerUp}
+                onPointerCancel={onBracketPointerUp}
+              />
+              <line
+                x1={padL}
+                x2={padL + plotW}
+                y1={yRaw(brRef)}
+                y2={yRaw(brRef)}
+                stroke="rgb(251,191,36)"
+                strokeWidth={2}
+                strokeDasharray="4 6"
+                className="pointer-events-none"
+              />
+              <text
+                x={padL + plotW / 2}
+                y={yRaw(brRef) + 16}
+                textAnchor="middle"
+                fill="rgb(253,230,138)"
+                fontSize="11"
+                fontWeight="800"
+                fontFamily="ui-monospace, monospace"
+                style={{ paintOrder: 'stroke', stroke: 'rgba(0,0,0,0.6)', strokeWidth: 2.5 }}
+                className="pointer-events-none"
+              >
+                REF {(brRef * 100).toFixed(1)}¢
+              </text>
+              {fmtPnlVsAvgEntry(brRef, entryForPnl) ? (
+                <text
+                  x={padL + plotW / 2}
+                  y={yRaw(brRef) + 30}
+                  textAnchor="middle"
+                  fill="rgba(253,230,138,0.92)"
+                  fontSize="10"
+                  fontWeight="800"
+                  fontFamily="ui-monospace, monospace"
+                  style={{ paintOrder: 'stroke', stroke: 'rgba(0,0,0,0.55)', strokeWidth: 2.5 }}
+                  className="pointer-events-none"
+                >
+                  {fmtPnlVsAvgEntry(brRef, entryForPnl)}
+                </text>
+              ) : null}
+            </g>
+          ) : null}
         </g>
       ) : null}
     </svg>

@@ -18,11 +18,11 @@ function shortHash(h: string | null): string {
 export function ChurnVsTapeLegend(): ReactElement {
   return (
     <div className="rounded-2xl border border-zinc-800/50 bg-zinc-900/25 px-4 py-3 text-xs leading-relaxed text-zinc-400 ring-1 ring-white/[0.02]">
-      <span className="font-semibold text-zinc-200">Churn vs tape:</span>{' '}
+      <span className="font-semibold text-zinc-200">Churn vs desk tape:</span>{' '}
       <span className="text-zinc-300">Churn</span> (order-flow chart) measures how fast <span className="italic">quoted sizes</span> change on
       the book between polls — it can be pulls, adds, or cancels, not necessarily someone trading.{' '}
-      <span className="text-zinc-300">Tape</span> (recent prints below) is matched trades from Polymarket’s Data API — real buys/sells at a price.
-      Use churn for <span className="italic">liquidity behavior</span>; use tape for <span className="italic">who actually traded</span>.
+      <span className="text-zinc-300">Desk tape</span> (recent prints below) is matched trades from Polymarket’s Data API — real buys/sells at a price.
+      Use churn for <span className="italic">liquidity behavior</span>; use desk tape for <span className="italic">who actually traded</span>.
     </div>
   );
 }
@@ -31,12 +31,19 @@ export function RecentPrintsPanel(props: {
   conditionId: string | null;
   activeTokenId: string | null;
   outcomeLabel: string | null;
+  /**
+   * When set, parent controls whether tape is filtered to `activeTokenId` (hides the local checkbox).
+   * Use `all` for full-market prints; use `one` with a non-null `activeTokenId` for a single outcome.
+   */
+  tapeScope?: 'all' | 'one';
 }): ReactElement {
-  const { conditionId, activeTokenId, outcomeLabel } = props;
+  const { conditionId, activeTokenId, outcomeLabel, tapeScope } = props;
   const [rows, setRows] = useState<DataTradeRow[]>([]);
   const [lastPx, setLastPx] = useState<{ price: string; side: string } | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [onlyOutcome, setOnlyOutcome] = useState(true);
+  const scopeLocked = tapeScope != null;
+  const effectiveOnlyOutcome = scopeLocked ? tapeScope === 'one' : onlyOutcome;
 
   const load = useCallback(async () => {
     if (!conditionId) {
@@ -49,19 +56,19 @@ export function RecentPrintsPanel(props: {
     const res = await recentTrades({
       market: conditionId,
       limit: 60,
-      asset: onlyOutcome && activeTokenId ? activeTokenId : undefined,
+      asset: effectiveOnlyOutcome && activeTokenId ? activeTokenId : undefined,
     });
     if (isOk<DataTradeRow[]>(res)) setRows(Array.isArray(res.data) ? res.data : []);
     else setErr(JSON.stringify((res as ApiErr).details ?? res));
 
-    if (activeTokenId) {
+    if (activeTokenId && effectiveOnlyOutcome) {
       const lt = await lastTradePrice(activeTokenId);
       if (isOk(lt)) setLastPx(lt.data);
       else setLastPx(null);
     } else {
       setLastPx(null);
     }
-  }, [conditionId, activeTokenId, onlyOutcome]);
+  }, [conditionId, activeTokenId, effectiveOnlyOutcome]);
 
   useEffect(() => {
     void load();
@@ -87,13 +94,15 @@ export function RecentPrintsPanel(props: {
             WebSocket latency.
           </p>
         </div>
-        <label className="flex cursor-pointer items-center gap-2 text-[11px] text-zinc-400">
-          <input type="checkbox" checked={onlyOutcome} onChange={(e) => setOnlyOutcome(e.target.checked)} />
-          Only {outcomeLabel ?? 'active'} token
-        </label>
+        {!scopeLocked ? (
+          <label className="flex cursor-pointer items-center gap-2 text-[11px] text-zinc-400">
+            <input type="checkbox" checked={onlyOutcome} onChange={(e) => setOnlyOutcome(e.target.checked)} />
+            Only {outcomeLabel ?? 'active'} token
+          </label>
+        ) : null}
       </div>
 
-      {activeTokenId && lastPx ? (
+      {activeTokenId && effectiveOnlyOutcome && lastPx ? (
         <div className="mt-3 rounded-xl border border-indigo-900/35 bg-indigo-950/20 px-3 py-2 text-[11px] text-indigo-100/90">
           <span className="font-semibold text-indigo-200/90">CLOB last trade</span> ({outcomeLabel ?? 'active'}):{' '}
           <span className="font-mono">{lastPx.side || '—'}</span> @ <span className="font-mono">{lastPx.price || '—'}</span>

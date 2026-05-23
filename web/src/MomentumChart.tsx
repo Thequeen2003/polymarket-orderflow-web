@@ -72,7 +72,7 @@ export function MomentumChart({
     const id = window.setInterval(() => setNow(Date.now()), 2_000);
     return () => window.clearInterval(id);
   }, []);
-  const stale = lastUpdateMs == null ? true : now - lastUpdateMs > 20_000;
+  const stale = lastUpdateMs == null ? true : now - lastUpdateMs > 45_000;
 
   const merged = [...a, ...b].filter((p) => typeof p.v === 'number' && Number.isFinite(p.v as number));
   const vals = merged.map((p) => p.v as number);

@@ -1,19 +1,42 @@
-import { useMemo, useState, type ReactElement } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
 import type { ClobBookEntry } from './lib/api';
 import { OverallOrderBookPanel } from './OverallOrderBookPanel';
 import { PtbOpportunityModeChart } from './PtbOpportunityModeChart';
 import { SignalsTradePanel } from './SignalsTradePanel';
+import { pickMarketSlug } from './gammaMarketSlug';
+import { pickConditionId } from './bookIntel';
+import { useRecentTapePrints } from './useRecentTapePrints';
 import type { SpotPoint } from './SpotLevelChart';
 import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
 import { underlyingChartTitle } from './underlyingChartTitle';
 import { midPrice, topOfBook } from './bookLevels';
 import { resolveUpDownIndices } from './upDown';
+import { MachineVerdictCard } from './MachineVerdictCard';
+import type { SpotPtbMachineReadout } from './spotPtbMachineSignals';
+import { TradeDirectiveCard } from './TradeDirectiveCard';
+import type { TradeDirective } from './tradeDirective';
+import { resolveTradeLevelsForDirective } from './tradeLevels';
+import { updateStability, type DirectiveStability } from './directiveStability';
+import { detectDirectiveDiscrepancy } from './directiveDiscrepancyGuard';
+import {
+  updateReEntryState,
+  checkReEntry,
+  type ReEntryState,
+} from './reEntryGuard';
+import { computeSizingMultiplier } from './directiveSizingMultiplier';
+import {
+  appendDirectiveToJournal,
+  resetJournal,
+  type DirectiveJournal,
+} from './directiveJournal';
 
 function fmtUsd(n: number | null): string {
   return n == null || !Number.isFinite(n) ? '—' : `$${n.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
 }
 
 export function DualPtbReferenceTab(props: {
+  /** Active market slug — forwarded to the chart so SECTIONAL_DECISION_EVENT toasts can filter by slug. */
+  slug?: string | null;
   market: unknown | null;
   books: ClobBookEntry[] | null;
   outcomeLabels: string[];
@@ -28,6 +51,7 @@ export function DualPtbReferenceTab(props: {
   spotStreamEligible?: boolean;
 }): ReactElement {
   const {
+    slug = null,
     market,
     books,
     outcomeLabels,
@@ -60,10 +84,81 @@ export function DualPtbReferenceTab(props: {
   const upToken = idx && books ? (books[idx.up]?.token ?? '') : '';
   const downToken = idx && books ? (books[idx.down]?.token ?? '') : '';
   const [activeLane, setActiveLane] = useState<'up' | 'down'>('up');
+  // Live trade prints for the active lane — drives tape velocity + No-Trade tier.
+  const conditionId = useMemo(() => pickConditionId(market), [market]);
+  const tapeTokenId = activeLane === 'up' ? upToken : downToken;
+  const tapePrints = useRecentTapePrints({ conditionId, activeTokenId: tapeTokenId });
+  const [machineVerdict, setMachineVerdict] = useState<SpotPtbMachineReadout | null>(null);
+  const onMachineVerdict = useCallback((r: SpotPtbMachineReadout | null) => {
+    setMachineVerdict(r);
+  }, []);
+  const [tradeDirective, setTradeDirective] = useState<TradeDirective | null>(null);
+  const onTradeDirective = useCallback((d: TradeDirective | null) => {
+    setTradeDirective(d);
+  }, []);
+  const tradeLevels = useMemo(
+    () =>
+      resolveTradeLevelsForDirective({
+        directive: tradeDirective,
+        laneEdges: machineVerdict?.edges ?? null,
+        crossProb: machineVerdict?.crossProb ?? null,
+        endsInMs: endsInMs ?? null,
+      }),
+    [tradeDirective, machineVerdict?.crossProb, machineVerdict?.edges, endsInMs],
+  );
+  const [stability, setStability] = useState<DirectiveStability | null>(null);
+  useEffect(() => {
+    if (!tradeDirective) return;
+    setStability((prev) => updateStability(prev, tradeDirective, Date.now()));
+  }, [tradeDirective]);
+  const discrepancy = useMemo(
+    () => detectDirectiveDiscrepancy(tradeDirective, machineVerdict),
+    [tradeDirective, machineVerdict],
+  );
+  const [reEntryState, setReEntryState] = useState<ReEntryState | null>(null);
+  const previousDirectiveRef = useRef<TradeDirective | null>(null);
+  useEffect(() => {
+    if (!tradeDirective) return;
+    const prev = previousDirectiveRef.current;
+    setReEntryState((s) => updateReEntryState(s, tradeDirective, prev, Date.now()));
+    previousDirectiveRef.current = tradeDirective;
+  }, [tradeDirective]);
+  const [reEntryNow, setReEntryNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setReEntryNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+  const reEntryCheck = useMemo(() => {
+    if (!tradeDirective || !reEntryState) return null;
+    return checkReEntry(reEntryState, tradeDirective, reEntryNow);
+  }, [tradeDirective, reEntryState, reEntryNow]);
+  const sizingMultiplier = useMemo(() => {
+    if (!tradeDirective) return null;
+    return computeSizingMultiplier({
+      stability,
+      discrepancy,
+      edges: machineVerdict?.edges ?? null,
+      lane: tradeDirective.lane,
+      cooldownActive: reEntryCheck?.onCooldown ?? false,
+    });
+  }, [tradeDirective, stability, discrepancy, machineVerdict?.edges, reEntryCheck]);
+  const [journal, setJournal] = useState<DirectiveJournal>(() => resetJournal());
+  useEffect(() => {
+    setJournal(resetJournal());
+  }, [slug]);
+  useEffect(() => {
+    if (!tradeDirective) return;
+    setJournal((prev) => appendDirectiveToJournal(prev, tradeDirective, machineVerdict, Date.now()));
+  }, [tradeDirective, machineVerdict]);
 
   const upMid = probUp.length ? (probUp[probUp.length - 1]!.v ?? null) : null;
   const downMid = probDown.length ? (probDown[probDown.length - 1]!.v ?? null) : null;
   const spotLast = spot.length ? spot[spot.length - 1]!.v : null;
+  /** Chart “Live” uses max(spot, book) so a quiet spot tick but fresh CLOB mid still counts as live. */
+  const chartLastFreshMs =
+    spotLastUpdateMs != null && probLastUpdateMs != null
+      ? Math.max(spotLastUpdateMs, probLastUpdateMs)
+      : spotLastUpdateMs ?? probLastUpdateMs ?? null;
   const spotDist = spotLast != null && priceToBeat != null ? spotLast - priceToBeat : null;
 
   const activeBook = activeLane === 'up' ? bookAbove : bookBelow;
@@ -84,7 +179,7 @@ export function DualPtbReferenceTab(props: {
   }, [endsInMs]);
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-5 xl:space-y-6">
       <div className="overflow-hidden rounded-[28px] border border-zinc-800/70 bg-[#0d1219] shadow-[0_18px_60px_rgba(0,0,0,0.3)] ring-1 ring-white/[0.03]">
         <div className="border-b border-zinc-800/70 px-4 py-2.5 text-[11px] leading-relaxed text-zinc-500 sm:px-5">
           {STREAM_ATTRIBUTION_LINE} <span className="text-zinc-600">·</span> PTB is fixed for the window; candles track underlying spot.
@@ -103,11 +198,44 @@ export function DualPtbReferenceTab(props: {
         </div>
       </div>
 
-      <div className="grid gap-4 xl:grid-cols-[minmax(0,1.65fr)_23rem]">
-        <div className="space-y-4">
+      <div className="grid min-w-0 max-w-full gap-5 xl:grid-cols-[minmax(0,2.35fr)_minmax(19rem,28rem)] xl:items-start 2xl:grid-cols-[minmax(0,2.55fr)_minmax(20rem,30rem)]">
+        <div className="min-w-0 max-w-full space-y-4 xl:space-y-5">
           <div className="rounded-xl border border-zinc-800/60 bg-zinc-950/35 px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-400">
             Main Chart
           </div>
+          <PtbOpportunityModeChart
+            chartAreaRoomy
+            slug={slug}
+            mode={activeLane}
+            spot={spot}
+            priceToBeat={priceToBeat}
+            lastUpdateMs={chartLastFreshMs}
+            endsInMs={endsInMs}
+            chartTitle={underlyingChartTitle(market)}
+            upLabel={upLabel}
+            downLabel={downLabel}
+            lastProbUp={upMid}
+            lastProbDown={downMid}
+            onMachineReadout={onMachineVerdict}
+            onTradeDirective={onTradeDirective}
+            recentPrints={tapePrints}
+          />
+
+          <TradeDirectiveCard
+            directive={tradeDirective}
+            compact
+            levels={tradeLevels}
+            laneEdges={machineVerdict?.edges ?? null}
+            tpSlHorizon={{ crossProb: machineVerdict?.crossProb ?? null, endsInMs }}
+            upOutcomeLabel={upLabel}
+            downOutcomeLabel={downLabel}
+            stability={stability}
+            discrepancy={discrepancy}
+            reEntry={reEntryCheck}
+            sizingMultiplier={sizingMultiplier}
+            journal={journal}
+          />
+          <MachineVerdictCard readout={machineVerdict} compact minimal />
           {spot.length < 2 ? (
             <div className="rounded-2xl border border-amber-900/35 bg-amber-950/15 px-4 py-3 text-sm leading-relaxed text-amber-100/90">
               <span className="font-semibold text-amber-50">Spot history is still warming up.</span>{' '}
@@ -121,17 +249,6 @@ export function DualPtbReferenceTab(props: {
               )}
             </div>
           ) : null}
-          <PtbOpportunityModeChart
-            mode={activeLane}
-            spot={spot}
-            priceToBeat={priceToBeat}
-            lastUpdateMs={spotLastUpdateMs}
-            endsInMs={endsInMs}
-            chartTitle={underlyingChartTitle(market)}
-            upLabel={upLabel}
-            downLabel={downLabel}
-          />
-
           <div className="flex flex-wrap gap-2">
             <button
               type="button"
@@ -182,6 +299,10 @@ export function DualPtbReferenceTab(props: {
         <div className="xl:sticky xl:top-4">
           {upToken && downToken ? (
             <SignalsTradePanel
+              marketSlug={pickMarketSlug(market)}
+              gammaMarket={market}
+              probMomentumUp={probUp}
+              probMomentumDown={probDown}
               upLabel={upLabel}
               downLabel={downLabel}
               upToken={upToken}

@@ -278,8 +278,8 @@ export function PtbMultiAssetGrid(props: {
 
       {sorted.length === 0 ? (
         <div className="rounded-2xl border border-dashed border-zinc-700/60 bg-zinc-950/40 px-4 py-8 text-center text-sm text-zinc-500">
-          No markets in your watch list. Add Up/Down slugs on the <span className="font-semibold text-zinc-400">Watch</span> tab, then
-          return here.
+          No markets in your Multi scan list yet. Load an Up/Down market in the sidebar, then use{' '}
+          <span className="font-semibold text-zinc-400">+ Add markets</span> to pin the current slug (up to 12).
         </div>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
@@ -293,7 +293,7 @@ export function PtbMultiAssetGrid(props: {
               className="flex min-h-[200px] max-w-[340px] flex-col items-center justify-center rounded-2xl border border-dashed border-zinc-700/60 bg-zinc-950/30 px-4 text-center text-[13px] font-semibold text-zinc-500 transition-colors hover:border-zinc-600 hover:bg-zinc-900/40 hover:text-zinc-300"
             >
               + Add markets
-              <span className="mt-2 text-[11px] font-normal text-zinc-600">Opens Watch list</span>
+              <span className="mt-2 text-[11px] font-normal text-zinc-600">Adds the loaded market slug to this list</span>
             </button>
           ) : null}
         </div>

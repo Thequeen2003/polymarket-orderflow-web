@@ -8,7 +8,7 @@ import { appendPtbDualSample, loadPtbDualSamples, sampleFromPtbEvent, summarizeP
 import { estimateNet4cLong } from './executionEstimator';
 import { computePtbNet4cRoom } from './ptbNet4cTradeability';
 import { computePtbPathToTarget } from './ptbPathToTarget';
-import { computePtbTargetEngine, topBookBias01 } from './ptbTargetEngine';
+import { computePtbTargetEngine, pickWinningChartLane, topBookBias01 } from './ptbTargetEngine';
 import { PtbUnifiedLineChartSvg } from './PtbUnifiedLineChartSvg';
 
 const BUCKET_N = 26;
@@ -352,10 +352,30 @@ export function PtbDualProbabilityChart(props: {
   }) => void;
   /** Watch cards: strip analyst chrome, keep a thin regime / gate strip. */
   compactHeader?: boolean;
+  /** Hide the “Reading these charts” legend above the panel pair (Signals / dense layouts). */
+  hideReadingGuide?: boolean;
+  /** When false, hides PTB target callouts on both Up/Down chart panels. */
+  showPtbTargetOnChart?: boolean;
+  /** Signals tab: richer header, side‑by‑side charts on large screens, tighter analyst chrome. */
+  signalsLayout?: boolean;
+  /** Signals desk hero: much taller canvas + loose SVG caps (stacked Up/Down read at full scale). */
+  largeCharts?: boolean;
   /** Place the PTB target engine block above or below the chart. */
   enginePlacement?: 'above' | 'below';
   /** Optional: localStorage key grouping for PTB Dual playbook samples. */
   playbookSlug?: string;
+  onSummary?: (s: {
+    lane: 'up' | 'down';
+    verdict: 'ENTER' | 'SCALP' | 'WATCH' | 'WAIT';
+    gate: 'ARMED' | 'PARTIAL' | 'NOT_ARMED';
+    enterLine: string | null;
+    enterOnlyIf: string;
+    go: boolean;
+    laneLock: { lane: 'up' | 'down' | null; status: 'LOCKED' | 'FORMING' | 'WAIT'; confidence: 'HIGH' | 'MED' | 'LOW'; reason: string };
+  }) => void;
+  /** CLOB token ids — align trade-panel SL/TP overlay with this market’s Dual charts. */
+  upOutcomeToken?: string;
+  downOutcomeToken?: string;
 }): ReactElement | null {
   const {
     probUp,
@@ -370,10 +390,24 @@ export function PtbDualProbabilityChart(props: {
     onTapProb,
     onGapsUpdate,
     compactHeader = false,
+    hideReadingGuide = false,
+    showPtbTargetOnChart = true,
+    signalsLayout = false,
+    largeCharts = false,
     enginePlacement = 'above',
     playbookSlug = '',
+    onSummary,
+    upOutcomeToken = '',
+    downOutcomeToken = '',
   } = props;
-  const [now, setNow] = useState(() => Date.now());
+  const compactChrome = compactHeader || signalsLayout;
+  const effectiveHideReadingGuide = hideReadingGuide || signalsLayout;
+  // Stale flag: re-render only when the staleness boolean actually flips, not every 2s.
+  const STALE_AFTER_MS = signalsLayout ? 90_000 : 60_000;
+  const [stale, setStale] = useState<boolean>(() => {
+    if (lastUpdateMs == null) return true;
+    return Date.now() - lastUpdateMs > STALE_AFTER_MS;
+  });
   const [flowOpen, setFlowOpen] = useState(() =>
     typeof window !== 'undefined' && window.localStorage.getItem('ptbChart.flowOpen') === '0' ? false : true,
   );
@@ -397,9 +431,14 @@ export function PtbDualProbabilityChart(props: {
     reason: 'Waiting for a stable directional edge.',
   });
   useEffect(() => {
-    const id = window.setInterval(() => setNow(Date.now()), 2000);
+    const tick = () => {
+      const next = lastUpdateMs == null ? true : Date.now() - lastUpdateMs > STALE_AFTER_MS;
+      setStale((prev) => (prev === next ? prev : next));
+    };
+    tick();
+    const id = window.setInterval(tick, 5_000);
     return () => window.clearInterval(id);
-  }, []);
+  }, [lastUpdateMs]);
   useEffect(() => {
     try {
       window.localStorage.setItem('ptbChart.flowOpen', flowOpen ? '1' : '0');
@@ -658,8 +697,9 @@ export function PtbDualProbabilityChart(props: {
     });
   }, [model, onGapsUpdate]);
 
-  const width = 680;
-  const height = 460;
+  /** Signals desk: wide viewBox + no artificial max-height cap so panels scale with width (aspect-ratio preserved). */
+  const width = largeCharts ? 1200 : 680;
+  const height = largeCharts ? 800 : 460;
   const padL = 12;
   const padR = 58;
   const padY = 10;
@@ -667,8 +707,15 @@ export function PtbDualProbabilityChart(props: {
   const topY0 = padY + 40;
   const plotH = height - topY0 - padY - 12;
 
-  const stale = lastUpdateMs == null || now - lastUpdateMs > 20_000;
+  const svgPanelShellClass = `${largeCharts ? 'w-full min-w-0 p-0.5 sm:p-1' : 'w-full min-w-0 p-1 sm:p-1.5'} [&_svg]:w-full [&_svg]:max-w-full ${
+    largeCharts
+      ? '[&_svg]:block [&_svg]:h-auto [&_svg]:max-h-none [&_svg]:min-h-[min(640px,52svh)] sm:[&_svg]:min-h-[min(760px,56svh)] lg:[&_svg]:min-h-[min(900px,58svh)] xl:[&_svg]:min-h-[min(1020px,60svh)]'
+      : signalsLayout
+        ? '[&_svg]:max-h-[min(240px,34svh)] sm:[&_svg]:max-h-[min(320px,42svh)] lg:[&_svg]:max-h-[min(420px,50svh)]'
+        : '[&_svg]:max-h-[min(220px,32svh)] sm:[&_svg]:max-h-[min(300px,40svh)] lg:[&_svg]:max-h-[min(440px,48svh)]'
+  }`;
 
+  // `stale` is now driven by the tick effect above (re-renders only on flip).
   const pathUpActive = engine.pathUpActive;
   const pathDnActive = engine.pathDnActive;
   const speedLabel = engine.tapeSpeedLabel;
@@ -882,15 +929,15 @@ export function PtbDualProbabilityChart(props: {
   /** Single execution condition: break level + tape speed (kill switch for guessing). */
   const tradeTrigger = useMemo(() => {
     const fallbackLane: 'up' | 'down' =
-      engine.highlightGap === 'down'
-        ? 'down'
-        : engine.highlightGap === 'up'
-          ? 'up'
-          : lastU > lastD
-            ? 'up'
-            : lastU < lastD
-              ? 'down'
-              : 'down';
+      engine.highlightGap ??
+      pickWinningChartLane({
+        lastU,
+        lastD,
+        gapU,
+        gapD,
+        upRising,
+        dnRising,
+      });
     const lane = preMove.chosen?.lane ?? fallbackLane;
     const laneTitle = lane === 'up' ? upLabel : downLabel;
     const line =
@@ -1188,6 +1235,35 @@ export function PtbDualProbabilityChart(props: {
     upLabel,
   ]);
 
+  /** Desk / cross-check: do not publish raw ENTER when break+gap setup never armed a lane. */
+  const summaryVerdict = useMemo(() => {
+    if (displayVerdict !== 'ENTER') return displayVerdict;
+    if (tradeTrigger.setupReady) return displayVerdict;
+    return 'SCALP' as const;
+  }, [displayVerdict, tradeTrigger.setupReady]);
+
+  useEffect(() => {
+    if (!onSummary) return;
+    onSummary({
+      lane: directionCall.lane,
+      verdict: summaryVerdict,
+      gate: directionCall.gate,
+      enterLine: directionCall.enterLine,
+      enterOnlyIf: tradeTrigger.enterOnlyIf,
+      go: goNoGo.go,
+      laneLock,
+    });
+  }, [
+    directionCall.enterLine,
+    directionCall.gate,
+    directionCall.lane,
+    summaryVerdict,
+    goNoGo.go,
+    laneLock,
+    onSummary,
+    tradeTrigger.enterOnlyIf,
+  ]);
+
   // Live cross-side meter: Up pushing while Down reverts to PTB (and vice versa).
   const liveMeter = useMemo(() => {
     const uPrev = candlesUp.length >= 2 ? candlesUp[candlesUp.length - 2]!.c : null;
@@ -1281,7 +1357,7 @@ export function PtbDualProbabilityChart(props: {
   if (!model) {
     const needData = probUp.length < 1 || probDown.length < 1;
     return (
-      <div className="rounded-2xl border border-zinc-800/70 bg-gradient-to-b from-zinc-950 to-zinc-950/80 p-6 shadow-xl ring-1 ring-white/[0.04]">
+      <div className="w-full min-w-0 max-w-full rounded-2xl border border-zinc-800/70 bg-gradient-to-b from-zinc-950 to-zinc-950/80 p-4 shadow-xl ring-1 ring-white/[0.04] sm:p-6">
         <div className="mx-auto max-w-md text-center">
           <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-xl border border-zinc-700/60 bg-zinc-900/60 text-lg text-zinc-500">
             ◔
@@ -1316,9 +1392,80 @@ export function PtbDualProbabilityChart(props: {
   }
 
   return (
-    <div className="overflow-hidden rounded-2xl border border-zinc-800/70 bg-gradient-to-b from-[#0c0c0f] to-[#08080a] shadow-2xl ring-1 ring-amber-500/20">
+    <div
+      className={`w-full min-w-0 max-w-full rounded-2xl border border-zinc-800/70 bg-gradient-to-b from-[#0c0c0f] to-[#08080a] shadow-2xl ring-1 ${
+        largeCharts
+          ? 'flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-visible'
+          : 'overflow-hidden'
+      } ${signalsLayout ? 'ring-amber-500/35 shadow-amber-950/20' : 'ring-amber-500/20'}`}
+    >
       {/* Scan-friendly title row */}
-      {!compactHeader ? (
+      {signalsLayout ? (
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-800/70 bg-gradient-to-r from-zinc-900/55 via-zinc-950/40 to-zinc-950/25 px-3 py-2.5 sm:px-4">
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="text-[11px] font-bold uppercase tracking-[0.16em] text-amber-200/95">Dual PTB</h2>
+              <span className="font-mono text-[10px] text-zinc-500">{fmtChartWindowMin(tMin, tMax)}</span>
+            </div>
+            <p className="mt-1 text-[10px] text-zinc-500">
+              SSR PTB{' '}
+              {priceToBeatUsd != null ? (
+                <span className="font-mono text-amber-200/90">${priceToBeatUsd.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span>
+              ) : (
+                <span className="text-zinc-600">—</span>
+              )}
+              <span className="ml-2 text-zinc-600">· book-implied paths vs 50¢</span>
+            </p>
+          </div>
+          <div
+            className={`shrink-0 inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[9px] font-bold uppercase tracking-wide ${
+              stale
+                ? 'border-amber-700/50 bg-amber-950/35 text-amber-100/95'
+                : 'border-emerald-700/45 bg-emerald-950/30 text-emerald-100/95'
+            }`}
+            title={lastUpdateMs != null ? `Last book sample ${new Date(lastUpdateMs).toLocaleTimeString()}` : 'No sample time'}
+          >
+            <span
+              className={`h-1.5 w-1.5 rounded-full ${stale ? 'bg-amber-400' : 'bg-emerald-400'} ${stale ? '' : 'animate-pulse'}`}
+              aria-hidden
+            />
+            {stale ? 'Stale' : 'Live'}
+          </div>
+        </div>
+      ) : compactHeader && largeCharts ? (
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-800/70 bg-gradient-to-r from-zinc-900/55 via-zinc-950/40 to-zinc-950/25 px-3 py-2.5 sm:px-4">
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+              <span className="text-[11px] font-bold uppercase tracking-[0.16em] text-amber-200/95">Dual PTB</span>
+              <span className="font-mono text-[10px] tabular-nums text-zinc-500">{fmtChartWindowMin(tMin, tMax)}</span>
+              {priceToBeatUsd != null ? (
+                <span className="font-mono text-[11px] tabular-nums text-amber-200/90" title="SSR price to beat">
+                  ${priceToBeatUsd.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                </span>
+              ) : (
+                <span className="text-[11px] text-zinc-600">SSR PTB —</span>
+              )}
+            </div>
+            <p className="mt-1 text-[10px] leading-snug text-zinc-600">
+              Book-implied paths vs <span className="font-mono text-zinc-500">50¢</span> anchor · gold band is fair strike
+            </p>
+          </div>
+          <div
+            className={`shrink-0 inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[9px] font-bold uppercase tracking-wide ${
+              stale
+                ? 'border-amber-700/50 bg-amber-950/35 text-amber-100/95'
+                : 'border-emerald-700/45 bg-emerald-950/30 text-emerald-100/95'
+            }`}
+            title={lastUpdateMs != null ? `Last book sample ${new Date(lastUpdateMs).toLocaleTimeString()}` : 'No sample time'}
+          >
+            <span
+              className={`h-1.5 w-1.5 rounded-full ${stale ? 'bg-amber-400' : 'bg-emerald-400'} ${stale ? '' : 'animate-pulse'}`}
+              aria-hidden
+            />
+            {stale ? 'Stale' : 'Live'}
+          </div>
+        </div>
+      ) : !compactHeader ? (
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-800/70 bg-zinc-900/35 px-4 py-2.5">
           <div>
             <h2 className="text-[11px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Belief vs PTB</h2>
@@ -1361,8 +1508,8 @@ export function PtbDualProbabilityChart(props: {
         </div>
       )}
       {enginePlacement === 'above' ? (
-      <div className="border-b border-zinc-800/80 px-4 py-3">
-        {compactHeader ? (
+      <div className="max-h-[min(58svh,560px)] overflow-y-auto overscroll-contain border-b border-zinc-800/80 px-3 py-3 sm:px-4 [-webkit-overflow-scrolling:touch]">
+        {compactChrome ? (
           <div className="space-y-2">
             <div
               className="rounded-xl border border-zinc-800/70 bg-zinc-950/60 px-2.5 py-2 ring-1 ring-white/[0.04]"
@@ -1529,6 +1676,36 @@ export function PtbDualProbabilityChart(props: {
                 </span>
                 <span className="rounded-lg border border-zinc-800/60 bg-black/20 px-2 py-1">Net +4c {net4cTradeability.room}</span>
               </div>
+              <p className="mt-2 text-[10px] font-semibold leading-snug text-amber-100/95">{tradeTrigger.enterOnlyIf}</p>
+              <div className="mt-2 rounded-lg border border-zinc-800/70 bg-black/30 px-2 py-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-[9px] font-black uppercase tracking-wide text-zinc-500">Entry gates (dual PTB)</div>
+                  <span
+                    className={`rounded-md px-2 py-0.5 text-[9px] font-black ${
+                      goNoGo.go ? 'bg-emerald-950/55 text-emerald-200' : 'bg-zinc-900/70 text-zinc-300'
+                    }`}
+                  >
+                    {goNoGo.go ? 'ALL PASS' : 'WAIT'}
+                  </span>
+                </div>
+                <div className="mt-1.5 grid gap-x-2 gap-y-1 sm:grid-cols-2">
+                  {goNoGo.checks.map((c) => (
+                    <div key={c.k} className="flex min-w-0 items-start justify-between gap-2">
+                      <span className={`text-[10px] font-semibold ${c.ok ? 'text-emerald-200' : 'text-zinc-400'}`}>
+                        {c.ok ? '✓' : '—'} {c.k}
+                      </span>
+                      <span className="min-w-0 truncate font-mono text-[9px] text-zinc-500" title={c.v}>
+                        {c.v}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <p className="mt-2 border-t border-zinc-800/60 pt-2 text-[10px] leading-snug text-zinc-400">
+                  <span className="font-semibold text-zinc-500">Direction lock: </span>
+                  {laneLock.status}
+                  {laneLock.lane ? ` · ${laneLock.lane === 'up' ? upLabel : downLabel}` : ''} · {laneLock.confidence} — {laneLock.reason}
+                </p>
+              </div>
               <div className="mt-3 flex flex-wrap gap-2">
                 <button
                   type="button"
@@ -1655,7 +1832,7 @@ export function PtbDualProbabilityChart(props: {
                   </div>
                   <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/55 px-3 py-2.5 text-[11px] text-zinc-200 shadow-inner shadow-black/20 ring-1 ring-white/[0.02]">
                     <div className="flex items-center justify-between gap-3">
-                      <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Tape</div>
+                      <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Desk tape</div>
                       <div className="rounded-full border border-zinc-800/60 bg-black/20 px-2 py-0.5 font-mono text-[10px] text-zinc-400">
                         speed{' '}
                         <span className={speedLabel === 'FAST' ? 'text-emerald-300' : speedLabel === 'MED' ? 'text-amber-200' : 'text-zinc-300'}>
@@ -1799,52 +1976,73 @@ export function PtbDualProbabilityChart(props: {
       </div>
       ) : null}
 
-      <div className="border-b border-zinc-800/70 bg-zinc-950/35 px-4 py-2.5">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Dual PTB direction lock</div>
-          <div
-            className={`rounded-lg border px-2 py-1 text-[10px] font-extrabold tracking-wide ${
-              laneLock.status === 'LOCKED'
-                ? laneLock.lane === 'up'
-                  ? 'border-emerald-500/45 bg-emerald-950/30 text-emerald-100'
-                  : 'border-rose-500/45 bg-rose-950/25 text-rose-100'
-                : laneLock.status === 'FORMING'
-                  ? 'border-amber-500/40 bg-amber-950/20 text-amber-100'
-                  : 'border-zinc-700/70 bg-zinc-900/30 text-zinc-200'
-            }`}
-          >
-            {laneLock.status}
-            {laneLock.lane ? ` · ${laneLock.lane === 'up' ? upLabel : downLabel}` : ' · NO SIDE'}
-            {` · ${laneLock.confidence}`}
+      <div
+        className={`min-h-0 w-full min-w-0 max-w-full space-y-3 overflow-x-auto px-0 pb-1 sm:space-y-4 sm:px-2 ${
+          largeCharts ? 'flex flex-1 flex-col sm:space-y-6 lg:space-y-7' : ''
+        }`}
+      >
+        {!effectiveHideReadingGuide ? (
+          <div className="rounded-xl border border-zinc-800/60 bg-zinc-950/40 px-2.5 py-2 sm:px-4 sm:py-2.5">
+            <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Reading these charts</div>
+            <div className="mt-2 flex flex-wrap gap-x-3 gap-y-2 text-[9px] leading-snug text-zinc-400 sm:gap-x-4 sm:text-[10px]">
+              <span className="inline-flex items-center gap-2">
+                <span className="h-2 w-6 rounded-sm bg-amber-400/90" aria-hidden />
+                <span>
+                  <span className="font-medium text-zinc-300">Gold band</span> — 50¢ PTB anchor (fair strike)
+                </span>
+              </span>
+              <span className="inline-flex items-center gap-2">
+                <span className="h-0.5 w-6 rounded-full bg-yellow-300" aria-hidden />
+                <span>
+                  <span className="font-medium text-zinc-300">Yellow dashed</span> — enter line (strategy; same level on both panels)
+                </span>
+              </span>
+              <span className="inline-flex items-center gap-2">
+                <span className="h-2 w-2 rounded-sm bg-violet-400/80" aria-hidden />
+                <span>
+                  <span className="font-medium text-zinc-300">Violet / rose</span> — your avg &amp; brackets (position tools)
+                </span>
+              </span>
+            </div>
           </div>
-        </div>
-        <div className="mt-1 text-[11px] leading-relaxed text-zinc-400">{laneLock.reason}</div>
-        <div className="mt-2 flex flex-wrap gap-2">
-          <button
-            type="button"
-            onClick={() => applyDualLaneToTradePanel(laneLock.lane ?? tradeTrigger.lane)}
-            className={`rounded-lg border px-3 py-1.5 text-[11px] font-semibold ${
-              (laneLock.lane ?? tradeTrigger.lane) === 'up'
-                ? 'border-emerald-800/50 bg-emerald-950/30 text-emerald-100 hover:bg-emerald-950/45'
-                : 'border-rose-800/50 bg-rose-950/30 text-rose-100 hover:bg-rose-950/35'
-            }`}
-            title="Set trade panel to locked primary lane."
-          >
-            Use locked side → {(laneLock.lane ?? tradeTrigger.lane) === 'up' ? upLabel : downLabel}
-          </button>
-          <button
-            type="button"
-            onClick={() => applyDualLaneToTradePanel((laneLock.lane ?? tradeTrigger.lane) === 'up' ? 'down' : 'up')}
-            className="rounded-lg border border-zinc-700/60 bg-zinc-950/35 px-3 py-1.5 text-[11px] font-semibold text-zinc-200 hover:bg-zinc-900/45"
-            title="Set trade panel to alternate lane."
-          >
-            Alternate side → {(laneLock.lane ?? tradeTrigger.lane) === 'up' ? downLabel : upLabel}
-          </button>
-        </div>
-      </div>
+        ) : null}
 
-      <div className="min-h-0 w-full space-y-4 overflow-x-auto overflow-y-visible px-1 pb-1 sm:px-2">
-        <div className="rounded-xl border border-zinc-800/55 bg-zinc-950/50 p-1.5 shadow-inner shadow-black/30 ring-1 ring-white/[0.03]">
+        <div
+          className={
+            signalsLayout
+              ? 'grid grid-cols-1 gap-3 lg:grid-cols-2 lg:items-stretch lg:gap-4'
+              : 'contents'
+          }
+        >
+        <div
+          className={`w-full min-w-0 rounded-xl border bg-zinc-950/50 shadow-inner shadow-black/30 ring-1 ring-emerald-500/10 ${
+            largeCharts ? 'overflow-x-hidden overflow-y-visible shadow-lg shadow-black/25 ring-2 ring-emerald-500/20' : 'overflow-hidden'
+          } ${signalsLayout ? 'border-emerald-800/45 lg:min-h-0' : largeCharts ? 'border-emerald-700/45' : 'border-emerald-800/35'}`}
+        >
+          <div
+            className={`flex flex-wrap items-center justify-between gap-2 border-b border-emerald-900/30 bg-emerald-950/20 px-2 sm:px-3 ${largeCharts ? 'py-2.5' : 'py-2'}`}
+          >
+            <div className={`min-w-0 ${largeCharts ? 'text-sm' : 'text-[11px]'} font-semibold text-emerald-100/95`}>
+              {signalsLayout || largeCharts ? (
+                <span className="inline-flex items-center gap-1.5">
+                  <span
+                    className={`rounded-md bg-emerald-500/25 px-1.5 font-mono font-bold text-emerald-200 ${largeCharts ? 'text-[10px]' : 'text-[9px]'}`}
+                  >
+                    UP
+                  </span>
+                  {upLabel}
+                </span>
+              ) : (
+                <>Panel A · {upLabel}</>
+              )}
+            </div>
+            <div
+              className={`max-w-[46%] truncate text-right text-zinc-500 sm:max-w-none ${largeCharts ? 'text-[11px]' : 'text-[9px] sm:text-[10px]'}`}
+            >
+              {signalsLayout || largeCharts ? 'vs 50¢ PTB' : 'Up outcome path'}
+            </div>
+          </div>
+          <div className={svgPanelShellClass}>
         <PtbUnifiedLineChartSvg
           width={width}
           height={height}
@@ -1869,7 +2067,7 @@ export function PtbDualProbabilityChart(props: {
           pathActive={pathUpActive}
           engine={engine}
           ptbTarget={ptbTarget}
-          showTarget={ptbTarget.engineLane === 'up'}
+          showTarget={showPtbTargetOnChart && ptbTarget.engineLane === 'up'}
           speedLabel={speedLabel}
           speedScore01={speedScore01}
           tradeTrigger={{
@@ -1886,10 +2084,40 @@ export function PtbDualProbabilityChart(props: {
           fmtChartWindowMin={fmtChartWindowMin}
           onTapProb={onTapProb}
           emitGap={emitGap}
+          bracketOutcomeToken={upOutcomeToken || null}
         />
+          </div>
         </div>
 
-        <div className="rounded-xl border border-zinc-800/55 bg-zinc-950/50 p-1.5 shadow-inner shadow-black/30 ring-1 ring-white/[0.03]">
+        <div
+          className={`w-full min-w-0 rounded-xl border bg-zinc-950/50 shadow-inner shadow-black/30 ring-1 ring-sky-500/10 ${
+            largeCharts ? 'overflow-x-hidden overflow-y-visible shadow-lg shadow-black/25 ring-2 ring-sky-500/20' : 'overflow-hidden'
+          } ${signalsLayout ? 'border-sky-800/45 lg:min-h-0' : largeCharts ? 'border-sky-700/45' : 'border-sky-800/35'}`}
+        >
+          <div
+            className={`flex flex-wrap items-center justify-between gap-2 border-b border-sky-900/30 bg-sky-950/15 px-2 sm:px-3 ${largeCharts ? 'py-2.5' : 'py-2'}`}
+          >
+            <div className={`min-w-0 ${largeCharts ? 'text-sm' : 'text-[11px]'} font-semibold text-sky-100/95`}>
+              {signalsLayout || largeCharts ? (
+                <span className="inline-flex items-center gap-1.5">
+                  <span
+                    className={`rounded-md bg-sky-500/25 px-1.5 font-mono font-bold text-sky-200 ${largeCharts ? 'text-[10px]' : 'text-[9px]'}`}
+                  >
+                    DN
+                  </span>
+                  {downLabel}
+                </span>
+              ) : (
+                <>Panel B · {downLabel}</>
+              )}
+            </div>
+            <div
+              className={`max-w-[46%] truncate text-right text-zinc-500 sm:max-w-none ${largeCharts ? 'text-[11px]' : 'text-[9px] sm:text-[10px]'}`}
+            >
+              {signalsLayout || largeCharts ? 'vs 50¢ PTB' : 'Down outcome path'}
+            </div>
+          </div>
+          <div className={svgPanelShellClass}>
         <PtbUnifiedLineChartSvg
           width={width}
           height={height}
@@ -1914,7 +2142,7 @@ export function PtbDualProbabilityChart(props: {
           pathActive={pathDnActive}
           engine={engine}
           ptbTarget={ptbTarget}
-          showTarget={ptbTarget.engineLane === 'down'}
+          showTarget={showPtbTargetOnChart && ptbTarget.engineLane === 'down'}
           speedLabel={speedLabel}
           speedScore01={speedScore01}
           tradeTrigger={{
@@ -1931,13 +2159,76 @@ export function PtbDualProbabilityChart(props: {
           fmtChartWindowMin={fmtChartWindowMin}
           onTapProb={onTapProb}
           emitGap={emitGap}
+          bracketOutcomeToken={downOutcomeToken || null}
         />
+          </div>
+        </div>
+        </div>
+
+        <div
+          className={`rounded-xl border border-zinc-700/55 bg-gradient-to-b from-zinc-950/80 to-zinc-950/40 px-3 py-3 ring-1 ring-white/[0.04] sm:px-4 ${
+            signalsLayout ? 'border-zinc-700/70' : ''
+          }`}
+        >
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+            <div className="min-w-0">
+              <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-zinc-500">
+                {signalsLayout ? 'Trade panel' : 'After you read the panels'}
+              </div>
+              <h3 className="mt-0.5 text-sm font-semibold text-zinc-100">
+                {signalsLayout ? 'Match lane to your ticket' : 'Sync the trade panel to a side'}
+              </h3>
+              <p className="mt-1 text-[11px] leading-relaxed text-zinc-500">
+                {signalsLayout
+                  ? "Pins the slide-out trader to Up or Down so limits/brackets align with the chart you're reading."
+                  : 'Direction lock stabilizes the call so it does not flip every tick. Buttons only set which outcome the Trade panel targets.'}
+              </p>
+            </div>
+            <div
+              className={`shrink-0 rounded-lg border px-2.5 py-1.5 text-[10px] font-extrabold tracking-wide ${
+                laneLock.status === 'LOCKED'
+                  ? laneLock.lane === 'up'
+                    ? 'border-emerald-500/45 bg-emerald-950/30 text-emerald-100'
+                    : 'border-rose-500/45 bg-rose-950/25 text-rose-100'
+                  : laneLock.status === 'FORMING'
+                    ? 'border-amber-500/40 bg-amber-950/20 text-amber-100'
+                    : 'border-zinc-700/70 bg-zinc-900/30 text-zinc-200'
+              }`}
+            >
+              {laneLock.status}
+              {laneLock.lane ? ` · ${laneLock.lane === 'up' ? upLabel : downLabel}` : ' · NO SIDE'}
+              {` · ${laneLock.confidence}`}
+            </div>
+          </div>
+          <p className="mt-2 text-[11px] leading-relaxed text-zinc-400">{laneLock.reason}</p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => applyDualLaneToTradePanel(laneLock.lane ?? tradeTrigger.lane)}
+              className={`rounded-lg border px-3 py-2 text-[12px] font-semibold ${
+                (laneLock.lane ?? tradeTrigger.lane) === 'up'
+                  ? 'border-emerald-600/50 bg-emerald-950/35 text-emerald-50 shadow-sm shadow-emerald-950/20 hover:bg-emerald-950/50'
+                  : 'border-rose-600/50 bg-rose-950/35 text-rose-50 shadow-sm shadow-rose-950/20 hover:bg-rose-950/50'
+              }`}
+              title="Set the slide/sidebar trade panel to this outcome and lane."
+            >
+              Open trade for {(laneLock.lane ?? tradeTrigger.lane) === 'up' ? upLabel : downLabel}
+            </button>
+            <button
+              type="button"
+              onClick={() => applyDualLaneToTradePanel((laneLock.lane ?? tradeTrigger.lane) === 'up' ? 'down' : 'up')}
+              className="rounded-lg border border-zinc-600/60 bg-zinc-950/50 px-3 py-2 text-[12px] font-medium text-zinc-200 hover:bg-zinc-900/60"
+              title="Set the trade panel to the opposite outcome."
+            >
+              Use opposite · {(laneLock.lane ?? tradeTrigger.lane) === 'up' ? downLabel : upLabel}
+            </button>
+          </div>
         </div>
       </div>
 
-      {!compactHeader ? (
-        <div className="border-t border-zinc-800/70 bg-zinc-950/30 px-4 py-4 text-[11px] leading-relaxed text-zinc-400">
-          <div className="grid gap-3 lg:grid-cols-[1fr_auto] lg:items-start">
+      {!compactChrome ? (
+        <div className="border-t border-zinc-800/70 bg-zinc-950/30 px-3 py-3 text-[11px] leading-relaxed text-zinc-400 sm:px-4 sm:py-4">
+          <div className="grid min-w-0 gap-3 lg:grid-cols-[1fr_auto] lg:items-start">
             <div className="min-w-0 text-zinc-300">
               <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Summary</span>
               <div className="mt-1.5 flex flex-wrap items-center gap-2">
@@ -1960,7 +2251,8 @@ export function PtbDualProbabilityChart(props: {
               <div className="mt-2 text-[11px] leading-relaxed text-zinc-400">{engine.finalLine}</div>
             </div>
             <div className="rounded-xl border border-zinc-800/60 bg-black/25 p-3 lg:max-w-[min(100%,20rem)]">
-              <div className="text-[9px] font-semibold uppercase tracking-wide text-zinc-500">Chart legend</div>
+              <div className="text-[9px] font-semibold uppercase tracking-wide text-zinc-500">Extra cues</div>
+              <p className="mt-1 text-[9px] leading-snug text-zinc-600">Main color key sits above the chart pair.</p>
               <div className="mt-2 flex flex-col gap-1.5">
                 <span className="inline-flex items-center gap-2 font-mono text-[10px] text-violet-200/90">
                   <span className="h-2 w-2 rounded-sm bg-violet-500/70" aria-hidden />
@@ -1981,20 +2273,32 @@ export function PtbDualProbabilityChart(props: {
       ) : null}
 
       {enginePlacement === 'below' ? (
-        <div className="border-t border-zinc-800/80 px-4 py-3">
-          {compactHeader ? (
+        <div
+          className={`overflow-y-auto overscroll-contain border-t border-zinc-800/80 px-3 py-3 sm:px-4 [-webkit-overflow-scrolling:touch] ${
+            largeCharts ? 'max-h-[min(52svh,620px)]' : 'max-h-[min(72svh,680px)]'
+          }`}
+        >
+          {compactChrome ? (
             <div className="space-y-2">
               <div
-                className="rounded-xl border border-zinc-800/70 bg-zinc-950/60 px-2.5 py-2 ring-1 ring-white/[0.04]"
+                className={`rounded-xl border border-zinc-800/70 bg-zinc-950/60 px-2.5 py-2 ring-1 ring-white/[0.04] ${
+                  signalsLayout ? 'sm:px-3' : ''
+                } ${largeCharts ? 'sm:py-2.5' : ''}`}
                 title={ptbTarget.summaryLine}
               >
-                <div className="text-[9px] font-black tracking-wide text-amber-200/90">PTB TARGET ENGINE</div>
-                <div className={`mt-1 space-y-0.5 text-[11px] font-bold leading-snug ${chartAccent}`}>
+                <div className={`font-black tracking-wide text-amber-200/90 ${largeCharts ? 'text-[10px]' : 'text-[9px]'}`}>
+                  PTB TARGET ENGINE
+                </div>
+                <div
+                  className={`mt-1 font-bold leading-snug ${chartAccent} ${
+                    largeCharts ? 'grid gap-x-4 gap-y-1 text-[12px] sm:grid-cols-2' : 'space-y-0.5 text-[11px]'
+                  }`}
+                >
                   <div>Side: {ptbTarget.side}</div>
                   <div>Now: {ptbTarget.nowLabel}</div>
                   <div>Momentum: {ptbTarget.momentum}</div>
                   <div>Next Target: {ptbTarget.nextTargetLabel}</div>
-                  <div>Target Range: {ptbTarget.targetRangeLabel}</div>
+                  <div className={largeCharts ? 'sm:col-span-2' : ''}>Target Range: {ptbTarget.targetRangeLabel}</div>
                   <div>First Wall: {ptbTarget.firstWallLabel}</div>
                   <div>Reversal Risk: {ptbTarget.reversalRisk}</div>
                 </div>

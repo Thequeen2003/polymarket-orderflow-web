@@ -23,7 +23,7 @@ export function OverallOrderBookPanel(props: {
     return () => window.clearInterval(id);
   }, []);
 
-  const stale = lastUpdateMs == null || now - lastUpdateMs > 20_000;
+  const stale = lastUpdateMs == null || now - lastUpdateMs > 45_000;
   const { asks, bids } = useMemo(() => pickBookLevels(book), [book]);
   const top = useMemo(() => topOfBook(book), [book]);
   const bestBid = top.bestBid;

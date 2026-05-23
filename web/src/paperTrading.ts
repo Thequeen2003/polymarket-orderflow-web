@@ -1,7 +1,14 @@
+import { notifyPaperAccountUpdated } from './paperAccountSync';
+import { inferPaperGammaSettlement } from './paperMarketSettlement';
+import { appendTradeHistory } from './tradeHistory';
 import {
+  clearPaperPositionsForTokens,
+  refundPaperPositionsForTokens,
   freshPaperAccount,
   getPaperPosition,
   markToMarket,
+  paperExpireResolvedLoser,
+  paperRedeemResolvedWinner,
   paperTrade as paperTradeCore,
   undoPaperFilledBuy as undoPaperFilledBuyCore,
   type PaperAccount,
@@ -11,7 +18,25 @@ import {
 } from './paperTradingCore';
 
 export type { PaperAccount, PaperPosition, PaperTradeResult, PaperTradeSide };
-export { freshPaperAccount, getPaperPosition, markToMarket };
+export { clearPaperPositionsForTokens, freshPaperAccount, getPaperPosition, markToMarket };
+
+export function resetPaperPositionsForTokens(tokenIds: string[]): PaperAccount {
+  const next = clearPaperPositionsForTokens(loadPaperAccount(), tokenIds);
+  savePaperAccount(next);
+  notifyPaperAccountUpdated();
+  return next;
+}
+
+/** Sell Up/Down paper legs back to practice cash (Signals “I didn’t buy — refund”). */
+export function refundPaperPositionsForMarket(
+  tokenIds: string[],
+  exitPrice01ByToken?: Record<string, number | null | undefined>,
+): PaperAccount {
+  const next = refundPaperPositionsForTokens(loadPaperAccount(), tokenIds, exitPrice01ByToken);
+  savePaperAccount(next);
+  notifyPaperAccountUpdated();
+  return next;
+}
 
 export type PaperOrder = {
   id: string;
@@ -87,6 +112,7 @@ export function undoPaperFilledBuy(args: {
   const r = undoPaperFilledBuyCore(args);
   if (!r.ok) return r;
   savePaperAccount(r.account);
+  notifyPaperAccountUpdated();
   return r;
 }
 
@@ -105,6 +131,165 @@ export function resetPaperAccount(): PaperAccount {
   const next = freshPaperAccount();
   savePaperAccount(next);
   return next;
+}
+
+const SETTLEMENT_LEDGER_KEY = 'pmof.paperSettlementLedger.v1';
+
+function loadSettlementLedger(): Record<string, string[]> {
+  try {
+    const raw = window.localStorage.getItem(SETTLEMENT_LEDGER_KEY);
+    if (!raw) return {};
+    const p = JSON.parse(raw) as unknown;
+    if (!p || typeof p !== 'object') return {};
+    const out: Record<string, string[]> = {};
+    for (const [k, v] of Object.entries(p as Record<string, unknown>)) {
+      if (Array.isArray(v)) out[k] = v.map(String);
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function saveSettlementLedger(rows: Record<string, string[]>): void {
+  try {
+    window.localStorage.setItem(SETTLEMENT_LEDGER_KEY, JSON.stringify(rows));
+  } catch {
+    /* ignore */
+  }
+}
+
+function settlementLedgerHas(marketKey: string, tokenId: string): boolean {
+  const mk = String(marketKey ?? '').trim();
+  const tk = String(tokenId ?? '').trim();
+  if (!mk || !tk) return false;
+  const L = loadSettlementLedger();
+  return (L[mk] ?? []).includes(tk);
+}
+
+function settlementLedgerMark(marketKey: string, tokenId: string): void {
+  const mk = String(marketKey ?? '').trim();
+  const tk = String(tokenId ?? '').trim();
+  if (!mk || !tk) return;
+  const L = loadSettlementLedger();
+  const prev = new Set(L[mk] ?? []);
+  if (prev.has(tk)) return;
+  prev.add(tk);
+  L[mk] = [...prev];
+  saveSettlementLedger(L);
+}
+
+/** Auto-settle practice positions when Gamma marks the market closed with decisive outcome prices ($1 / $0). */
+export function applyPaperSettlementForLoadedMarket(args: {
+  market: unknown | null;
+  slug: string;
+  marketTitle?: string;
+}): void {
+  try {
+    if (typeof window === 'undefined') return;
+    const plan = inferPaperGammaSettlement(args.market, args.slug);
+    if (!plan) return;
+
+    let account = loadPaperAccount();
+    const title = String(args.marketTitle ?? '').trim().slice(0, 800);
+    const slugTrim = String(args.slug ?? '').trim();
+    let dirty = false;
+
+    const MIN_SH = 1e-4;
+
+    const settleWinner = (tokenId: string, label: string) => {
+      const tk = tokenId.trim();
+      if (!tk || settlementLedgerHas(plan.marketKey, tk)) return;
+      const pos = getPaperPosition(account, tk);
+      if (pos.shares < MIN_SH) {
+        settlementLedgerMark(plan.marketKey, tk);
+        return;
+      }
+      const r = paperRedeemResolvedWinner({ account, tokenId: tk });
+      if (!r.ok) return;
+      account = r.account;
+      dirty = true;
+      settlementLedgerMark(plan.marketKey, tk);
+      if (r.shares >= MIN_SH && r.payoutUsdCents > 0) {
+        appendTradeHistory({
+          mode: 'paper',
+          exec: 'settlement',
+          side: 'sell',
+          token: tk,
+          label: label.slice(0, 120),
+          price01: 1,
+          fillAvgPrice01: 1,
+          quotedPrice01: null,
+          shares: r.shares,
+          requestedShares: r.shares,
+          remainingShares: 0,
+          usdCents: r.payoutUsdCents,
+          status: 'filled',
+          marketSlug: slugTrim || undefined,
+          marketTitle: title || undefined,
+          auditNote: 'Paper settlement · resolved winner · $1/sh @ $1',
+        });
+      }
+    };
+
+    const settleLoser = (tokenId: string, label: string) => {
+      const tk = tokenId.trim();
+      if (!tk || settlementLedgerHas(plan.marketKey, tk)) return;
+      const pos = getPaperPosition(account, tk);
+      if (pos.shares < MIN_SH) {
+        settlementLedgerMark(plan.marketKey, tk);
+        return;
+      }
+      const r = paperExpireResolvedLoser({ account, tokenId: tk });
+      if (!r.ok) {
+        if (r.error === 'no_position') settlementLedgerMark(plan.marketKey, tk);
+        return;
+      }
+      account = r.account;
+      dirty = true;
+      settlementLedgerMark(plan.marketKey, tk);
+      if (r.shares >= MIN_SH) {
+        appendTradeHistory({
+          mode: 'paper',
+          exec: 'settlement',
+          side: 'sell',
+          token: tk,
+          label: label.slice(0, 120),
+          price01: 0,
+          fillAvgPrice01: 0,
+          quotedPrice01: null,
+          shares: r.shares,
+          requestedShares: r.shares,
+          remainingShares: 0,
+          usdCents: 0,
+          status: 'filled',
+          marketSlug: slugTrim || undefined,
+          marketTitle: title || undefined,
+          auditNote: 'Paper settlement · losing outcome · expired @ $0',
+        });
+      }
+    };
+
+    for (const w of plan.winners) settleWinner(w.tokenId, w.label);
+    for (const l of plan.losers) settleLoser(l.tokenId, l.label);
+
+    if (dirty) {
+      savePaperAccount(account);
+      notifyPaperAccountUpdated();
+      const ids = [...plan.winners.map((w) => w.tokenId), ...plan.losers.map((l) => l.tokenId)];
+      cancelPaperOrdersForTokenIds(ids);
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Cancel resting paper orders tied to resolved outcome tokens (avoid zombie limits after settlement). */
+export function cancelPaperOrdersForTokenIds(tokenIds: string[]): void {
+  const want = new Set(tokenIds.map((t) => String(t ?? '').trim()).filter(Boolean));
+  if (!want.size) return;
+  const orders = loadPaperOrders();
+  savePaperOrders(orders.filter((o) => !want.has(String(o.tokenId ?? '').trim())));
 }
 
 function clamp01(x: number): number {
