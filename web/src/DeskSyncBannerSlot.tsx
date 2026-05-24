@@ -5,12 +5,12 @@ export function DeskSyncBannerSlot(props: { children: ReactNode }): ReactElement
   const active = props.children != null;
   return (
     <div
-      className={`mb-3 overflow-hidden transition-[min-height] duration-150 ${
-        active ? 'min-h-[3.25rem]' : 'min-h-0'
-      }`}
+      className="mb-3 min-h-[3.25rem] overflow-hidden"
       aria-live="polite"
     >
-      {props.children}
+      <div className={active ? '' : 'pointer-events-none invisible'} aria-hidden={!active}>
+        {props.children}
+      </div>
     </div>
   );
 }

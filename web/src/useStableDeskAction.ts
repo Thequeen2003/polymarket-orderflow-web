@@ -16,6 +16,11 @@ export function useStableDeskAction(live: DeskSingleAction, meaningKey: string):
       setDisplayed(live);
       return;
     }
+    setDisplayed((prev) =>
+      prev.primary === live.primary && prev.tone === live.tone
+        ? prev
+        : { ...prev, primary: live.primary, tone: live.tone },
+    );
     const id = window.setTimeout(() => setDisplayed(live), DETAIL_DEBOUNCE_MS);
     return () => window.clearTimeout(id);
   }, [live, meaningKey]);

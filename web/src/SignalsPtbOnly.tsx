@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
 import type { ClobBookEntry } from './lib/api';
 import { pickConditionId } from './bookIntel';
 import { FlowZoneSignalsPanel } from './FlowZoneSignalsPanel';
@@ -81,7 +81,6 @@ import { useStableDeskAction } from './useStableDeskAction';
 import { TakeSignalStrategyPanel } from './TakeSignalStrategyPanel';
 import { evaluateFivePctGainStrategy } from './fivePctGainStrategy';
 import { applyTakeSignalStrategies, type TakeSignalStrategyId } from './takeSignalStrategy';
-import { price01ToWholeCents } from './displayCents';
 import {
   applyTakeSignalStabilityGate,
   takeSignalPlanMeaningKey,
@@ -1342,9 +1341,6 @@ export function SignalsPtbOnly(props: {
         tradeDirectiveSpot?.lane ?? '-',
         operatorVerdictDesk?.state ?? '-',
         operatorVerdictDesk?.bigVerb ?? '-',
-        tradeLevelsSpot
-          ? `${price01ToWholeCents(tradeLevelsSpot.entry)}|${price01ToWholeCents(tradeLevelsSpot.takeProfit)}|${price01ToWholeCents(tradeLevelsSpot.stopLoss)}`
-          : '-',
       ].join('|'),
     [
       manualPositionLane,
@@ -1352,9 +1348,6 @@ export function SignalsPtbOnly(props: {
       tradeDirectiveSpot?.lane,
       operatorVerdictDesk?.state,
       operatorVerdictDesk?.bigVerb,
-      tradeLevelsSpot?.entry,
-      tradeLevelsSpot?.takeProfit,
-      tradeLevelsSpot?.stopLoss,
     ],
   );
 
@@ -1744,16 +1737,7 @@ export function SignalsPtbOnly(props: {
     [spotChartCall, dualChartCall, upLabel, downLabel],
   );
 
-  const crossCheckWarn = crossCheckMeta.pill === 'CONFLICT' || crossCheckMeta.pill === 'INCOMPLETE';
-  const [crossCheckOpen, setCrossCheckOpen] = useState(crossCheckWarn);
-  const crossCheckAutoOpenedSlugRef = useRef<string | null>(null);
-  useLayoutEffect(() => {
-    const s = slug?.trim() ?? '';
-    if (!s || crossCheckMeta.pill !== 'CONFLICT') return;
-    if (crossCheckAutoOpenedSlugRef.current === s) return;
-    crossCheckAutoOpenedSlugRef.current = s;
-    setCrossCheckOpen(true);
-  }, [crossCheckMeta.pill, slug]);
+  const [crossCheckOpen, setCrossCheckOpen] = useState(false);
 
   // Inline cross-engine strip — replaces the old `xcheck` chart tab. One-line by
   // default; click to expand the full Spot / Dual call breakdown without leaving
@@ -2386,7 +2370,7 @@ export function SignalsPtbOnly(props: {
   /** Tabbed Spot vs PTB / Dual PTB. Cross-check is now an inline strip inside
    *  `spotVsPtbSection` so it's always glanceable without a tab switch. */
   const chartCard = (
-    <div className="flex min-w-0 max-w-full flex-col rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-2 sm:p-3 min-h-[min(56vh,640px)]">
+    <div className="flex min-h-[min(72dvh,900px)] min-w-0 max-w-full flex-col rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-2 sm:p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Chart</div>
         {hasDual ? (
