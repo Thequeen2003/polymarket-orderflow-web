@@ -3,7 +3,6 @@ import {
   applyTakeSignalStabilityGate,
   directiveAllowsTakeSignal,
   takeSignalPlanMeaningKey,
-  TAKE_SIGNAL_MIN_DIRECTIVE_MS,
   TAKE_SIGNAL_MIN_DIRECTIVE_HIGH_MS,
   TAKE_SIGNAL_PLAN_HOLD_MS,
   updateStableTakeSignalPlan,

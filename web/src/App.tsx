@@ -810,15 +810,6 @@ function App() {
     setGlobalTradeContext(currentTradeContext);
   }, [currentTradeContext, globalTradeLocked]);
 
-  /** Unpin trade panel when the chart loads a different market so Signals / positions stay aligned. */
-  useEffect(() => {
-    const chart = selectedSlug.trim();
-    const pinned = globalTradeContext?.slug?.trim() ?? '';
-    if (globalTradeLocked && chart && pinned && chart !== pinned) {
-      setGlobalTradeLocked(false);
-    }
-  }, [selectedSlug, globalTradeContext?.slug, globalTradeLocked]);
-
   const effectiveTradeContext = globalTradeLocked && globalTradeContext ? globalTradeContext : currentTradeContext;
   const effectiveTradeReady = Boolean(effectiveTradeContext.slug) && globalTradeReady && !binanceSpotActive;
   const effectiveTradeEnabled = Boolean(effectiveTradeContext.upToken && effectiveTradeContext.downToken);
@@ -915,7 +906,6 @@ function App() {
     setBooks(null);
     setBooksFetchedAt(null);
     setBooksLoading(Boolean(clean));
-    setGlobalTradeLocked(false);
     setSsrPriceToBeat(null);
     setSsrPtbSource(null);
     setPtbError(null);
@@ -1627,18 +1617,22 @@ function App() {
       return;
     }
     const ptbGen = marketSyncGenRef.current;
+    let stopped = false;
+    let nextTimer: number | null = null;
+    let hasPriceToBeat = false;
     queueMicrotask(() => {
+      if (stopped) return;
       setSsrPriceToBeat(null);
       setSsrPtbSource(null);
       setPtbError(null);
     });
-    let stopped = false;
     const tick = async () => {
       const ptb = await priceToBeat(slug);
       if (stopped) return;
       if (ptbGen !== marketSyncGenRef.current) return;
       if (selectedSlugRef.current.trim() !== slug) return;
       if (isOk(ptb)) {
+        hasPriceToBeat = true;
         setSsrPriceToBeat(ptb.data.price_to_beat);
         setSsrPtbSource(ptb.data.source);
         setPtbError(null);
@@ -1646,15 +1640,16 @@ function App() {
         // Keep last good PTB only when still the same market load generation.
         setPtbError(pretty(ptb));
       }
+      if (!stopped) {
+        nextTimer = window.setTimeout(() => void tick(), hasPriceToBeat ? 20_000 : 5_000);
+      }
     };
     void tick();
-    const intervalMs = ssrPriceToBeat == null ? 5_000 : 20_000;
-    const id = window.setInterval(() => void tick(), intervalMs);
     return () => {
       stopped = true;
-      window.clearInterval(id);
+      if (nextTimer != null) window.clearTimeout(nextTimer);
     };
-  }, [selectedSlug, ssrPriceToBeat]);
+  }, [selectedSlug]);
 
   useEffect(() => {
     setRtdsSpotFeedSource(null);
@@ -2869,29 +2864,31 @@ function App() {
                     </button>
                   </div>
                 ) : null}
-                <SignalsPtbOnly
-                  key={selectedSlug ?? ''}
-                  slug={selectedSlug}
-                  market={marketJson}
-                  books={books}
-                  outcomeLabels={outcomeLabels}
-                  priceToBeat={ssrPriceToBeat}
-                  spot={spotSeriesBySlug[selectedSlug] ?? []}
-                  spotLastUpdateMs={signalsSpotFeedLastMs}
-                  probUp={signalsProbMids.up}
-                  probDown={signalsProbMids.down}
-                  probLastUpdateMs={signalsProbFeedLastMs}
-                  flowSeriesForSlug={flowSeriesBySlug[selectedSlug] ?? null}
-                  endsInMs={marketEndsInMs}
-                  booksFetchedAt={booksFetchedAt}
-                  spotStreamEligible={isUpdownDeskMarket(selectedSlug, updownSlugHints)}
-                  ptbSource={ssrPtbSource}
-                  spotFeedSource={rtdsSpotFeedSource}
-                  onOpenTradeHistory={() => setMainTab('tradehistory')}
-                  tradePanelSlug={effectiveTradeContext.slug}
-                  tradePanelLane={globalTradeLane}
-                  tradePanelPinned={globalTradeLocked}
-                />
+                {selectedSlug.trim() ? (
+                  <SignalsPtbOnly
+                    key={selectedSlug}
+                    slug={selectedSlug}
+                    market={marketJson}
+                    books={books}
+                    outcomeLabels={outcomeLabels}
+                    priceToBeat={ssrPriceToBeat}
+                    spot={spotSeriesBySlug[selectedSlug] ?? []}
+                    spotLastUpdateMs={signalsSpotFeedLastMs}
+                    probUp={signalsProbMids.up}
+                    probDown={signalsProbMids.down}
+                    probLastUpdateMs={signalsProbFeedLastMs}
+                    flowSeriesForSlug={flowSeriesBySlug[selectedSlug] ?? null}
+                    endsInMs={marketEndsInMs}
+                    booksFetchedAt={booksFetchedAt}
+                    spotStreamEligible={isUpdownDeskMarket(selectedSlug, updownSlugHints)}
+                    ptbSource={ssrPtbSource}
+                    spotFeedSource={rtdsSpotFeedSource}
+                    onOpenTradeHistory={() => setMainTab('tradehistory')}
+                    tradePanelSlug={effectiveTradeContext.slug}
+                    tradePanelLane={globalTradeLane}
+                    tradePanelPinned={globalTradeLocked}
+                  />
+                ) : null}
                 <p className="mt-3 text-center text-[11px] text-zinc-600">
                   Book tab: order flow, ladders, and above/below context. Assistant tab: chat + digest.
                 </p>

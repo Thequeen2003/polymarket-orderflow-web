@@ -421,6 +421,7 @@ export function dispatchDeskSubmitBuyOnce(detail: {
     window.dispatchEvent(
       new CustomEvent(BPX_TRADE_SUBMIT_BUY_EVENT, {
         detail: {
+          slug: detail.slug,
           lane: detail.lane,
           price01: detail.price01,
           stopLoss01: detail.stopLoss01,

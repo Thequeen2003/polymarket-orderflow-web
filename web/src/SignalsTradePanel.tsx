@@ -774,9 +774,12 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     return () => window.removeEventListener(BPX_DESK_TOAST_EVENT, onDeskToast as EventListener);
   }, [pushToast]);
 
+  const [armRiskAfterBuy, setArmRiskAfterBuy] = useState<ArmRiskAfterBuyPrefs>(() => loadArmRiskAfterBuyPrefs());
+
   useEffect(() => {
     const onSubmitBuy = (ev: Event) => {
       const ce = ev as CustomEvent<{
+        slug?: string;
         lane?: 'up' | 'down';
         price01?: number;
         stopLoss01?: number | null;
@@ -788,10 +791,16 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       const d = ce.detail;
       const submitLane = d?.lane;
       if (submitLane !== 'up' && submitLane !== 'down') return;
+      const submitSlug = d?.slug?.trim();
+      const panelSlug = marketSlug?.trim();
+      if (submitSlug && panelSlug && submitSlug !== panelSlug) {
+        pushToast('err', 'Buy blocked — signal belongs to a different market. Re-open the matching Signals market.', 7200);
+        return;
+      }
 
       const ingressSh =
         d.sizeShares != null && Number.isFinite(d.sizeShares) ? roundShares4(d.sizeShares) : null;
-      const ingressKey = `${submitLane}|${ingressSh ?? ''}|${
+      const ingressKey = `${submitSlug ?? panelSlug ?? ''}|${submitLane}|${ingressSh ?? ''}|${
         d.price01 != null && Number.isFinite(d.price01) ? d.price01.toFixed(4) : ''
       }`;
       const ingressNow = Date.now();
@@ -883,7 +892,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
 
     window.addEventListener(BPX_TRADE_SUBMIT_BUY_EVENT, onSubmitBuy as EventListener);
     return () => window.removeEventListener(BPX_TRADE_SUBMIT_BUY_EVENT, onSubmitBuy as EventListener);
-  }, [controlledLane, downToken, onLaneChange, pushToast, upToken]);
+  }, [controlledLane, downToken, marketSlug, onLaneChange, pushToast, setArmRiskAfterBuy, upToken]);
 
   const [lastExecLatencyMs, setLastExecLatencyMs] = useState<number | null>(null);
   const liveSubmitGenRef = useRef(0);
@@ -1194,7 +1203,6 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     msg: string | null;
   }>(null);
 
-  const [armRiskAfterBuy, setArmRiskAfterBuy] = useState<ArmRiskAfterBuyPrefs>(() => loadArmRiskAfterBuyPrefs());
   /** Latest trade-card TP/SL from Signals desk (see `dispatchSignalRiskLevels`). */
   const signalRiskRef = useRef<SignalRiskSnapshot | null>(null);
   /** Planning reference (PTB overlays / drag sync; does not auto-trade). */
@@ -2569,7 +2577,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         return merged;
       });
     },
-    [applyArmRiskNow],
+    [applyArmRiskNow, setArmRiskAfterBuy],
   );
 
   const onAutoArmTpChange = useCallback(
@@ -2584,7 +2592,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         return merged;
       });
     },
-    [applyArmRiskNow],
+    [applyArmRiskNow, setArmRiskAfterBuy],
   );
 
   const commitTakeProfitArmed = useCallback(
@@ -3582,6 +3590,9 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     ],
   );
 
+  const [pinnedLiveStatusId, setPinnedLiveStatusId] = useState<string | null>(null);
+  const [pinnedLiveStatusDismissed, setPinnedLiveStatusDismissed] = useState(false);
+
   /** Push reconciled sell VWAP + size into every desk surface (history, status pin, brackets). */
   const applyConfirmedSellFillToDesk = useCallback(
     (
@@ -3663,7 +3674,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         }
       }
     },
-    [pushToast, pushTradeActivity],
+    [pushToast, pushTradeActivity, setPinnedLiveStatusDismissed, setPinnedLiveStatusId],
   );
 
   /** Reconcile CLOB tape first, then mirror exchange VWAP/shares across the desk. */
@@ -5554,9 +5565,6 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     positionShares != null && positionShares > 0 ? fmtShares(positionShares, 'compact') : accountMode === 'live' && balLoading ? '…' : '—';
 
   const [quickSellMode, setQuickSellMode] = useState<'market' | 'touch_limit'>('market');
-
-  const [pinnedLiveStatusId, setPinnedLiveStatusId] = useState<string | null>(null);
-  const [pinnedLiveStatusDismissed, setPinnedLiveStatusDismissed] = useState(false);
 
   const activeLiveOrderRow = useMemo(() => {
     if (accountMode !== 'live') return null;

@@ -601,6 +601,7 @@ export function SignalsPtbOnly(props: {
     if (autoTradeSizeShares == null) return null;
     return { submitBuy: true, sizeShares: autoTradeSizeShares, armSlTp: false, endsInMs };
   }, [autoTradeSizeShares, endsInMs]);
+  const [switchForecastSpot, setSwitchForecastSpot] = useState<SwitchForecast | null>(null);
 
   useEffect(() => {
     if (autoTradeSizeShares == null) return;
@@ -672,7 +673,6 @@ export function SignalsPtbOnly(props: {
     () => computeTapeVelocity(heldOutcomeTapePrints, { now: tapeClock }),
     [heldOutcomeTapePrints, tapeClock],
   );
-  const [switchForecastSpot, setSwitchForecastSpot] = useState<SwitchForecast | null>(null);
   useEffect(() => {
     if (slug == null || !String(slug).trim()) return;
     saveSignalsDeskPersist(String(slug).trim(), {
@@ -970,7 +970,7 @@ export function SignalsPtbOnly(props: {
       upToken: upToken?.trim() || undefined,
       downToken: downToken?.trim() || undefined,
     });
-  }, [slug, tradeDirectiveSpot, spot, priceToBeat, probUp, probDown, upToken, downToken]);
+  }, [slug, tradeDirectiveSpot, spot, priceToBeat, probUp, probDown, upToken, downToken, setSwitchForecastSpot]);
 
   const spotChartLive = priceToBeat != null && spot.length >= 2;
   const [chartTab, setChartTab] = useState<'spot' | 'dual'>('spot');

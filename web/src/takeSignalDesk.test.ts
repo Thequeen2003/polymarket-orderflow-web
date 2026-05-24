@@ -253,7 +253,7 @@ describe('executeTakeSignal', () => {
     if (typeof globalThis.window === 'undefined') {
       vi.stubGlobal('window', {
         dispatchEvent: vi.fn(),
-        setTimeout: (fn: () => void, _ms?: number) => {
+        setTimeout: (fn: () => void) => {
           fn();
           return 0;
         },
