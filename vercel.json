@@ -1,0 +1,12 @@
+{
+  "buildCommand": "npm run build -w web",
+  "installCommand": "npm ci",
+  "outputDirectory": "web/dist",
+  "framework": "vite",
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}

@@ -13,6 +13,19 @@ Important:
 
 After merging to `main`, enable Pages in GitHub repo settings with **Source: GitHub Actions**.
 
+## Render / Vercel deployment
+
+`render.yaml` at the repo root can deploy both pieces on Render:
+
+- `polymarket-orderflow-api` — Node API service.
+- `polymarket-orderflow-web` — static Vite web site.
+
+Set the static site's `VITE_API_BASE` to the Render API service URL after the API is created, for example
+`https://polymarket-orderflow-api.onrender.com`.
+
+`vercel.json` can deploy the static web client on Vercel. Vercel still needs `VITE_API_BASE` pointed at a hosted API
+(Render is the better fit for the API because this server uses a long-running Node process and WebSockets).
+
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
 Currently, two official plugins are available:
