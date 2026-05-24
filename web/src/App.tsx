@@ -2294,7 +2294,7 @@ function App() {
         </header>
 
         <div className="mt-8 flex flex-col gap-5 xl:grid xl:grid-cols-12 xl:items-start xl:gap-6">
-          <div className="rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-5 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm xl:col-span-3">
+          <div className="order-2 rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-5 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm xl:order-none xl:col-span-3">
             <div className="mb-4 flex flex-col gap-2">
               <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Open market</div>
               <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-amber-200/70">Polymarket · prediction</div>
@@ -2449,7 +2449,7 @@ function App() {
             </div>
           </div>
 
-          <div className="min-w-0 max-w-full rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-4 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm sm:p-5 xl:col-span-7">
+          <div className="order-1 min-w-0 max-w-full rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-4 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm sm:p-5 xl:order-none xl:col-span-7">
             <div className="flex flex-wrap items-center gap-2 border-b border-zinc-800/40 pb-3">
               <div className="text-[15px] font-semibold text-zinc-100">{mainTabTitle(mainTab)}</div>
               <div className="truncate rounded-md bg-zinc-900/50 px-2 py-0.5 font-mono text-xs text-zinc-400">{selectedSlug || '—'}</div>
@@ -2993,7 +2993,7 @@ function App() {
             ) : null}
           </div>
 
-          <div className="xl:col-span-2">
+          <div className="order-3 xl:order-none xl:col-span-2">
             <div className="rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-5 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm">
               <div className="text-[15px] font-semibold text-zinc-100">Quick actions</div>
               <div className="mt-2 text-xs leading-relaxed text-zinc-500">
