@@ -18,6 +18,9 @@ export default defineConfig(({ mode }) => {
     plugins: [react()],
     server: {
       port: 5173,
+      // Cursor / cloud preview URLs use dynamic hostnames. Allow them in dev so
+      // forwarded links load on phones and external browsers.
+      allowedHosts: true,
       // If 5173 is taken (another tab, old Vite, another app), use the next free port instead of exiting.
       strictPort: false,
       // Web calls `/api/*` on the Vite origin; this forwards to the local API. Start API with `npm run dev -w api` or root `npm run dev`.
