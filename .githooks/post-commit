@@ -1,0 +1,9 @@
+#!/bin/sh
+# Auto-push to origin after every local commit (CLI, agent, or IDE).
+branch=$(git symbolic-ref --short HEAD 2>/dev/null) || exit 0
+
+if git rev-parse --verify "@{u}" >/dev/null 2>&1; then
+  git push origin "$branch"
+else
+  git push -u origin "$branch"
+fi

@@ -249,7 +249,20 @@ function mergeSpotHistory(
     out.push(p);
     lastT = p.t;
   }
-  return out.slice(-900);
+  const trimmed = out.slice(-900);
+  if (trimmed.length === prev.length) {
+    let same = true;
+    for (let i = 0; i < trimmed.length; i++) {
+      const a = trimmed[i]!;
+      const b = prev[i]!;
+      if (a.t !== b.t || a.v !== b.v) {
+        same = false;
+        break;
+      }
+    }
+    if (same) return prev;
+  }
+  return trimmed;
 }
 
 function isShortcutAsset(asset: string): asset is UpdownShortcutAsset {
@@ -652,6 +665,8 @@ function App() {
   const loadBooksRef = useRef<
     (ids: string[], opts?: { updateSeries?: boolean; updateFlow?: boolean }) => Promise<void>
   >(async () => {});
+  const booksRef = useRef<ClobBookEntry[] | null>(null);
+  const lastBooksBootstrapMsRef = useRef(0);
 
   const [globalTradeLane, setGlobalTradeLane] = useState<'up' | 'down'>('up');
   /** Operator picked UP/DOWN on the trade panel — block card lane sync until Take signal or lock expires. */
@@ -1079,6 +1094,10 @@ function App() {
     };
   };
 
+  useEffect(() => {
+    booksRef.current = books;
+  }, [books]);
+
   const loadBooks = useCallback(async (ids: string[], opts?: { updateSeries?: boolean; updateFlow?: boolean }) => {
     if (ids.length === 0) {
       setBooks(null);
@@ -1087,25 +1106,30 @@ function App() {
     }
     const syncGen = marketSyncGenRef.current;
     const reqKey = `${selectedSlugRef.current}:${ids.join(',')}`;
-    setBooksLoading(true);
-    setError(null);
+    const hadLiveBooks = (booksRef.current ?? []).some((e) => !e.error && e.book != null);
+    if (!hadLiveBooks) setBooksLoading(true);
+    if (!hadLiveBooks) setError(null);
     try {
       const res = await clobBooks(ids);
       if (syncGen !== marketSyncGenRef.current) return;
       if (`${selectedSlugRef.current}:${ids.join(',')}` !== reqKey) return;
       if (isOk(res)) {
-        setBooks(res.data);
+        const rows = res.data ?? [];
+        const anyBook = rows.some((e) => !e.error && e.book != null);
         const ts = Date.now();
-        setBooksFetchedAt(ts);
+        if (anyBook || !hadLiveBooks) {
+          setBooks(rows);
+          setBooksFetchedAt(ts);
+        }
         const updateSeries = opts?.updateSeries === true;
         const updateFlow = opts?.updateFlow === true;
-        if (updateSeries) {
+        if (updateSeries && (anyBook || !hadLiveBooks)) {
           const slug = selectedSlugRef.current.trim();
           setChartSeriesBySlug((m) => {
             if (!slug) return m;
             const existingForSlug = m[slug] ?? {};
             const nextForSlug: Record<string, SeriesPoint[]> = { ...existingForSlug };
-            for (const e of res.data) {
+            for (const e of rows) {
               const token = e.token;
               const v = e.error ? null : midPrice(e.book);
               const prev = nextForSlug[token] ?? [];
@@ -1114,13 +1138,13 @@ function App() {
             return { ...m, [slug]: nextForSlug };
           });
         }
-        if (updateFlow) {
+        if (updateFlow && (anyBook || !hadLiveBooks)) {
           const slug = selectedSlugRef.current.trim();
           setFlowSeriesBySlug((m) => {
             if (!slug) return m;
             const existingForSlug = m[slug] ?? {};
             const nextForSlug: Record<string, BookSnapshot[]> = { ...existingForSlug };
-            for (const e of res.data) {
+            for (const e of rows) {
               const token = e.token;
               const key = `${slug}:${token}`;
               const prevMaps = prevDepthMapsRef.current[key] ?? null;
@@ -1133,7 +1157,13 @@ function App() {
             return { ...m, [slug]: nextForSlug };
           });
         }
-      } else setError(pretty(res));
+      } else if (!hadLiveBooks) {
+        setError(
+          res.error === 'fetch_failed'
+            ? 'Order book API timed out — CLOB may be slow. WebSocket books still update when connected; retry or hard-refresh.'
+            : pretty(res),
+        );
+      }
     } finally {
       if (syncGen === marketSyncGenRef.current && `${selectedSlugRef.current}:${ids.join(',')}` === reqKey) {
         setBooksLoading(false);
@@ -1268,6 +1298,9 @@ function App() {
     };
 
     const bootstrapBooks = () => {
+      const now = Date.now();
+      if (now - lastBooksBootstrapMsRef.current < 10_000) return;
+      lastBooksBootstrapMsRef.current = now;
       void loadBooks(ids, { updateSeries: wantSeriesRef.current, updateFlow: wantFlowRef.current });
     };
 
@@ -1387,19 +1420,22 @@ function App() {
     const run = () => {
       if (stopped) return;
       if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      if (booksWsStatus === 'open' && booksFetchedAt != null && Date.now() - booksFetchedAt < 22_000) {
+        return;
+      }
       const wantSeries = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals';
       const wantFlow = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals';
       void loadBooks(tokenIds, { updateSeries: wantSeries, updateFlow: wantFlow });
     };
 
-    const intervalMs = mainTab === 'book' ? 5_000 : mainTab === 'signals' ? 4_000 : 6_500;
+    const intervalMs = mainTab === 'book' ? 5_000 : mainTab === 'signals' ? 8_000 : 6_500;
     void run();
     const id = window.setInterval(() => void run(), intervalMs);
     return () => {
       stopped = true;
       window.clearInterval(id);
     };
-  }, [chartEnabled, loadBooks, mainTab, selectedSlug, tokenIds, binanceSpotActive]);
+  }, [booksFetchedAt, booksWsStatus, chartEnabled, loadBooks, mainTab, selectedSlug, tokenIds, binanceSpotActive]);
 
   /** If CLOB WS goes quiet, REST + reconnect so implied mids do not sit "stale" for minutes. */
   useEffect(() => {
@@ -1703,6 +1739,8 @@ function App() {
         let okAny = false;
         let firstErr: string | null = null;
         let activeReceivedAt: number | null = null;
+        let anySeriesChanged = false;
+        let activeSeriesChanged = false;
         for (let i = 0; i < SYMS.length; i++) {
           const sym = SYMS[i]!;
           const res = results[i]!;
@@ -1711,9 +1749,14 @@ function App() {
             continue;
           }
           okAny = true;
-          next[sym] = mergeSpotHistory(base[sym] ?? [], res.data);
+          const merged = mergeSpotHistory(base[sym] ?? [], res.data);
+          next[sym] = merged;
+          if (merged !== (base[sym] ?? [])) {
+            anySeriesChanged = true;
+            if (sym === selectedSym) activeSeriesChanged = true;
+          }
         }
-        setSpotBySymbol(next);
+        if (anySeriesChanged) setSpotBySymbol(next);
         setRtdsError(okAny ? null : firstErr);
         const sym = symFromSlug(selectedSlug);
         const pollAt = Date.now();
@@ -1725,7 +1768,9 @@ function App() {
               if (Number.isFinite(res.data.receivedAt) && res.data.receivedAt > 0) {
                 activeReceivedAt = res.data.receivedAt;
               }
-              queueMicrotask(() => setRtdsLastPollMs(pollAt));
+              queueMicrotask(() =>
+                setRtdsLastPollMs((prev) => (activeSeriesChanged || prev == null || pollAt - prev >= 5_000 ? pollAt : prev)),
+              );
             }
             break;
           }
@@ -1754,13 +1799,21 @@ function App() {
           break;
         }
         queueMicrotask(() => {
-          setSpotSeriesBySlug((m) => ({ ...m, [selectedSlug]: series }));
-          if (spotSrc != null) setRtdsSpotFeedSource(spotSrc);
-          if (activeReceivedAt != null) setRtdsReceivedAt(activeReceivedAt);
+          setSpotSeriesBySlug((m) => {
+            if (m[selectedSlug] === series) return m;
+            return { ...m, [selectedSlug]: series };
+          });
+          if (spotSrc != null) setRtdsSpotFeedSource((prev) => (prev === spotSrc ? prev : spotSrc));
+          if (activeReceivedAt != null) {
+            setRtdsReceivedAt((prev) =>
+              activeSeriesChanged || prev == null || activeReceivedAt - prev >= 5_000 ? activeReceivedAt : prev,
+            );
+          }
           if (series.length > 0) {
             const last = series[series.length - 1]!;
-            setRtdsSpot(last.v);
-            setRtdsTickAt(normalizeEpochMs(last.t) ?? last.t);
+            const lastTs = normalizeEpochMs(last.t) ?? last.t;
+            setRtdsSpot((prev) => (prev === last.v ? prev : last.v));
+            setRtdsTickAt((prev) => (prev === lastTs ? prev : lastTs));
           }
         });
       } finally {
@@ -2403,9 +2456,14 @@ function App() {
             <div className="flex flex-wrap items-center gap-2 border-b border-zinc-800/40 pb-3">
               <div className="text-[15px] font-semibold text-zinc-100">{mainTabTitle(mainTab)}</div>
               <div className="truncate rounded-md bg-zinc-900/50 px-2 py-0.5 font-mono text-xs text-zinc-400">{selectedSlug || '—'}</div>
-              {booksLoading ? (
-                <div className="rounded-full bg-indigo-500/15 px-2.5 py-0.5 text-xs font-medium text-indigo-200/90">Loading…</div>
-              ) : null}
+              <div
+                className={`rounded-full px-2.5 py-0.5 text-xs font-medium transition-opacity ${
+                  booksLoading ? 'bg-indigo-500/15 text-indigo-200/90 opacity-100' : 'pointer-events-none opacity-0'
+                }`}
+                aria-hidden={!booksLoading}
+              >
+                Loading…
+              </div>
 
               <div className="ml-auto flex items-center gap-2">
                 <button
@@ -2467,98 +2525,102 @@ function App() {
               </div>
             ) : null}
 
-            {isMarketClosed(marketJson) ? (
-              <div className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-800/25 bg-amber-950/15 px-3 py-2 text-xs text-amber-100/85">
-                <div className="leading-relaxed">
-                  {updownParsed ? (
-                    <>
-                      This {updownParsed.interval} window market looks <span className="font-medium text-amber-100">closed</span>, and CLOB books may not exist.
-                      Tap the shortcut again to load the newest window.
-                    </>
-                  ) : (
-                    <>
-                      This market looks <span className="font-medium text-amber-100">closed</span>, and CLOB books may not exist.
-                      Try opening a different slug or search.
-                    </>
-                  )}
-                </div>
-                {(updownParsed && isShortcutAsset(updownParsed.asset)) || lastShortcut ? (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      void openUpdownShortcut(
-                        (updownParsed && isShortcutAsset(updownParsed.asset) ? updownParsed.asset : lastShortcut!.asset) as UpdownShortcutAsset,
-                        (updownParsed?.interval ?? lastShortcut!.interval) as UpdownInterval,
-                      )
-                    }
-                    className="rounded-lg border border-amber-700/40 bg-amber-950/30 px-3 py-2 text-xs font-semibold text-amber-100 hover:bg-amber-950/50"
-                  >
-                    Refresh {(updownParsed?.asset ?? lastShortcut!.asset).toUpperCase()} {updownParsed?.interval ?? lastShortcut!.interval}
-                  </button>
+            {updownParsed || isMarketClosed(marketJson) ? (
+              <div className="mt-4 min-h-[4.5rem]">
+                {isMarketClosed(marketJson) ? (
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-800/25 bg-amber-950/15 px-3 py-2 text-xs text-amber-100/85">
+                    <div className="leading-relaxed">
+                      {updownParsed ? (
+                        <>
+                          This {updownParsed.interval} window market looks <span className="font-medium text-amber-100">closed</span>, and CLOB books may not exist.
+                          Tap the shortcut again to load the newest window.
+                        </>
+                      ) : (
+                        <>
+                          This market looks <span className="font-medium text-amber-100">closed</span>, and CLOB books may not exist.
+                          Try opening a different slug or search.
+                        </>
+                      )}
+                    </div>
+                    {(updownParsed && isShortcutAsset(updownParsed.asset)) || lastShortcut ? (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void openUpdownShortcut(
+                            (updownParsed && isShortcutAsset(updownParsed.asset) ? updownParsed.asset : lastShortcut!.asset) as UpdownShortcutAsset,
+                            (updownParsed?.interval ?? lastShortcut!.interval) as UpdownInterval,
+                          )
+                        }
+                        className="rounded-lg border border-amber-700/40 bg-amber-950/30 px-3 py-2 text-xs font-semibold text-amber-100 hover:bg-amber-950/50"
+                      >
+                        Refresh {(updownParsed?.asset ?? lastShortcut!.asset).toUpperCase()} {updownParsed?.interval ?? lastShortcut!.interval}
+                      </button>
+                    ) : null}
+                  </div>
+                ) : updownBehindBySec != null && updownParsed != null && updownBehindBySec >= updownParsed.stepSec ? (
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-800/25 bg-amber-950/15 px-3 py-2 text-xs text-amber-100/85">
+                    <div className="leading-relaxed">
+                      You’re viewing an older {updownParsed.interval} window (behind by <span className="font-mono">{Math.round(updownBehindBySec / 60)}m</span>).
+                      Jump to the live window.
+                    </div>
+                    <div className="flex gap-2">
+                      {nextUpdownSlug(selectedSlug, -1) ? (
+                        <button
+                          type="button"
+                          onClick={() => void loadMarket(nextUpdownSlug(selectedSlug, -1)!)}
+                          className="rounded-lg border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
+                        >
+                          Prev
+                        </button>
+                      ) : null}
+                      {updownParsed && isShortcutAsset(updownParsed.asset) ? (
+                        <button
+                          type="button"
+                          onClick={() => void openUpdownShortcut(updownParsed.asset as UpdownShortcutAsset, updownParsed.interval)}
+                          className="rounded-lg border border-amber-700/40 bg-amber-950/30 px-3 py-2 text-xs font-semibold text-amber-100 hover:bg-amber-950/50"
+                        >
+                          Jump to live
+                        </button>
+                      ) : null}
+                      {nextUpdownSlug(selectedSlug, 1) ? (
+                        <button
+                          type="button"
+                          onClick={() => void loadMarket(nextUpdownSlug(selectedSlug, 1)!)}
+                          className="rounded-lg border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
+                        >
+                          +{updownParsed.stepSec}s
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : marketEndsInMs != null && marketEndsInMs < -5_000 ? (
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-800/25 bg-amber-950/15 px-3 py-2 text-xs text-amber-100/85">
+                    <div className="leading-relaxed">
+                      This window likely ended already. Load the next{' '}
+                      <span className="font-mono">+{updownParsed?.stepSec ?? 300}s</span> market for the live book.
+                    </div>
+                    <div className="flex gap-2">
+                      {nextUpdownSlug(selectedSlug, -1) ? (
+                        <button
+                          type="button"
+                          onClick={() => void loadMarket(nextUpdownSlug(selectedSlug, -1)!)}
+                          className="rounded-lg border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
+                        >
+                          Prev
+                        </button>
+                      ) : null}
+                      {nextUpdownSlug(selectedSlug, 1) ? (
+                        <button
+                          type="button"
+                          onClick={() => void loadMarket(nextUpdownSlug(selectedSlug, 1)!)}
+                          className="rounded-lg border border-amber-700/40 bg-amber-950/30 px-3 py-2 text-xs font-semibold text-amber-100 hover:bg-amber-950/50"
+                        >
+                          Next
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
                 ) : null}
-              </div>
-            ) : updownBehindBySec != null && updownParsed != null && updownBehindBySec >= updownParsed.stepSec ? (
-              <div className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-800/25 bg-amber-950/15 px-3 py-2 text-xs text-amber-100/85">
-                <div className="leading-relaxed">
-                  You’re viewing an older {updownParsed.interval} window (behind by <span className="font-mono">{Math.round(updownBehindBySec / 60)}m</span>).
-                  Jump to the live window.
-                </div>
-                <div className="flex gap-2">
-                  {nextUpdownSlug(selectedSlug, -1) ? (
-                    <button
-                      type="button"
-                      onClick={() => void loadMarket(nextUpdownSlug(selectedSlug, -1)!)}
-                      className="rounded-lg border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
-                    >
-                      Prev
-                    </button>
-                  ) : null}
-                  {updownParsed && isShortcutAsset(updownParsed.asset) ? (
-                    <button
-                      type="button"
-                      onClick={() => void openUpdownShortcut(updownParsed.asset as UpdownShortcutAsset, updownParsed.interval)}
-                      className="rounded-lg border border-amber-700/40 bg-amber-950/30 px-3 py-2 text-xs font-semibold text-amber-100 hover:bg-amber-950/50"
-                    >
-                      Jump to live
-                    </button>
-                  ) : null}
-                  {nextUpdownSlug(selectedSlug, 1) ? (
-                    <button
-                      type="button"
-                      onClick={() => void loadMarket(nextUpdownSlug(selectedSlug, 1)!)}
-                      className="rounded-lg border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
-                    >
-                      +{updownParsed.stepSec}s
-                    </button>
-                  ) : null}
-                </div>
-              </div>
-            ) : marketEndsInMs != null && marketEndsInMs < -5_000 ? (
-              <div className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-800/25 bg-amber-950/15 px-3 py-2 text-xs text-amber-100/85">
-                <div className="leading-relaxed">
-                  This window likely ended already. Load the next{' '}
-                  <span className="font-mono">+{updownParsed?.stepSec ?? 300}s</span> market for the live book.
-                </div>
-                <div className="flex gap-2">
-                  {nextUpdownSlug(selectedSlug, -1) ? (
-                    <button
-                      type="button"
-                      onClick={() => void loadMarket(nextUpdownSlug(selectedSlug, -1)!)}
-                      className="rounded-lg border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
-                    >
-                      Prev
-                    </button>
-                  ) : null}
-                  {nextUpdownSlug(selectedSlug, 1) ? (
-                    <button
-                      type="button"
-                      onClick={() => void loadMarket(nextUpdownSlug(selectedSlug, 1)!)}
-                      className="rounded-lg border border-amber-700/40 bg-amber-950/30 px-3 py-2 text-xs font-semibold text-amber-100 hover:bg-amber-950/50"
-                    >
-                      Next
-                    </button>
-                  ) : null}
-                </div>
               </div>
             ) : null}
 
@@ -2630,7 +2692,8 @@ function App() {
             mainTab !== 'tradehistory' &&
             mainTab !== 'btc' &&
             mainTab !== 'tvbtc' &&
-            mainTab !== 'perps' ? (
+            mainTab !== 'perps' &&
+            mainTab !== 'signals' ? (
               <div className="mt-4 text-sm leading-relaxed text-zinc-500">Select a market to load token ids and ladders.</div>
             ) : null}
 
@@ -2784,10 +2847,6 @@ function App() {
                       Tap a <span className="font-medium text-amber-50">BTC / ETH / SOL / HYPE</span> shortcut on the left (5m is fastest), or paste a slug, then stay on this tab.
                     </p>
                   </div>
-                ) : booksLoading && !books ? (
-                  <div className="mb-4 rounded-2xl border border-zinc-800/60 bg-zinc-950/40 px-4 py-6 text-center text-sm text-zinc-400">
-                    Loading order books for signals…
-                  </div>
                 ) : null}
                 {error && selectedSlug.trim() && !marketJson ? (
                   <div className="mb-4 rounded-2xl border border-amber-800/40 bg-amber-950/20 px-4 py-4 text-sm leading-relaxed text-amber-100/90">
@@ -2807,34 +2866,6 @@ function App() {
                       className="mt-3 rounded-xl border border-amber-600/50 bg-amber-950/40 px-4 py-2 text-xs font-semibold text-amber-50 hover:bg-amber-950/55"
                     >
                       Retry load
-                    </button>
-                  </div>
-                ) : null}
-                {selectedSlug.trim() && ssrPriceToBeat == null && ptbError ? (
-                  <div className="mb-4 rounded-2xl border border-amber-800/40 bg-amber-950/20 px-4 py-4 text-sm leading-relaxed text-amber-100/90">
-                    <p className="font-semibold text-amber-50">Price-to-beat (PTB) not loaded yet</p>
-                    <p className="mt-2 text-amber-100/75">
-                      The yellow PTB line and spot-vs-bell signals need SSR or Chainlink bucket price from the API.
-                      Retrying every few seconds — chart may show a placeholder scale until PTB arrives.
-                    </p>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const slug = selectedSlug.trim();
-                        if (!slug) return;
-                        void priceToBeat(slug).then((ptb) => {
-                          if (!isOk(ptb)) {
-                            setPtbError(pretty(ptb));
-                            return;
-                          }
-                          setSsrPriceToBeat(ptb.data.price_to_beat);
-                          setSsrPtbSource(ptb.data.source);
-                          setPtbError(null);
-                        });
-                      }}
-                      className="mt-3 rounded-xl border border-amber-600/50 bg-amber-950/40 px-4 py-2 text-xs font-semibold text-amber-50 hover:bg-amber-950/55"
-                    >
-                      Retry PTB
                     </button>
                   </div>
                 ) : null}

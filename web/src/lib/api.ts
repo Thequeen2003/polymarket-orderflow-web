@@ -464,10 +464,8 @@ export type ClobBookEntry = { token: string; book: unknown; error: string | null
 
 export function clobBooks(tokenIds: string[]) {
   const q = tokenIds.join(',');
-  return getJsonWithRetry<ClobBookEntry[]>(`/api/clob/books?tokens=${encodeURIComponent(q)}`, {
-    timeoutMs: 24_000,
-    retries: 1,
-    retryDelayMs: 600,
+  return getJson<ClobBookEntry[]>(`/api/clob/books?tokens=${encodeURIComponent(q)}`, {
+    timeoutMs: 12_000,
   });
 }
 

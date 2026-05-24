@@ -177,8 +177,11 @@ async function resolveMarketBySlug(slug: string): Promise<unknown> {
 }
 
 const CLOB_BOOK_HTTP_MS = 10_000;
+const CLOB_BOOK_HTTP_FAST_MS = 3_500;
 const CLOB_BOOK_CLI_MS = 2_500;
 const CLOB_BOOK_CACHE_TTL_MS = 2_500;
+/** Bulk `/api/clob/books` may serve slightly stale snapshots so Signals is not blocked by CLOB blips. */
+const CLOB_BOOK_STALE_MS = 45_000;
 type ClobBookCacheEntry = { token: string; book: unknown; error: string | null };
 const clobBookCache = new Map<string, { at: number; entry: ClobBookCacheEntry }>();
 const clobBookInflight = new Map<string, Promise<ClobBookCacheEntry>>();
@@ -218,6 +221,39 @@ async function fetchClobBookEntry(token: string): Promise<ClobBookCacheEntry> {
     }
   })();
   clobBookInflight.set(token, pending);
+  return pending;
+}
+
+/** Signals bulk route — HTTP only, short timeout, stale cache; never chain into Bullpen CLI. */
+async function fetchClobBookEntryFast(token: string): Promise<ClobBookCacheEntry> {
+  const cached = clobBookCache.get(token);
+  if (cached && Date.now() - cached.at < CLOB_BOOK_STALE_MS) return cached.entry;
+  const inFlight = clobBookInflight.get(`fast:${token}`);
+  if (inFlight) return inFlight;
+
+  const pending = (async (): Promise<ClobBookCacheEntry> => {
+    try {
+      const entry: ClobBookCacheEntry = {
+        token,
+        book: await clobBookHttp(token, { timeoutMs: CLOB_BOOK_HTTP_FAST_MS }),
+        error: null,
+      };
+      clobBookCache.set(token, { at: Date.now(), entry });
+      return entry;
+    } catch (httpErr) {
+      if (cached) return cached.entry;
+      const entry: ClobBookCacheEntry = {
+        token,
+        book: null,
+        error: String(httpErr instanceof Error ? httpErr.message : httpErr).slice(0, 240),
+      };
+      clobBookCache.set(token, { at: Date.now(), entry });
+      return entry;
+    } finally {
+      clobBookInflight.delete(`fast:${token}`);
+    }
+  })();
+  clobBookInflight.set(`fast:${token}`, pending);
   return pending;
 }
 
@@ -1642,8 +1678,8 @@ app.get('/api/clob/books', async (req, res) => {
   const tokens = raw.split(',').map((t) => t.trim()).filter(Boolean).slice(0, 4);
   if (tokens.length === 0) return json(res, 400, { ok: false, error: 'missing_tokens' });
 
-  // Browser-side `/api/clob/books` aborts at 24s; return a soft timeout sooner so Signals can degrade gracefully.
-  const routeDeadlineMs = 15_000;
+  // Browser-side `/api/clob/books` aborts at 12s; respond before that with cache or per-token errors.
+  const routeDeadlineMs = 7_500;
   const books = await new Promise<ClobBookCacheEntry[]>((resolve) => {
     const timer = setTimeout(() => {
       resolve(
@@ -1654,7 +1690,7 @@ app.get('/api/clob/books', async (req, res) => {
         }),
       );
     }, routeDeadlineMs);
-    void Promise.all(tokens.map((token) => fetchClobBookEntry(token)))
+    void Promise.all(tokens.map((token) => fetchClobBookEntryFast(token)))
       .then((rows) => {
         clearTimeout(timer);
         resolve(rows);
