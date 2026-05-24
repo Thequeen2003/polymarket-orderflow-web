@@ -500,26 +500,26 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
   const chartPanelWrapSk =
     chartAreaRoomy
       ? signalsEmbed
-        ? 'flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-visible px-2 pt-1 sm:px-3 sm:pt-2'
+        ? 'min-h-0 overflow-x-hidden overflow-y-visible px-2 pt-1 sm:px-3 sm:pt-2'
         : 'min-h-0 flex-1 overflow-x-hidden overflow-y-visible px-3 pt-2 sm:px-4'
       : 'min-h-0 flex-1 overflow-hidden px-3 pt-2 sm:px-4';
   const chartPanelWrapMain =
     chartAreaRoomy
       ? signalsEmbed
-        ? 'flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-visible px-2 pt-1 sm:px-3 sm:pt-2'
+        ? 'min-h-0 overflow-x-hidden overflow-y-visible px-2 pt-1 sm:px-3 sm:pt-2'
         : 'min-h-0 flex-1 overflow-x-hidden overflow-y-visible px-3 pt-2 sm:px-4'
       : 'min-h-0 flex-1 overflow-hidden px-3 pt-2 sm:px-4 [contain:paint]';
   /** Dual PTB only — tall plot + high cap so the PTB chart reads at “dashboard” scale, not a card thumbnail. */
   const chartSvgSk =
     chartAreaRoomy
       ? signalsEmbed
-        ? 'block h-full min-h-[min(68svh,1500px)] w-full max-w-none flex-1 rounded-[24px] bg-[#0a0f16] [contain:paint] xl:min-h-[min(74svh,1700px)]'
+        ? 'block h-auto min-h-[min(56svh,760px)] w-full max-w-none rounded-[24px] bg-[#0a0f16] [contain:paint] xl:min-h-[min(62svh,920px)]'
         : 'block h-full min-h-[min(78vh,940px)] max-h-[min(100dvh,1720px)] w-full rounded-[24px] bg-[#0a0f16] [contain:paint] xl:min-h-[min(82vh,1020px)] xl:max-h-[min(100dvh,1800px)]'
       : 'block h-full min-h-[min(54vh,620px)] max-h-[min(88vh,960px)] w-full rounded-[24px] bg-[#0a0f16] [contain:paint]';
   const chartSvgMain =
     chartAreaRoomy
       ? signalsEmbed
-        ? 'block h-full min-h-[min(68svh,1500px)] w-full max-w-none flex-1 rounded-[24px] bg-[#0a0f16] xl:min-h-[min(74svh,1700px)] [contain:strict]'
+        ? 'block h-auto min-h-[min(56svh,760px)] w-full max-w-none rounded-[24px] bg-[#0a0f16] xl:min-h-[min(62svh,920px)] [contain:strict]'
         : 'block h-full min-h-[min(78vh,940px)] max-h-[min(100dvh,1720px)] w-full rounded-[24px] bg-[#0a0f16] xl:min-h-[min(82vh,1020px)] xl:max-h-[min(100dvh,1800px)]'
       : 'block h-full min-h-[min(54vh,620px)] max-h-[min(88vh,960px)] w-full rounded-[24px] bg-[#0a0f16] [contain:strict]';
   const gradId = useId().replace(/:/g, '');
@@ -592,6 +592,9 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
     if (!bracketOverlay || !u || !d) return false;
     return bracketOverlay.upToken?.trim() === u && bracketOverlay.downToken?.trim() === d;
   }, [bracketOverlay, upOutcomeToken, downOutcomeToken]);
+  const reserveBracketStrip = signalsEmbed
+    ? Boolean(upOutcomeToken?.trim()) && Boolean(downOutcomeToken?.trim())
+    : overlayAppliesSpot && bracketOverlay != null;
 
   const chartInnerW = W - PAD_L - PAD_R;
 
@@ -682,6 +685,10 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
       : lastUpdateMs ?? spotLastPointMs;
   const staleAfterMs = signalsEmbed ? 90_000 : 55_000;
   const stale = feedLastMs == null ? pts.length < 2 : Date.now() - feedLastMs > staleAfterMs;
+  const plotBoundsRef = useRef<{ min: number; max: number } | null>(null);
+  useEffect(() => {
+    plotBoundsRef.current = null;
+  }, [slug, zoomWindow, priceToBeat]);
 
   const model = useMemo(() => {
     if (priceToBeat == null || !Number.isFinite(priceToBeat) || pts.length < 2) return null;
@@ -707,8 +714,30 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
     const needAbove = Math.max(0, spotMax - priceToBeat);
     const needBelow = Math.max(0, priceToBeat - spotMin);
     const halfSpan = Math.max(needAbove, needBelow, Math.abs(priceToBeat) * 3e-5, 1);
-    const plotMin = priceToBeat - halfSpan * 1.08;
-    const plotMax = priceToBeat + halfSpan * 1.08;
+    const rawPlotMin = priceToBeat - halfSpan * 1.08;
+    const rawPlotMax = priceToBeat + halfSpan * 1.08;
+    let plotMin = rawPlotMin;
+    let plotMax = rawPlotMax;
+    if (signalsEmbed) {
+      const rawSpan = rawPlotMax - rawPlotMin;
+      const prev = plotBoundsRef.current;
+      if (!prev || !(prev.max > prev.min) || !Number.isFinite(rawSpan)) {
+        plotBoundsRef.current = { min: rawPlotMin, max: rawPlotMax };
+      } else {
+        let nextMin = prev.min;
+        let nextMax = prev.max;
+        const edgePad = rawSpan * 0.12;
+        if (rawPlotMin < prev.min + edgePad) nextMin = Math.min(prev.min, rawPlotMin);
+        if (rawPlotMax > prev.max - edgePad) nextMax = Math.max(prev.max, rawPlotMax);
+        if (prev.max - prev.min > rawSpan * 1.8) {
+          nextMin = prev.min * 0.9 + rawPlotMin * 0.1;
+          nextMax = prev.max * 0.9 + rawPlotMax * 0.1;
+        }
+        plotBoundsRef.current = { min: nextMin, max: nextMax };
+      }
+      plotMin = plotBoundsRef.current.min;
+      plotMax = plotBoundsRef.current.max;
+    }
     if (!(plotMax > plotMin)) return null;
     const band = ptbTouchEpsilonUsd(pts, priceToBeat);
     if (!Number.isFinite(band)) return null;
@@ -731,9 +760,9 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
       plotMin, plotMax, band, maxAbs, status, conviction, hint,
       tMin: pts[0]!.t, tMax: pts[pts.length - 1]!.t,
     };
-  }, [mode, priceToBeat, pts, upLabel, downLabel]);
+  }, [mode, priceToBeat, pts, upLabel, downLabel, signalsEmbed]);
 
-  const svgHeight = H + (model != null && overlayAppliesSpot ? PROB_STRIP_GAP + PROB_STRIP_H + 12 : 0);
+  const svgHeight = H + (reserveBracketStrip ? PROB_STRIP_GAP + PROB_STRIP_H + 12 : 0);
 
   const derivedStrip = useMemo(() => {
     if (!model || priceToBeat == null || !Number.isFinite(priceToBeat)) return null;
@@ -2199,7 +2228,9 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             : 'No underlying spot feed wired for this slug yet — only the PTB line will draw.'
           : 'Waiting for a second tick to draw candles…';
     return (
-      <div className="flex min-h-0 flex-col rounded-[30px] border border-zinc-800/90 bg-[#0b1018] shadow-[0_28px_80px_rgba(0,0,0,0.35)] ring-1 ring-zinc-700/40">
+      <div
+        className="flex min-h-0 flex-col rounded-[30px] border border-zinc-800/90 bg-[#0b1018] shadow-[0_28px_80px_rgba(0,0,0,0.35)] ring-1 ring-zinc-700/40"
+      >
         <header className="shrink-0 border-b border-zinc-800/80 px-4 py-3 sm:px-5">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="min-w-0">
@@ -2214,6 +2245,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
                 </span>
               </div>
               <p className="mt-2 max-w-xl text-sm text-zinc-400">{skeletonMsg}</p>
+              {signalsEmbed ? <div className="mt-2 min-h-[3.25rem] border-t border-zinc-800/50 pt-2" /> : null}
             </div>
             <div className="flex flex-wrap items-center gap-2">
               {endsInMs != null ? (
@@ -2524,12 +2556,12 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
 
   return (
     <div
-      className={`flex min-h-0 flex-col rounded-[30px] border border-zinc-800/90 bg-[#0b1018] shadow-[0_28px_80px_rgba(0,0,0,0.35)] ring-1 ring-zinc-700/40 ${signalsEmbed ? 'min-h-[min(94dvh,2000px)]' : ''}`}
+      className="flex min-h-0 flex-col rounded-[30px] border border-zinc-800/90 bg-[#0b1018] shadow-[0_28px_80px_rgba(0,0,0,0.35)] ring-1 ring-zinc-700/40"
     >
       <div
         className={
           signalsEmbed
-            ? 'flex min-h-0 w-full min-w-0 flex-1 flex-col'
+            ? 'flex min-h-0 w-full min-w-0 flex-col'
             : 'flex w-full min-h-0 min-w-0 flex-col'
         }
       >
@@ -2609,12 +2641,13 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             </div>
           </div>
         </div>
-        {(fmtSourceChip(ptbSource) != null ||
-          fmtSourceChip(spotFeedSource) != null ||
-          tickMeta.n >= 2 ||
-          (lastProbUp != null && Number.isFinite(lastProbUp)) ||
-          (lastProbDown != null && Number.isFinite(lastProbDown))) ? (
-          <div className="mt-2 flex flex-col gap-1.5 border-t border-zinc-800/50 pt-2">
+        <div className="mt-2 flex min-h-[3.25rem] flex-col gap-1.5 border-t border-zinc-800/50 pt-2">
+          {(fmtSourceChip(ptbSource) != null ||
+            fmtSourceChip(spotFeedSource) != null ||
+            tickMeta.n >= 2 ||
+            (lastProbUp != null && Number.isFinite(lastProbUp)) ||
+            (lastProbDown != null && Number.isFinite(lastProbDown))) ? (
+            <>
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] leading-snug text-zinc-500">
               {fmtSourceChip(ptbSource) != null ? (
                 <span title="How the venue PTB was resolved for this slug">
@@ -2660,8 +2693,11 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
               </div>
             ) : null}
             <p className="text-[9px] text-zinc-600">Hover the chart plot for time, interpolated spot, and % vs PTB.</p>
-          </div>
-        ) : null}
+            </>
+          ) : null}
+        </div>
+        {!signalsEmbed ? (
+        <>
         <div className="mt-3 flex w-full min-w-0 flex-col gap-2 sm:flex-row sm:items-stretch sm:gap-3">
           <div
             className={`min-w-0 flex-1 rounded-xl border-2 px-3 py-2.5 shadow-md shadow-black/30 ${positionVsPtbLabel.className}`}
@@ -2786,9 +2822,11 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             </li>
           </ul>
         </details>
+        </>
+        ) : null}
       </header>
 
-      {switchForecast ? (
+      {switchForecast && !signalsEmbed ? (
         <div className="mx-3 mt-2 sm:mx-4">
           {featureFlags.pinnedNote ? <RoundNote slug={slug} visible={pinnedNoteVisible} /> : null}
           <SignalTruthStrip
@@ -3658,6 +3696,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
       </div>
       </div>
 
+      {!signalsEmbed ? (
       <section
         className={`shrink-0 border-t-2 bg-zinc-950/85 px-4 py-4 text-zinc-100 sm:px-5 ${statusBarBorder}`}
         title={derivedStrip?.controlBlurb ?? undefined}
@@ -4057,7 +4096,9 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
           );
         })() : null}
       </section>
+      ) : null}
 
+      {!signalsEmbed ? (
       <details className="mx-4 mb-3 mt-1 rounded-xl border border-zinc-800/50 bg-zinc-900/20 px-3 py-2 text-[11px] text-zinc-500 ring-1 ring-white/[0.02]">
         <summary className="cursor-pointer select-none font-semibold text-zinc-400">Chart details · engine · attribution</summary>
         <p className="mt-2 text-[10px] leading-snug text-zinc-600">{STREAM_ATTRIBUTION_LINE}</p>
@@ -4073,6 +4114,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
           <span className="font-semibold text-amber-200/90">PTB read</span> — {derivedStrip?.interactionLabel ?? 'Scoring…'}
         </div>
       </details>
+      ) : null}
     </div>
   );
 });

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
 import type { ClobBookEntry } from './lib/api';
 import { pickConditionId } from './bookIntel';
 import { FlowZoneSignalsPanel } from './FlowZoneSignalsPanel';
@@ -81,7 +81,6 @@ import { useStableDeskAction } from './useStableDeskAction';
 import { TakeSignalStrategyPanel } from './TakeSignalStrategyPanel';
 import { evaluateFivePctGainStrategy } from './fivePctGainStrategy';
 import { applyTakeSignalStrategies, type TakeSignalStrategyId } from './takeSignalStrategy';
-import { price01ToWholeCents } from './displayCents';
 import {
   applyTakeSignalStabilityGate,
   takeSignalPlanMeaningKey,
@@ -119,6 +118,11 @@ function deskActionIsWeakFall(a: DeskSingleAction): boolean {
 const DO_THIS_NOW_FALL_HOLD_MS = 6_000;
 /** Min gap between auto-trade fires on the same slug (prevents re-entry spam on flicker). */
 const AUTO_TRADE_COOLDOWN_MS = 45_000;
+const EMPTY_BOOK: Record<string, never> = {};
+
+function compactNum(value: number | null | undefined, digits = 2): string {
+  return value != null && Number.isFinite(value) ? value.toFixed(digits) : '-';
+}
 
 type SpotEngineCall = {
   lane: 'up' | 'down' | null;
@@ -137,6 +141,74 @@ type DualEngineCall = {
   go: boolean;
   laneLock: { lane: 'up' | 'down' | null; status: 'LOCKED' | 'FORMING' | 'WAIT'; confidence: 'HIGH' | 'MED' | 'LOW'; reason: string };
 };
+
+function tradeDirectiveKey(d: TradeDirective | null): string {
+  if (!d) return 'null';
+  return [
+    d.action,
+    d.lane ?? '-',
+    d.urgency,
+    d.confidence,
+    d.headline,
+    compactNum(d.laneMid, 3),
+    compactNum(d.edgePerShareUsd, 3),
+  ].join('|');
+}
+
+function machineReadoutKey(r: SpotPtbMachineReadout | null): string {
+  if (!r) return 'null';
+  return [
+    r.focusLane ?? '-',
+    r.flowWinningLane ?? '-',
+    Math.round(r.agreementScore),
+    r.regime,
+    r.urgency,
+    r.probVsSpot,
+    compactNum(r.crossProb, 2),
+    compactNum(r.edges?.up?.edgePerShareUsd, 3),
+    compactNum(r.edges?.down?.edgePerShareUsd, 3),
+    r.wallFlow?.headline ?? '-',
+    r.sensors.tapeDominance ?? '-',
+    r.sensors.tapeReliable ? 'tape-ok' : 'tape-wait',
+  ].join('|');
+}
+
+function bandGaugeKey(g: SpotBandGaugeSnapshot | null): string {
+  if (!g) return 'null';
+  return [
+    g.mode,
+    g.geo,
+    g.separation,
+    g.activeStep,
+    g.edgeOk ? 'edge' : 'no-edge',
+    g.inBand ? 'band' : 'out',
+    compactNum(g.distUsd, 1),
+    compactNum(g.slopeUsdPerMin, 1),
+    compactNum(g.proj30s, 1),
+  ].join('|');
+}
+
+function switchForecastKey(f: SwitchForecast | null): string {
+  if (!f) return 'null';
+  return [
+    f.status,
+    f.lane ?? '-',
+    f.driftLane ?? '-',
+    f.incomingLane ?? '-',
+    f.confidence,
+    f.etaSec == null ? '-' : Math.round(f.etaSec / 5) * 5,
+    f.headline,
+  ].join('|');
+}
+
+function noTradeScoreKey(s: NoTradeScore | null): string {
+  if (!s) return 'null';
+  return [
+    s.tier,
+    Math.round(s.score),
+    s.contributions.map((c) => `${c.reason}:${c.weight}`).join(','),
+  ].join('|');
+}
 
 function crossCheckToneClass(tone: 'emerald' | 'amber' | 'zinc' | 'rose'): string {
   if (tone === 'emerald') return 'border-emerald-700/50 bg-emerald-950/30 text-emerald-200';
@@ -336,20 +408,32 @@ export function SignalsPtbOnly(props: {
   }
 
   const idx = resolveUpDownIndices(outcomeLabels, market);
-  let bookAbove: unknown = {};
-  let bookBelow: unknown = {};
-  let upLabel = 'YES';
-  let downLabel = 'NO';
-  if (idx && books && books.length >= 2) {
-    const up = books[idx.up];
-    const down = books[idx.down];
-    if (up && down && !up.error && !down.error) {
-      bookAbove = up.book;
-      bookBelow = down.book;
-      upLabel = outcomeLabels[idx.up] ?? upLabel;
-      downLabel = outcomeLabels[idx.down] ?? downLabel;
+  const idxUp = idx?.up ?? -1;
+  const idxDown = idx?.down ?? -1;
+  const { bookAbove, bookBelow, upLabel: rawUpLabel, downLabel: rawDownLabel } = useMemo(() => {
+    let nextBookAbove: unknown = EMPTY_BOOK;
+    let nextBookBelow: unknown = EMPTY_BOOK;
+    let nextUpLabel = 'YES';
+    let nextDownLabel = 'NO';
+    if (idxUp >= 0 && idxDown >= 0 && books && books.length >= 2) {
+      const up = books[idxUp];
+      const down = books[idxDown];
+      if (up && down && !up.error && !down.error) {
+        nextBookAbove = up.book ?? EMPTY_BOOK;
+        nextBookBelow = down.book ?? EMPTY_BOOK;
+        nextUpLabel = outcomeLabels[idxUp] ?? nextUpLabel;
+        nextDownLabel = outcomeLabels[idxDown] ?? nextDownLabel;
+      }
     }
-  }
+    return {
+      bookAbove: nextBookAbove,
+      bookBelow: nextBookBelow,
+      upLabel: nextUpLabel,
+      downLabel: nextDownLabel,
+    };
+  }, [books, idxDown, idxUp, outcomeLabels]);
+  let upLabel = rawUpLabel;
+  let downLabel = rawDownLabel;
   const deskSlug = pickMarketSlug(market);
   if (parseUpdownSlug(deskSlug) && upLabel.toUpperCase() === 'YES' && downLabel.toUpperCase() === 'NO') {
     upLabel = 'Up';
@@ -399,7 +483,11 @@ export function SignalsPtbOnly(props: {
   }, [bookAbove, bookBelow, priceToBeat, spot]);
 
   const [tradeDirectiveSpot, setTradeDirectiveSpot] = useState<TradeDirective | null>(null);
+  const lastTradeDirectiveKeyRef = useRef('init');
   const onTradeDirectiveSpot = useCallback((d: TradeDirective | null) => {
+    const key = tradeDirectiveKey(d);
+    if (key === lastTradeDirectiveKeyRef.current) return;
+    lastTradeDirectiveKeyRef.current = key;
     setTradeDirectiveSpot(d);
   }, []);
   // ─── Master lane (must sit above tape hooks): chart directive drives desk tape ───
@@ -419,7 +507,15 @@ export function SignalsPtbOnly(props: {
     masterReady &&
     tradePanelLane !== masterLane;
 
-  const hasDual = probUp.length >= 1 && probDown.length >= 1;
+  const dualReady = probUp.length >= 2 && probDown.length >= 2;
+  const [hasDual, setHasDual] = useState(() => dualReady);
+  useEffect(() => {
+    if (dualReady) {
+      setHasDual(true);
+      return;
+    }
+    if (probUp.length === 0 && probDown.length === 0) setHasDual(false);
+  }, [dualReady, probUp.length, probDown.length, slug]);
   const spotChartLaneLockedRef = useRef(false);
   const lastSpotChartInferSlugRef = useRef<string | null>(null);
   const [spotChartLane, setSpotChartLane] = useState<'up' | 'down'>(() =>
@@ -436,7 +532,11 @@ export function SignalsPtbOnly(props: {
     setSpotChartLane(inferDefaultSpotChartLane(spot, priceToBeat, probUp, probDown));
   }, [slug, spot, priceToBeat, probUp, probDown]);
   const [machineVerdictSpot, setMachineVerdictSpot] = useState<SpotPtbMachineReadout | null>(null);
+  const lastMachineVerdictKeyRef = useRef('init');
   const onMachineVerdictSpot = useCallback((r: SpotPtbMachineReadout | null) => {
+    const key = machineReadoutKey(r);
+    if (key === lastMachineVerdictKeyRef.current) return;
+    lastMachineVerdictKeyRef.current = key;
     setMachineVerdictSpot(r);
   }, []);
   // Desk tape follows order-flow winning side when known, else trade card / chart toggle.
@@ -455,7 +555,11 @@ export function SignalsPtbOnly(props: {
     return s && s.length ? s : null;
   }, [idx, books, flowSeriesForSlug, spotChartLane]);
   const [bandGaugeSpot, setBandGaugeSpot] = useState<SpotBandGaugeSnapshot | null>(null);
+  const lastBandGaugeKeyRef = useRef('init');
   const onBandGaugeSpot = useCallback((g: SpotBandGaugeSnapshot | null) => {
+    const key = bandGaugeKey(g);
+    if (key === lastBandGaugeKeyRef.current) return;
+    lastBandGaugeKeyRef.current = key;
     setBandGaugeSpot(g);
   }, []);
 
@@ -548,7 +652,15 @@ export function SignalsPtbOnly(props: {
   }, [tradeDirectiveSpot, stabilitySpot, discrepancySpot, machineVerdictSpot?.edges, reEntryCheckSpot]);
   /** Mirrored from `PtbOpportunityModeChart` so the Answer card below matches chart No-Trade math. */
   const [chartNoTradeScore, setChartNoTradeScore] = useState<NoTradeScore | null>(null);
+  const lastNoTradeScoreKeyRef = useRef('init');
+  const onNoTradeScoreSpot = useCallback((s: NoTradeScore | null) => {
+    const key = noTradeScoreKey(s);
+    if (key === lastNoTradeScoreKeyRef.current) return;
+    lastNoTradeScoreKeyRef.current = key;
+    setChartNoTradeScore(s);
+  }, []);
   useEffect(() => {
+    lastNoTradeScoreKeyRef.current = 'init';
     setChartNoTradeScore(null);
   }, [slug]);
   /** Bump with "Reset desk" so the chart clears its embedded directive journal without a slug change. */
@@ -601,6 +713,14 @@ export function SignalsPtbOnly(props: {
     if (autoTradeSizeShares == null) return null;
     return { submitBuy: true, sizeShares: autoTradeSizeShares, armSlTp: false, endsInMs };
   }, [autoTradeSizeShares, endsInMs]);
+  const [switchForecastSpot, setSwitchForecastSpot] = useState<SwitchForecast | null>(null);
+  const lastSwitchForecastKeyRef = useRef('init');
+  const onSwitchForecastSpot = useCallback((f: SwitchForecast | null) => {
+    const key = switchForecastKey(f);
+    if (key === lastSwitchForecastKeyRef.current) return;
+    lastSwitchForecastKeyRef.current = key;
+    setSwitchForecastSpot(f);
+  }, []);
 
   useEffect(() => {
     if (autoTradeSizeShares == null) return;
@@ -620,6 +740,11 @@ export function SignalsPtbOnly(props: {
     setTradeDirectiveSpot(null);
     setSwitchForecastSpot(null);
     setChartNoTradeScore(null);
+    lastTradeDirectiveKeyRef.current = 'init';
+    lastMachineVerdictKeyRef.current = 'init';
+    lastBandGaugeKeyRef.current = 'init';
+    lastNoTradeScoreKeyRef.current = 'init';
+    lastSwitchForecastKeyRef.current = 'init';
     lastAutoTakeKeyRef.current = null;
     spotChartLaneLockedRef.current = false;
     lastSpotChartInferSlugRef.current = null;
@@ -672,7 +797,6 @@ export function SignalsPtbOnly(props: {
     () => computeTapeVelocity(heldOutcomeTapePrints, { now: tapeClock }),
     [heldOutcomeTapePrints, tapeClock],
   );
-  const [switchForecastSpot, setSwitchForecastSpot] = useState<SwitchForecast | null>(null);
   useEffect(() => {
     if (slug == null || !String(slug).trim()) return;
     saveSignalsDeskPersist(String(slug).trim(), {
@@ -970,7 +1094,7 @@ export function SignalsPtbOnly(props: {
       upToken: upToken?.trim() || undefined,
       downToken: downToken?.trim() || undefined,
     });
-  }, [slug, tradeDirectiveSpot, spot, priceToBeat, probUp, probDown, upToken, downToken]);
+  }, [slug, tradeDirectiveSpot, spot, priceToBeat, probUp, probDown, upToken, downToken, setSwitchForecastSpot]);
 
   const spotChartLive = priceToBeat != null && spot.length >= 2;
   const [chartTab, setChartTab] = useState<'spot' | 'dual'>('spot');
@@ -1217,9 +1341,6 @@ export function SignalsPtbOnly(props: {
         tradeDirectiveSpot?.lane ?? '-',
         operatorVerdictDesk?.state ?? '-',
         operatorVerdictDesk?.bigVerb ?? '-',
-        tradeLevelsSpot
-          ? `${price01ToWholeCents(tradeLevelsSpot.entry)}|${price01ToWholeCents(tradeLevelsSpot.takeProfit)}|${price01ToWholeCents(tradeLevelsSpot.stopLoss)}`
-          : '-',
       ].join('|'),
     [
       manualPositionLane,
@@ -1227,9 +1348,6 @@ export function SignalsPtbOnly(props: {
       tradeDirectiveSpot?.lane,
       operatorVerdictDesk?.state,
       operatorVerdictDesk?.bigVerb,
-      tradeLevelsSpot?.entry,
-      tradeLevelsSpot?.takeProfit,
-      tradeLevelsSpot?.stopLoss,
     ],
   );
 
@@ -1619,14 +1737,7 @@ export function SignalsPtbOnly(props: {
     [spotChartCall, dualChartCall, upLabel, downLabel],
   );
 
-  const crossCheckWarn = crossCheckMeta.pill === 'CONFLICT' || crossCheckMeta.pill === 'INCOMPLETE';
-  const [crossCheckOpen, setCrossCheckOpen] = useState(crossCheckWarn);
-  const prevCrossPillRef = useRef(crossCheckMeta.pill);
-  useLayoutEffect(() => {
-    const p = crossCheckMeta.pill;
-    if (crossCheckWarn && prevCrossPillRef.current !== p) setCrossCheckOpen(true);
-    prevCrossPillRef.current = p;
-  }, [crossCheckMeta.pill, crossCheckWarn]);
+  const [crossCheckOpen, setCrossCheckOpen] = useState(false);
 
   // Inline cross-engine strip — replaces the old `xcheck` chart tab. One-line by
   // default; click to expand the full Spot / Dual call breakdown without leaving
@@ -1996,7 +2107,7 @@ export function SignalsPtbOnly(props: {
     return 'border-zinc-600/60 bg-zinc-900/55 ring-1 ring-zinc-800/45 text-zinc-100';
   }, [deskSingleActionDisplay.tone]);
 
-  const spotVsPtbSection = (
+  const spotChartPanel = (
     <div className="flex min-h-0 w-full min-w-0 flex-col gap-2">
       {/* Chart first — directive / verdict cards used to sit above and pushed it too far down. */}
       <div className="flex min-h-0 w-full min-w-0 flex-1 flex-col">
@@ -2022,16 +2133,21 @@ export function SignalsPtbOnly(props: {
           onBandGaugeSnapshot={onBandGaugeSpot}
           onTradeDirective={onTradeDirectiveSpot}
           currentPositionLane={manualPositionLane}
-          onSwitchForecast={setSwitchForecastSpot}
+          onSwitchForecast={onSwitchForecastSpot}
           recentPrints={tapePrints}
           tapeLane={deskTapeLane}
           chartAreaRoomy
           signalsEmbed
-          onNoTradeScore={setChartNoTradeScore}
+          onNoTradeScore={onNoTradeScoreSpot}
           deskResetKey={deskResetKey}
           wallFlow={dualWallFlow}
         />
       </div>
+    </div>
+  );
+
+  const spotDeskSection = (
+    <div className="flex min-h-0 w-full min-w-0 flex-col gap-2">
       {/* Lane-agreement bar — card · vote · desk tape — sits directly under the chart so
           the operator's first read is "do my sensors agree?" */}
       {laneAgreementBar}
@@ -2258,37 +2374,43 @@ export function SignalsPtbOnly(props: {
 
   /** Tabbed Spot vs PTB / Dual PTB. Cross-check is now an inline strip inside
    *  `spotVsPtbSection` so it's always glanceable without a tab switch. */
-  const dualTabChartCard = hasDual ? (
-    <div className="flex min-w-0 max-w-full flex-col rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-2 sm:p-3 min-h-[min(56vh,640px)]">
+  const chartCard = (
+    <div className="flex min-h-[min(52dvh,760px)] min-w-0 max-w-full flex-col rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-2 sm:p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Chart</div>
-        <div className="flex gap-1 rounded-xl border border-zinc-800/60 bg-black/20 p-1">
-          <button
-            type="button"
-            onClick={() => setChartTab('spot')}
-            className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
-              chartTab === 'spot' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
-            }`}
-          >
+        {hasDual ? (
+          <div className="flex gap-1 rounded-xl border border-zinc-800/60 bg-black/20 p-1">
+            <button
+              type="button"
+              onClick={() => setChartTab('spot')}
+              className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
+                chartTab === 'spot' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              Spot vs PTB
+            </button>
+            <button
+              type="button"
+              onClick={() => setChartTab('dual')}
+              className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
+                chartTab === 'dual' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              Dual PTB
+            </button>
+          </div>
+        ) : (
+          <div className="rounded-xl border border-zinc-800/60 bg-black/20 px-3 py-1.5 text-[11px] font-semibold text-zinc-500">
             Spot vs PTB
-          </button>
-          <button
-            type="button"
-            onClick={() => setChartTab('dual')}
-            className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
-              chartTab === 'dual' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
-            }`}
-          >
-            Dual PTB
-          </button>
-        </div>
+          </div>
+        )}
       </div>
 
       <div className="mt-3 flex min-h-0 min-w-0 max-w-full flex-1 flex-col">
         {/* Both panels stay mounted so the cross-check strip in spotVsPtbSection
             sees both engines' summaries immediately. */}
-        <div className={chartTab === 'spot' ? 'flex min-h-0 min-w-0 flex-1 flex-col' : 'hidden'}>{spotVsPtbSection}</div>
-        <div className={chartTab === 'dual' ? 'flex min-h-0 min-w-0 flex-1 flex-col' : 'hidden'}>
+        <div className={!hasDual || chartTab === 'spot' ? 'flex min-h-0 min-w-0 flex-1 flex-col' : 'hidden'}>{spotChartPanel}</div>
+        <div className={hasDual && chartTab === 'dual' ? 'flex min-h-0 min-w-0 flex-1 flex-col' : 'hidden'}>
             <PtbDualProbabilityChart
               probUp={probUp}
               probDown={probDown}
@@ -2309,7 +2431,7 @@ export function SignalsPtbOnly(props: {
         </div>
       </div>
     </div>
-  ) : null;
+  );
 
   const body = hasDual ? (
     <div className="min-w-0 max-w-full space-y-3">
@@ -2376,7 +2498,6 @@ export function SignalsPtbOnly(props: {
               <span className="font-mono text-zinc-300">btc|eth|sol-updown-*</span> slug so RTDS ticks fill (see note when mids exist).
         </p>
       </div>
-      {spotVsPtbSection}
       {trackingUnderCharts}
       {books && books.length >= 2 ? (
         <div className="grid gap-3 lg:grid-cols-2">
@@ -2406,7 +2527,6 @@ export function SignalsPtbOnly(props: {
         endsInMs={endsInMs}
         booksFetchedAt={booksFetchedAt}
       />
-      {spotVsPtbSection}
       {trackingUnderCharts}
       <div className="grid gap-3 lg:grid-cols-2">
         <OverallOrderBookPanel
@@ -2443,7 +2563,8 @@ export function SignalsPtbOnly(props: {
           </div>
         ) : null}
       </DeskSyncBannerSlot>
-      {hasDual ? dualTabChartCard : null}
+      {chartCard}
+      {spotDeskSection}
       {body}
     </>
   );

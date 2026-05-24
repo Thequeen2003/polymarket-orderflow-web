@@ -33,11 +33,13 @@ export function bracketBidRef01(bid01: number | null): number | null {
 
 /** @deprecated Use bracketBidRef01 — strip no longer affects triggers. */
 export function stopLossRef01(bid01: number | null, _stripMid01?: number | null): number | null {
+  void _stripMid01;
   return bracketBidRef01(bid01);
 }
 
 /** @deprecated Use bracketBidRef01 — strip no longer affects triggers. */
 export function takeProfitRef01(bid01: number | null, _stripMid01?: number | null): number | null {
+  void _stripMid01;
   return bracketBidRef01(bid01);
 }
 
