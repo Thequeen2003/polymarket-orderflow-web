@@ -2199,7 +2199,9 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             : 'No underlying spot feed wired for this slug yet — only the PTB line will draw.'
           : 'Waiting for a second tick to draw candles…';
     return (
-      <div className="flex min-h-0 flex-col rounded-[30px] border border-zinc-800/90 bg-[#0b1018] shadow-[0_28px_80px_rgba(0,0,0,0.35)] ring-1 ring-zinc-700/40">
+      <div
+        className={`flex min-h-0 flex-col rounded-[30px] border border-zinc-800/90 bg-[#0b1018] shadow-[0_28px_80px_rgba(0,0,0,0.35)] ring-1 ring-zinc-700/40 ${signalsEmbed ? 'min-h-[min(94dvh,2000px)]' : ''}`}
+      >
         <header className="shrink-0 border-b border-zinc-800/80 px-4 py-3 sm:px-5">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="min-w-0">
@@ -2788,7 +2790,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
         </details>
       </header>
 
-      {switchForecast ? (
+      {switchForecast && !signalsEmbed ? (
         <div className="mx-3 mt-2 sm:mx-4">
           {featureFlags.pinnedNote ? <RoundNote slug={slug} visible={pinnedNoteVisible} /> : null}
           <SignalTruthStrip

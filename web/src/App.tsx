@@ -813,6 +813,8 @@ function App() {
   const effectiveTradeContext = globalTradeLocked && globalTradeContext ? globalTradeContext : currentTradeContext;
   const effectiveTradeReady = Boolean(effectiveTradeContext.slug) && globalTradeReady && !binanceSpotActive;
   const effectiveTradeEnabled = Boolean(effectiveTradeContext.upToken && effectiveTradeContext.downToken);
+  const openTradeHistoryTab = useCallback(() => setMainTab('tradehistory'), []);
+  const openSignalsTab = useCallback(() => setMainTab('signals'), []);
   const trackingConditionId = useMemo(() => pickConditionId(marketJson), [marketJson]);
 
   const signalsProbMids = useMemo(() => {
@@ -2883,7 +2885,7 @@ function App() {
                     spotStreamEligible={isUpdownDeskMarket(selectedSlug, updownSlugHints)}
                     ptbSource={ssrPtbSource}
                     spotFeedSource={rtdsSpotFeedSource}
-                    onOpenTradeHistory={() => setMainTab('tradehistory')}
+                    onOpenTradeHistory={openTradeHistoryTab}
                     tradePanelSlug={effectiveTradeContext.slug}
                     tradePanelLane={globalTradeLane}
                     tradePanelPinned={globalTradeLocked}
@@ -2911,8 +2913,8 @@ function App() {
                   slug={effectiveTradeContext.slug}
                   upMid01={tradePanelBookMids.up}
                   downMid01={tradePanelBookMids.down}
-                  onOpenTradeHistory={() => setMainTab('tradehistory')}
-                  onOpenSignals={() => setMainTab('signals')}
+                  onOpenTradeHistory={openTradeHistoryTab}
+                  onOpenSignals={openSignalsTab}
                 />
                 </Suspense>
               )
