@@ -2107,7 +2107,7 @@ export function SignalsPtbOnly(props: {
     return 'border-zinc-600/60 bg-zinc-900/55 ring-1 ring-zinc-800/45 text-zinc-100';
   }, [deskSingleActionDisplay.tone]);
 
-  const spotVsPtbSection = (
+  const spotChartPanel = (
     <div className="flex min-h-0 w-full min-w-0 flex-col gap-2">
       {/* Chart first — directive / verdict cards used to sit above and pushed it too far down. */}
       <div className="flex min-h-0 w-full min-w-0 flex-1 flex-col">
@@ -2143,6 +2143,11 @@ export function SignalsPtbOnly(props: {
           wallFlow={dualWallFlow}
         />
       </div>
+    </div>
+  );
+
+  const spotDeskSection = (
+    <div className="flex min-h-0 w-full min-w-0 flex-col gap-2">
       {/* Lane-agreement bar — card · vote · desk tape — sits directly under the chart so
           the operator's first read is "do my sensors agree?" */}
       {laneAgreementBar}
@@ -2370,7 +2375,7 @@ export function SignalsPtbOnly(props: {
   /** Tabbed Spot vs PTB / Dual PTB. Cross-check is now an inline strip inside
    *  `spotVsPtbSection` so it's always glanceable without a tab switch. */
   const chartCard = (
-    <div className="flex min-h-[min(72dvh,900px)] min-w-0 max-w-full flex-col rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-2 sm:p-3">
+    <div className="flex min-h-[min(52dvh,760px)] min-w-0 max-w-full flex-col rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-2 sm:p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Chart</div>
         {hasDual ? (
@@ -2404,7 +2409,7 @@ export function SignalsPtbOnly(props: {
       <div className="mt-3 flex min-h-0 min-w-0 max-w-full flex-1 flex-col">
         {/* Both panels stay mounted so the cross-check strip in spotVsPtbSection
             sees both engines' summaries immediately. */}
-        <div className={!hasDual || chartTab === 'spot' ? 'flex min-h-0 min-w-0 flex-1 flex-col' : 'hidden'}>{spotVsPtbSection}</div>
+        <div className={!hasDual || chartTab === 'spot' ? 'flex min-h-0 min-w-0 flex-1 flex-col' : 'hidden'}>{spotChartPanel}</div>
         <div className={hasDual && chartTab === 'dual' ? 'flex min-h-0 min-w-0 flex-1 flex-col' : 'hidden'}>
             <PtbDualProbabilityChart
               probUp={probUp}
@@ -2559,6 +2564,7 @@ export function SignalsPtbOnly(props: {
         ) : null}
       </DeskSyncBannerSlot>
       {chartCard}
+      {spotDeskSection}
       {body}
     </>
   );
