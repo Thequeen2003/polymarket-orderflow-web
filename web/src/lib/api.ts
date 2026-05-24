@@ -403,7 +403,7 @@ export type UpdownShortcutAsset = 'btc' | 'eth' | 'sol' | 'hype';
 export type UpdownInterval = '5m' | '15m' | '1h' | '4h' | '1d';
 
 export function marketsUpdownShortcut(asset: UpdownShortcutAsset, interval: UpdownInterval = '5m') {
-  return getJson<{
+  return getJsonWithRetry<{
     slug: string;
     asset: string;
     interval?: string;
