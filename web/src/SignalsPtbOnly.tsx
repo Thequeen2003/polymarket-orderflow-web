@@ -973,7 +973,6 @@ export function SignalsPtbOnly(props: {
   }, [slug, tradeDirectiveSpot, spot, priceToBeat, probUp, probDown, upToken, downToken]);
 
   const spotChartLive = priceToBeat != null && spot.length >= 2;
-  const [chartTab, setChartTab] = useState<'spot' | 'dual'>('spot');
   const [spotChartCall, setSpotChartCall] = useState<{
     lane: 'up' | 'down' | null;
     status: 'ENTER' | 'PREP' | 'WAIT';
@@ -2012,6 +2011,9 @@ export function SignalsPtbOnly(props: {
           downLabel={downLabel}
           lastProbUp={probUp.length ? (probUp[probUp.length - 1]!.v ?? null) : null}
           lastProbDown={probDown.length ? (probDown[probDown.length - 1]!.v ?? null) : null}
+          probUp={probUp}
+          probDown={probDown}
+          probLastUpdateMs={probLastUpdateMs}
           bookFlow={spotChartBookFlow}
           upOutcomeToken={upToken}
           downOutcomeToken={downToken}
@@ -2256,58 +2258,26 @@ export function SignalsPtbOnly(props: {
     </div>
   );
 
-  /** Tabbed Spot vs PTB / Dual PTB. Cross-check is now an inline strip inside
-   *  `spotVsPtbSection` so it's always glanceable without a tab switch. */
-  const dualTabChartCard = hasDual ? (
-    <div className="flex min-w-0 max-w-full flex-col rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-2 sm:p-3 min-h-[min(56vh,640px)]">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Chart</div>
-        <div className="flex gap-1 rounded-xl border border-zinc-800/60 bg-black/20 p-1">
-          <button
-            type="button"
-            onClick={() => setChartTab('spot')}
-            className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
-              chartTab === 'spot' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
-            }`}
-          >
-            Spot vs PTB
-          </button>
-          <button
-            type="button"
-            onClick={() => setChartTab('dual')}
-            className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
-              chartTab === 'dual' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
-            }`}
-          >
-            Dual PTB
-          </button>
-        </div>
-      </div>
-
-      <div className="mt-3 flex min-h-0 min-w-0 max-w-full flex-1 flex-col">
-        {/* Both panels stay mounted so the cross-check strip in spotVsPtbSection
-            sees both engines' summaries immediately. */}
-        <div className={chartTab === 'spot' ? 'flex min-h-0 min-w-0 flex-1 flex-col' : 'hidden'}>{spotVsPtbSection}</div>
-        <div className={chartTab === 'dual' ? 'flex min-h-0 min-w-0 flex-1 flex-col' : 'hidden'}>
-            <PtbDualProbabilityChart
-              probUp={probUp}
-              probDown={probDown}
-              upLabel={upLabel}
-              downLabel={downLabel}
-              lastUpdateMs={probLastUpdateMs}
-              priceToBeatUsd={priceToBeat}
-              bookUp={bookAbove}
-              bookDown={bookBelow}
-              compactHeader
-              hideReadingGuide
-              largeCharts
-              enginePlacement="below"
-              onSummary={onDualSummary}
-              upOutcomeToken={upToken ?? ''}
-              downOutcomeToken={downToken ?? ''}
-            />
-        </div>
-      </div>
+  /** Hidden dual engine — keeps cross-check strip fed while the fused chart shows UP/DOWN lines inline. */
+  const hiddenDualEngine = hasDual ? (
+    <div className="hidden" aria-hidden>
+      <PtbDualProbabilityChart
+        probUp={probUp}
+        probDown={probDown}
+        upLabel={upLabel}
+        downLabel={downLabel}
+        lastUpdateMs={probLastUpdateMs}
+        priceToBeatUsd={priceToBeat}
+        bookUp={bookAbove}
+        bookDown={bookBelow}
+        compactHeader
+        hideReadingGuide
+        largeCharts
+        enginePlacement="below"
+        onSummary={onDualSummary}
+        upOutcomeToken={upToken ?? ''}
+        downOutcomeToken={downToken ?? ''}
+      />
     </div>
   ) : null;
 
@@ -2443,7 +2413,12 @@ export function SignalsPtbOnly(props: {
           </div>
         ) : null}
       </DeskSyncBannerSlot>
-      {hasDual ? dualTabChartCard : null}
+      {hasDual ? (
+        <>
+          {hiddenDualEngine}
+          {spotVsPtbSection}
+        </>
+      ) : null}
       {body}
     </>
   );
