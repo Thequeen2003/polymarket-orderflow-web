@@ -29,6 +29,13 @@ import {
   type SectionalDecisionDetail,
 } from './sectionalDecisionEvent';
 import type { DualOutcomeWallFlow } from './dualOutcomeWalls';
+import {
+  downsampleLinePoints,
+  extentSymProb,
+  normalizeProbSeries,
+  padProbSeries,
+  segmentDualLaneStyle,
+} from './ptbLineChart';
 import { computeSpotPtbMachineReadout, type SpotPtbMachineReadout } from './spotPtbMachineSignals';
 import { computeSpotBandGaugeSnapshot, type SpotBandGaugeSnapshot } from './spotBandDeskAction';
 import {
@@ -265,6 +272,9 @@ const PAD_Y = 18;
 const PROB_STRIP_H = 54;
 const PROB_STRIP_GAP = 6;
 
+const DUAL_PROB_STRIP_H = 132;
+const DUAL_PROB_STRIP_GAP = 8;
+
 function parseTradeBracketCents01(raw: string): number | null {
   const n = Number(String(raw).trim());
   if (!Number.isFinite(n) || n <= 0 || n >= 100) return null;
@@ -404,6 +414,9 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
   /** Last implied mid (0–1) for settlement/cross model confirmation. */
   lastProbUp?: number | null;
   lastProbDown?: number | null;
+  probUp?: SpotPoint[];
+  probDown?: SpotPoint[];
+  probLastUpdateMs?: number | null;
   /** Book flow snapshots for the active UP/DOWN outcome token. */
   bookFlow?: BookSnapshot[] | null;
   chartTitle?: string;
@@ -462,6 +475,9 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
     endsInMs = null,
     lastProbUp = null,
     lastProbDown = null,
+    probUp = [],
+    probDown = [],
+    probLastUpdateMs = null,
     bookFlow = null,
     chartTitle = 'Spot (USD)',
     upLabel = 'UP',
@@ -485,6 +501,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
     onBandGaugeSnapshot,
     wallFlow = null,
   } = props;
+  const hasDualProbInput = probUp.length >= 1 && probDown.length >= 1;
   const featureFlags = useFeatureFlags();
   const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
   const [pinnedNoteVisible, setPinnedNoteVisible] = useState<boolean>(featureFlags.pinnedNote);
@@ -509,17 +526,20 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
         ? 'flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-visible px-2 pt-1 sm:px-3 sm:pt-2'
         : 'min-h-0 flex-1 overflow-x-hidden overflow-y-visible px-3 pt-2 sm:px-4'
       : 'min-h-0 flex-1 overflow-hidden px-3 pt-2 sm:px-4 [contain:paint]';
-  /** Dual PTB only — tall plot + high cap so the PTB chart reads at “dashboard” scale, not a card thumbnail. */
   const chartSvgSk =
     chartAreaRoomy
       ? signalsEmbed
-        ? 'block h-full min-h-[min(68svh,1500px)] w-full max-w-none flex-1 rounded-[24px] bg-[#0a0f16] [contain:paint] xl:min-h-[min(74svh,1700px)]'
+        ? hasDualProbInput
+          ? 'block h-full min-h-[min(74svh,1620px)] w-full max-w-none flex-1 rounded-[24px] bg-[#0a0f16] [contain:paint] xl:min-h-[min(80svh,1820px)]'
+          : 'block h-full min-h-[min(68svh,1500px)] w-full max-w-none flex-1 rounded-[24px] bg-[#0a0f16] [contain:paint] xl:min-h-[min(74svh,1700px)]'
         : 'block h-full min-h-[min(78vh,940px)] max-h-[min(100dvh,1720px)] w-full rounded-[24px] bg-[#0a0f16] [contain:paint] xl:min-h-[min(82vh,1020px)] xl:max-h-[min(100dvh,1800px)]'
       : 'block h-full min-h-[min(54vh,620px)] max-h-[min(88vh,960px)] w-full rounded-[24px] bg-[#0a0f16] [contain:paint]';
   const chartSvgMain =
     chartAreaRoomy
       ? signalsEmbed
-        ? 'block h-full min-h-[min(68svh,1500px)] w-full max-w-none flex-1 rounded-[24px] bg-[#0a0f16] xl:min-h-[min(74svh,1700px)] [contain:strict]'
+        ? hasDualProbInput
+          ? 'block h-full min-h-[min(74svh,1620px)] w-full max-w-none flex-1 rounded-[24px] bg-[#0a0f16] xl:min-h-[min(80svh,1820px)] [contain:strict]'
+          : 'block h-full min-h-[min(68svh,1500px)] w-full max-w-none flex-1 rounded-[24px] bg-[#0a0f16] xl:min-h-[min(74svh,1700px)] [contain:strict]'
         : 'block h-full min-h-[min(78vh,940px)] max-h-[min(100dvh,1720px)] w-full rounded-[24px] bg-[#0a0f16] xl:min-h-[min(82vh,1020px)] xl:max-h-[min(100dvh,1800px)]'
       : 'block h-full min-h-[min(54vh,620px)] max-h-[min(88vh,960px)] w-full rounded-[24px] bg-[#0a0f16] [contain:strict]';
   const gradId = useId().replace(/:/g, '');
@@ -733,7 +753,27 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
     };
   }, [mode, priceToBeat, pts, upLabel, downLabel]);
 
-  const svgHeight = H + (model != null && overlayAppliesSpot ? PROB_STRIP_GAP + PROB_STRIP_H + 12 : 0);
+  const dualProbOverlay = useMemo(() => {
+    if (!model || !hasDualProbInput) return null;
+    const u0 = padProbSeries(normalizeProbSeries(probUp.map((pt) => ({ t: pt.t, v: pt.v }))));
+    const d0 = padProbSeries(normalizeProbSeries(probDown.map((pt) => ({ t: pt.t, v: pt.v }))));
+    if (u0.length < 2 || d0.length < 2) return null;
+    const tMin = model.tMin;
+    const tMax = model.tMax;
+    const inWindow = (pt: { t: number; v: number }) => pt.t >= tMin - 1 && pt.t <= tMax + 1;
+    const uW = u0.filter(inWindow);
+    const dW = d0.filter(inWindow);
+    const seriesUp = (uW.length >= 2 ? uW : u0).map((pt) => ({ t: pt.t, v: pt.v }));
+    const seriesDown = (dW.length >= 2 ? dW : d0).map((pt) => ({ t: pt.t, v: pt.v }));
+    const vals = [...seriesUp, ...seriesDown].map((pt) => pt.v);
+    const scale = extentSymProb(Math.min(...vals), Math.max(...vals));
+    return { tMin, tMax, seriesUp, seriesDown, scale, lastU: u0[u0.length - 1]!.v, lastD: d0[d0.length - 1]!.v };
+  }, [hasDualProbInput, model, probDown, probUp]);
+
+  const plotBaseH = signalsEmbed && dualProbOverlay ? 780 : H;
+  const dualStripExtra = dualProbOverlay ? DUAL_PROB_STRIP_GAP + DUAL_PROB_STRIP_H : 0;
+  const bracketStripExtra = model != null && overlayAppliesSpot ? PROB_STRIP_GAP + PROB_STRIP_H + 12 : 0;
+  const svgHeight = plotBaseH + dualStripExtra + bracketStripExtra;
 
   const derivedStrip = useMemo(() => {
     if (!model || priceToBeat == null || !Number.isFinite(priceToBeat)) return null;
@@ -2065,7 +2105,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
   }, [model, derivedStrip, priceToBeat]);
 
   const width = W;
-  const height = H;
+  const height = plotBaseH;
   const padL = PAD_L;
   const padR = PAD_R;
   const padY = PAD_Y;
@@ -3381,8 +3421,122 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             </g>
           ) : null}
 
+          {dualProbOverlay
+            ? (() => {
+                const stripY0 = padY + innerH + DUAL_PROB_STRIP_GAP;
+                const gridY0 = stripY0 + 30;
+                const gridBottom = stripY0 + DUAL_PROB_STRIP_H - 8;
+                const gridH = Math.max(8, gridBottom - gridY0);
+                const probSpan = Math.max(1e-9, dualProbOverlay.scale.max - dualProbOverlay.scale.min);
+                const yProb = (p: number) => gridY0 + (1 - (clamp01(p) - dualProbOverlay.scale.min) / probSpan) * gridH;
+                const y50 = yProb(0.5);
+                const ptsU = downsampleLinePoints(dualProbOverlay.seriesUp, 480);
+                const ptsD = downsampleLinePoints(dualProbOverlay.seriesDown, 480);
+                const fmtCents = (p: number) => `${(clamp01(p) * 100).toFixed(1)}¢`;
+                const renderLane = (lane: 'up' | 'down', pts: typeof ptsU) =>
+                  pts.slice(1).map((b, i) => {
+                    const a = pts[i]!;
+                    const vPrev = i > 0 ? pts[i - 1]!.v : null;
+                    const st = segmentDualLaneStyle(lane, vPrev, a.v, b.v, a.t, b.t, 0.5);
+                    return (
+                      <line
+                        key={`dual-${lane}-${b.t}-${i}`}
+                        x1={xTime(a.t)}
+                        y1={yProb(a.v)}
+                        x2={xTime(b.t)}
+                        y2={yProb(b.v)}
+                        stroke={st.stroke}
+                        strokeWidth={st.strokeWidth}
+                        strokeLinecap="round"
+                        className="pointer-events-none"
+                      />
+                    );
+                  });
+                const centTicks = [0, 0.25, 0.5, 0.75, 1].filter(
+                  (tp) => tp >= dualProbOverlay.scale.min - 1e-9 && tp <= dualProbOverlay.scale.max + 1e-9,
+                );
+                return (
+                  <g aria-label="Dual PTB implied mid strip">
+                    <rect
+                      x={padL}
+                      y={stripY0}
+                      width={innerW}
+                      height={DUAL_PROB_STRIP_H}
+                      rx={12}
+                      fill="rgba(9,10,12,0.96)"
+                      stroke="rgba(63,63,70,0.88)"
+                      strokeWidth={1}
+                    />
+                    <text x={padL + 8} y={stripY0 + 14} fill="rgb(251,191,36)" fontSize="9" fontWeight="800">
+                      DUAL PTB · book-implied mids vs 50¢
+                    </text>
+                    <text x={padL + 8} y={stripY0 + 24} fill="rgb(113,113,122)" fontSize="8" fontWeight="600">
+                      <tspan fill="rgb(167,243,208)">{upLabel}</tspan> {fmtCents(dualProbOverlay.lastU)}
+                      {' · '}
+                      <tspan fill="rgb(254,202,202)">{downLabel}</tspan> {fmtCents(dualProbOverlay.lastD)}
+                    </text>
+                    {centTicks.map((tp) => (
+                      <line
+                        key={`dpg-${tp}`}
+                        x1={padL}
+                        x2={padL + innerW}
+                        y1={yProb(tp)}
+                        y2={yProb(tp)}
+                        stroke={Math.abs(tp - 0.5) < 1e-6 ? 'rgba(250,204,21,0.22)' : 'rgba(255,255,255,0.05)'}
+                        strokeWidth={1}
+                        className="pointer-events-none"
+                      />
+                    ))}
+                    <line
+                      x1={padL}
+                      x2={padL + innerW}
+                      y1={y50}
+                      y2={y50}
+                      stroke="rgb(250 204 21)"
+                      strokeWidth={2}
+                      strokeDasharray="5 4"
+                      className="pointer-events-none"
+                    />
+                    {renderLane('down', ptsD)}
+                    {renderLane('up', ptsU)}
+                    <circle
+                      cx={xTime(ptsU[ptsU.length - 1]!.t)}
+                      cy={yProb(dualProbOverlay.lastU)}
+                      r={4.5}
+                      fill="white"
+                      stroke="rgb(52 211 153)"
+                      strokeWidth={2}
+                      className="pointer-events-none"
+                    />
+                    <circle
+                      cx={xTime(ptsD[ptsD.length - 1]!.t)}
+                      cy={yProb(dualProbOverlay.lastD)}
+                      r={4.5}
+                      fill="white"
+                      stroke="rgb(251 113 133)"
+                      strokeWidth={2}
+                      className="pointer-events-none"
+                    />
+                    <text
+                      x={padL + innerW - 6}
+                      y={stripY0 + 14}
+                      textAnchor="end"
+                      fill="rgb(113,113,122)"
+                      fontSize="8"
+                      fontWeight="600"
+                    >
+                      {upLabel} / {downLabel}
+                    </text>
+                  </g>
+                );
+              })()
+            : null}
+
           {overlayAppliesSpot && bracketOverlay ? (() => {
-            const stripY0 = padY + innerH + PROB_STRIP_GAP;
+            const stripY0 =
+              padY +
+              innerH +
+              (dualProbOverlay ? DUAL_PROB_STRIP_GAP + DUAL_PROB_STRIP_H + PROB_STRIP_GAP : PROB_STRIP_GAP);
             const bo = bracketOverlay;
             const bsl = parseTradeBracketCents01(bo.slStopCents);
             const btp = parseTradeBracketCents01(bo.tpTakeCents);
