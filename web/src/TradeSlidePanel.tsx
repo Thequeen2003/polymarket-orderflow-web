@@ -1,5 +1,8 @@
 import { useEffect, type ReactElement, type ReactNode } from 'react';
 
+/** @deprecated Slide width constant kept for callers that adjust layout padding. */
+export const TRADE_SLIDE_PANEL_WIDTH_PX = 380;
+
 export type TradeSlidePanelProps = {
   open: boolean;
   onClose: () => void;
@@ -8,7 +11,8 @@ export type TradeSlidePanelProps = {
 };
 
 /**
- * Fixed right trade column — no drag/resize. Overlays the page (chart stays full width).
+ * Fixed right trade column — no drag/resize. App.tsx adds matching right padding when open
+ * so the main dashboard sits left of the panel instead of underneath it.
  */
 export function TradeSlidePanel(props: TradeSlidePanelProps): ReactElement {
   const { open, onClose, title = 'Trade', children } = props;
@@ -36,25 +40,25 @@ export function TradeSlidePanel(props: TradeSlidePanelProps): ReactElement {
       />
       <div
         className={`fixed inset-y-0 right-0 z-[135] flex w-[min(380px,100vw)] flex-col border-l border-zinc-700/80 bg-zinc-950 shadow-[-12px_0_40px_rgba(0,0,0,0.45)] will-change-transform transition-transform duration-200 ease-out ${
-          open ? 'translate-x-0' : 'translate-x-full pointer-events-none'
+          open ? 'translate-x-0' : 'pointer-events-none translate-x-full'
         }`}
         aria-hidden={!open}
       >
-      <div className="flex shrink-0 items-center justify-between gap-2 border-b border-zinc-800/80 px-3 py-2.5">
-        <div className="min-w-0">
-          <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Trade</div>
-          <div className="truncate text-[13px] font-semibold text-zinc-100">{title}</div>
+        <div className="flex shrink-0 items-center justify-between gap-2 border-b border-zinc-800/80 px-3 py-2.5">
+          <div className="min-w-0">
+            <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Trade</div>
+            <div className="truncate text-[13px] font-semibold text-zinc-100">{title}</div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="shrink-0 rounded-lg border border-zinc-600/60 bg-zinc-900/80 px-3 py-1.5 text-[11px] font-semibold text-zinc-200 hover:bg-zinc-800/90"
+            title="Close (Esc)"
+          >
+            Close
+          </button>
         </div>
-        <button
-          type="button"
-          onClick={onClose}
-          className="shrink-0 rounded-lg border border-zinc-600/60 bg-zinc-900/80 px-3 py-1.5 text-[11px] font-semibold text-zinc-200 hover:bg-zinc-800/90"
-          title="Close (Esc)"
-        >
-          Close
-        </button>
-      </div>
-      <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-y-contain px-3 py-3">{children}</div>
+        <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-y-contain px-3 py-3">{children}</div>
       </div>
     </>
   );

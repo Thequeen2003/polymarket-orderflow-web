@@ -11,6 +11,7 @@ import type { SizingMultiplier } from './directiveSizingMultiplier';
 import type { DirectiveJournal } from './directiveJournal';
 import type { NoTradeScore } from './noTradeScore';
 import type { SwitchForecast } from './sectionalMomentum';
+import { buildTraderDiscipline, type TraderDiscipline } from './traderDiscipline';
 import {
   buildOperatorVerdict,
   type OperatorVerdict,
@@ -337,6 +338,93 @@ function ExecutionSnapshotPanel(props: {
   );
 }
 
+function TraderDisciplinePanel(props: { coach: TraderDiscipline; compact: boolean }): ReactElement {
+  const { coach, compact } = props;
+  const tone =
+    coach.mode === 'PRESS'
+      ? {
+          border: 'border-emerald-600/45',
+          bg: 'from-emerald-950/35 to-zinc-950/45',
+          text: 'text-emerald-100',
+          chip: 'border-emerald-500/45 bg-emerald-950/50 text-emerald-100',
+        }
+      : coach.mode === 'PROBE'
+        ? {
+            border: 'border-sky-600/45',
+            bg: 'from-sky-950/30 to-zinc-950/45',
+            text: 'text-sky-100',
+            chip: 'border-sky-500/45 bg-sky-950/50 text-sky-100',
+          }
+        : coach.mode === 'WAIT'
+          ? {
+              border: 'border-amber-600/45',
+              bg: 'from-amber-950/30 to-zinc-950/45',
+              text: 'text-amber-100',
+              chip: 'border-amber-500/45 bg-amber-950/50 text-amber-100',
+            }
+          : coach.mode === 'MANAGE'
+            ? {
+                border: 'border-indigo-600/45',
+                bg: 'from-indigo-950/30 to-zinc-950/45',
+                text: 'text-indigo-100',
+                chip: 'border-indigo-500/45 bg-indigo-950/50 text-indigo-100',
+              }
+            : {
+                border: 'border-rose-600/45',
+                bg: 'from-rose-950/30 to-zinc-950/45',
+                text: 'text-rose-100',
+                chip: 'border-rose-500/45 bg-rose-950/50 text-rose-100',
+              };
+
+  return (
+    <div className={`rounded-xl border ${tone.border} bg-gradient-to-r ${tone.bg} px-3 py-2.5`}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <div className="text-[9px] font-black uppercase tracking-[0.18em] text-zinc-500">Trader coach</div>
+          <div className={`mt-0.5 ${compact ? 'text-sm' : 'text-base'} font-black uppercase tracking-tight ${tone.text}`}>
+            {coach.mode} · {coach.headline}
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className={`rounded-lg border px-2 py-1 text-[10px] font-black uppercase tracking-wide ${tone.chip}`}>
+            Quality {coach.score}/100
+          </span>
+          <span className="rounded-lg border border-zinc-700/70 bg-black/35 px-2 py-1 text-[10px] font-black uppercase tracking-wide text-zinc-200">
+            Size {coach.sizePct}%
+          </span>
+        </div>
+      </div>
+
+      <div className="mt-2 grid gap-2 md:grid-cols-3">
+        <div className="rounded-lg border border-white/10 bg-black/25 px-2 py-1.5">
+          <div className="text-[8px] font-black uppercase tracking-wide text-emerald-300/80">Confirmations</div>
+          <ul className="mt-1 space-y-1 text-[10px] leading-snug text-zinc-300">
+            {(coach.confirmations.length > 0 ? coach.confirmations : ['waiting for stronger evidence']).slice(0, 3).map((x) => (
+              <li key={x}>{x}</li>
+            ))}
+          </ul>
+        </div>
+        <div className="rounded-lg border border-white/10 bg-black/25 px-2 py-1.5">
+          <div className="text-[8px] font-black uppercase tracking-wide text-rose-300/80">Blockers</div>
+          <ul className="mt-1 space-y-1 text-[10px] leading-snug text-zinc-300">
+            {(coach.blockers.length > 0 ? coach.blockers : ['none active']).slice(0, 3).map((x) => (
+              <li key={x}>{x}</li>
+            ))}
+          </ul>
+        </div>
+        <div className="rounded-lg border border-white/10 bg-black/25 px-2 py-1.5">
+          <div className="text-[8px] font-black uppercase tracking-wide text-sky-300/80">Rules</div>
+          <ul className="mt-1 space-y-1 text-[10px] leading-snug text-zinc-300">
+            {coach.rules.slice(0, 3).map((x) => (
+              <li key={x}>{x}</li>
+            ))}
+          </ul>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /**
  * Prominent "what should I actually do" card. Renders a single dominant
  * **verdict band** (ENTER / EXIT / HOLD / DON'T TRADE) at the top so the
@@ -473,6 +561,19 @@ export function TradeDirectiveCard(props: {
     () =>
       directive ? buildEntryProfitBrief(verdict, directive, levels, upOutcomeLabel, downOutcomeLabel) : null,
     [verdict, directive, levels, upOutcomeLabel, downOutcomeLabel],
+  );
+  const traderDiscipline = useMemo<TraderDiscipline>(
+    () =>
+      buildTraderDiscipline({
+        directive,
+        verdict,
+        levels: levels ?? null,
+        noTradeScore: noTradeScore ?? null,
+        stability: stability ?? null,
+        reEntry: reEntry ?? null,
+        sizingMultiplier: sizingMultiplier ?? null,
+      }),
+    [directive, verdict, levels, noTradeScore, stability, reEntry, sizingMultiplier],
   );
   const verdictPalette = VERDICT_PALETTE[verdict.color];
   const { showTimingStrip, snapshotPanelMode, hasMomentumVsCardClash } = useMemo(() => {
@@ -636,6 +737,8 @@ export function TradeDirectiveCard(props: {
           <p className="mt-0.5 font-semibold">{playbookChip.body}</p>
         </div>
       ) : null}
+
+      <TraderDisciplinePanel coach={traderDiscipline} compact={!!compact} />
 
       {causalBlocks.length > 0 ? (
         <div className="rounded-lg border border-indigo-500/35 bg-indigo-950/20 px-3 py-2.5">

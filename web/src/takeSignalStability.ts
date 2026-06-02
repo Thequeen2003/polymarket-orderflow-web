@@ -13,6 +13,9 @@ export const TAKE_SIGNAL_MIN_DIRECTIVE_MS = 3_000;
 /** HIGH-confidence INITIATE/ADD can arm sooner — still blocks whipsaw. */
 export const TAKE_SIGNAL_MIN_DIRECTIVE_HIGH_MS = 2_000;
 
+/** Rapid-conviction path: HIGH + tape surging/building + was STAND_DOWN → arm very fast. */
+export const TAKE_SIGNAL_RAPID_CONVICTION_MS = 1_200;
+
 /** UI plan (lane / canTake / entry) must be unchanged this long before flipping CTA off. */
 export const TAKE_SIGNAL_PLAN_HOLD_MS = 2_000;
 
@@ -26,6 +29,9 @@ export function minDirectiveMsForTake(
   directive: TradeDirective | null | undefined,
 ): number {
   if (stability?.whipsaw) return TAKE_SIGNAL_MIN_DIRECTIVE_MS;
+  if (stability?.rapidConviction && directive?.confidence === 'HIGH' && isEntryDirective(directive)) {
+    return TAKE_SIGNAL_RAPID_CONVICTION_MS;
+  }
   if (directive?.confidence === 'HIGH' && isEntryDirective(directive)) {
     return TAKE_SIGNAL_MIN_DIRECTIVE_HIGH_MS;
   }

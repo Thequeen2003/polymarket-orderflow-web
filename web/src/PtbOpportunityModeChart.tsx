@@ -29,6 +29,13 @@ import {
   type SectionalDecisionDetail,
 } from './sectionalDecisionEvent';
 import type { DualOutcomeWallFlow } from './dualOutcomeWalls';
+import {
+  downsampleLinePoints,
+  extentSymProb,
+  normalizeProbSeries,
+  padProbSeries,
+  segmentDualLaneStyle,
+} from './ptbLineChart';
 import { computeSpotPtbMachineReadout, type SpotPtbMachineReadout } from './spotPtbMachineSignals';
 import { computeSpotBandGaugeSnapshot, type SpotBandGaugeSnapshot } from './spotBandDeskAction';
 import {
@@ -71,7 +78,10 @@ import { playBoomChime, primeBoomChime } from './boomChime';
 import { downloadJournalCsv } from './directiveJournal';
 import { RoundNote } from './RoundNote';
 import { classifyExitReason, updateReEntryStateWithReason } from './reEntryGuard';
-import { SpotPriceProjectionGrid } from './SpotPriceProjectionGrid';
+import { DeskClosePanel } from './DeskClosePanel';
+import { SpotPriceProjectionGrid, type PtbDirectionContext } from './SpotPriceProjectionGrid';
+import { computeStableProjectedHeader } from './chartStableProjectedHeader';
+import { StableProjectedHeaderDisplay, useStableProjectedHeaderDisplay } from './StableProjectedHeaderDisplay';
 import { parseUpdownSlug, titledUpdownAssetFromSlug } from './sixPackUpdownSlugs';
 
 type Mode = 'up' | 'down';
@@ -265,6 +275,9 @@ const PAD_Y = 18;
 const PROB_STRIP_H = 54;
 const PROB_STRIP_GAP = 6;
 
+const DUAL_PROB_STRIP_H = 132;
+const DUAL_PROB_STRIP_GAP = 8;
+
 function parseTradeBracketCents01(raw: string): number | null {
   const n = Number(String(raw).trim());
   if (!Number.isFinite(n) || n <= 0 || n >= 100) return null;
@@ -404,6 +417,10 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
   /** Last implied mid (0–1) for settlement/cross model confirmation. */
   lastProbUp?: number | null;
   lastProbDown?: number | null;
+  /** Full UP/DOWN implied-mid series — renders dual PTB lines under the spot chart when both are present. */
+  probUp?: SpotPoint[];
+  probDown?: SpotPoint[];
+  probLastUpdateMs?: number | null;
   /** Book flow snapshots for the active UP/DOWN outcome token. */
   bookFlow?: BookSnapshot[] | null;
   chartTitle?: string;
@@ -420,6 +437,10 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
   chartAreaRoomy?: boolean;
   /** Signals Spot vs PTB: chart first (fills viewport), controls/meta below; plot scales much larger. */
   signalsEmbed?: boolean;
+  /** UP/DOWN split desk: one column per lane — shorter plot, lighter chrome. */
+  signalsCombinedColumn?: boolean;
+  /** When false, parent owns desk callbacks (sibling column publishes). Default true. */
+  publishDesk?: boolean;
   onPrimaryCall?: (c: {
     lane: 'up' | 'down' | null;
     status: 'ENTER' | 'PREP' | 'WAIT';
@@ -462,6 +483,8 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
     endsInMs = null,
     lastProbUp = null,
     lastProbDown = null,
+    probUp = [],
+    probDown = [],
     bookFlow = null,
     chartTitle = 'Spot (USD)',
     upLabel = 'UP',
@@ -472,6 +495,8 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
     downOutcomeToken = null,
     chartAreaRoomy = false,
     signalsEmbed = false,
+    signalsCombinedColumn = false,
+    publishDesk = true,
     onPrimaryCall,
     slug = null,
     onMachineReadout,
@@ -485,6 +510,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
     onBandGaugeSnapshot,
     wallFlow = null,
   } = props;
+  const hasDualProbInput = probUp.length >= 1 && probDown.length >= 1;
   const featureFlags = useFeatureFlags();
   const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
   const [pinnedNoteVisible, setPinnedNoteVisible] = useState<boolean>(featureFlags.pinnedNote);
@@ -498,30 +524,38 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
   // Hide legacy mini “rules” panels; the big Trade Plan card is the primary read.
   const showLegacyRulePanels = false;
   const chartPanelWrapSk =
-    chartAreaRoomy
-      ? signalsEmbed
-        ? 'flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-visible px-2 pt-1 sm:px-3 sm:pt-2'
-        : 'min-h-0 flex-1 overflow-x-hidden overflow-y-visible px-3 pt-2 sm:px-4'
-      : 'min-h-0 flex-1 overflow-hidden px-3 pt-2 sm:px-4';
+    signalsCombinedColumn
+      ? 'min-h-0 flex-1 overflow-x-hidden overflow-y-visible px-1.5 pt-1 sm:px-2'
+      : chartAreaRoomy
+        ? signalsEmbed
+          ? 'overflow-x-hidden overflow-y-visible px-1.5 pt-1 sm:px-2'
+          : 'flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-visible px-2 pt-1 sm:px-3 sm:pt-2'
+        : 'min-h-0 flex-1 overflow-hidden px-3 pt-2 sm:px-4';
   const chartPanelWrapMain =
-    chartAreaRoomy
-      ? signalsEmbed
-        ? 'flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-visible px-2 pt-1 sm:px-3 sm:pt-2'
-        : 'min-h-0 flex-1 overflow-x-hidden overflow-y-visible px-3 pt-2 sm:px-4'
-      : 'min-h-0 flex-1 overflow-hidden px-3 pt-2 sm:px-4 [contain:paint]';
+    signalsCombinedColumn
+      ? 'min-h-0 flex-1 overflow-x-hidden overflow-y-visible px-1.5 pt-1 sm:px-2 [contain:paint]'
+      : chartAreaRoomy
+        ? signalsEmbed
+          ? 'overflow-x-hidden overflow-y-visible px-1.5 pt-1 sm:px-2'
+          : 'flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-visible px-2 pt-1 sm:px-3 sm:pt-2'
+        : 'min-h-0 flex-1 overflow-hidden px-3 pt-2 sm:px-4 [contain:paint]';
   /** Dual PTB only — tall plot + high cap so the PTB chart reads at “dashboard” scale, not a card thumbnail. */
   const chartSvgSk =
-    chartAreaRoomy
-      ? signalsEmbed
-        ? 'block h-full min-h-[min(68svh,1500px)] w-full max-w-none flex-1 rounded-[24px] bg-[#0a0f16] [contain:paint] xl:min-h-[min(74svh,1700px)]'
-        : 'block h-full min-h-[min(78vh,940px)] max-h-[min(100dvh,1720px)] w-full rounded-[24px] bg-[#0a0f16] [contain:paint] xl:min-h-[min(82vh,1020px)] xl:max-h-[min(100dvh,1800px)]'
-      : 'block h-full min-h-[min(54vh,620px)] max-h-[min(88vh,960px)] w-full rounded-[24px] bg-[#0a0f16] [contain:paint]';
+    signalsCombinedColumn
+      ? 'block h-full min-h-[min(26svh,320px)] max-h-[min(38svh,440px)] w-full rounded-[18px] bg-[#0a0f16] [contain:paint]'
+      : chartAreaRoomy
+        ? signalsEmbed
+          ? 'block h-auto w-full max-w-none rounded-[20px] bg-[#0a0f16]'
+          : 'block h-full min-h-[min(68svh,1500px)] w-full max-w-none flex-1 rounded-[24px] bg-[#0a0f16] [contain:paint] xl:min-h-[min(74svh,1700px)]'
+        : 'block h-full min-h-[min(54vh,620px)] max-h-[min(88vh,960px)] w-full rounded-[24px] bg-[#0a0f16] [contain:paint]';
   const chartSvgMain =
-    chartAreaRoomy
-      ? signalsEmbed
-        ? 'block h-full min-h-[min(68svh,1500px)] w-full max-w-none flex-1 rounded-[24px] bg-[#0a0f16] xl:min-h-[min(74svh,1700px)] [contain:strict]'
-        : 'block h-full min-h-[min(78vh,940px)] max-h-[min(100dvh,1720px)] w-full rounded-[24px] bg-[#0a0f16] xl:min-h-[min(82vh,1020px)] xl:max-h-[min(100dvh,1800px)]'
-      : 'block h-full min-h-[min(54vh,620px)] max-h-[min(88vh,960px)] w-full rounded-[24px] bg-[#0a0f16] [contain:strict]';
+    signalsCombinedColumn
+      ? 'block h-full min-h-[min(26svh,320px)] max-h-[min(38svh,440px)] w-full rounded-[18px] bg-[#0a0f16] [contain:strict]'
+      : chartAreaRoomy
+        ? signalsEmbed
+          ? 'block h-auto w-full max-w-none rounded-[20px] bg-[#0a0f16]'
+          : 'block h-full min-h-[min(68svh,1500px)] w-full max-w-none flex-1 rounded-[24px] bg-[#0a0f16] xl:min-h-[min(74svh,1700px)] [contain:strict]'
+        : 'block h-full min-h-[min(54vh,620px)] max-h-[min(88vh,960px)] w-full rounded-[24px] bg-[#0a0f16] [contain:strict]';
   const gradId = useId().replace(/:/g, '');
   const [displayMode, setDisplayMode] = useState<'line' | 'ohlc'>('line');
   type ZoomSec = 60 | 120 | 300 | 900 | 1800 | 3600 | 7200 | 14400;
@@ -733,7 +767,27 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
     };
   }, [mode, priceToBeat, pts, upLabel, downLabel]);
 
-  const svgHeight = H + (model != null && overlayAppliesSpot ? PROB_STRIP_GAP + PROB_STRIP_H + 12 : 0);
+  const dualProbOverlay = useMemo(() => {
+    if (!model || !hasDualProbInput) return null;
+    const u0 = padProbSeries(normalizeProbSeries(probUp.map((pt) => ({ t: pt.t, v: pt.v }))));
+    const d0 = padProbSeries(normalizeProbSeries(probDown.map((pt) => ({ t: pt.t, v: pt.v }))));
+    if (u0.length < 2 || d0.length < 2) return null;
+    const tMin = model.tMin;
+    const tMax = model.tMax;
+    const inWindow = (pt: { t: number; v: number }) => pt.t >= tMin - 1 && pt.t <= tMax + 1;
+    const uW = u0.filter(inWindow);
+    const dW = d0.filter(inWindow);
+    const seriesUp = (uW.length >= 2 ? uW : u0).map((pt) => ({ t: pt.t, v: pt.v }));
+    const seriesDown = (dW.length >= 2 ? dW : d0).map((pt) => ({ t: pt.t, v: pt.v }));
+    const vals = [...seriesUp, ...seriesDown].map((pt) => pt.v);
+    const scale = extentSymProb(Math.min(...vals), Math.max(...vals));
+    return { tMin, tMax, seriesUp, seriesDown, scale, lastU: u0[u0.length - 1]!.v, lastD: d0[d0.length - 1]!.v };
+  }, [hasDualProbInput, model, probDown, probUp]);
+
+  const plotBaseH = dualProbOverlay ? 780 : H;
+  const dualStripExtra = dualProbOverlay ? DUAL_PROB_STRIP_GAP + DUAL_PROB_STRIP_H : 0;
+  const bracketStripExtra = model != null && overlayAppliesSpot ? PROB_STRIP_GAP + PROB_STRIP_H + 12 : 0;
+  const svgHeight = plotBaseH + dualStripExtra + bracketStripExtra;
 
   const derivedStrip = useMemo(() => {
     if (!model || priceToBeat == null || !Number.isFinite(priceToBeat)) return null;
@@ -888,7 +942,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
   }, [derivedStrip, model, priceToBeat, upLabel, downLabel]);
 
   useEffect(() => {
-    if (!onPrimaryCall) return;
+    if (!publishDesk || !onPrimaryCall) return;
     onPrimaryCall({
       lane: primaryCall.lane,
       status: primaryCall.status,
@@ -896,7 +950,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
       reason: primaryCall.reason,
       enterWhen: primaryCall.enterWhen ?? null,
     });
-  }, [onPrimaryCall, primaryCall.confidence, primaryCall.enterWhen, primaryCall.lane, primaryCall.reason, primaryCall.status]);
+  }, [publishDesk, onPrimaryCall, primaryCall.confidence, primaryCall.enterWhen, primaryCall.lane, primaryCall.reason, primaryCall.status]);
 
   /**
    * Sectional breakdown for long-window markets (1h / 4h). The user wants to see the
@@ -1061,8 +1115,9 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
   ]);
 
   useEffect(() => {
+    if (!publishDesk) return;
     onMachineReadout?.(machineReadout);
-  }, [machineReadout, onMachineReadout]);
+  }, [publishDesk, machineReadout, onMachineReadout]);
 
   /**
    * Top-level "what should I actually do?" directive — fuses the machine readout
@@ -1081,12 +1136,14 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
   }, [machineReadout, switchForecast, currentPositionLane, upLabel, downLabel]);
 
   useEffect(() => {
+    if (!publishDesk) return;
     onTradeDirective?.(tradeDirective);
-  }, [tradeDirective, onTradeDirective]);
+  }, [publishDesk, tradeDirective, onTradeDirective]);
 
   useEffect(() => {
+    if (!publishDesk) return;
     onSwitchForecast?.(switchForecast);
-  }, [switchForecast, onSwitchForecast]);
+  }, [publishDesk, switchForecast, onSwitchForecast]);
 
   /** Auto-suggested take-profit / stop-loss levels for the Answer card (directive lane, else best +EV book). */
   const tradeLevels: TradeLevels | null = useMemo(
@@ -1270,8 +1327,9 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
   }, [noTradeScore]);
 
   useEffect(() => {
+    if (!publishDesk) return;
     onNoTradeScore?.(noTradeScore);
-  }, [onNoTradeScore, noTradeScore]);
+  }, [publishDesk, onNoTradeScore, noTradeScore]);
 
   /**
    * Operator verdict — same fusion the trade card displays. Hoisted to the
@@ -2065,7 +2123,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
   }, [model, derivedStrip, priceToBeat]);
 
   const width = W;
-  const height = H;
+  const height = plotBaseH;
   const padL = PAD_L;
   const padR = PAD_R;
   const padY = PAD_Y;
@@ -2158,6 +2216,22 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
     };
   }, [derivedStrip, model]);
 
+  const stableProjectedHeaderLive = useMemo(() => {
+    if (!model || derivedStrip == null) return null;
+    return computeStableProjectedHeader({
+      spotLast: model.last,
+      slopeUsdPerSec: derivedStrip.slopeUsdPerSec,
+      ptb: priceToBeat,
+      lastProbUp,
+      lastProbDown,
+      upLabel,
+      downLabel,
+      horizonSec: projection?.t1 ?? 30,
+    });
+  }, [model, derivedStrip, priceToBeat, lastProbUp, lastProbDown, upLabel, downLabel, projection?.t1]);
+
+  const stableProjectedHeader = useStableProjectedHeaderDisplay(stableProjectedHeaderLive);
+
   const bandGaugeSnapshot = useMemo(() => {
     if (!model || priceToBeat == null || !Number.isFinite(priceToBeat)) return null;
     return computeSpotBandGaugeSnapshot({
@@ -2175,8 +2249,9 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
   }, [model, priceToBeat, mode, derivedStrip, projection, upLabel, downLabel]);
 
   useEffect(() => {
+    if (!publishDesk) return;
     onBandGaugeSnapshot?.(bandGaugeSnapshot);
-  }, [bandGaugeSnapshot, onBandGaugeSnapshot]);
+  }, [publishDesk, bandGaugeSnapshot, onBandGaugeSnapshot]);
 
   if (!model) {
     const sk = skeleton;
@@ -2524,19 +2599,19 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
 
   return (
     <div
-      className={`flex min-h-0 flex-col rounded-[30px] border border-zinc-800/90 bg-[#0b1018] shadow-[0_28px_80px_rgba(0,0,0,0.35)] ring-1 ring-zinc-700/40 ${signalsEmbed ? 'min-h-[min(94dvh,2000px)]' : ''}`}
+      className={`flex min-h-0 flex-col border border-zinc-800/90 bg-[#0b1018] ring-1 ring-zinc-700/40 ${
+        signalsCombinedColumn
+          ? 'rounded-2xl shadow-lg shadow-black/25'
+          : 'rounded-[30px] shadow-[0_28px_80px_rgba(0,0,0,0.35)]'
+      }`}
     >
-      <div
-        className={
-          signalsEmbed
-            ? 'flex min-h-0 w-full min-w-0 flex-1 flex-col'
-            : 'flex w-full min-h-0 min-w-0 flex-col'
-        }
-      >
-      <header className="shrink-0 border-b border-zinc-800/80 bg-[#0b1018] px-4 py-3 sm:px-5">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1">
-            <span className="truncate text-lg font-semibold tracking-tight text-zinc-100 sm:text-xl">{chartTitle}</span>
+      <div className={signalsEmbed ? 'flex w-full min-w-0 flex-col' : 'flex min-h-0 w-full min-w-0 flex-1 flex-col'}>
+      <header className={`shrink-0 border-b border-zinc-800/80 bg-[#0b1018] ${signalsCombinedColumn ? 'px-2 py-2 sm:px-3' : 'px-4 py-3 sm:px-5'}`}>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
+            {!signalsCombinedColumn ? (
+              <span className="truncate text-lg font-semibold tracking-tight text-zinc-100 sm:text-xl">{chartTitle}</span>
+            ) : null}
             <span
               className={`rounded-md border px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ${
                 mode === 'up' ? 'border-emerald-700/50 bg-emerald-950/40 text-emerald-200' : 'border-rose-700/50 bg-rose-950/40 text-rose-200'
@@ -2544,10 +2619,27 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             >
               {meta.label}
             </span>
-            <span className="font-mono text-2xl font-semibold tabular-nums tracking-tight text-zinc-50 sm:text-3xl">{fmtUsd(model.last)}</span>
-            <span className={`text-sm font-semibold tabular-nums ${model.recentMove >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-              {fmtUsdSigned(model.recentMove)} <span className="font-normal text-zinc-500">({fmtPctSigned(model.pctChange)})</span>
-            </span>
+            {stableProjectedHeader ? (
+              <StableProjectedHeaderDisplay
+                snapshot={stableProjectedHeader}
+                confirmedBand={
+                  bandGaugeSnapshot
+                    ? {
+                        bandHi: bandGaugeSnapshot.bandHi,
+                        bandLo: bandGaugeSnapshot.bandLo,
+                        ptb: bandGaugeSnapshot.ptb,
+                      }
+                    : null
+                }
+              />
+            ) : (
+              <>
+                <span className="font-mono text-2xl font-semibold tabular-nums tracking-tight text-zinc-50 sm:text-3xl">{fmtUsd(model.last)}</span>
+                <span className={`text-sm font-semibold tabular-nums ${model.recentMove >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                  {fmtUsdSigned(model.recentMove)} <span className="font-normal text-zinc-500">({fmtPctSigned(model.pctChange)})</span>
+                </span>
+              </>
+            )}
           </div>
           <div className="flex flex-wrap items-center justify-end gap-2">
             {endsInMs != null ? (
@@ -2643,48 +2735,57 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
                 </span>
               ) : null}
             </div>
-            {(lastProbUp != null && Number.isFinite(lastProbUp)) || (lastProbDown != null && Number.isFinite(lastProbDown)) ? (
-              <div className="flex flex-wrap gap-x-4 gap-y-0.5 text-[10px] text-zinc-500">
-                <span>
-                  <span className="font-semibold text-emerald-300/90">{upLabel}</span> book mid{' '}
-                  <span className="font-mono text-zinc-200">
-                    {lastProbUp != null && Number.isFinite(lastProbUp) ? `${(lastProbUp * 100).toFixed(1)}¢` : '—'}
-                  </span>
-                </span>
-                <span>
-                  <span className="font-semibold text-rose-300/90">{downLabel}</span> book mid{' '}
-                  <span className="font-mono text-zinc-200">
-                    {lastProbDown != null && Number.isFinite(lastProbDown) ? `${(lastProbDown * 100).toFixed(1)}¢` : '—'}
-                  </span>
-                </span>
-              </div>
-            ) : null}
             <p className="text-[9px] text-zinc-600">Hover the chart plot for time, interpolated spot, and % vs PTB.</p>
           </div>
         ) : null}
-        <div className="mt-3 flex w-full min-w-0 flex-col gap-2 sm:flex-row sm:items-stretch sm:gap-3">
-          <div
-            className={`min-w-0 flex-1 rounded-xl border-2 px-3 py-2.5 shadow-md shadow-black/30 ${positionVsPtbLabel.className}`}
-            title="Where spot is vs the fixed PTB: which side of the level is ahead right now, not the tick path."
-          >
-            <div className="text-[9px] font-extrabold uppercase tracking-[0.18em] text-inherit/90">1 · Level (vs PTB)</div>
-            <div className="mt-0.5 text-lg font-black leading-tight tracking-tight sm:text-xl">{positionVsPtbLabel.title}</div>
-            <div className="mt-1 text-[10px] leading-snug text-inherit/95">{positionVsPtbLabel.sub}</div>
+        {!signalsCombinedColumn ? (
+          <>
+        <DeskClosePanel
+          id="spot-level-path"
+          title="Level & path"
+          summary={`${positionVsPtbLabel.title} · ${pathNowLabel.title}`}
+          defaultOpen={false}
+          className="mt-2"
+          bodyClassName="p-2"
+        >
+          <div className="flex w-full min-w-0 flex-col gap-2 sm:flex-row sm:items-stretch sm:gap-3">
+            <div
+              className={`min-w-0 flex-1 rounded-xl border-2 px-3 py-2.5 shadow-md shadow-black/30 ${positionVsPtbLabel.className}`}
+              title="Where spot is vs the fixed PTB: which side of the level is ahead right now, not the tick path."
+            >
+              <div className="text-[9px] font-extrabold uppercase tracking-[0.18em] text-inherit/90">1 · Level (vs PTB)</div>
+              <div className="mt-0.5 text-lg font-black leading-tight tracking-tight sm:text-xl">{positionVsPtbLabel.title}</div>
+              <div className="mt-1 text-[10px] leading-snug text-inherit/95">{positionVsPtbLabel.sub}</div>
+            </div>
+            <div
+              className={`min-w-0 flex-1 rounded-xl border-2 px-3 py-2.5 shadow-md shadow-black/30 ${pathNowLabel.className}`}
+              title="Candles + slope in the visible 1m–5m window only — can disagree with the level (pullback, bounce)."
+            >
+              <div className="text-[9px] font-extrabold uppercase tracking-[0.18em] text-inherit/90">2 · Path (this window)</div>
+              <div className="mt-0.5 text-lg font-black leading-tight tracking-tight sm:text-xl">{pathNowLabel.title}</div>
+              <div className="mt-1 text-[10px] leading-snug text-inherit/95">{pathNowLabel.sub}</div>
+            </div>
           </div>
-          <div
-            className={`min-w-0 flex-1 rounded-xl border-2 px-3 py-2.5 shadow-md shadow-black/30 ${pathNowLabel.className}`}
-            title="Candles + slope in the visible 1m–5m window only — can disagree with the level (pullback, bounce)."
-          >
-            <div className="text-[9px] font-extrabold uppercase tracking-[0.18em] text-inherit/90">2 · Path (this window)</div>
-            <div className="mt-0.5 text-lg font-black leading-tight tracking-tight sm:text-xl">{pathNowLabel.title}</div>
-            <div className="mt-1 text-[10px] leading-snug text-inherit/95">{pathNowLabel.sub}</div>
-          </div>
-        </div>
+        </DeskClosePanel>
         <p className="mt-2 text-[10px] leading-snug text-zinc-600">
           <span className="font-semibold text-zinc-500">Read</span> — how spot behaves vs the fixed PTB line ·{' '}
           <span className="text-amber-200/80">Yellow</span> = PTB · LINE = ticks · OHLC = buckets
         </p>
-        <div className="mt-2 rounded-xl border border-zinc-800/70 bg-black/25 px-3 py-2">
+        <DeskClosePanel
+          id="spot-single-call"
+          title="Single call"
+          summary={`${primaryCall.status}${primaryCall.lane ? ` · ${primaryCall.lane === 'up' ? upLabel : downLabel}` : ' · NO SIDE'} · ${primaryCall.confidence}`}
+          badge={
+            executionClash ? (
+              <span className="rounded border border-amber-600/40 bg-amber-950/30 px-1.5 py-px text-[8px] font-bold uppercase text-amber-200">
+                Card overrides
+              </span>
+            ) : null
+          }
+          defaultOpen={false}
+          className="mt-2"
+          bodyClassName="px-3 py-2"
+        >
           {executionClash ? (
             <div className="mb-2 rounded-lg border border-amber-700/45 bg-amber-950/25 px-2.5 py-2 text-[10px] font-semibold leading-snug text-amber-100/95">
               <span className="font-extrabold uppercase tracking-wide text-amber-200">Trade card overrides · </span>
@@ -2757,7 +2858,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
               Alternate side → {(primaryCall.lane ?? mode) === 'up' ? downLabel : upLabel}
             </button>
           </div>
-        </div>
+        </DeskClosePanel>
         <details className="mt-2 rounded-lg border border-zinc-800/70 bg-black/25 px-3 py-2 text-[10px] leading-relaxed text-zinc-500 open:bg-black/35">
           <summary className="cursor-pointer select-none font-semibold text-zinc-400 marker:text-zinc-600">
             Chart read — axis, tints, time window, momentum (tap)
@@ -2786,34 +2887,81 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             </li>
           </ul>
         </details>
+          </>
+        ) : (
+          <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+            <span
+              className={`rounded-md border px-2 py-0.5 text-[9px] font-extrabold tracking-wide ${
+                primaryCall.status === 'ENTER'
+                  ? primaryCall.lane === 'up'
+                    ? 'border-emerald-500/45 bg-emerald-950/30 text-emerald-100'
+                    : 'border-rose-500/45 bg-rose-950/25 text-rose-100'
+                  : primaryCall.status === 'PREP'
+                    ? 'border-amber-500/35 bg-amber-950/20 text-amber-100'
+                    : 'border-zinc-700/70 bg-zinc-900/30 text-zinc-200'
+              }`}
+            >
+              {primaryCall.status}
+              {primaryCall.lane ? ` · ${primaryCall.lane === 'up' ? upLabel : downLabel}` : ''}
+            </span>
+            <span className="text-[9px] leading-snug text-zinc-500">{positionVsPtbLabel.title}</span>
+          </div>
+        )}
       </header>
 
-      {switchForecast ? (
-        <div className="mx-3 mt-2 sm:mx-4">
-          {featureFlags.pinnedNote ? <RoundNote slug={slug} visible={pinnedNoteVisible} /> : null}
-          <SignalTruthStrip
-            tradeDirective={tradeDirective}
-            operatorVerdict={operatorVerdict}
-            switchForecast={switchForecast}
-            boomActive={boom != null}
-            boomKind={boom?.kind ?? null}
-            boomLane={boom?.lane ?? null}
-            upLabel={upLabel}
-            downLabel={downLabel}
-            executionClash={executionClash}
-            tapeWaitCardGo={tapeWaitCardGo}
-            machineFocusLane={machineReadout?.focusLane ?? null}
-            machineAgreementPct={machineReadout?.agreementScore ?? null}
-            inSettlement={machineReadout?.urgency === 'settlement'}
-          />
-          {featureFlags.tapeVelocity && tapeVelocity ? (
-            <TapeVelocityStrip
-              tape={tapeVelocity}
-              lane={tradeDirective?.lane ?? null}
+      {switchForecast && !signalsCombinedColumn ? (
+        <div className="mx-3 mt-2 space-y-2 sm:mx-4">
+          {featureFlags.pinnedNote ? (
+            <DeskClosePanel id="round-note" title="Note" summary="Round journal" defaultOpen={false}>
+              <RoundNote slug={slug} visible={pinnedNoteVisible} />
+            </DeskClosePanel>
+          ) : null}
+          <DeskClosePanel
+            id="signal-stack"
+            title="Signal stack"
+            summary={operatorVerdict.bigVerb}
+            badge={
+              executionClash ? (
+                <span className="rounded border border-rose-500/35 bg-rose-950/40 px-1 py-px text-[8px] font-bold uppercase text-rose-200">
+                  Card wins
+                </span>
+              ) : null
+            }
+            defaultOpen={false}
+            bodyClassName="p-1.5"
+          >
+            <SignalTruthStrip
+              tradeDirective={tradeDirective}
+              operatorVerdict={operatorVerdict}
+              switchForecast={switchForecast}
+              boomActive={boom != null}
+              boomKind={boom?.kind ?? null}
+              boomLane={boom?.lane ?? null}
               upLabel={upLabel}
               downLabel={downLabel}
-              reduceMotion={reduceMotion}
+              executionClash={executionClash}
+              tapeWaitCardGo={tapeWaitCardGo}
+              machineFocusLane={machineReadout?.focusLane ?? null}
+              machineAgreementPct={machineReadout?.agreementScore ?? null}
+              inSettlement={machineReadout?.urgency === 'settlement'}
             />
+          </DeskClosePanel>
+          {featureFlags.tapeVelocity && tapeVelocity ? (
+            <DeskClosePanel
+              id="tape-velocity"
+              title="Tape"
+              summary={`${tapeVelocity.dominance} · ${tapeVelocity.burst}`}
+              defaultOpen={false}
+              bodyClassName="p-1.5"
+            >
+              <TapeVelocityStrip
+                tape={tapeVelocity}
+                lane={tradeDirective?.lane ?? null}
+                upLabel={upLabel}
+                downLabel={downLabel}
+                reduceMotion={reduceMotion}
+              />
+            </DeskClosePanel>
           ) : null}
           {boom ? (
             <BoomOverlay
@@ -2835,7 +2983,13 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             />
           ) : null}
           {tradeDirective && !signalsEmbed ? (
-            <div className="mb-2">
+            <DeskClosePanel
+              id="answer-card"
+              title="Answer"
+              summary={operatorVerdict.bigVerb}
+              defaultOpen
+              bodyClassName="p-2"
+            >
               <div className="mb-1.5 flex flex-wrap items-center gap-2">
                 <span className="rounded-md border border-emerald-500/50 bg-emerald-950/35 px-2 py-0.5 text-[9px] font-black uppercase tracking-[0.2em] text-emerald-100">
                   Answer
@@ -2870,7 +3024,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
                   incomingSwitchLevels,
                 }}
               />
-            </div>
+            </DeskClosePanel>
           ) : !signalsEmbed && !tradeDirective ? (
             <div className="mb-2 rounded-xl border border-dashed border-zinc-800/70 bg-zinc-950/25 px-3 py-2.5 text-center">
               <span className="text-[9px] font-black uppercase tracking-[0.2em] text-zinc-500">Answer</span>
@@ -2880,11 +3034,15 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             </div>
           ) : null}
           {!signalsEmbed && featureFlags.noTradeBanner && noTradeScore && noTradeScore.tier !== 'GREEN' ? (
-            <NoTradeBanner
-              score={noTradeScore}
-              reduceMotion={reduceMotion}
-              compact={executionClash}
-            />
+            <DeskClosePanel
+              id="no-trade-banner"
+              title="No-trade"
+              summary={`${noTradeScore.tier} · ${noTradeScore.score}/100`}
+              defaultOpen={false}
+              bodyClassName="p-1.5"
+            >
+              <NoTradeBanner score={noTradeScore} reduceMotion={reduceMotion} compact={executionClash} />
+            </DeskClosePanel>
           ) : null}
           {shortcutHelpOpen ? (
             <ShortcutHelp onClose={() => setShortcutHelpOpen(false)} />
@@ -2926,57 +3084,63 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
               </button>
             </div>
           ) : null}
-          <div className="mb-1 flex items-center gap-2 border-b border-zinc-800/80 pb-1">
-            <span className="text-[9px] font-black uppercase tracking-[0.22em] text-zinc-600">Chart</span>
-            <span className="text-[9px] leading-none text-zinc-600">—</span>
-            <span className="text-[9px] font-semibold uppercase tracking-wide text-zinc-500">
-              {executionClash
-                ? 'Tape read · Answer block is law'
-                : tapeWaitCardGo
-                  ? 'Tape WAIT · card GO (full model)'
-                  : 'context only · card above wins'}
-            </span>
-          </div>
-          <DecisionBanner
-            forecast={switchForecast}
-            upLabel={upLabel}
-            downLabel={downLabel}
-            dwellInfo={dwellInfo}
-            onTestBoom={fireTestBoom}
-            machine={machineReadout}
-            operatorVerdict={operatorVerdict}
-            hasDirective={tradeDirective != null}
-            tapeWaitCardGo={tapeWaitCardGo}
-          />
-          {sections.length > 0 && sectionalPlan != null ? (
-            <SectionalStrip
-              sections={sections}
-              sectionMs={sectionalPlan.sectionMs}
+          <DeskClosePanel
+            id="chart-tape-context"
+            title="Chart / tape"
+            summary={
+              machineReadout
+                ? `Sensors ${Math.round(machineReadout.agreementScore)}% · ${switchForecast.status}`
+                : switchForecast.status
+            }
+            badge={
+              <span className="rounded border border-zinc-700/60 bg-zinc-900/50 px-1 py-px text-[8px] font-semibold uppercase text-zinc-400">
+                {executionClash ? 'Answer block is law' : tapeWaitCardGo ? 'Tape WAIT · card GO' : 'context'}
+              </span>
+            }
+            defaultOpen={false}
+            bodyClassName="space-y-2 p-2"
+          >
+            <DecisionBanner
+              forecast={switchForecast}
               upLabel={upLabel}
               downLabel={downLabel}
-              forecast={switchForecast}
-              executionClash={executionClash}
+              dwellInfo={dwellInfo}
+              onTestBoom={fireTestBoom}
+              machine={machineReadout}
+              operatorVerdict={operatorVerdict}
+              hasDirective={tradeDirective != null}
+              tapeWaitCardGo={tapeWaitCardGo}
             />
-          ) : (
-            <div className="mt-2 rounded-xl border border-dashed border-zinc-800/80 bg-zinc-950/20 px-3 py-2.5 text-center text-[10px] leading-relaxed text-zinc-500">
-              {sectionalPlan ? (
-                <>
-                  <span className="font-semibold text-zinc-400">Round breakdown</span> — waiting for enough spot ticks to paint{' '}
-                  {sectionalPlan.count} slice{sectionalPlan.count === 1 ? '' : 's'} (
-                  {sectionalPlan.sectionMs >= 60_000
-                    ? `${Math.round(sectionalPlan.sectionMs / 60_000)}m`
-                    : `${Math.round(sectionalPlan.sectionMs / 1000)}s`}{' '}
-                  each). The strip reappears as data fills; try a wider zoom if this stays empty.
-                </>
-              ) : (
-                <>
-                  <span className="font-semibold text-zinc-400">Round breakdown</span> — set chart zoom to{' '}
-                  <strong className="text-zinc-300">≥ 1 minute</strong> for sectional slices. The Answer card, TP/SL, and
-                  boom above still use spot, book, and PTB sensors at any zoom.
-                </>
-              )}
-            </div>
-          )}
+            {sections.length > 0 && sectionalPlan != null ? (
+              <SectionalStrip
+                sections={sections}
+                sectionMs={sectionalPlan.sectionMs}
+                upLabel={upLabel}
+                downLabel={downLabel}
+                forecast={switchForecast}
+                executionClash={executionClash}
+              />
+            ) : (
+              <div className="rounded-xl border border-dashed border-zinc-800/80 bg-zinc-950/20 px-3 py-2.5 text-center text-[10px] leading-relaxed text-zinc-500">
+                {sectionalPlan ? (
+                  <>
+                    <span className="font-semibold text-zinc-400">Round breakdown</span> — waiting for enough spot ticks to paint{' '}
+                    {sectionalPlan.count} slice{sectionalPlan.count === 1 ? '' : 's'} (
+                    {sectionalPlan.sectionMs >= 60_000
+                      ? `${Math.round(sectionalPlan.sectionMs / 60_000)}m`
+                      : `${Math.round(sectionalPlan.sectionMs / 1000)}s`}{' '}
+                    each). The strip reappears as data fills; try a wider zoom if this stays empty.
+                  </>
+                ) : (
+                  <>
+                    <span className="font-semibold text-zinc-400">Round breakdown</span> — set chart zoom to{' '}
+                    <strong className="text-zinc-300">≥ 1 minute</strong> for sectional slices. The Answer card, TP/SL, and
+                    boom above still use spot, book, and PTB sensors at any zoom.
+                  </>
+                )}
+              </div>
+            )}
+          </DeskClosePanel>
         </div>
       ) : null}
 
@@ -3381,8 +3545,122 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             </g>
           ) : null}
 
+          {dualProbOverlay
+            ? (() => {
+                const stripY0 = padY + innerH + DUAL_PROB_STRIP_GAP;
+                const gridY0 = stripY0 + 30;
+                const gridBottom = stripY0 + DUAL_PROB_STRIP_H - 8;
+                const gridH = Math.max(8, gridBottom - gridY0);
+                const probSpan = Math.max(1e-9, dualProbOverlay.scale.max - dualProbOverlay.scale.min);
+                const yProb = (p: number) => gridY0 + (1 - (clamp01(p) - dualProbOverlay.scale.min) / probSpan) * gridH;
+                const y50 = yProb(0.5);
+                const ptsU = downsampleLinePoints(dualProbOverlay.seriesUp, 480);
+                const ptsD = downsampleLinePoints(dualProbOverlay.seriesDown, 480);
+                const fmtCents = (p: number) => `${(clamp01(p) * 100).toFixed(1)}¢`;
+                const renderLane = (lane: 'up' | 'down', pts: typeof ptsU) =>
+                  pts.slice(1).map((b, i) => {
+                    const a = pts[i]!;
+                    const vPrev = i > 0 ? pts[i - 1]!.v : null;
+                    const st = segmentDualLaneStyle(lane, vPrev, a.v, b.v, a.t, b.t, 0.5);
+                    return (
+                      <line
+                        key={`dual-${lane}-${b.t}-${i}`}
+                        x1={xTime(a.t)}
+                        y1={yProb(a.v)}
+                        x2={xTime(b.t)}
+                        y2={yProb(b.v)}
+                        stroke={st.stroke}
+                        strokeWidth={st.strokeWidth}
+                        strokeLinecap="round"
+                        className="pointer-events-none"
+                      />
+                    );
+                  });
+                const centTicks = [0, 0.25, 0.5, 0.75, 1].filter(
+                  (tp) => tp >= dualProbOverlay.scale.min - 1e-9 && tp <= dualProbOverlay.scale.max + 1e-9,
+                );
+                return (
+                  <g aria-label="Dual PTB implied mid strip">
+                    <rect
+                      x={padL}
+                      y={stripY0}
+                      width={innerW}
+                      height={DUAL_PROB_STRIP_H}
+                      rx={12}
+                      fill="rgba(9,10,12,0.96)"
+                      stroke="rgba(63,63,70,0.88)"
+                      strokeWidth={1}
+                    />
+                    <text x={padL + 8} y={stripY0 + 14} fill="rgb(251,191,36)" fontSize="9" fontWeight="800">
+                      DUAL PTB · book-implied mids vs 50¢
+                    </text>
+                    <text x={padL + 8} y={stripY0 + 24} fill="rgb(113,113,122)" fontSize="8" fontWeight="600">
+                      <tspan fill="rgb(167,243,208)">{upLabel}</tspan> {fmtCents(dualProbOverlay.lastU)}
+                      {' · '}
+                      <tspan fill="rgb(254,202,202)">{downLabel}</tspan> {fmtCents(dualProbOverlay.lastD)}
+                    </text>
+                    {centTicks.map((tp) => (
+                      <line
+                        key={`dpg-${tp}`}
+                        x1={padL}
+                        x2={padL + innerW}
+                        y1={yProb(tp)}
+                        y2={yProb(tp)}
+                        stroke={Math.abs(tp - 0.5) < 1e-6 ? 'rgba(250,204,21,0.22)' : 'rgba(255,255,255,0.05)'}
+                        strokeWidth={1}
+                        className="pointer-events-none"
+                      />
+                    ))}
+                    <line
+                      x1={padL}
+                      x2={padL + innerW}
+                      y1={y50}
+                      y2={y50}
+                      stroke="rgb(250 204 21)"
+                      strokeWidth={2}
+                      strokeDasharray="5 4"
+                      className="pointer-events-none"
+                    />
+                    {renderLane('down', ptsD)}
+                    {renderLane('up', ptsU)}
+                    <circle
+                      cx={xTime(ptsU[ptsU.length - 1]!.t)}
+                      cy={yProb(dualProbOverlay.lastU)}
+                      r={4.5}
+                      fill="white"
+                      stroke="rgb(52 211 153)"
+                      strokeWidth={2}
+                      className="pointer-events-none"
+                    />
+                    <circle
+                      cx={xTime(ptsD[ptsD.length - 1]!.t)}
+                      cy={yProb(dualProbOverlay.lastD)}
+                      r={4.5}
+                      fill="white"
+                      stroke="rgb(251 113 133)"
+                      strokeWidth={2}
+                      className="pointer-events-none"
+                    />
+                    <text
+                      x={padL + innerW - 6}
+                      y={stripY0 + 14}
+                      textAnchor="end"
+                      fill="rgb(113,113,122)"
+                      fontSize="8"
+                      fontWeight="600"
+                    >
+                      {upLabel} / {downLabel}
+                    </text>
+                  </g>
+                );
+              })()
+            : null}
+
           {overlayAppliesSpot && bracketOverlay ? (() => {
-            const stripY0 = padY + innerH + PROB_STRIP_GAP;
+            const stripY0 =
+              padY +
+              innerH +
+              (dualProbOverlay ? DUAL_PROB_STRIP_GAP + DUAL_PROB_STRIP_H + PROB_STRIP_GAP : PROB_STRIP_GAP);
             const bo = bracketOverlay;
             const bsl = parseTradeBracketCents01(bo.slStopCents);
             const btp = parseTradeBracketCents01(bo.tpTakeCents);
@@ -3658,6 +3936,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
       </div>
       </div>
 
+      {!signalsEmbed ? (
       <section
         className={`shrink-0 border-t-2 bg-zinc-950/85 px-4 py-4 text-zinc-100 sm:px-5 ${statusBarBorder}`}
         title={derivedStrip?.controlBlurb ?? undefined}
@@ -3806,18 +4085,36 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
           <span className="rounded border border-zinc-700/60 bg-black/30 px-2 py-1 text-zinc-500">{model.conviction}</span>
         </div>
 
-        {priceToBeat != null && model && derivedStrip ? (
-          <SpotPriceProjectionGrid
-            spotLast={model.last}
-            slopeUsdPerSec={derivedStrip.slopeUsdPerSec}
-            endsInMs={endsInMs}
-            assetLabel={
-              slug
-                ? (parseUpdownSlug(slug)?.asset ?? titledUpdownAssetFromSlug(slug) ?? undefined)?.toUpperCase()
-                : undefined
-            }
-          />
-        ) : null}
+        {priceToBeat != null && model && derivedStrip ? (() => {
+          const _band = model.band;
+          const _lo = priceToBeat - _band;
+          const _hi = priceToBeat + _band;
+          const _d = model.last - priceToBeat;
+          const _inBand = Math.abs(_d) <= _band;
+          const _geo = _inBand ? 'IN_BAND' as const : _d > 0 ? 'ABOVE' as const : 'BELOW' as const;
+          const _absDist = Math.abs(_d);
+          const _sep = _absDist >= _band * 3 ? 'STRONG' as const : _absDist >= _band * 1.75 ? 'CLEAR' as const : 'WEAK' as const;
+          const _favorableNow = mode === 'up' ? model.last > _hi : model.last < _lo;
+          const _edgeLive = _sep !== 'WEAK' && _favorableNow;
+          const _ptbCtx: PtbDirectionContext = {
+            geo: _geo, separation: _sep, edgeLive: _edgeLive, mode,
+            viewLabel: mode === 'up' ? upLabel : downLabel,
+            ptb: priceToBeat, bandHi: _hi, bandLo: _lo,
+          };
+          return (
+            <SpotPriceProjectionGrid
+              spotLast={model.last}
+              slopeUsdPerSec={derivedStrip.slopeUsdPerSec}
+              endsInMs={endsInMs}
+              assetLabel={
+                slug
+                  ? (parseUpdownSlug(slug)?.asset ?? titledUpdownAssetFromSlug(slug) ?? undefined)?.toUpperCase()
+                  : undefined
+              }
+              ptbContext={_ptbCtx}
+            />
+          );
+        })() : null}
 
         {/* Make “WEAK SEPARATION” impossible to misread: bold, actionable, not just a chip. */}
         {priceToBeat != null && model ? (() => {
@@ -4057,7 +4354,9 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
           );
         })() : null}
       </section>
+      ) : null}
 
+      {!signalsEmbed ? (
       <details className="mx-4 mb-3 mt-1 rounded-xl border border-zinc-800/50 bg-zinc-900/20 px-3 py-2 text-[11px] text-zinc-500 ring-1 ring-white/[0.02]">
         <summary className="cursor-pointer select-none font-semibold text-zinc-400">Chart details · engine · attribution</summary>
         <p className="mt-2 text-[10px] leading-snug text-zinc-600">{STREAM_ATTRIBUTION_LINE}</p>
@@ -4073,6 +4372,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
           <span className="font-semibold text-amber-200/90">PTB read</span> — {derivedStrip?.interactionLabel ?? 'Scoring…'}
         </div>
       </details>
+      ) : null}
     </div>
   );
 });

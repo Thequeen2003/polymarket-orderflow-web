@@ -403,7 +403,7 @@ export type UpdownShortcutAsset = 'btc' | 'eth' | 'sol' | 'hype';
 export type UpdownInterval = '5m' | '15m' | '1h' | '4h' | '1d';
 
 export function marketsUpdownShortcut(asset: UpdownShortcutAsset, interval: UpdownInterval = '5m') {
-  return getJson<{
+  return getJsonWithRetry<{
     slug: string;
     asset: string;
     interval?: string;
@@ -435,13 +435,19 @@ export async function marketsGet(slugOrId: string) {
 }
 
 export function priceToBeat(slugOrId: string) {
-  return getJsonWithRetry<{ slug: string; price_to_beat: number; source: string }>(
+  return getJsonWithRetry<{
+    slug: string;
+    price_to_beat: number;
+    source: string;
+    preview?: boolean;
+    opens_at_ms?: number;
+  }>(
     `/api/price-to-beat/${encodeURIComponent(slugOrId)}`,
     { timeoutMs: 22_000, retries: 2, retryDelayMs: 600 },
   );
 }
 
-export type RtdsCryptoPoint = { t: number; v: number };
+export type RtdsCryptoPoint = { t: number; v: number; src?: 'chainlink' | 'binance' };
 
 /** Latest underlying from Polymarket RTDS (Chainlink primary on WS; server may label Binance fallback). */
 export function rtdsCrypto(symbol: string) {

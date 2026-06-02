@@ -42,6 +42,10 @@ import type { SwitchForecast } from './sectionalMomentum';
 import { computeSignalTakenPlaybook } from './signalTakenPlaybook';
 import { SignalTakenAckPanel } from './SignalTakenAckPanel';
 import { buildHeldSideDeskMetrics } from './heldSideDeskMetrics';
+import { DeskClosePanel } from './DeskClosePanel';
+import { MomentumProjectionStrip } from './MomentumProjectionStrip';
+import { shouldBuyWhichSide, type BuySideAdvisory } from './shouldBuyWhichSide';
+import { ShouldBuyCard } from './ShouldBuyCard';
 import {
   loadAutoTradeOnDoThisNow,
   loadAutoTradeSizeShares,
@@ -78,10 +82,17 @@ import { TakeSignalNowButton } from './TakeSignalNowButton';
 import { DeskSyncBannerSlot } from './DeskSyncBannerSlot';
 import { FivePctGainSignalCard } from './FivePctGainSignalCard';
 import { useStableDeskAction } from './useStableDeskAction';
+import {
+  bandGaugeMeaningKey,
+  buildDeskMeaningKey,
+  machineReadoutMeaningKey,
+  tradeDirectiveMeaningKey,
+} from './signalsDeskStable';
+import { NowPriceSignalsPanel } from './NowPriceSignalsPanel';
+import { ProbabilityLagMonitorPanel } from './ProbabilityLagMonitorPanel';
 import { TakeSignalStrategyPanel } from './TakeSignalStrategyPanel';
 import { evaluateFivePctGainStrategy } from './fivePctGainStrategy';
 import { applyTakeSignalStrategies, type TakeSignalStrategyId } from './takeSignalStrategy';
-import { price01ToWholeCents } from './displayCents';
 import {
   applyTakeSignalStabilityGate,
   takeSignalPlanMeaningKey,
@@ -115,8 +126,9 @@ function deskActionIsWeakFall(a: DeskSingleAction): boolean {
   return a.primary.trim().toUpperCase().startsWith('WAIT');
 }
 
-/** Brief hold when the live strip flickers to WAIT/sync — must not block playbook flips. */
-const DO_THIS_NOW_FALL_HOLD_MS = 6_000;
+/** Brief hold when the live strip flickers to WAIT/sync — must not block playbook flips.
+ *  Reduced from 6s→3s so re-entry ENTER signals appear faster after brief WAIT dips. */
+const DO_THIS_NOW_FALL_HOLD_MS = 3_000;
 /** Min gap between auto-trade fires on the same slug (prevents re-entry spam on flicker). */
 const AUTO_TRADE_COOLDOWN_MS = 45_000;
 
@@ -143,6 +155,14 @@ function crossCheckToneClass(tone: 'emerald' | 'amber' | 'zinc' | 'rose'): strin
   if (tone === 'amber') return 'border-amber-700/50 bg-amber-950/30 text-amber-200';
   if (tone === 'rose') return 'border-rose-700/50 bg-rose-950/30 text-rose-200';
   return 'border-zinc-700/60 bg-zinc-950/20 text-zinc-300';
+}
+
+function isCrossCheckWarnPill(pill: string): boolean {
+  return pill === 'CONFLICT' || pill === 'INCOMPLETE';
+}
+
+export function shouldAutoOpenCrossCheck(prevPill: string, nextPill: string): boolean {
+  return isCrossCheckWarnPill(nextPill) && !isCrossCheckWarnPill(prevPill);
 }
 
 /** Which outcome book-flow feeds the Spot chart until the operator locks a view tab. */
@@ -399,7 +419,11 @@ export function SignalsPtbOnly(props: {
   }, [bookAbove, bookBelow, priceToBeat, spot]);
 
   const [tradeDirectiveSpot, setTradeDirectiveSpot] = useState<TradeDirective | null>(null);
+  const lastTradeDirectiveKeyRef = useRef('');
   const onTradeDirectiveSpot = useCallback((d: TradeDirective | null) => {
+    const key = tradeDirectiveMeaningKey(d);
+    if (key === lastTradeDirectiveKeyRef.current) return;
+    lastTradeDirectiveKeyRef.current = key;
     setTradeDirectiveSpot(d);
   }, []);
   // ─── Master lane (must sit above tape hooks): chart directive drives desk tape ───
@@ -436,7 +460,11 @@ export function SignalsPtbOnly(props: {
     setSpotChartLane(inferDefaultSpotChartLane(spot, priceToBeat, probUp, probDown));
   }, [slug, spot, priceToBeat, probUp, probDown]);
   const [machineVerdictSpot, setMachineVerdictSpot] = useState<SpotPtbMachineReadout | null>(null);
+  const lastMachineReadoutKeyRef = useRef('');
   const onMachineVerdictSpot = useCallback((r: SpotPtbMachineReadout | null) => {
+    const key = machineReadoutMeaningKey(r);
+    if (key === lastMachineReadoutKeyRef.current) return;
+    lastMachineReadoutKeyRef.current = key;
     setMachineVerdictSpot(r);
   }, []);
   // Desk tape follows order-flow winning side when known, else trade card / chart toggle.
@@ -455,7 +483,11 @@ export function SignalsPtbOnly(props: {
     return s && s.length ? s : null;
   }, [idx, books, flowSeriesForSlug, spotChartLane]);
   const [bandGaugeSpot, setBandGaugeSpot] = useState<SpotBandGaugeSnapshot | null>(null);
+  const lastBandGaugeKeyRef = useRef('');
   const onBandGaugeSpot = useCallback((g: SpotBandGaugeSnapshot | null) => {
+    const key = bandGaugeMeaningKey(g);
+    if (key === lastBandGaugeKeyRef.current) return;
+    lastBandGaugeKeyRef.current = key;
     setBandGaugeSpot(g);
   }, []);
 
@@ -499,6 +531,14 @@ export function SignalsPtbOnly(props: {
     () => computeTapeVelocity(tapePrints, { now: tapeClock }),
     [tapePrints, tapeClock],
   );
+  const tradeLevelsBookPrices = useMemo(() => {
+    const lane = tradeDirectiveSpot?.lane;
+    if (!lane) return { bestAsk: null as number | null, bestBid: null as number | null };
+    const book = lane === 'up' ? bookAbove : bookBelow;
+    const tob = topOfBook(book);
+    return { bestAsk: tob.bestAsk, bestBid: tob.bestBid };
+  }, [tradeDirectiveSpot?.lane, bookAbove, bookBelow]);
+
   const tradeLevelsSpot = useMemo(
     () =>
       resolveTradeLevelsForDirective({
@@ -506,14 +546,18 @@ export function SignalsPtbOnly(props: {
         laneEdges: machineVerdictSpot?.edges ?? null,
         crossProb: machineVerdictSpot?.crossProb ?? null,
         endsInMs: endsInMs ?? null,
+        bestAsk: tradeLevelsBookPrices.bestAsk,
+        bestBid: tradeLevelsBookPrices.bestBid,
       }),
-    [tradeDirectiveSpot, machineVerdictSpot?.crossProb, machineVerdictSpot?.edges, endsInMs],
+    [tradeDirectiveSpot, machineVerdictSpot?.crossProb, machineVerdictSpot?.edges, endsInMs, tradeLevelsBookPrices],
   );
   const [stabilitySpot, setStabilitySpot] = useState<DirectiveStability | null>(null);
   useEffect(() => {
     if (!tradeDirectiveSpot) return;
     setStabilitySpot((prev) => updateStability(prev, tradeDirectiveSpot, Date.now()));
   }, [tradeDirectiveSpot]);
+
+  const [switchForecastSpot, setSwitchForecastSpot] = useState<SwitchForecast | null>(null);
   const discrepancySpot = useMemo(
     () => detectDirectiveDiscrepancy(tradeDirectiveSpot, machineVerdictSpot),
     [tradeDirectiveSpot, machineVerdictSpot],
@@ -618,6 +662,9 @@ export function SignalsPtbOnly(props: {
     if (prev == null || prev === s) return;
 
     setTradeDirectiveSpot(null);
+    lastTradeDirectiveKeyRef.current = '';
+    lastMachineReadoutKeyRef.current = '';
+    lastBandGaugeKeyRef.current = '';
     setSwitchForecastSpot(null);
     setChartNoTradeScore(null);
     lastAutoTakeKeyRef.current = null;
@@ -672,7 +719,6 @@ export function SignalsPtbOnly(props: {
     () => computeTapeVelocity(heldOutcomeTapePrints, { now: tapeClock }),
     [heldOutcomeTapePrints, tapeClock],
   );
-  const [switchForecastSpot, setSwitchForecastSpot] = useState<SwitchForecast | null>(null);
   useEffect(() => {
     if (slug == null || !String(slug).trim()) return;
     saveSignalsDeskPersist(String(slug).trim(), {
@@ -700,6 +746,21 @@ export function SignalsPtbOnly(props: {
       endsInMs: endsInMs ?? null,
     });
   }, [switchForecastSpot, tradeDirectiveSpot, machineVerdictSpot?.edges, machineVerdictSpot?.crossProb, endsInMs]);
+
+  const [buySideAdvisory, setBuySideAdvisory] = useState<BuySideAdvisory | null>(null);
+  const askShouldBuy = useCallback(() => {
+    const result = shouldBuyWhichSide({
+      machine: machineVerdictSpot,
+      tape: tapeNowSpot,
+      tapeLane: deskTapeLane,
+      forecast: switchForecastSpot,
+      directive: tradeDirectiveSpot,
+      stability: stabilitySpot,
+      upLabel,
+      downLabel,
+    });
+    setBuySideAdvisory(result);
+  }, [machineVerdictSpot, tapeNowSpot, deskTapeLane, switchForecastSpot, tradeDirectiveSpot, stabilitySpot, upLabel, downLabel]);
 
   const executionSnapshotSpot = useMemo((): TradeExecutionSnapshot | null => {
     if (manualPositionLane == null) return null;
@@ -973,7 +1034,8 @@ export function SignalsPtbOnly(props: {
   }, [slug, tradeDirectiveSpot, spot, priceToBeat, probUp, probDown, upToken, downToken]);
 
   const spotChartLive = priceToBeat != null && spot.length >= 2;
-  const [chartTab, setChartTab] = useState<'spot' | 'dual'>('spot');
+  const [chartTab, setChartTab] = useState<'spot' | 'dual' | 'now' | 'plm'>('spot');
+  const showChartTabs = priceToBeat != null && spot.length >= 1;
   const [spotChartCall, setSpotChartCall] = useState<{
     lane: 'up' | 'down' | null;
     status: 'ENTER' | 'PREP' | 'WAIT';
@@ -1208,29 +1270,15 @@ export function SignalsPtbOnly(props: {
     [deskSingleActionLive.primary, deskSingleActionLive.detail, deskSingleActionLive.tone],
   );
 
-  /** Lane / action / verdict state — when this changes, always adopt live (no fall-hold). */
+  /** Lane / action / verdict — not entry/TP/SL ticks (those update via deskLiveSig only). */
   const deskMeaningKey = useMemo(
     () =>
-      [
-        manualPositionLane ?? '-',
-        tradeDirectiveSpot?.action ?? '-',
-        tradeDirectiveSpot?.lane ?? '-',
-        operatorVerdictDesk?.state ?? '-',
-        operatorVerdictDesk?.bigVerb ?? '-',
-        tradeLevelsSpot
-          ? `${price01ToWholeCents(tradeLevelsSpot.entry)}|${price01ToWholeCents(tradeLevelsSpot.takeProfit)}|${price01ToWholeCents(tradeLevelsSpot.stopLoss)}`
-          : '-',
-      ].join('|'),
-    [
-      manualPositionLane,
-      tradeDirectiveSpot?.action,
-      tradeDirectiveSpot?.lane,
-      operatorVerdictDesk?.state,
-      operatorVerdictDesk?.bigVerb,
-      tradeLevelsSpot?.entry,
-      tradeLevelsSpot?.takeProfit,
-      tradeLevelsSpot?.stopLoss,
-    ],
+      buildDeskMeaningKey({
+        manualLane: manualPositionLane,
+        directive: tradeDirectiveSpot,
+        verdict: operatorVerdictDesk,
+      }),
+    [manualPositionLane, tradeDirectiveSpot, operatorVerdictDesk],
   );
 
   const deskSingleActionDisplay = useStableDeskAction(deskSingleActionSpot, deskMeaningKey);
@@ -1414,6 +1462,18 @@ export function SignalsPtbOnly(props: {
       else if (tapeNowSpot.dominance === 'sell' && masterLane === 'up') tapeAdj -= 10;
       if (tapeNowSpot.burst === 'extreme' && tapeNowSpot.dominance !== 'mixed') tapeAdj += 4;
       else if (tapeNowSpot.burst === 'aggressive' && tapeNowSpot.dominance !== 'mixed') tapeAdj += 2;
+    }
+    // Micro-window leading boost: acceleration in the last 10s predicts imminent move.
+    if (tapeNowSpot.microReliable && tapeNowSpot.acceleration === 'surging') {
+      const microAligned =
+        (tapeNowSpot.microDominance === 'buy' && masterLane === 'up') ||
+        (tapeNowSpot.microDominance === 'sell' && masterLane === 'down');
+      if (microAligned) tapeAdj += 10;
+    } else if (tapeNowSpot.microReliable && tapeNowSpot.acceleration === 'building') {
+      const microAligned =
+        (tapeNowSpot.microDominance === 'buy' && masterLane === 'up') ||
+        (tapeNowSpot.microDominance === 'sell' && masterLane === 'down');
+      if (microAligned) tapeAdj += 5;
     }
     score += tapeAdj;
 
@@ -1624,9 +1684,9 @@ export function SignalsPtbOnly(props: {
   const prevCrossPillRef = useRef(crossCheckMeta.pill);
   useLayoutEffect(() => {
     const p = crossCheckMeta.pill;
-    if (crossCheckWarn && prevCrossPillRef.current !== p) setCrossCheckOpen(true);
+    if (shouldAutoOpenCrossCheck(prevCrossPillRef.current, p)) setCrossCheckOpen(true);
     prevCrossPillRef.current = p;
-  }, [crossCheckMeta.pill, crossCheckWarn]);
+  }, [crossCheckMeta.pill]);
 
   // Inline cross-engine strip — replaces the old `xcheck` chart tab. One-line by
   // default; click to expand the full Spot / Dual call breakdown without leaving
@@ -1635,7 +1695,7 @@ export function SignalsPtbOnly(props: {
     <details
       className={`rounded-xl border ${crossCheckToneClass(crossCheckMeta.tone)}`}
       open={crossCheckOpen}
-      onToggle={(e) => setCrossCheckOpen((e.target as HTMLDetailsElement).open)}
+      onToggle={(e) => setCrossCheckOpen(e.currentTarget.open)}
     >
       <summary className="cursor-pointer select-none px-3 py-2 text-[11px] font-semibold tracking-wide hover:opacity-90 [&::-webkit-details-marker]:hidden">
         <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1997,9 +2057,8 @@ export function SignalsPtbOnly(props: {
   }, [deskSingleActionDisplay.tone]);
 
   const spotVsPtbSection = (
-    <div className="flex min-h-0 w-full min-w-0 flex-col gap-2">
-      {/* Chart first — directive / verdict cards used to sit above and pushed it too far down. */}
-      <div className="flex min-h-0 w-full min-w-0 flex-1 flex-col">
+    <div className="flex w-full min-w-0 flex-col gap-2">
+      <div className="w-full min-w-0">
         <PtbOpportunityModeChart
           slug={slug}
           mode={spotChartLane}
@@ -2032,23 +2091,90 @@ export function SignalsPtbOnly(props: {
           wallFlow={dualWallFlow}
         />
       </div>
-      {/* Lane-agreement bar — card · vote · desk tape — sits directly under the chart so
-          the operator's first read is "do my sensors agree?" */}
-      {laneAgreementBar}
-      {/* Cross-engine strip (only when both engines are loaded). Inline collapsible —
-          no more separate Cross-check tab. */}
-      {hasDual ? crossCheckStrip : null}
-      <div className="rounded-xl border border-sky-900/35 bg-sky-950/20 px-3 py-2 text-[10px] leading-snug text-sky-100/95">
-        <span className="font-extrabold uppercase tracking-wide text-sky-200">Math · </span>
-        <span className="font-semibold text-zinc-100">{upLabel}</span> / <span className="font-semibold text-zinc-100">{downLabel}</span> are{' '}
-        <span className="font-semibold text-zinc-100">outcome tokens</span> on Polymarket (priced 0–100¢). The bell compares{' '}
-        <span className="font-semibold text-zinc-100">settlement spot vs price-to-beat (PTB)</span>.{' '}
-        <span className="font-semibold text-zinc-100">Do this now</span> = trade card action + entry/TP/SL on that token.{' '}
-        <span className="font-semibold text-zinc-100">Sensor strip</span> = who controls the book (walls, mids, tape) — can disagree with spot vs PTB; follow the physics line when they fight.
-      </div>
-      <div className={`rounded-2xl border px-4 py-3.5 min-h-[12rem] ${deskSingleActionSkin}`}>
-        <div className="text-[9px] font-black uppercase tracking-[0.22em] text-white/45">Do this now</div>
-        <p className="mt-1 min-h-[1.35em] text-[clamp(1.08rem,3.6vw,1.5rem)] font-black leading-[1.15] tracking-tight">
+      <DeskClosePanel
+        id="lane-agreement"
+        title="Lane agreement"
+        summary={`${laneAgreement.tier}${laneAgreement.winner ? ` · ${laneAgreement.winner.toUpperCase()}` : ''}`}
+        defaultOpen={false}
+        className="mt-2"
+        bodyClassName="p-1.5"
+      >
+        {laneAgreementBar}
+      </DeskClosePanel>
+      {(probUp.length >= 3 || probDown.length >= 3) ? (
+        <DeskClosePanel
+          id="momentum-proj"
+          title="Projected price"
+          summary={`${upLabel} / ${downLabel} · momentum`}
+          defaultOpen={false}
+          bodyClassName="p-1.5"
+        >
+          <div className="flex gap-2">
+            {probUp.length >= 3 ? (
+              <div className="min-w-0 flex-1">
+                <MomentumProjectionStrip
+                  pts={probUp}
+                  tapeNetPressure={spotChartLane === 'up' ? (tapeNowSpot?.netPressure ?? null) : null}
+                  outcomeLabel={upLabel}
+                />
+              </div>
+            ) : null}
+            {probDown.length >= 3 ? (
+              <div className="min-w-0 flex-1">
+                <MomentumProjectionStrip
+                  pts={probDown}
+                  tapeNetPressure={spotChartLane === 'down' ? (tapeNowSpot?.netPressure ?? null) : null}
+                  outcomeLabel={downLabel}
+                />
+              </div>
+            ) : null}
+          </div>
+        </DeskClosePanel>
+      ) : null}
+      {hasDual ? (
+        <DeskClosePanel
+          id="cross-check"
+          title="Cross-check"
+          summary={`${crossCheckMeta.pill} · ${crossCheckMeta.title}`}
+          defaultOpen={crossCheckWarn}
+          bodyClassName="p-1.5"
+        >
+          {crossCheckStrip}
+        </DeskClosePanel>
+      ) : null}
+      <DeskClosePanel id="math-hint" title="Math" summary="Outcome tokens vs PTB" defaultOpen={false} bodyClassName="px-3 py-2">
+        <div className="text-[10px] leading-snug text-sky-100/95">
+          <span className="font-extrabold uppercase tracking-wide text-sky-200">Math · </span>
+          <span className="font-semibold text-zinc-100">{upLabel}</span> / <span className="font-semibold text-zinc-100">{downLabel}</span> are{' '}
+          <span className="font-semibold text-zinc-100">outcome tokens</span> on Polymarket (priced 0–100¢). The bell compares{' '}
+          <span className="font-semibold text-zinc-100">settlement spot vs price-to-beat (PTB)</span>.{' '}
+          <span className="font-semibold text-zinc-100">Do this now</span> = trade card action + entry/TP/SL on that token.{' '}
+          <span className="font-semibold text-zinc-100">Sensor strip</span> = who controls the book (walls, mids, tape) — can disagree with spot vs PTB; follow the physics line when they fight.
+        </div>
+      </DeskClosePanel>
+      <DeskClosePanel
+        id="do-this-now-v2"
+        title="Do this now"
+        summary={deskSingleActionDisplay.primary}
+        badge={
+          deskSingleActionDisplay.tone === 'green' || deskSingleActionDisplay.tone === 'emerald' ? (
+            <span className="rounded border border-emerald-500/40 bg-emerald-950/35 px-1.5 py-px text-[8px] font-bold uppercase text-emerald-200">
+              Enter
+            </span>
+          ) : deskSingleActionDisplay.tone === 'gray' ||
+            deskSingleActionDisplay.tone === 'amber' ||
+            deskSingleActionDisplay.tone === 'rose' ||
+            deskSingleActionDisplay.tone === 'red' ? (
+            <span className="rounded border border-rose-500/40 bg-rose-950/35 px-1.5 py-px text-[8px] font-bold uppercase text-rose-200">
+              Stand down
+            </span>
+          ) : null
+        }
+        defaultOpen={false}
+        bodyClassName="p-1"
+      >
+      <div className={`rounded-2xl border px-4 py-3.5 ${deskSingleActionSkin}`}>
+        <p className="min-h-[1.35em] text-[clamp(1.08rem,3.6vw,1.5rem)] font-black leading-[1.15] tracking-tight">
           {deskSingleActionDisplay.primary}
         </p>
         <div className="mt-2 min-h-[2.75rem]">
@@ -2078,6 +2204,18 @@ export function SignalsPtbOnly(props: {
           onTake={() => onTakeSignalNow()}
           physicsHint={takeSignalPhysicsHint}
         />
+        <DeskClosePanel
+          id="do-this-now-automation"
+          title="Strategies & auto-trade"
+          summary={
+            takeSignalStrategyIds.length > 0
+              ? `${takeSignalStrategyIds.length} filter${takeSignalStrategyIds.length === 1 ? '' : 's'} · ${autoTradeSizeSharesStr} sh`
+              : `Off · ${autoTradeSizeSharesStr} sh`
+          }
+          defaultOpen={false}
+          className="mt-2"
+          bodyClassName="space-y-2 p-2"
+        >
         <TakeSignalStrategyPanel
           activeIds={takeSignalStrategyIds}
           onToggle={onToggleTakeSignalStrategy}
@@ -2092,7 +2230,7 @@ export function SignalsPtbOnly(props: {
           signal={fivePctGainEval?.signal ?? null}
           blockedReason={fivePctGainEval?.ok ? null : fivePctGainEval?.reason ?? null}
         />
-        <div className="mt-2.5 space-y-2 rounded-lg border border-zinc-700/40 bg-black/20 px-3 py-2">
+        <div className="space-y-2 rounded-lg border border-zinc-700/40 bg-black/20 px-3 py-2">
           <label className="flex items-center justify-between gap-3">
             <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-400">Auto-trade size</span>
             <span className="text-[10px] text-zinc-500">shares</span>
@@ -2152,43 +2290,80 @@ export function SignalsPtbOnly(props: {
             your wallet. Set SL/TP manually in the trade panel Brackets tab if you want exits armed.
           </p>
         </div>
+        </DeskClosePanel>
       </div>
-      <TradeDirectiveCard
-        directive={tradeDirectiveSpot}
-        compact
-        deskFlow
-        causalBlocks={tradeCausalBlocks}
-        bandPlayStep={bandGaugeSpot?.activeStep ?? null}
-        heldOutcomeLane={manualPositionLane}
-        levels={tradeLevelsSpot}
-        laneEdges={machineVerdictSpot?.edges ?? null}
-        tpSlHorizon={{ crossProb: machineVerdictSpot?.crossProb ?? null, endsInMs }}
-        upOutcomeLabel={upLabel}
-        downOutcomeLabel={downLabel}
-        stability={stabilitySpot}
-        discrepancy={discrepancySpot}
-        reEntry={reEntryCheckSpot}
-        sizingMultiplier={sizingMultiplierSpot}
-        noTradeScore={chartNoTradeScore}
-        crossEngineLaneConflict={crossEngineLaneConflict}
-        crossCheckSpotLane={spotChartCall?.lane ?? null}
-        crossCheckDualLane={dualChartCall?.lane ?? null}
-        journal={journalSpot}
-        executionSnapshot={executionSnapshotSpot}
-      >
-        <SignalTakenAckPanel
-          upLabel={upLabel}
-          downLabel={downLabel}
-          manualLane={manualPositionLane}
-          pendingHoldLane={pendingHoldLane}
-          onPickLane={onAckSignalLane}
-          onResetDesk={resetSignalsDesk}
-          onClearAllHolds={clearAllDeskHolds}
-          playbook={signalTakenPlaybookSpot}
-          positionAlerts={positionDeskAlertsSpot}
-          heldMetrics={heldSideDeskMetricsSpot}
-        />
-      </TradeDirectiveCard>
+      </DeskClosePanel>
+      <ShouldBuyCard
+        advisory={buySideAdvisory}
+        onAsk={askShouldBuy}
+        upLabel={upLabel}
+        downLabel={downLabel}
+      />
+      {tradeDirectiveSpot ? (
+        <DeskClosePanel
+          id="trade-directive-card-v1"
+          title="Trade card"
+          summary={operatorVerdictDesk.bigVerb}
+          badge={
+            operatorVerdictDesk.state === 'GO_LONG' || operatorVerdictDesk.state === 'GO_SHORT' ? (
+              <span className="rounded border border-emerald-500/40 bg-emerald-950/35 px-1.5 py-px text-[8px] font-bold uppercase text-emerald-200">
+                Enter
+              </span>
+            ) : operatorVerdictDesk.isStandDown ? (
+              <span className="rounded border border-rose-500/40 bg-rose-950/35 px-1.5 py-px text-[8px] font-bold uppercase text-rose-200">
+                Stand down
+              </span>
+            ) : operatorVerdictDesk.state === 'EXIT_NOW' ? (
+              <span className="rounded border border-amber-500/40 bg-amber-950/35 px-1.5 py-px text-[8px] font-bold uppercase text-amber-200">
+                Exit
+              </span>
+            ) : (
+              <span className="rounded border border-zinc-600/40 bg-zinc-900/50 px-1.5 py-px text-[8px] font-bold uppercase text-zinc-300">
+                {operatorVerdictDesk.bigVerb}
+              </span>
+            )
+          }
+          defaultOpen={false}
+          bodyClassName="space-y-2 p-1"
+        >
+          <TradeDirectiveCard
+            directive={tradeDirectiveSpot}
+            compact
+            deskFlow
+            causalBlocks={tradeCausalBlocks}
+            bandPlayStep={bandGaugeSpot?.activeStep ?? null}
+            heldOutcomeLane={manualPositionLane}
+            levels={tradeLevelsSpot}
+            laneEdges={machineVerdictSpot?.edges ?? null}
+            tpSlHorizon={{ crossProb: machineVerdictSpot?.crossProb ?? null, endsInMs }}
+            upOutcomeLabel={upLabel}
+            downOutcomeLabel={downLabel}
+            stability={stabilitySpot}
+            discrepancy={discrepancySpot}
+            reEntry={reEntryCheckSpot}
+            sizingMultiplier={sizingMultiplierSpot}
+            noTradeScore={chartNoTradeScore}
+            crossEngineLaneConflict={crossEngineLaneConflict}
+            crossCheckSpotLane={spotChartCall?.lane ?? null}
+            crossCheckDualLane={dualChartCall?.lane ?? null}
+            journal={journalSpot}
+            executionSnapshot={executionSnapshotSpot}
+          >
+            <SignalTakenAckPanel
+              upLabel={upLabel}
+              downLabel={downLabel}
+              manualLane={manualPositionLane}
+              pendingHoldLane={pendingHoldLane}
+              onPickLane={onAckSignalLane}
+              onResetDesk={resetSignalsDesk}
+              onClearAllHolds={clearAllDeskHolds}
+              playbook={signalTakenPlaybookSpot}
+              positionAlerts={positionDeskAlertsSpot}
+              heldMetrics={heldSideDeskMetricsSpot}
+            />
+          </TradeDirectiveCard>
+        </DeskClosePanel>
+      ) : null}
       <MachineVerdictCard
         readout={machineVerdictSpot}
         physicsLine={causalHeadline ?? entryPhysicsLine}
@@ -2256,10 +2431,21 @@ export function SignalsPtbOnly(props: {
     </div>
   );
 
-  /** Tabbed Spot vs PTB / Dual PTB. Cross-check is now an inline strip inside
+  /** Tabbed Spot vs PTB / Dual PTB / Now Price Signals / PLM. Cross-check is an inline strip inside
    *  `spotVsPtbSection` so it's always glanceable without a tab switch. */
-  const dualTabChartCard = hasDual ? (
-    <div className="flex min-w-0 max-w-full flex-col rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-2 sm:p-3 min-h-[min(56vh,640px)]">
+  const plmPMktUp = useMemo(() => {
+    const u = probUp.length ? (probUp[probUp.length - 1]!.v ?? null) : null;
+    const d = probDown.length ? (probDown[probDown.length - 1]!.v ?? null) : null;
+    if (u != null && Number.isFinite(u)) return Math.max(0.01, Math.min(0.99, u));
+    if (d != null && Number.isFinite(d)) return Math.max(0.01, Math.min(0.99, 1 - d));
+    return null;
+  }, [probUp, probDown]);
+  const plmBandUsd =
+    deskBandGauge != null ? (deskBandGauge.bandHi - deskBandGauge.bandLo) / 2 : ptbContext?.bandUsd ?? null;
+  const plmSlopeUsdPerSec = ptbContext?.slopeUsdPerSec ?? null;
+
+  const chartTabCard = showChartTabs ? (
+    <div className="flex min-w-0 max-w-full flex-col rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-2 sm:p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Chart</div>
         <div className="flex gap-1 rounded-xl border border-zinc-800/60 bg-black/20 p-1">
@@ -2272,23 +2458,44 @@ export function SignalsPtbOnly(props: {
           >
             Spot vs PTB
           </button>
+          {hasDual ? (
+            <button
+              type="button"
+              onClick={() => setChartTab('dual')}
+              className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
+                chartTab === 'dual' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              Dual PTB
+            </button>
+          ) : null}
           <button
             type="button"
-            onClick={() => setChartTab('dual')}
+            onClick={() => setChartTab('now')}
             className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
-              chartTab === 'dual' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
+              chartTab === 'now' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
             }`}
           >
-            Dual PTB
+            Now Price Signals
+          </button>
+          <button
+            type="button"
+            onClick={() => setChartTab('plm')}
+            title="Probability Lag Monitor — P_model vs P_mkt repricing"
+            className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
+              chartTab === 'plm' ? 'bg-cyan-900/60 text-cyan-50' : 'text-zinc-400 hover:text-cyan-200'
+            }`}
+          >
+            PLM
           </button>
         </div>
       </div>
 
-      <div className="mt-3 flex min-h-0 min-w-0 max-w-full flex-1 flex-col">
-        {/* Both panels stay mounted so the cross-check strip in spotVsPtbSection
-            sees both engines' summaries immediately. */}
-        <div className={chartTab === 'spot' ? 'flex min-h-0 min-w-0 flex-1 flex-col' : 'hidden'}>{spotVsPtbSection}</div>
-        <div className={chartTab === 'dual' ? 'flex min-h-0 min-w-0 flex-1 flex-col' : 'hidden'}>
+      <div className="mt-2 flex min-w-0 max-w-full flex-col">
+        {/* Spot + Dual stay mounted so cross-check sees both engines immediately. */}
+        <div className={chartTab === 'spot' ? 'flex min-w-0 flex-col' : 'hidden'}>{spotVsPtbSection}</div>
+        {hasDual ? (
+          <div className={chartTab === 'dual' ? 'flex min-w-0 flex-col' : 'hidden'}>
             <PtbDualProbabilityChart
               probUp={probUp}
               probDown={probDown}
@@ -2300,12 +2507,41 @@ export function SignalsPtbOnly(props: {
               bookDown={bookBelow}
               compactHeader
               hideReadingGuide
-              largeCharts
               enginePlacement="below"
               onSummary={onDualSummary}
               upOutcomeToken={upToken ?? ''}
               downOutcomeToken={downToken ?? ''}
             />
+          </div>
+        ) : null}
+        <div className={chartTab === 'now' ? 'flex min-w-0 flex-col' : 'hidden'}>
+          <NowPriceSignalsPanel
+            spot={spot}
+            priceToBeat={priceToBeat}
+            endsInMs={endsInMs}
+            bandGauge={deskBandGauge}
+            ptbContext={ptbContext}
+            machineReadout={machineVerdictSpot}
+            tape={tapeNowSpot}
+            probUp={probUp}
+            probDown={probDown}
+            upLabel={upLabel}
+            downLabel={downLabel}
+            spotBookAlignment={spotBookAlignment}
+            physicsLine={causalHeadline ?? entryPhysicsLine}
+          />
+        </div>
+        <div className={chartTab === 'plm' ? 'flex min-w-0 flex-col' : 'hidden'}>
+          <ProbabilityLagMonitorPanel
+            slug={slug ?? 'unknown'}
+            spot={spot}
+            priceToBeat={priceToBeat}
+            pMktUp={plmPMktUp}
+            slopeUsdPerSec={plmSlopeUsdPerSec}
+            bandUsd={plmBandUsd}
+            upLabel={upLabel}
+            enabled={chartTab === 'plm'}
+          />
         </div>
       </div>
     </div>
@@ -2318,7 +2554,7 @@ export function SignalsPtbOnly(props: {
       <details
         className="rounded-2xl border border-zinc-800/60 bg-zinc-950/35"
         open={flowZonesOpen}
-        onToggle={(e) => setFlowZonesOpen((e.target as HTMLDetailsElement).open)}
+        onToggle={(e) => setFlowZonesOpen(e.currentTarget.open)}
       >
         <summary className="cursor-pointer select-none px-4 py-3 text-[11px] font-semibold text-zinc-400 hover:text-zinc-200 [&::-webkit-details-marker]:hidden">
           <span className="mr-1 text-zinc-600" aria-hidden>
@@ -2376,7 +2612,7 @@ export function SignalsPtbOnly(props: {
               <span className="font-mono text-zinc-300">btc|eth|sol-updown-*</span> slug so RTDS ticks fill (see note when mids exist).
         </p>
       </div>
-      {spotVsPtbSection}
+      {showChartTabs ? null : spotVsPtbSection}
       {trackingUnderCharts}
       {books && books.length >= 2 ? (
         <div className="grid gap-3 lg:grid-cols-2">
@@ -2406,7 +2642,7 @@ export function SignalsPtbOnly(props: {
         endsInMs={endsInMs}
         booksFetchedAt={booksFetchedAt}
       />
-      {spotVsPtbSection}
+      {showChartTabs ? null : spotVsPtbSection}
       {trackingUnderCharts}
       <div className="grid gap-3 lg:grid-cols-2">
         <OverallOrderBookPanel
@@ -2443,7 +2679,7 @@ export function SignalsPtbOnly(props: {
           </div>
         ) : null}
       </DeskSyncBannerSlot>
-      {hasDual ? dualTabChartCard : null}
+      {hasDual ? chartTabCard : showChartTabs ? chartTabCard : null}
       {body}
     </>
   );

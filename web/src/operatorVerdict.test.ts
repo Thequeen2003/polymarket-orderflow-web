@@ -120,7 +120,7 @@ describe('buildOperatorVerdict', () => {
   });
 
   it('forces STAND_DOWN when noTradeScore tier is RED and score is severe', () => {
-    const noTrade: NoTradeScore = { score: 97, tier: 'RED', contributions: [], summary: 'red' };
+    const noTrade: NoTradeScore = { score: 99, tier: 'RED', contributions: [], summary: 'red' };
     const v = buildOperatorVerdict({
       directive: mkDirective(),
       levels: mkLevels(),
@@ -129,7 +129,7 @@ describe('buildOperatorVerdict', () => {
     expect(v.state).toBe('STAND_DOWN');
     expect(v.isStandDown).toBe(true);
     expect(v.bigVerb).toBe("DON'T TRADE");
-    expect(v.primaryBlocker).toContain('No-Trade 97');
+    expect(v.primaryBlocker).toContain('No-Trade 99');
   });
 
   it('does not STAND_DOWN on elevated no-trade when below severity cutoff', () => {
@@ -174,7 +174,7 @@ describe('buildOperatorVerdict', () => {
   it('forces STAND_DOWN on shouldBlock discrepancy', () => {
     const v = buildOperatorVerdict({
       directive: mkDirective(),
-      discrepancy: mkDiscrepancy({ shouldBlock: true, any: true, score: 95 }),
+      discrepancy: mkDiscrepancy({ shouldBlock: true, any: true, score: 97 }),
     });
     expect(v.state).toBe('STAND_DOWN');
     expect(v.primaryBlocker).toContain('disagree');
@@ -287,7 +287,7 @@ describe('buildOperatorVerdict', () => {
     const v = buildOperatorVerdict({
       directive: mkDirective(),
       stability: mkStability({ tier: 'whipsaw', flipsLastMin: 12 }),
-      discrepancy: mkDiscrepancy({ shouldBlock: true, any: true, score: 95 }),
+      discrepancy: mkDiscrepancy({ shouldBlock: true, any: true, score: 97 }),
     });
     expect(v.state).toBe('STAND_DOWN');
     expect(v.blockers.length).toBeGreaterThanOrEqual(2);
@@ -303,21 +303,30 @@ describe('buildOperatorVerdict', () => {
     expect(v.confidence).not.toBe('HIGH');
   });
 
-  it('cross-engine lane mismatch blocks only LOW-conviction INITIATE', () => {
+  it('cross-engine lane mismatch blocks only LOW-conviction INITIATE with low edge', () => {
     const blocked = buildOperatorVerdict({
-      directive: mkDirective({ action: 'INITIATE', lane: 'up', confidence: 'LOW' }),
+      directive: mkDirective({ action: 'INITIATE', lane: 'up', confidence: 'LOW', edgePerShareUsd: 0.01 }),
       levels: mkLevels(),
       crossEngineLaneConflict: true,
     });
     expect(blocked.state).toBe('STAND_DOWN');
     expect(blocked.blockers.join(' ')).toMatch(/Dual lane mismatch/i);
 
+    // HIGH confidence not blocked even with low edge
     const allowed = buildOperatorVerdict({
       directive: mkDirective({ action: 'INITIATE', lane: 'up', confidence: 'HIGH' }),
       levels: mkLevels(),
       crossEngineLaneConflict: true,
     });
     expect(allowed.state).toBe('GO_LONG');
+
+    // LOW confidence but strong edge (+5¢) NOT blocked — math overrides
+    const mathOverride = buildOperatorVerdict({
+      directive: mkDirective({ action: 'INITIATE', lane: 'up', confidence: 'LOW', edgePerShareUsd: 0.05 }),
+      levels: mkLevels(),
+      crossEngineLaneConflict: true,
+    });
+    expect(mathOverride.state).toBe('GO_LONG');
 
     const add = buildOperatorVerdict({
       directive: mkDirective({ action: 'ADD', lane: 'up' }),
@@ -340,7 +349,7 @@ describe('buildOperatorVerdict', () => {
 
   it('explains Cross-check STAND_DOWN with Spot vs Dual lanes when provided', () => {
     const v = buildOperatorVerdict({
-      directive: mkDirective({ action: 'INITIATE', lane: 'down', headline: 'INITIATE DOWN', confidence: 'LOW' }),
+      directive: mkDirective({ action: 'INITIATE', lane: 'down', headline: 'INITIATE DOWN', confidence: 'LOW', edgePerShareUsd: 0.01 }),
       levels: mkLevels({ lane: 'down', entry: 0.4, takeProfit: 0.52, stopLoss: 0.33, rrRatio: 1.4 }),
       crossEngineLaneConflict: true,
       crossCheckSpotLane: 'up',

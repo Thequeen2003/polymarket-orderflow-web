@@ -89,4 +89,50 @@ describe('updateStability', () => {
     const next = updateStability(start, null, 10_000);
     expect(next).toBe(start);
   });
+
+  describe('rapid conviction fast-path', () => {
+    function mkHighDirective(action: DirectiveAction, lane: 'up' | 'down' | null = 'up'): TradeDirective {
+      return { ...mkDirective(action, lane), confidence: 'HIGH' };
+    }
+
+    it('sets rapidConviction=true for HIGH INITIATE after STAND_DOWN', () => {
+      let s = updateStability(null, mkDirective('STAND_DOWN', null), 0);
+      s = updateStability(s, mkDirective('STAND_DOWN', null), 5_000);
+      s = updateStability(s, mkHighDirective('INITIATE', 'up'), 6_000);
+      expect(s.rapidConviction).toBe(true);
+    });
+
+    it('uses faster forming window (4s not 10s) when rapidConviction', () => {
+      let s = updateStability(null, mkDirective('STAND_DOWN', null), 0);
+      s = updateStability(s, mkDirective('STAND_DOWN', null), 30_000);
+      s = updateStability(s, mkHighDirective('INITIATE', 'down'), 31_000);
+      expect(s.rapidConviction).toBe(true);
+      expect(s.tier).toBe('forming');
+      // After 4.5s it should be consolidating (not still forming for 10s)
+      s = updateStability(s, mkHighDirective('INITIATE', 'down'), 35_500);
+      expect(s.tier).toBe('consolidating');
+    });
+
+    it('warnFresh=false on rapid conviction (immediate trust)', () => {
+      let s = updateStability(null, mkDirective('HOLD', 'up'), 0);
+      s = updateStability(s, mkDirective('HOLD', 'up'), 30_000);
+      s = updateStability(s, mkHighDirective('INITIATE', 'down'), 31_000);
+      expect(s.rapidConviction).toBe(true);
+      expect(s.warnFresh).toBe(false);
+    });
+
+    it('does NOT set rapidConviction for MED confidence', () => {
+      let s = updateStability(null, mkDirective('STAND_DOWN', null), 0);
+      s = updateStability(s, mkDirective('STAND_DOWN', null), 30_000);
+      s = updateStability(s, mkDirective('INITIATE', 'up'), 31_000);
+      expect(s.rapidConviction).toBe(false);
+    });
+
+    it('does NOT set rapidConviction for HOLD→HOLD (no action change)', () => {
+      let s = updateStability(null, mkDirective('HOLD', 'up'), 0);
+      s = updateStability(s, mkDirective('HOLD', 'up'), 30_000);
+      s = updateStability(s, mkHighDirective('HOLD', 'down'), 31_000);
+      expect(s.rapidConviction).toBe(false);
+    });
+  });
 });

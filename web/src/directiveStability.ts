@@ -42,6 +42,11 @@ export type DirectiveStability = {
   whipsaw: boolean;
   /** Short, user-facing summary. */
   summary: string;
+  /**
+   * True when this is a high-conviction transition (STAND_DOWN/HOLD → INITIATE/ADD HIGH).
+   * Downstream consumers can use this to skip additional debounce gates.
+   */
+  rapidConviction: boolean;
 };
 
 const MAX_HISTORY = 30;
@@ -56,6 +61,7 @@ const EMPTY: DirectiveStability = {
   warnFresh: false,
   whipsaw: false,
   summary: 'No directive yet.',
+  rapidConviction: false,
 };
 
 function snapshotKey(s: DirectiveSnapshot): string {
@@ -67,9 +73,14 @@ function snapshotFromDirective(directive: TradeDirective | null, nowMs: number):
   return { ts: nowMs, action: directive.action, lane: directive.lane };
 }
 
-function tierFor(msSinceChange: number, flipsLastMin: number): StabilityTier {
+/** High-conviction transitions (STAND_DOWN→INITIATE with HIGH conf) use a faster forming window. */
+const FAST_FORMING_MS = 4_000;
+const NORMAL_FORMING_MS = 10_000;
+
+function tierFor(msSinceChange: number, flipsLastMin: number, rapidConviction = false): StabilityTier {
   if (flipsLastMin >= 4) return 'whipsaw';
-  if (msSinceChange < 10_000) return 'forming';
+  const formingThreshold = rapidConviction ? FAST_FORMING_MS : NORMAL_FORMING_MS;
+  if (msSinceChange < formingThreshold) return 'forming';
   if (msSinceChange < 30_000) return 'consolidating';
   return 'stable';
 }
@@ -89,6 +100,18 @@ function summaryFor(state: Omit<DirectiveStability, 'summary'>, current: Directi
   return `${current.action} stable — held for ${sec}s+ across the last several ticks.`;
 }
 
+/** Detect high-conviction transition: STAND_DOWN/HOLD → INITIATE/ADD with HIGH confidence. */
+function isRapidConvictionTransition(
+  prevSnap: DirectiveSnapshot | null,
+  current: DirectiveSnapshot,
+  directive: TradeDirective | null,
+): boolean {
+  if (!directive || directive.confidence !== 'HIGH') return false;
+  if (current.action !== 'INITIATE' && current.action !== 'ADD' && current.action !== 'FLIP') return false;
+  if (!prevSnap) return true;
+  return prevSnap.action === 'STAND_DOWN' || prevSnap.action === 'HOLD';
+}
+
 /**
  * Update the stability state given the latest directive at `nowMs`.
  */
@@ -104,6 +127,7 @@ export function updateStability(
 
   // First-ever snapshot.
   if (!prev || !prev.current) {
+    const rapidConviction = isRapidConvictionTransition(null, current, directive);
     const state = {
       ...EMPTY,
       tier: 'forming' as StabilityTier,
@@ -112,8 +136,9 @@ export function updateStability(
       current,
       previous: null,
       history: [current],
-      warnFresh: true,
+      warnFresh: !rapidConviction,
       whipsaw: false,
+      rapidConviction,
     };
     return { ...state, summary: summaryFor(state, current) };
   }
@@ -126,27 +151,27 @@ export function updateStability(
   let lastChangeTs: number;
 
   if (isMeaningfulChange) {
-    // Stamp the change into history.
     history = [...prev.history, current].slice(-MAX_HISTORY);
     previous = prevSnap;
     lastChangeTs = nowMs;
   } else {
-    // Same directive — keep history (don't append duplicates).
     lastChangeTs = prev.history.length > 0 ? prev.history[prev.history.length - 1]!.ts : nowMs;
     if (history[history.length - 1]?.action !== current.action || history[history.length - 1]?.lane !== current.lane) {
-      // First snapshot path; ensure we have at least one entry.
       history = [...history, current].slice(-MAX_HISTORY);
     }
   }
 
   const msSinceChange = Math.max(0, nowMs - lastChangeTs);
-  // Flips in last 60s: count history entries within window minus 1 (initial state isn't a "flip").
   const oneMinAgo = nowMs - 60_000;
   const flipsLastMin = Math.max(0, history.filter((h) => h.ts >= oneMinAgo).length - 1);
 
-  const tier = tierFor(msSinceChange, flipsLastMin);
+  const rapidConviction = isMeaningfulChange
+    ? isRapidConvictionTransition(prevSnap, current, directive)
+    : prev.rapidConviction;
+
+  const tier = tierFor(msSinceChange, flipsLastMin, rapidConviction);
   const whipsaw = tier === 'whipsaw';
-  const warnFresh = tier === 'forming' || whipsaw;
+  const warnFresh = (tier === 'forming' && !rapidConviction) || whipsaw;
 
   const next: Omit<DirectiveStability, 'summary'> = {
     tier,
@@ -157,6 +182,7 @@ export function updateStability(
     history,
     warnFresh,
     whipsaw,
+    rapidConviction,
   };
 
   return { ...next, summary: summaryFor(next, current) };

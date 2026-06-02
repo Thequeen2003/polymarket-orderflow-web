@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState, type ReactElement } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
 import { displayPrice, groupLevelsByDime, type BookLevel } from './bookLevels';
+import { smoothBookLevels } from './stableBookDisplay';
 
 function displaySize(s: number): string {
   if (!Number.isFinite(s)) return '—';
@@ -27,19 +28,42 @@ export function BookSideGrouped({
   levels: BookLevel[];
   tone: 'ask' | 'bid';
 }): ReactElement {
-  const empty = levels.length === 0;
-  const groups = useMemo(() => groupLevelsByDime(levels, tone), [levels, tone]);
+  const sizeMapRef = useRef<Map<string, number>>(new Map());
+  const stableLevels = useMemo(() => {
+    const { levels: smoothed, sizes } = smoothBookLevels(sizeMapRef.current, levels);
+    sizeMapRef.current = sizes;
+    return smoothed;
+  }, [levels]);
+
+  const empty = stableLevels.length === 0;
+  const groups = useMemo(() => groupLevelsByDime(stableLevels, tone), [stableLevels, tone]);
   const isAsk = tone === 'ask';
   const [selected, setSelected] = useState<number | null>(groups[0]?.bandLo ?? null);
+  const missingBandTicksRef = useRef(0);
 
   useEffect(() => {
     const first = groups[0]?.bandLo ?? null;
     if (first == null) {
+      missingBandTicksRef.current = 0;
       queueMicrotask(() => setSelected(null));
       return;
     }
     const stillThere = selected != null && groups.some((g) => g.bandLo === selected);
-    if (!stillThere) queueMicrotask(() => setSelected(first));
+    if (stillThere) {
+      missingBandTicksRef.current = 0;
+      return;
+    }
+    missingBandTicksRef.current += 1;
+    if (missingBandTicksRef.current < 3) return;
+    missingBandTicksRef.current = 0;
+    if (selected != null && groups.length > 0) {
+      const nearest = groups.reduce((best, g) =>
+        Math.abs(g.bandLo - selected) < Math.abs(best.bandLo - selected) ? g : best,
+      );
+      queueMicrotask(() => setSelected(nearest.bandLo));
+      return;
+    }
+    queueMicrotask(() => setSelected(first));
   }, [groups, selected]);
 
   const activeGroup = selected == null ? null : groups.find((g) => g.bandLo === selected) ?? null;

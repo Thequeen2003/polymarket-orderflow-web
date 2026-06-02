@@ -469,33 +469,34 @@ export function buildTradeDirective(input: TradeDirectiveInput): TradeDirective 
   // PROBE branch at 55–64 agreement so we always *commit* when sensors lean,
   // just with smaller size when conviction is thin.
 
-  // Choppy regime: only veto when agreement is genuinely weak (< 40).
-  if (regime === 'chop' && agreement < 40) {
-    return {
-      ...STAND_DOWN,
-      headline: 'WAIT — CHOPPY',
-      reason: 'Regime is choppy and agreement is too weak to fight it.',
-      evidence: [`Agreement ${agreement}%`, 'Regime: CHOP'],
-    };
-  }
-  // Implied↔spot conflict: only veto on weak agreement; with 60%+ the rest of the
-  // stack outweighs the implied/spot disagreement.
-  if (probVsSpot === 'conflict' && agreement < 40) {
-    return {
-      ...STAND_DOWN,
-      headline: 'WAIT — CONFLICT',
-      reason: 'Implied probability and spot vs PTB disagree and agreement is thin.',
-      evidence: [`Agreement ${agreement}%`, 'Align: conflict (spot vs implied)'],
-    };
-  }
-  // Overextension anti-chase: only veto when agreement is below 70 (was 80).
-  // Strong consensus can override overextension — that's a confirmed trend, not a chase.
-  const chasingExtended =
-    overext && overext.state === 'overextended' && overext.direction === lane;
+  // Compute edge early so all guards can use the math to override weak friction.
   const eLane = laneEdge(lane);
   const edgeUsd = eLane?.edgePerShareUsd ?? null;
   const negativeEv = edgeUsd != null && edgeUsd < 0;
-  if (chasingExtended && agreement < 50) {
+
+  // Choppy regime: only block when agreement is very weak AND edge confirms no opportunity.
+  if (regime === 'chop' && agreement < 35 && (edgeUsd == null || edgeUsd < 0.03)) {
+    return {
+      ...STAND_DOWN,
+      headline: 'WAIT — CHOPPY',
+      reason: 'Regime is choppy, agreement weak, and no clear edge from book math.',
+      evidence: [`Agreement ${agreement}%`, 'Regime: CHOP', edgeUsd != null ? `Edge ${edgeUsd.toFixed(3)}/sh` : 'No edge data'],
+    };
+  }
+  // Implied↔spot conflict: only block when both agreement is weak AND no positive edge.
+  if (probVsSpot === 'conflict' && agreement < 35 && (edgeUsd == null || edgeUsd < 0.02)) {
+    return {
+      ...STAND_DOWN,
+      headline: 'WAIT — CONFLICT',
+      reason: 'Implied probability and spot vs PTB disagree, agreement thin, and no math edge.',
+      evidence: [`Agreement ${agreement}%`, 'Align: conflict (spot vs implied)'],
+    };
+  }
+  // Overextension: only block when agreement is genuinely weak AND edge is flat/negative.
+  // If the math shows +EV at this price, "overextended" just means we're getting a discount.
+  const chasingExtended =
+    overext && overext.state === 'overextended' && overext.direction === lane;
+  if (chasingExtended && agreement < 45 && (edgeUsd == null || edgeUsd < 0.03)) {
     return {
       action: 'STAND_DOWN',
       lane,
@@ -516,9 +517,9 @@ export function buildTradeDirective(input: TradeDirectiveInput): TradeDirective 
       laneOutcomeLabel: lane === 'up' ? (upLabel ?? 'UP') : (downLabel ?? 'DOWN'),
     };
   }
-  // Negative-EV consensus: only block when conviction is meh (was 85, now 70).
-  // Above 70% agreement we let the user enter even on a slightly-overpriced lane.
-  if (negativeEv && agreement < 50) {
+  // Negative-EV: only block when agreement is weak AND edge is meaningfully negative (>4¢ underwater).
+  // A slight −1-2¢ on a fast-moving token is noise, not a real block.
+  if (negativeEv && edgeUsd < -0.04 && agreement < 45) {
     return {
       action: 'STAND_DOWN',
       lane,
@@ -541,7 +542,10 @@ export function buildTradeDirective(input: TradeDirectiveInput): TradeDirective 
   }
 
   // ─── INITIATE branches ────────────────────────────────────────────────────
-  if (orderFlowConflictsLane(lane, machine)) {
+  // Flow conflict only blocks when agreement is weak AND edge is not clearly positive.
+  // Previous version blocked any time tape disagreed — killed good +EV entries at
+  // discounted prices (e.g. buying UP token cheap while tape shows selling = opportunity).
+  if (orderFlowConflictsLane(lane, machine) && agreement < 60 && (edgeUsd == null || edgeUsd < 0.04)) {
     const flow = machine.flowWinningLane!;
     return {
       action: 'STAND_DOWN',
@@ -564,14 +568,14 @@ export function buildTradeDirective(input: TradeDirectiveInput): TradeDirective 
     };
   }
 
-  // We *commit* whenever agreement >= 65 — the forecaster being patient (`WAIT`)
-  // shouldn't block the call, it just means we're not in a hot triple-confirm
-  // window. Forecast `EXIT` on the focus lane downgrades to LOW conviction but
-  // still allows the trade if other sensors override. LOW-confidence EXIT is treated as
-  // noise so we do not block INITIATE / flash immediate exit on a single thin slice.
+  // We *commit* whenever sensors lean hard enough — the forecaster being patient (`WAIT`)
+  // shouldn't block the call. When edge is clearly positive (≥4¢), lower the agreement
+  // bar because the math itself confirms the trade is +EV at current book prices.
   const forecastForbids =
     fStatus === 'EXIT' && forecast?.lane === lane && forecast.confidence === 'HIGH';
-  if (agreement >= 52 && !forecastForbids) {
+  const edgeLowersBar = edgeUsd != null && edgeUsd >= 0.04;
+  const initiateThreshold = edgeLowersBar ? 45 : 50;
+  if (agreement >= initiateThreshold && !forecastForbids) {
     const size = sizeFor({
       agreement,
       cross,
@@ -612,12 +616,13 @@ export function buildTradeDirective(input: TradeDirectiveInput): TradeDirective 
     };
   }
 
-  // PROBE branch: 50–57 agreement with at least mildly non-negative EV → small INITIATE
-  // with LOW confidence rather than WATCH. In **chop**, require 54%+ for a probe.
+  // PROBE branch: agreement below INITIATE threshold but sensors lean a direction.
+  // With +EV edge math, probe even at lower agreement (the book is offering a discount).
+  const probeThreshold = edgeLowersBar ? 38 : 42;
   if (
-    agreement >= 45 &&
+    agreement >= probeThreshold &&
     !forecastForbids &&
-    (regime !== 'chop' || agreement >= 48) &&
+    (regime !== 'chop' || agreement >= 44) &&
     (edgeUsd == null || edgeUsd >= -0.03)
   ) {
     const baseSize = sizeFor({

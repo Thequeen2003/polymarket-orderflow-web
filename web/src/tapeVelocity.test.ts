@@ -82,4 +82,60 @@ describe('computeTapeVelocity', () => {
     expect(v.recent.count).toBe(0);
     expect(v.baseline.count).toBe(0);
   });
+
+  describe('micro-window (10s) leading indicator', () => {
+    it('populates micro fields when prints exist in the last 10s', () => {
+      const prints = [buy(-2_000, 200), buy(-5_000, 150), buy(-8_000, 100)];
+      const v = computeTapeVelocity(prints, { now: NOW });
+      expect(v.micro.count).toBe(3);
+      expect(v.micro.buyVol).toBe(450);
+      expect(v.microReliable).toBe(true);
+      expect(v.microDominance).toBe('buy');
+    });
+
+    it('microReliable=false when only 1 print in micro window', () => {
+      const prints = [buy(-2_000, 200), buy(-15_000, 100), buy(-25_000, 100)];
+      const v = computeTapeVelocity(prints, { now: NOW });
+      expect(v.microReliable).toBe(false);
+    });
+
+    it('detects surging acceleration when micro is much hotter than rest of recent', () => {
+      // Quiet 20-30s window, then burst in last 10s
+      const baseline = [buy(-120_000, 50), sell(-90_000, 50)];
+      const restOfRecent = [buy(-20_000, 30), buy(-25_000, 30)];
+      const microBurst = [buy(-2_000, 300), buy(-4_000, 250), buy(-7_000, 200)];
+      const v = computeTapeVelocity([...baseline, ...restOfRecent, ...microBurst], { now: NOW });
+      expect(v.acceleration).toBe('surging');
+      expect(v.microDominance).toBe('buy');
+    });
+
+    it('detects building acceleration when micro is moderately hotter', () => {
+      const restOfRecent = [buy(-15_000, 100), buy(-20_000, 100), sell(-25_000, 80)];
+      const microPrints = [buy(-3_000, 200), buy(-6_000, 180)];
+      const v = computeTapeVelocity([...restOfRecent, ...microPrints], { now: NOW });
+      expect(['building', 'surging']).toContain(v.acceleration);
+    });
+
+    it('detects fading when micro is much quieter than rest of recent', () => {
+      const restOfRecent = [buy(-15_000, 500), buy(-18_000, 400), buy(-22_000, 300)];
+      const microQuiet = [buy(-5_000, 10), sell(-8_000, 10)];
+      const v = computeTapeVelocity([...restOfRecent, ...microQuiet], { now: NOW });
+      expect(v.acceleration).toBe('fading');
+    });
+
+    it('microNetPressure reflects 10s directional skew', () => {
+      const prints = [buy(-2_000, 400), sell(-5_000, 50)];
+      const v = computeTapeVelocity(prints, { now: NOW });
+      expect(v.microNetPressure).toBeGreaterThan(60);
+    });
+
+    it('micro buy-dominance with sell-dominated full window = early reversal signal', () => {
+      const older = [sell(-15_000, 300), sell(-18_000, 250), sell(-22_000, 200)];
+      const recent = [buy(-2_000, 400), buy(-5_000, 350)];
+      const v = computeTapeVelocity([...older, ...recent], { now: NOW });
+      expect(v.microDominance).toBe('buy');
+      expect(v.dominance).toBe('mixed');
+      expect(['building', 'surging']).toContain(v.acceleration);
+    });
+  });
 });

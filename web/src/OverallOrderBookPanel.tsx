@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
-import { displayPrice, pickBookLevels, topOfBook } from './bookLevels';
+import { displayPrice, topOfBook } from './bookLevels';
+import { useStableBookLadder } from './useStableBookLadder';
 
 function fmtK(x: number): string {
   if (!Number.isFinite(x)) return '—';
@@ -24,16 +25,16 @@ export function OverallOrderBookPanel(props: {
   }, []);
 
   const stale = lastUpdateMs == null || now - lastUpdateMs > 45_000;
-  const { asks, bids } = useMemo(() => pickBookLevels(book), [book]);
+  const stable = useStableBookLadder(book, maxLevels);
   const top = useMemo(() => topOfBook(book), [book]);
   const bestBid = top.bestBid;
   const bestAsk = top.bestAsk;
   const spread = bestBid != null && bestAsk != null && bestAsk >= bestBid ? bestAsk - bestBid : null;
 
-  const asksTop = asks.slice(0, maxLevels);
-  const bidsTop = bids.slice(0, maxLevels);
-  const maxAsk = Math.max(1, ...asksTop.map((l) => (Number.isFinite(l.size) ? l.size : 0)));
-  const maxBid = Math.max(1, ...bidsTop.map((l) => (Number.isFinite(l.size) ? l.size : 0)));
+  const asksTop = stable.asks;
+  const bidsTop = stable.bids;
+  const maxAsk = stable.maxAsk;
+  const maxBid = stable.maxBid;
 
   const insights = useMemo(() => {
     const wallAsk = asksTop.reduce<{ price: number; size: number } | null>((best, l) => {
@@ -130,7 +131,10 @@ export function OverallOrderBookPanel(props: {
           {displayPrice(p.price)} {wall ? <span className="ml-1 text-[10px] font-bold text-amber-200">WALL</span> : thin ? <span className="ml-1 text-[10px] text-zinc-500">thin</span> : null}
         </div>
         <div className="relative h-4 overflow-hidden rounded bg-zinc-900/40">
-          <div className={`absolute inset-y-0 right-0 ${bar}`} style={{ width: `${(w * 100).toFixed(1)}%` }} />
+          <div
+            className={`absolute inset-y-0 right-0 ${bar} transition-[width] duration-150 ease-out`}
+            style={{ width: `${(w * 100).toFixed(1)}%` }}
+          />
           <div className="relative px-2 text-right tabular-nums text-zinc-300">{fmtK(p.size)}</div>
         </div>
         <div className="text-right tabular-nums text-zinc-500">${fmtK(p.price * p.size)}</div>

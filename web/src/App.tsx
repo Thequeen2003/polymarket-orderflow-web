@@ -23,11 +23,13 @@ import { AboveBelowDashboard } from './AboveBelowDashboard';
 const FlowZonesTab = lazy(() => import('./FlowZonesTab').then((m) => ({ default: m.FlowZonesTab })));
 import { SignalsPtbOnly } from './SignalsPtbOnly';
 import { applyPaperSettlementForLoadedMarket } from './paperTrading';
+import { TradePanelBody, TradePanelShell } from './TradePanelBody';
 import { SignalsTradePanel } from './SignalsTradePanel';
 import { TradeSegmentedControl } from './tradeUi';
-import { priceToBeat, rtdsCrypto, type RtdsCryptoPoint } from './lib/api';
+import { loadTradeUiPreferences, saveTradeUiPreferences } from './tradeUiPreferences';
+import { priceToBeat, rtdsCrypto } from './lib/api';
 import { pickMarketSlug } from './gammaMarketSlug';
-import { TradeSlidePanel } from './TradeSlidePanel';
+import { TradeSlidePanel, TRADE_SLIDE_PANEL_WIDTH_PX } from './TradeSlidePanel';
 const PositionsCommandPanel = lazy(() =>
   import('./PositionsCommandPanel').then((m) => ({ default: m.PositionsCommandPanel })),
 );
@@ -44,7 +46,9 @@ const TrackingTab = lazy(() => import('./TrackingTab').then((m) => ({ default: m
 import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
 import { releaseOrphanPointerCapture } from './pointerCaptureSafety';
 import type { SpotPoint } from './SpotLevelChart';
+import { mergeSpotHistory } from './rtdsSpotMerge';
 import { openClobMarketChannel, type ClobWsPriceChange } from './clobMarketChannel';
+import { mergeWsBestBidAsk } from './stableBookDisplay';
 import {
   bookIntelForAssistant,
   bookIntelLines,
@@ -214,42 +218,6 @@ function isMarketClosed(m: unknown | null): boolean {
   if (!m || typeof m !== 'object') return false;
   const o = m as Record<string, unknown>;
   return o.closed === true;
-}
-
-function mergeSpotHistory(
-  prev: SpotPoint[],
-  data: { value: number; ts: number; history?: RtdsCryptoPoint[] },
-): SpotPoint[] {
-  const serverTs = Number.isFinite(data.ts) ? data.ts : Date.now();
-  const serverV = Number.isFinite(data.value) ? data.value : NaN;
-  const hist = data.history;
-  const fromHist: SpotPoint[] =
-    Array.isArray(hist) && hist.length > 0
-      ? hist
-          .filter((q) => typeof q.t === 'number' && typeof q.v === 'number' && Number.isFinite(q.t) && Number.isFinite(q.v))
-          .map((q) => ({ t: q.t, v: q.v }))
-          .sort((a, b) => a.t - b.t)
-      : [];
-
-  // Build a monotonic, deduped series. Prefer server-provided history for hydration,
-  // but always keep the newest tick (some backends may omit the very latest tick from `history`).
-  const merged = [...prev, ...fromHist];
-  if (Number.isFinite(serverTs) && Number.isFinite(serverV)) merged.push({ t: serverTs, v: serverV });
-  merged.sort((a, b) => a.t - b.t);
-
-  const out: SpotPoint[] = [];
-  let lastT: number | null = null;
-  for (const p of merged) {
-    if (!Number.isFinite(p.t) || !Number.isFinite(p.v)) continue;
-    if (lastT != null && p.t === lastT) {
-      // Replace same-timestamp entry with the latest observed value.
-      out[out.length - 1] = p;
-      continue;
-    }
-    out.push(p);
-    lastT = p.t;
-  }
-  return out.slice(-900);
 }
 
 function isShortcutAsset(asset: string): asset is UpdownShortcutAsset {
@@ -577,7 +545,7 @@ function MainTabButton({
       type="button"
       title={titleAttr ?? label}
       onClick={() => onSelect(id)}
-      className={`border-b-2 px-2.5 py-2 text-[13px] font-medium transition-colors ${
+      className={`shrink-0 border-b-2 px-2.5 py-2 text-[13px] font-medium transition-colors ${
         active
           ? 'border-amber-500/75 text-zinc-100'
           : 'border-transparent text-zinc-500 hover:text-zinc-300'
@@ -588,7 +556,23 @@ function MainTabButton({
   );
 }
 
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(false);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const media = window.matchMedia(query);
+    const onChange = () => setMatches(media.matches);
+    onChange();
+    media.addEventListener?.('change', onChange);
+    return () => media.removeEventListener?.('change', onChange);
+  }, [query]);
+
+  return matches;
+}
+
 function App() {
+  const mobileLayout = useMediaQuery('(max-width: 767px)');
   const tradeAccountMode = useTradeAccountMode();
   const [apiHealth, setApiHealth] = useState<string>('Checking API…');
   const [q, setQ] = useState('');
@@ -606,6 +590,7 @@ function App() {
   const [shortcutBusy, setShortcutBusy] = useState<{ asset: UpdownShortcutAsset; interval: UpdownInterval } | null>(null);
   const [lastShortcut, setLastShortcut] = useState<{ asset: UpdownShortcutAsset; interval: UpdownInterval } | null>(null);
   const [mainTab, setMainTab] = useState<MainTab>('signals');
+  const [mobileMarketPanelOpen, setMobileMarketPanelOpen] = useState(false);
   /** Binance BTCUSDT spot — own book/flow/signals; pauses Polymarket CLOB WS/polls while active. */
   const [binanceSpotActive, setBinanceSpotActive] = useState(false);
   const [ptbWatchSlugs, setPtbWatchSlugs] = useState<string[]>(() => readStringArray(PTB_WATCH_SLUGS_KEY, 12));
@@ -618,6 +603,14 @@ function App() {
   const autoThreadRef = useRef<Record<string, { role: 'user' | 'assistant'; content: string }[]>>({});
   const [booksFetchedAt, setBooksFetchedAt] = useState<number | null>(null);
   const [chartEnabled, setChartEnabled] = useState(true);
+
+  useEffect(() => {
+    if (!mobileLayout) {
+      setMobileMarketPanelOpen(false);
+      return;
+    }
+    if (!selectedSlug.trim()) setMobileMarketPanelOpen(true);
+  }, [mobileLayout, selectedSlug]);
   const [chartSeriesBySlug, setChartSeriesBySlug] = useState<Record<string, Record<string, SeriesPoint[]>>>({});
   const [flowSeriesBySlug, setFlowSeriesBySlug] = useState<Record<string, Record<string, BookSnapshot[]>>>({});
   const [flowMode, setFlowMode] = useState<'price' | 'flow'>('flow');
@@ -658,6 +651,14 @@ function App() {
   const operatorTradeLaneLockRef = useRef<{ lane: 'up' | 'down'; at: number } | null>(null);
   const OPERATOR_TRADE_LANE_LOCK_MS = 120_000;
   const [tradePanelOpen, setTradePanelOpen] = useState(false);
+  const [tradeUiPrefs, setTradeUiPrefs] = useState(() => loadTradeUiPreferences());
+  const setTradeUiPref = useCallback((patch: Partial<typeof tradeUiPrefs>) => {
+    setTradeUiPrefs((prev) => {
+      const next = { ...prev, ...patch };
+      saveTradeUiPreferences(next);
+      return next;
+    });
+  }, []);
   const [positionsPanelOpen, setPositionsPanelOpen] = useState(false);
   const [globalTradeLocked, setGlobalTradeLocked] = useState(false);
   const [updownPickerOpen, setUpdownPickerOpen] = useState(false);
@@ -689,16 +690,6 @@ function App() {
   useEffect(() => {
     selectedSlugRef.current = selectedSlug;
   }, [selectedSlug]);
-
-  useEffect(() => {
-    const onOpenTrade = (ev: Event) => {
-      const d = (ev as CustomEvent<{ lane?: 'up' | 'down' }>).detail;
-      if (d?.lane === 'up' || d?.lane === 'down') setGlobalTradeLane(d.lane);
-      setTradePanelOpen(true);
-    };
-    window.addEventListener(BPX_TRADE_PANEL_OPEN_EVENT, onOpenTrade as EventListener);
-    return () => window.removeEventListener(BPX_TRADE_PANEL_OPEN_EVENT, onOpenTrade as EventListener);
-  }, []);
 
   useEffect(() => {
     const onLaneSync = (ev: Event) => {
@@ -983,6 +974,75 @@ function App() {
     [activeTradeSessionTabId],
   );
 
+  const tradePanelSharedProps = useMemo(
+    () => ({
+      marketSlug: effectiveTradeContext.slug,
+      marketQuestion: effectiveTradeContext.question,
+      gammaMarket: marketJson,
+      probMomentumUp: signalsProbMids.up,
+      probMomentumDown: signalsProbMids.down,
+      upLabel: effectiveTradeContext.upLabel,
+      downLabel: effectiveTradeContext.downLabel,
+      upToken: effectiveTradeContext.upToken,
+      downToken: effectiveTradeContext.downToken,
+      upMid:
+        (signalsProbMids.up.length ? signalsProbMids.up[signalsProbMids.up.length - 1]!.v : null) ??
+        tradePanelBookMids.up,
+      downMid:
+        (signalsProbMids.down.length ? signalsProbMids.down[signalsProbMids.down.length - 1]!.v : null) ??
+        tradePanelBookMids.down,
+      bookMidUp: tradePanelBookMids.up,
+      bookMidDown: tradePanelBookMids.down,
+      bookTouchUp: tradePanelBookTouch.up,
+      bookTouchDown: tradePanelBookTouch.down,
+      lane: globalTradeLane,
+      onLaneChange: onGlobalTradeLaneChange,
+    }),
+    [
+      effectiveTradeContext,
+      marketJson,
+      signalsProbMids.down,
+      signalsProbMids.up,
+      tradePanelBookMids.down,
+      tradePanelBookMids.up,
+      tradePanelBookTouch.down,
+      tradePanelBookTouch.up,
+      globalTradeLane,
+      onGlobalTradeLaneChange,
+    ],
+  );
+
+  const showEmbeddedTradeDock =
+    tradeUiPrefs.embedded &&
+    !binanceSpotActive &&
+    (mainTab === 'signals' || mainTab === 'book' || mainTab === 'tracking' || mainTab === 'flowzones');
+
+  /** Slide trade panel is fixed on the right — shrink main column so charts are not covered. */
+  const tradeSlideReservesSpace = tradeUiPrefs.slide && tradePanelOpen;
+
+  const openTradeUi = useCallback(() => {
+    if (tradeUiPrefs.slide) {
+      setTradePanelOpen(true);
+      return;
+    }
+    if (!tradeUiPrefs.embedded) {
+      setTradeUiPref({ embedded: true, slide: true });
+    }
+    if (mainTab !== 'signals' && mainTab !== 'book' && mainTab !== 'tracking') {
+      setMainTab('signals');
+    }
+  }, [mainTab, setTradeUiPref, tradeUiPrefs.embedded, tradeUiPrefs.slide]);
+
+  useEffect(() => {
+    const onOpenTrade = (ev: Event) => {
+      const d = (ev as CustomEvent<{ lane?: 'up' | 'down' }>).detail;
+      if (d?.lane === 'up' || d?.lane === 'down') setGlobalTradeLane(d.lane);
+      openTradeUi();
+    };
+    window.addEventListener(BPX_TRADE_PANEL_OPEN_EVENT, onOpenTrade as EventListener);
+    return () => window.removeEventListener(BPX_TRADE_PANEL_OPEN_EVENT, onOpenTrade as EventListener);
+  }, [openTradeUi]);
+
   const onSelectTradeSessionTab = useCallback(
     (id: string) => {
       const t = tradeSessionTabs.find((x) => x.id === id);
@@ -1246,7 +1306,7 @@ function App() {
 
     // Coalesce book updates to avoid rendering at full WS tick rate.
     // Rendering ~60fps from websocket churn can cause visible UI jank.
-    const MIN_FLUSH_MS = 60;
+    const MIN_FLUSH_MS = 150;
     let lastFlushAt = 0;
     let flushTimer: number | null = null;
 
@@ -1278,13 +1338,8 @@ function App() {
         scheduleFlush();
       },
       onBestBidAsk: (assetId, best) => {
-        const bidPx = best.bestBid && best.bestBid !== '0' ? String(best.bestBid) : null;
-        const askPx = best.bestAsk && best.bestAsk !== '0' ? String(best.bestAsk) : null;
-        if (!bidPx && !askPx) return;
-        booksCacheRef.current.set(assetId, {
-          bids: bidPx ? [{ price: bidPx, size: '1' }] : [],
-          asks: askPx ? [{ price: askPx, size: '1' }] : [],
-        });
+        const merged = mergeWsBestBidAsk(booksCacheRef.current.get(assetId), best);
+        booksCacheRef.current.set(assetId, merged);
         scheduleFlush();
       },
       onStatus: (s) => {
@@ -1581,6 +1636,8 @@ function App() {
     void openUpdownShortcut('btc', '5m');
   }, [apiHealth, selectedSlug, shortcutBusy]);
 
+  /** PTB poll — depends on slug only. Do not list `ssrPriceToBeat` in deps: clearing PTB when it
+   *  updates caused the Signals chart to flicker between live data and the SSR skeleton. */
   useEffect(() => {
     const slug = selectedSlug.trim();
     if (!slug) {
@@ -1597,6 +1654,8 @@ function App() {
       setPtbError(null);
     });
     let stopped = false;
+    let intervalId: ReturnType<typeof window.setInterval> | null = null;
+    let slowPoll = false;
     const tick = async () => {
       const ptb = await priceToBeat(slug);
       if (stopped) return;
@@ -1606,23 +1665,38 @@ function App() {
         setSsrPriceToBeat(ptb.data.price_to_beat);
         setSsrPtbSource(ptb.data.source);
         setPtbError(null);
+        if (!slowPoll && intervalId != null && !ptb.data.preview) {
+          slowPoll = true;
+          window.clearInterval(intervalId);
+          intervalId = window.setInterval(() => void tick(), 20_000);
+        }
       } else {
         // Keep last good PTB only when still the same market load generation.
         setPtbError(pretty(ptb));
       }
     };
     void tick();
-    const intervalMs = ssrPriceToBeat == null ? 5_000 : 20_000;
-    const id = window.setInterval(() => void tick(), intervalMs);
+    intervalId = window.setInterval(() => void tick(), 5_000);
     return () => {
       stopped = true;
-      window.clearInterval(id);
+      if (intervalId != null) window.clearInterval(intervalId);
     };
-  }, [selectedSlug, ssrPriceToBeat]);
+  }, [selectedSlug]);
 
   useEffect(() => {
     setRtdsSpotFeedSource(null);
-  }, [selectedSlug]);
+    setSpotBySymbol((m) => {
+      const sym = (() => {
+        const p = parseUpdownSlugWithHints(selectedSlug, updownSlugHints);
+        if (p) return `${p.asset}/usd`;
+        const titled = titledUpdownAssetFromSlug(selectedSlug);
+        if (titled) return `${titled}/usd`;
+        return null;
+      })();
+      if (!sym?.endsWith('/usd')) return m;
+      return { ...m, [sym]: [] };
+    });
+  }, [selectedSlug, updownSlugHints]);
 
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 5_000);
@@ -1681,10 +1755,8 @@ function App() {
     // Fast-boot should hydrate the active chart quickly without hammering RTDS for every watched slug.
     const SYMS = rtdsPollFast
       ? selectedSym
-        ? selectedSym === 'btc/usd'
-          ? [selectedSym, 'btc/usdt']
-          : [selectedSym]
-        : ['btc/usd', 'btc/usdt', 'eth/usd', 'sol/usd']
+        ? [selectedSym]
+        : ['btc/usd', 'eth/usd', 'sol/usd']
       : collect();
     let stopped = false;
     let inflight = false;
@@ -1711,7 +1783,7 @@ function App() {
             continue;
           }
           okAny = true;
-          next[sym] = mergeSpotHistory(base[sym] ?? [], res.data);
+          next[sym] = mergeSpotHistory(base[sym] ?? [], res.data, sym);
         }
         setSpotBySymbol(next);
         setRtdsError(okAny ? null : firstErr);
@@ -1757,7 +1829,11 @@ function App() {
           setSpotSeriesBySlug((m) => ({ ...m, [selectedSlug]: series }));
           if (spotSrc != null) setRtdsSpotFeedSource(spotSrc);
           if (activeReceivedAt != null) setRtdsReceivedAt(activeReceivedAt);
-          if (series.length > 0) {
+          const liveRes = SYMS.map((s, i) => ({ s, r: results[i]! })).find((x) => x.s === sym)?.r;
+          if (liveRes && isOk(liveRes) && (liveRes.data.source === 'chainlink' || !sym.endsWith('/usd'))) {
+            setRtdsSpot(liveRes.data.value);
+            setRtdsTickAt(normalizeEpochMs(liveRes.data.ts) ?? liveRes.data.ts);
+          } else if (series.length > 0) {
             const last = series[series.length - 1]!;
             setRtdsSpot(last.v);
             setRtdsTickAt(normalizeEpochMs(last.t) ?? last.t);
@@ -2169,9 +2245,177 @@ function App() {
     </div>
   );
 
+  const marketControls = (
+    <>
+      <div className="mb-4 flex flex-col gap-2">
+        <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Open market</div>
+        <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-amber-200/70">Polymarket · prediction</div>
+        <div className="flex flex-wrap gap-2">
+          {(['btc', 'eth', 'sol', 'hype'] as const).map((asset) => {
+            const busy = shortcutBusy?.asset === asset && shortcutBusy.interval === '5m';
+            return (
+              <button
+                key={`5m-${asset}`}
+                type="button"
+                disabled={busy}
+                onClick={() => void openUpdownShortcut(asset, '5m')}
+                className={`min-w-[4.5rem] flex-1 rounded-xl border px-3 py-2.5 text-center text-sm font-semibold uppercase tracking-wide transition-colors disabled:cursor-wait disabled:opacity-50 sm:flex-none ${
+                  asset === 'btc'
+                    ? 'border-amber-700/50 bg-amber-950/30 text-amber-100 hover:bg-amber-950/50'
+                    : asset === 'eth'
+                      ? 'border-indigo-700/50 bg-indigo-950/30 text-indigo-100 hover:bg-indigo-950/50'
+                      : asset === 'sol'
+                        ? 'border-violet-700/50 bg-violet-950/30 text-violet-100 hover:bg-violet-950/50'
+                        : 'border-emerald-700/45 bg-emerald-950/20 text-emerald-100 hover:bg-emerald-950/35'
+                }`}
+              >
+                {busy ? '…' : asset}
+              </button>
+            );
+          })}
+        </div>
+        <p className="text-[10px] leading-snug text-zinc-600">
+          5m Up/Down — the <span className="font-medium text-zinc-400">btc</span> chip is only the Polymarket BTC 5-minute window (share prices), not Binance spot.
+        </p>
+        <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-cyan-200/75">Separate market · spot</div>
+        <div className="mt-1 rounded-xl border border-cyan-800/45 bg-cyan-950/20 p-3 ring-1 ring-cyan-500/10">
+          <div className="text-[10px] font-semibold uppercase tracking-wide text-cyan-200/85">BTC / USDT (Binance)</div>
+          <p className="mt-1 text-[10px] leading-snug text-zinc-500">
+            Full <span className="font-medium text-zinc-400">Book</span>, <span className="font-medium text-zinc-400">Flow</span>, and{' '}
+            <span className="font-medium text-zinc-400">Signals</span> tabs use this feed (same layout as Polymarket). Not a Polymarket slug.
+          </p>
+          <button
+            type="button"
+            onClick={() => {
+              setBinanceSpotActive(true);
+              setMainTab('book');
+            }}
+            className="mt-2 w-full rounded-xl border border-cyan-600/45 bg-cyan-950/35 px-3 py-2.5 text-center text-sm font-semibold tracking-tight text-cyan-50 shadow-sm transition-colors hover:border-cyan-500/55 hover:bg-cyan-950/50"
+          >
+            Open BTC / USDT market
+          </button>
+        </div>
+        {(['15m', '1h', '4h', '1d'] as const).map((interval) => (
+          <div key={interval} className="mt-2">
+            <div className="flex flex-wrap gap-2">
+              {(['btc', 'eth', 'sol', 'hype'] as const).map((asset) => {
+                const busy = shortcutBusy?.asset === asset && shortcutBusy.interval === interval;
+                return (
+                  <button
+                    key={`${interval}-${asset}`}
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void openUpdownShortcut(asset, interval)}
+                    className={`min-w-[4.5rem] flex-1 rounded-xl border px-3 py-2.5 text-center text-sm font-semibold uppercase tracking-wide transition-colors disabled:cursor-wait disabled:opacity-50 sm:flex-none ${
+                      asset === 'btc'
+                        ? 'border-amber-700/50 bg-amber-950/30 text-amber-100 hover:bg-amber-950/50'
+                        : asset === 'eth'
+                          ? 'border-indigo-700/50 bg-indigo-950/30 text-indigo-100 hover:bg-indigo-950/50'
+                          : asset === 'sol'
+                            ? 'border-violet-700/50 bg-violet-950/30 text-violet-100 hover:bg-violet-950/50'
+                            : 'border-emerald-700/45 bg-emerald-950/20 text-emerald-100 hover:bg-emerald-950/35'
+                    }`}
+                  >
+                    {busy ? '…' : `${asset} ${interval}`}
+                  </button>
+                );
+              })}
+            </div>
+            <p className="mt-1 text-[10px] leading-snug text-zinc-600">
+              {interval} Up/Down — BTC/ETH/SOL windows.
+            </p>
+          </div>
+        ))}
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <input
+            value={slugInput}
+            onChange={(e) => setSlugInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') void loadMarket(slugInput.trim());
+            }}
+            placeholder="Slug, id, or polymarket.com/event/…"
+            className="w-full rounded-xl border border-zinc-700/50 bg-zinc-900/35 px-3 py-2.5 text-sm text-zinc-100 outline-none ring-indigo-500/0 transition-shadow placeholder:text-zinc-600 focus:border-indigo-500/40 focus:ring-2 focus:ring-indigo-500/20"
+          />
+          <button
+            type="button"
+            onClick={() => void loadMarket(slugInput.trim())}
+            className="shrink-0 rounded-xl border border-zinc-600/60 bg-zinc-800/80 px-4 py-2.5 text-sm font-medium text-zinc-100 shadow-sm transition-colors hover:border-zinc-500 hover:bg-zinc-700/90"
+          >
+            Open
+          </button>
+        </div>
+      </div>
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+        <input
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') void runSearch();
+          }}
+          placeholder="Search markets…"
+          className="w-full rounded-xl border border-zinc-700/50 bg-zinc-900/35 px-3 py-2.5 text-sm text-zinc-100 outline-none ring-indigo-500/0 transition-shadow placeholder:text-zinc-600 focus:border-indigo-500/40 focus:ring-2 focus:ring-indigo-500/20"
+        />
+        <button
+          type="button"
+          onClick={() => void runSearch()}
+          className="rounded-xl bg-indigo-500 px-4 py-2.5 text-sm font-semibold text-white shadow-md shadow-indigo-950/40 transition-colors hover:bg-indigo-400"
+        >
+          Search
+        </button>
+      </div>
+
+      <div className="mt-4 text-xs leading-relaxed text-zinc-500">Choose a row to load both token books.</div>
+      {marketsError ? (
+        <pre className="mt-3 overflow-auto rounded-xl border border-amber-800/30 bg-amber-950/15 p-3 text-xs leading-relaxed text-amber-100/90">{marketsError}</pre>
+      ) : null}
+      <div className="mt-3 max-h-[60vh] overflow-auto rounded-xl border border-zinc-800/50 bg-black/15 shadow-inner shadow-black/20">
+        {marketsListLoading ? (
+          <div className="p-4 text-sm leading-relaxed text-zinc-400">Loading markets…</div>
+        ) : markets.length === 0 ? (
+          <div className="p-4 text-sm leading-relaxed text-zinc-500">No results yet. Search or paste a slug above.</div>
+        ) : (
+          <ul className="divide-y divide-zinc-800/40">
+            {markets.map((m, idx) => {
+              const obj = m && typeof m === 'object' ? (m as Record<string, unknown>) : null;
+              const slug = pickMarketSlug(m);
+              const label = String(obj?.question ?? obj?.title ?? obj?.slug ?? obj?.id ?? `Market ${idx + 1}`);
+              const active = selectedSlug === slug;
+              return (
+                <li key={slug ? `${slug}-${idx}` : `row-${idx}`}>
+                  <button
+                    type="button"
+                    disabled={!slug}
+                    className={`w-full px-3 py-2.5 text-left text-sm transition-colors hover:bg-zinc-800/35 disabled:cursor-not-allowed disabled:opacity-40 ${
+                      active ? 'border-l-2 border-indigo-400 bg-indigo-950/15' : 'border-l-2 border-transparent'
+                    }`}
+                    onClick={() => void loadMarket(slug)}
+                  >
+                    <div className="truncate font-medium text-zinc-100">{label}</div>
+                    <div className="truncate font-mono text-[11px] text-zinc-500">{slug || '— no slug/id'}</div>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </div>
+    </>
+  );
+
   return (
       <div className="min-h-full bg-zinc-950 bg-[radial-gradient(100%_60%_at_50%_-10%,rgba(99,102,241,0.08),transparent_52%),linear-gradient(180deg,#0b0b0f_0%,#09090b_45%,#060608_100%)] font-sans text-zinc-200 antialiased">
-      <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
+      <div
+        className={`mx-auto px-4 py-8 transition-[padding,max-width] duration-200 ease-out sm:px-6 lg:px-8 ${
+          tradeSlideReservesSpace ? 'w-full max-w-none' : 'max-w-7xl'
+        }`}
+        style={
+          tradeSlideReservesSpace
+            ? {
+                paddingRight: `max(1rem, min(${TRADE_SLIDE_PANEL_WIDTH_PX}px, 100vw))`,
+              }
+            : undefined
+        }
+      >
         <header className="rounded-2xl border border-zinc-800/50 bg-zinc-900/20 px-5 py-5 shadow-lg shadow-black/20 ring-1 ring-white/[0.03] backdrop-blur-sm sm:px-6">
           <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
             <div>
@@ -2189,9 +2433,35 @@ function App() {
                   Live
                 </span>
               ) : null}
+              <div className="flex flex-wrap items-center gap-1 rounded-full border border-zinc-700/45 bg-zinc-950/55 p-1">
+                <button
+                  type="button"
+                  onClick={() => setTradeUiPref({ embedded: !tradeUiPrefs.embedded })}
+                  className={`min-h-[30px] rounded-full px-2.5 text-[10px] font-bold uppercase tracking-wide transition-colors ${
+                    tradeUiPrefs.embedded
+                      ? 'bg-zinc-800 text-zinc-100 ring-1 ring-zinc-600/50'
+                      : 'text-zinc-500 hover:text-zinc-300'
+                  }`}
+                  title="Docked trade panel in the right column (classic layout)"
+                >
+                  Dock
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTradeUiPref({ slide: !tradeUiPrefs.slide })}
+                  className={`min-h-[30px] rounded-full px-2.5 text-[10px] font-bold uppercase tracking-wide transition-colors ${
+                    tradeUiPrefs.slide
+                      ? 'bg-amber-500/20 text-amber-100 ring-1 ring-amber-500/35'
+                      : 'text-zinc-500 hover:text-zinc-300'
+                  }`}
+                  title="Slide-in trade panel from the right (Trade button)"
+                >
+                  Slide
+                </button>
+              </div>
               <button
                 type="button"
-                onClick={() => setTradePanelOpen(true)}
+                onClick={openTradeUi}
                 className={`min-h-[34px] rounded-full border px-4 text-[12px] font-black tracking-wide shadow-lg shadow-black/20 ring-1 ring-white/[0.04] transition-colors ${
                   tradeAccountMode === 'live'
                     ? 'border-rose-500/40 bg-rose-950/50 text-rose-50 hover:bg-rose-950/65'
@@ -2244,170 +2514,55 @@ function App() {
         </header>
 
         <div className="mt-8 flex flex-col gap-5 xl:grid xl:grid-cols-12 xl:items-start xl:gap-6">
-          <div className="rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-5 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm xl:col-span-3">
-            <div className="mb-4 flex flex-col gap-2">
-              <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Open market</div>
-              <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-amber-200/70">Polymarket · prediction</div>
-              <div className="flex flex-wrap gap-2">
-                {(['btc', 'eth', 'sol', 'hype'] as const).map((asset) => {
-                  const busy = shortcutBusy?.asset === asset && shortcutBusy.interval === '5m';
-                  return (
-                    <button
-                      key={`5m-${asset}`}
-                      type="button"
-                      disabled={busy}
-                      onClick={() => void openUpdownShortcut(asset, '5m')}
-                      className={`min-w-[4.5rem] flex-1 rounded-xl border px-3 py-2.5 text-center text-sm font-semibold uppercase tracking-wide transition-colors disabled:cursor-wait disabled:opacity-50 sm:flex-none ${
-                        asset === 'btc'
-                          ? 'border-amber-700/50 bg-amber-950/30 text-amber-100 hover:bg-amber-950/50'
-                          : asset === 'eth'
-                            ? 'border-indigo-700/50 bg-indigo-950/30 text-indigo-100 hover:bg-indigo-950/50'
-                            : asset === 'sol'
-                              ? 'border-violet-700/50 bg-violet-950/30 text-violet-100 hover:bg-violet-950/50'
-                              : 'border-emerald-700/45 bg-emerald-950/20 text-emerald-100 hover:bg-emerald-950/35'
-                      }`}
-                    >
-                      {busy ? '…' : asset}
-                    </button>
-                  );
-                })}
-              </div>
-              <p className="text-[10px] leading-snug text-zinc-600">
-                5m Up/Down — the <span className="font-medium text-zinc-400">btc</span> chip is only the Polymarket BTC 5-minute window (share prices), not Binance spot.
-              </p>
-              <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-cyan-200/75">Separate market · spot</div>
-              <div className="mt-1 rounded-xl border border-cyan-800/45 bg-cyan-950/20 p-3 ring-1 ring-cyan-500/10">
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-cyan-200/85">BTC / USDT (Binance)</div>
-                <p className="mt-1 text-[10px] leading-snug text-zinc-500">
-                  Full <span className="font-medium text-zinc-400">Book</span>, <span className="font-medium text-zinc-400">Flow</span>, and{' '}
-                  <span className="font-medium text-zinc-400">Signals</span> tabs use this feed (same layout as Polymarket). Not a Polymarket slug.
-                </p>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setBinanceSpotActive(true);
-                    setMainTab('book');
-                  }}
-                  className="mt-2 w-full rounded-xl border border-cyan-600/45 bg-cyan-950/35 px-3 py-2.5 text-center text-sm font-semibold tracking-tight text-cyan-50 shadow-sm transition-colors hover:border-cyan-500/55 hover:bg-cyan-950/50"
-                >
-                  Open BTC / USDT market
-                </button>
-              </div>
-              {(['15m', '1h', '4h', '1d'] as const).map((interval) => (
-                <div key={interval} className="mt-2">
-                  <div className="flex flex-wrap gap-2">
-                    {(['btc', 'eth', 'sol', 'hype'] as const).map((asset) => {
-                      const busy = shortcutBusy?.asset === asset && shortcutBusy.interval === interval;
-                      return (
-                        <button
-                          key={`${interval}-${asset}`}
-                          type="button"
-                          disabled={busy}
-                          onClick={() => void openUpdownShortcut(asset, interval)}
-                          className={`min-w-[4.5rem] flex-1 rounded-xl border px-3 py-2.5 text-center text-sm font-semibold uppercase tracking-wide transition-colors disabled:cursor-wait disabled:opacity-50 sm:flex-none ${
-                            asset === 'btc'
-                              ? 'border-amber-700/50 bg-amber-950/30 text-amber-100 hover:bg-amber-950/50'
-                              : asset === 'eth'
-                                ? 'border-indigo-700/50 bg-indigo-950/30 text-indigo-100 hover:bg-indigo-950/50'
-                                : asset === 'sol'
-                                  ? 'border-violet-700/50 bg-violet-950/30 text-violet-100 hover:bg-violet-950/50'
-                                  : 'border-emerald-700/45 bg-emerald-950/20 text-emerald-100 hover:bg-emerald-950/35'
-                          }`}
-                        >
-                          {busy ? '…' : `${asset} ${interval}`}
-                        </button>
-                      );
-                    })}
-                  </div>
-                  <p className="mt-1 text-[10px] leading-snug text-zinc-600">
-                    {interval} Up/Down — BTC/ETH/SOL windows.
-                  </p>
-                </div>
-              ))}
-              <div className="flex gap-2">
-                <input
-                  value={slugInput}
-                  onChange={(e) => setSlugInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') void loadMarket(slugInput.trim());
-                  }}
-                  placeholder="Slug, id, or polymarket.com/event/…"
-                  className="w-full rounded-xl border border-zinc-700/50 bg-zinc-900/35 px-3 py-2.5 text-sm text-zinc-100 outline-none ring-indigo-500/0 transition-shadow placeholder:text-zinc-600 focus:border-indigo-500/40 focus:ring-2 focus:ring-indigo-500/20"
-                />
-                <button
-                  type="button"
-                  onClick={() => void loadMarket(slugInput.trim())}
-                  className="shrink-0 rounded-xl border border-zinc-600/60 bg-zinc-800/80 px-4 py-2.5 text-sm font-medium text-zinc-100 shadow-sm transition-colors hover:border-zinc-500 hover:bg-zinc-700/90"
-                >
-                  Open
-                </button>
-              </div>
-            </div>
-            <div className="flex items-center gap-2">
-              <input
-                value={q}
-                onChange={(e) => setQ(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') void runSearch();
-                }}
-                placeholder="Search markets…"
-                className="w-full rounded-xl border border-zinc-700/50 bg-zinc-900/35 px-3 py-2.5 text-sm text-zinc-100 outline-none ring-indigo-500/0 transition-shadow placeholder:text-zinc-600 focus:border-indigo-500/40 focus:ring-2 focus:ring-indigo-500/20"
-              />
-              <button
-                type="button"
-                onClick={() => void runSearch()}
-                className="rounded-xl bg-indigo-500 px-4 py-2.5 text-sm font-semibold text-white shadow-md shadow-indigo-950/40 transition-colors hover:bg-indigo-400"
+          <div
+            className={`rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-5 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm xl:col-span-3 ${
+              mainTab === 'signals' ? 'order-2 xl:order-1' : ''
+            }`}
+          >
+            {mobileLayout ? (
+              <details
+                open={mobileMarketPanelOpen}
+                onToggle={(e) => setMobileMarketPanelOpen(e.currentTarget.open)}
+                className="-m-1 overflow-hidden rounded-2xl"
               >
-                Search
-              </button>
-            </div>
-
-            <div className="mt-4 text-xs leading-relaxed text-zinc-500">Choose a row to load both token books.</div>
-            {marketsError ? (
-              <pre className="mt-3 overflow-auto rounded-xl border border-amber-800/30 bg-amber-950/15 p-3 text-xs leading-relaxed text-amber-100/90">{marketsError}</pre>
-            ) : null}
-            <div className="mt-3 max-h-[60vh] overflow-auto rounded-xl border border-zinc-800/50 bg-black/15 shadow-inner shadow-black/20">
-              {marketsListLoading ? (
-                <div className="p-4 text-sm leading-relaxed text-zinc-400">Loading markets…</div>
-              ) : markets.length === 0 ? (
-                <div className="p-4 text-sm leading-relaxed text-zinc-500">No results yet. Search or paste a slug above.</div>
-              ) : (
-                <ul className="divide-y divide-zinc-800/40">
-                  {markets.map((m, idx) => {
-                    const obj = m && typeof m === 'object' ? (m as Record<string, unknown>) : null;
-                    const slug = pickMarketSlug(m);
-                    const label = String(obj?.question ?? obj?.title ?? obj?.slug ?? obj?.id ?? `Market ${idx + 1}`);
-                    const active = selectedSlug === slug;
-                    return (
-                      <li key={slug ? `${slug}-${idx}` : `row-${idx}`}>
-                        <button
-                          type="button"
-                          disabled={!slug}
-                          className={`w-full px-3 py-2.5 text-left text-sm transition-colors hover:bg-zinc-800/35 disabled:cursor-not-allowed disabled:opacity-40 ${
-                            active ? 'border-l-2 border-indigo-400 bg-indigo-950/15' : 'border-l-2 border-transparent'
-                          }`}
-                          onClick={() => void loadMarket(slug)}
-                        >
-                          <div className="truncate font-medium text-zinc-100">{label}</div>
-                          <div className="truncate font-mono text-[11px] text-zinc-500">{slug || '— no slug/id'}</div>
-                        </button>
-                      </li>
-                    );
-                  })}
-                </ul>
-              )}
-            </div>
+                <summary className="flex cursor-pointer list-none items-center justify-between gap-3 rounded-2xl px-1 py-1 text-left [&::-webkit-details-marker]:hidden">
+                  <div>
+                    <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Market controls</div>
+                    <div className="mt-1 text-sm font-semibold text-zinc-100">
+                      {selectedSlug.trim() ? 'Current market ready' : 'Open market, shortcuts, and search'}
+                    </div>
+                    <div className="mt-1 truncate text-[11px] text-zinc-500">
+                      {selectedSlug.trim() || 'Choose a shortcut or search result'}
+                    </div>
+                  </div>
+                  <span className="rounded-full border border-zinc-700/50 bg-zinc-900/35 px-3 py-1 text-[11px] font-semibold text-zinc-300">
+                    {mobileMarketPanelOpen ? 'Hide' : 'Show'}
+                  </span>
+                </summary>
+                <div className="mt-3 border-t border-zinc-800/50 pt-4">{marketControls}</div>
+              </details>
+            ) : (
+              marketControls
+            )}
           </div>
 
-          <div className="min-w-0 max-w-full rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-4 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm sm:p-5 xl:col-span-7">
-            <div className="flex flex-wrap items-center gap-2 border-b border-zinc-800/40 pb-3">
-              <div className="text-[15px] font-semibold text-zinc-100">{mainTabTitle(mainTab)}</div>
-              <div className="truncate rounded-md bg-zinc-900/50 px-2 py-0.5 font-mono text-xs text-zinc-400">{selectedSlug || '—'}</div>
-              {booksLoading ? (
-                <div className="rounded-full bg-indigo-500/15 px-2.5 py-0.5 text-xs font-medium text-indigo-200/90">Loading…</div>
-              ) : null}
+          <div
+            className={`min-w-0 max-w-full rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-4 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm sm:p-5 ${
+              showEmbeddedTradeDock ? 'xl:col-span-7' : 'xl:col-span-9'
+            } ${mainTab === 'signals' ? 'order-1 xl:order-2' : ''}`}
+          >
+            <div className="flex flex-col gap-3 border-b border-zinc-800/40 pb-3 sm:flex-row sm:flex-wrap sm:items-center">
+              <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+                <div className="text-[15px] font-semibold text-zinc-100">{mainTabTitle(mainTab)}</div>
+                <div className="min-w-0 max-w-full truncate rounded-md bg-zinc-900/50 px-2 py-0.5 font-mono text-xs text-zinc-400">
+                  {selectedSlug || '—'}
+                </div>
+                {booksLoading ? (
+                  <div className="rounded-full bg-indigo-500/15 px-2.5 py-0.5 text-xs font-medium text-indigo-200/90">Loading…</div>
+                ) : null}
+              </div>
 
-              <div className="ml-auto flex items-center gap-2">
+              <div className="flex items-center gap-2 sm:ml-auto">
                 <button
                   type="button"
                   onClick={() => setPositionsPanelOpen(true)}
@@ -2418,7 +2573,7 @@ function App() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setTradePanelOpen(true)}
+                  onClick={openTradeUi}
                   className={`min-h-[34px] rounded-xl border px-3 text-[12px] font-black tracking-wide ring-1 ring-white/[0.04] transition-colors ${
                     'border-zinc-700/70 bg-black/20 text-zinc-200 hover:bg-black/30'
                   }`}
@@ -2435,30 +2590,32 @@ function App() {
               </div>
             </div>
 
-            <div className="mt-4 flex flex-wrap gap-x-0.5 gap-y-0 border-b border-zinc-800/80">
-              <MainTabButton id="book" label="Book" active={mainTab === 'book'} onSelect={setMainTab} />
-              <MainTabButton id="flowzones" label="Flow" title="Flow Zones" active={mainTab === 'flowzones'} onSelect={setMainTab} />
-              <MainTabButton id="signals" label="Signals" active={mainTab === 'signals'} onSelect={setMainTab} />
-              <MainTabButton id="tracking" label="Tracking" title="Positions + open orders + cash" active={mainTab === 'tracking'} onSelect={setMainTab} />
-              <MainTabButton id="tradehistory" label="History" title="Trade history (paper + live log)" active={mainTab === 'tradehistory'} onSelect={setMainTab} />
-              <MainTabButton id="btc" label="BTC" title="BTC live spot + paper trading" active={mainTab === 'btc'} onSelect={setMainTab} />
-              <MainTabButton
-                id="tvbtc"
-                label="BTC/USDT"
-                title="Binance BTCUSDT spot — full dollar price & TradingView (not Polymarket share prices)"
-                active={mainTab === 'tvbtc'}
-                onSelect={setMainTab}
-              />
-              <MainTabButton
-                id="perps"
-                label="Perps"
-                title="Perps Trade Command Center — BTC/ETH/SOL charts, bias, SL/TP, liq, funding, sizing"
-                active={mainTab === 'perps'}
-                onSelect={setMainTab}
-              />
-              <MainTabButton id="multiscan" label="Multi" title="Multi-asset PTB scan" active={mainTab === 'multiscan'} onSelect={setMainTab} />
-              <MainTabButton id="assistant" label="Assistant" active={mainTab === 'assistant'} onSelect={setMainTab} />
-              <MainTabButton id="raw" label="Raw" active={mainTab === 'raw'} onSelect={setMainTab} />
+            <div className="-mx-1 mt-4 overflow-x-auto pb-1 [scrollbar-width:none]">
+              <div className="flex min-w-max gap-x-0.5 gap-y-0 border-b border-zinc-800/80 px-1">
+                <MainTabButton id="book" label="Book" active={mainTab === 'book'} onSelect={setMainTab} />
+                <MainTabButton id="flowzones" label="Flow" title="Flow Zones" active={mainTab === 'flowzones'} onSelect={setMainTab} />
+                <MainTabButton id="signals" label="Signals" active={mainTab === 'signals'} onSelect={setMainTab} />
+                <MainTabButton id="tracking" label="Tracking" title="Positions + open orders + cash" active={mainTab === 'tracking'} onSelect={setMainTab} />
+                <MainTabButton id="tradehistory" label="History" title="Trade history (paper + live log)" active={mainTab === 'tradehistory'} onSelect={setMainTab} />
+                <MainTabButton id="btc" label="BTC" title="BTC live spot + paper trading" active={mainTab === 'btc'} onSelect={setMainTab} />
+                <MainTabButton
+                  id="tvbtc"
+                  label="BTC/USDT"
+                  title="Binance BTCUSDT spot — full dollar price & TradingView (not Polymarket share prices)"
+                  active={mainTab === 'tvbtc'}
+                  onSelect={setMainTab}
+                />
+                <MainTabButton
+                  id="perps"
+                  label="Perps"
+                  title="Perps Trade Command Center — BTC/ETH/SOL charts, bias, SL/TP, liq, funding, sizing"
+                  active={mainTab === 'perps'}
+                  onSelect={setMainTab}
+                />
+                <MainTabButton id="multiscan" label="Multi" title="Multi-asset PTB scan" active={mainTab === 'multiscan'} onSelect={setMainTab} />
+                <MainTabButton id="assistant" label="Assistant" active={mainTab === 'assistant'} onSelect={setMainTab} />
+                <MainTabButton id="raw" label="Raw" active={mainTab === 'raw'} onSelect={setMainTab} />
+              </div>
             </div>
 
             {binanceSpotActive ? (
@@ -2961,55 +3118,42 @@ function App() {
                 </div>
               </div>
             ) : null}
+
+            {showEmbeddedTradeDock ? (
+              <div className="mt-5 xl:hidden">
+                <TradePanelShell>
+                  <TradePanelBody
+                    title="Docked trade"
+                    subtitle="Full order entry — same controls as the right column on desktop."
+                    enabled={effectiveTradeEnabled}
+                    ready={effectiveTradeReady}
+                    panelProps={tradePanelSharedProps}
+                    visualStyle="default"
+                  />
+                </TradePanelShell>
+              </div>
+            ) : null}
           </div>
 
-          <div className="xl:col-span-2">
-            <div className="rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-5 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm">
-              <div className="text-[15px] font-semibold text-zinc-100">Quick actions</div>
-              <div className="mt-2 text-xs leading-relaxed text-zinc-500">
-                Use the tabs in the Book panel. This right column is kept minimal to avoid the “everything stacked” feel.
-              </div>
-              <div className="mt-4 flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  onClick={() => setMainTab('book')}
-                  className="rounded-xl border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
-                >
-                  Book
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setMainTab('signals')}
-                  className="rounded-xl border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
-                >
-                  Signals
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setMainTab('tradehistory')}
-                  className="rounded-xl border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
-                >
-                  History
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setMainTab('assistant')}
-                  className="rounded-xl border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
-                >
-                  Assistant
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setMainTab('raw')}
-                  className="rounded-xl border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
-                >
-                  Raw
-                </button>
+          {showEmbeddedTradeDock ? (
+            <div className="hidden xl:col-span-2 xl:block">
+              <div className="sticky top-4 max-h-[calc(100vh-2rem)] overflow-y-auto overscroll-y-contain [-ms-overflow-style:none] [scrollbar-width:thin]">
+                <TradePanelShell>
+                  <TradePanelBody
+                    title="Docked trade"
+                    subtitle="Classic sidebar — lane, size, brackets, and orders while you read charts."
+                    enabled={effectiveTradeEnabled}
+                    ready={effectiveTradeReady}
+                    panelProps={tradePanelSharedProps}
+                    visualStyle="default"
+                  />
+                </TradePanelShell>
               </div>
             </div>
-          </div>
+          ) : null}
         </div>
 
+        {tradeUiPrefs.slide ? (
         <TradeSlidePanel
           open={tradePanelOpen}
           onClose={() => setTradePanelOpen(false)}
@@ -3023,7 +3167,7 @@ function App() {
                 </span>
                 Markets · pin
               </summary>
-              <div className="border-t border-zinc-800/50 px-3 py-3 space-y-2">
+              <div className="space-y-2 border-t border-zinc-800/50 px-3 py-3">
                 <TradeSessionTabsBar
                   tabs={tradeSessionTabs}
                   activeId={activeTradeSessionTabId}
@@ -3057,34 +3201,7 @@ function App() {
             </details>
 
             {effectiveTradeEnabled ? (
-              <SignalsTradePanel
-                marketSlug={effectiveTradeContext.slug}
-                marketQuestion={effectiveTradeContext.question}
-                gammaMarket={marketJson}
-                probMomentumUp={signalsProbMids.up}
-                probMomentumDown={signalsProbMids.down}
-                upLabel={effectiveTradeContext.upLabel}
-                downLabel={effectiveTradeContext.downLabel}
-                upToken={effectiveTradeContext.upToken}
-                downToken={effectiveTradeContext.downToken}
-                upMid={
-                  signalsProbMids.up.length
-                    ? (signalsProbMids.up[signalsProbMids.up.length - 1]!.v ?? null)
-                    : tradePanelBookMids.up
-                }
-                downMid={
-                  signalsProbMids.down.length
-                    ? (signalsProbMids.down[signalsProbMids.down.length - 1]!.v ?? null)
-                    : tradePanelBookMids.down
-                }
-                bookMidUp={tradePanelBookMids.up}
-                bookMidDown={tradePanelBookMids.down}
-                bookTouchUp={tradePanelBookTouch.up}
-                bookTouchDown={tradePanelBookTouch.down}
-                lane={globalTradeLane}
-                onLaneChange={onGlobalTradeLaneChange}
-                visualStyle="slide"
-              />
+              <SignalsTradePanel {...tradePanelSharedProps} visualStyle="slide" />
             ) : !effectiveTradeReady ? (
               <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/40 p-4 text-[13px] leading-relaxed text-zinc-400">
                 <p className="font-medium text-zinc-300">Almost there</p>
@@ -3100,15 +3217,11 @@ function App() {
                 <p className="mt-2 text-amber-100/75">
                   This market loaded, but we still need both outcome tokens (usually a two-sided Yes/No or Up/Down market). Try another slug, or wait for books to populate.
                 </p>
-                <p className="mt-2 text-[12px] text-amber-200/60">
-                  For <span className="font-medium text-amber-100/90">live</span> orders, your API needs{' '}
-                  <code className="rounded bg-black/30 px-1 py-0.5 font-mono text-[11px] text-amber-200/90">POLYMARKET_PRIVATE_KEY</code>{' '}
-                  configured — Paper mode still works for practice.
-                </p>
               </div>
             )}
           </div>
         </TradeSlidePanel>
+        ) : null}
 
         {positionsPanelOpen ? (
           <Suspense fallback={null}>

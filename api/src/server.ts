@@ -38,7 +38,22 @@ import {
 import { parseOrderLane, resolveBullpenOutcomeForOrder } from './bullpenGammaMarket.js';
 import { formatBullpenPriceArg, roundPriceToTick } from './priceTick.js';
 import { extractCanonicalMarketFill } from './clobFillExtract.js';
-import { shouldSkipFutureUpdownBucketStart, updownBucketContainsNow, updownShortcutAnchorFloors } from './updownBucketEt.js';
+import {
+  bucketPtbCacheKey,
+  chainlinkUsdHistory,
+  dedupeRtdsHistPreferChainlink,
+  derivePtbFromRtdsHistory,
+  derivePtbPreview,
+  historyCoversBucketOpen,
+  isLockedPtbSource,
+  type RtdsHistPoint,
+} from './ptbFromRtds.js';
+import { loadPtbBucketDiskCache, savePtbBucketDiskEntry } from './ptbBucketDiskCache.js';
+import {
+  shouldSkipFutureUpdownBucketStart,
+  updownBucketContainsNow,
+  updownShortcutAnchorFloors,
+} from './updownBucketEt.js';
 import { clobHasBookCached, gammaMarketCached, resolveCanonicalUpdownSlug } from './updownCanonicalProbe.js';
 import { resolveUpdownTradingSlug } from './updownTradingSlug.js';
 import {
@@ -517,29 +532,8 @@ function inferredBucketStartSecFromEnd(endMs: number | null, stepSec: number, fa
   return Math.floor(endMs / 1000) - stepSec;
 }
 
-function derivePtbFromRtdsHistory(symbol: string, bucketStartMs: number): number | null {
-  const hist = rtdsHistory.get(symbol) ?? [];
-  if (hist.length === 0) return null;
-  // Prefer last tick at/before bucket start; else first tick after bucket start.
-  let before: RtdsHistPoint | null = null;
-  let after: RtdsHistPoint | null = null;
-  for (let i = 0; i < hist.length; i++) {
-    const p = hist[i]!;
-    if (p.t <= bucketStartMs) before = p;
-    else {
-      after = p;
-      break;
-    }
-  }
-  const chosen = before ?? after;
-  if (!chosen) return null;
-  const v = Number(chosen.v);
-  return Number.isFinite(v) ? v : null;
-}
-
 /** Polymarket RTDS websocket: `crypto_prices_chainlink` preferred; `crypto_prices` may supply Binance-backed values. */
 type RtdsPrice = { symbol: string; value: number; ts: number; receivedAt: number; source: 'chainlink' | 'binance' };
-type RtdsHistPoint = { t: number; v: number };
 const rtdsCache = new Map<string, RtdsPrice>();
 /** Ring buffer of Chainlink ticks per symbol (WS pushes) — returned to the web client to hydrate charts. */
 const rtdsHistory = new Map<string, RtdsHistPoint[]>();
@@ -552,37 +546,77 @@ function normalizeChainlinkTsMs(tsRaw: number): number {
   return tsRaw < 1e12 ? tsRaw * 1000 : tsRaw;
 }
 
-/** Normalize RTDS symbols: Chainlink uses `eth/usd`; Binance uses `ethusdt`. */
+/** Normalize RTDS symbols: Chainlink uses `btc/usd`; Binance uses `btcusdt` → `btc/usdt` (never mix Binance into slash-USD). */
 function canonicalCryptoSpotSymbol(raw: string): string | null {
   const s = String(raw ?? '').trim().toLowerCase();
   if (!s) return null;
   if (/^[a-z0-9]{2,12}\/usd$/.test(s)) return s;
-  const binanceToSlash: Record<string, string> = {
-    btcusdt: 'btc/usd',
-    ethusdt: 'eth/usd',
-    solusdt: 'sol/usd',
-    xrpusdt: 'xrp/usd',
+  if (/^(btc|eth|sol|xrp)\/usdt$/.test(s)) return s;
+  const binanceToUsdt: Record<string, string> = {
+    btcusdt: 'btc/usdt',
+    ethusdt: 'eth/usdt',
+    solusdt: 'sol/usdt',
+    xrpusdt: 'xrp/usdt',
   };
-  return binanceToSlash[s] ?? null;
+  return binanceToUsdt[s] ?? null;
 }
 
 function pushRtdsHistPoint(symbol: string, value: number, tsMs: number, source: RtdsPrice['source']): void {
-  rtdsCache.set(symbol, {
-    symbol,
-    value,
-    ts: tsMs,
-    receivedAt: Date.now(),
-    source,
-  });
+  if (source === 'binance' && symbol.endsWith('/usd')) return;
+
   const arr = rtdsHistory.get(symbol) ?? [];
-  const last = arr[arr.length - 1];
-  if (last && last.t === tsMs) {
-    last.v = value;
-  } else {
-    arr.push({ t: tsMs, v: value });
-    if (arr.length > RTDS_HIST_CAP) arr.splice(0, arr.length - RTDS_HIST_CAP);
+  for (let i = arr.length - 1; i >= 0; i--) {
+    const pt = arr[i]!;
+    if (pt.t === tsMs) {
+      if (source === 'binance' && pt.src === 'chainlink') return;
+      if (source === 'chainlink' || pt.src !== 'chainlink') {
+        pt.v = value;
+        pt.src = source;
+      }
+      if (source === 'chainlink' || !symbol.endsWith('/usd')) {
+        rtdsCache.set(symbol, { symbol, value, ts: tsMs, receivedAt: Date.now(), source });
+      }
+      rtdsHistory.set(symbol, arr);
+      return;
+    }
+    if (pt.t < tsMs) break;
   }
+
+  arr.push({ t: tsMs, v: value, src: source });
+  if (arr.length > RTDS_HIST_CAP) arr.splice(0, arr.length - RTDS_HIST_CAP);
   rtdsHistory.set(symbol, arr);
+  if (source === 'chainlink' || !symbol.endsWith('/usd')) {
+    rtdsCache.set(symbol, { symbol, value, ts: tsMs, receivedAt: Date.now(), source });
+  }
+}
+
+function rtdsHistoryForSymbol(symbol: string): RtdsHistPoint[] {
+  const raw = rtdsHistory.get(symbol) ?? [];
+  if (symbol.endsWith('/usd')) return chainlinkUsdHistory(raw);
+  return dedupeRtdsHistPreferChainlink(raw);
+}
+
+function latestChainlinkUsdPrice(symbol: string): RtdsPrice | null {
+  const cached = rtdsCache.get(symbol);
+  if (cached?.source === 'chainlink') return cached;
+  const hist = rtdsHistoryForSymbol(symbol);
+  for (let i = hist.length - 1; i >= 0; i--) {
+    const p = hist[i]!;
+    if (p.src === 'chainlink' || symbol.endsWith('/usd')) {
+      return rtdsPriceFromPoint(symbol, p);
+    }
+  }
+  return cached ?? null;
+}
+
+function rtdsPriceFromPoint(symbol: string, p: RtdsHistPoint): RtdsPrice {
+  return {
+    symbol,
+    value: p.v,
+    ts: p.t,
+    receivedAt: Date.now(),
+    source: p.src === 'binance' ? 'binance' : 'chainlink',
+  };
 }
 
 function recordRtdsTick(symbol: string, value: number, tsRaw: number, source: RtdsPrice['source']): void {
@@ -590,13 +624,6 @@ function recordRtdsTick(symbol: string, value: number, tsRaw: number, source: Rt
   if (!sym) return;
   const tsMs = normalizeChainlinkTsMs(tsRaw);
   pushRtdsHistPoint(sym, value, tsMs, source);
-  // Binance USDT-margined spot stream: expose an explicit `*/usdt` series (Chainlink stays `*/usd` only).
-  if (source === 'binance' && sym.endsWith('/usd')) {
-    const base = sym.slice(0, -'/usd'.length);
-    if (base === 'btc' || base === 'eth' || base === 'sol') {
-      pushRtdsHistPoint(`${base}/usdt`, value, tsMs, source);
-    }
-  }
 }
 
 const RTDS_WS_OPEN_TIMEOUT_MS = 8_000;
@@ -623,7 +650,7 @@ async function ensureRtdsWs(): Promise<void> {
     rtdsWs = ws;
     ws.onopen = () => {
       clearTimeout(openTimer);
-      // Chainlink (slash symbols) + Binance (concat symbols) — both map into `btc/usd`, `eth/usd`, `sol/usd`.
+      // Chainlink (slash symbols) + Binance USDT (concat symbols) — separate series, never mix into slash-USD.
       const chainlinkSubs = ['btc/usd', 'eth/usd', 'sol/usd'].map((symbol) => ({
         topic: 'crypto_prices_chainlink',
         type: '*',
@@ -672,6 +699,8 @@ async function ensureRtdsWs(): Promise<void> {
               const val = Number(ro.value);
               if (Number.isFinite(t) && Number.isFinite(val)) recordRtdsTick(symRaw, val, t, src);
             }
+            const symCanon = canonicalCryptoSpotSymbol(symRaw);
+            if (symCanon) notifyRtdsHistoryBatch(symCanon);
             continue;
           }
 
@@ -704,16 +733,134 @@ async function ensureRtdsWs(): Promise<void> {
   return rtdsWsStarting;
 }
 
+/** Locked PTB per (symbol, bucket open) — fixed for the whole window once computed. */
+const ptbByBucketCache = loadPtbBucketDiskCache();
+
+const rtdsHistoryBatchWaiters = new Map<string, Set<() => void>>();
+
+function notifyRtdsHistoryBatch(symbol: string): void {
+  const waiters = rtdsHistoryBatchWaiters.get(symbol);
+  if (!waiters) return;
+  rtdsHistoryBatchWaiters.delete(symbol);
+  for (const done of waiters) {
+    try {
+      done();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/** Re-send Chainlink subscribe so RTDS may replay `payload.data` history (cold start / mid-window). */
+async function awaitRtdsHistoryBatch(symbol: string, timeoutMs: number): Promise<void> {
+  const sym = normalizeRtdsSymbol(symbol);
+  if (!sym || sym.endsWith('/usdt')) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      const set = rtdsHistoryBatchWaiters.get(sym);
+      if (set) {
+        set.delete(done);
+        if (set.size === 0) rtdsHistoryBatchWaiters.delete(sym);
+      }
+      resolve();
+    }, timeoutMs);
+    const done = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    let set = rtdsHistoryBatchWaiters.get(sym);
+    if (!set) {
+      set = new Set();
+      rtdsHistoryBatchWaiters.set(sym, set);
+    }
+    set.add(done);
+    try {
+      if (rtdsWs && rtdsWs.readyState === WebSocket.OPEN) {
+        rtdsWs.send(
+          JSON.stringify({
+            action: 'subscribe',
+            subscriptions: [{ topic: 'crypto_prices_chainlink', type: '*', filters: JSON.stringify({ symbol: sym }) }],
+          }),
+        );
+      }
+    } catch {
+      clearTimeout(timer);
+      resolve();
+    }
+  });
+}
+
+function lockBucketPtb(cacheKey: string, out: { value: number; source: string }): { value: number; source: string } {
+  if (!isLockedPtbSource(out.source)) return out;
+  ptbByBucketCache.set(cacheKey, out);
+  savePtbBucketDiskEntry(cacheKey, out);
+  return out;
+}
+
 async function tryRtdsBucketPtb(bucket: { symbol: string; bucketStartMs: number }): Promise<{ value: number; source: string } | null> {
+  const cacheKey = bucketPtbCacheKey(bucket.symbol, bucket.bucketStartMs);
+  const locked = ptbByBucketCache.get(cacheKey);
+  if (locked && isLockedPtbSource(locked.source)) return locked;
+
+  const now = Date.now();
+  const preOpen = now < bucket.bucketStartMs;
+
   try {
     await ensureRtdsWs();
   } catch {
     /* may still have cache from a prior connection */
   }
   ensureRtdsSubscribed(bucket.symbol);
-  await waitForRtdsPrice(bucket.symbol, 32, 100);
-  const v = derivePtbFromRtdsHistory(bucket.symbol, bucket.bucketStartMs);
-  if (v != null) return { value: v, source: 'rtds_chainlink_bucket_floor' };
+  await waitForRtdsPrice(bucket.symbol, 12, 80);
+
+  if (preOpen) {
+    const hist = rtdsHistoryForSymbol(bucket.symbol);
+    const live = latestChainlinkUsdPrice(bucket.symbol)?.value ?? null;
+    const preview = derivePtbPreview(hist, bucket.bucketStartMs, live);
+    if (preview != null) {
+      return { value: preview, source: 'rtds_chainlink_preview_pre_open' };
+    }
+    return null;
+  }
+
+  const bucketOpen = now >= bucket.bucketStartMs;
+  const justOpened = bucketOpen && now - bucket.bucketStartMs < 45_000;
+  const bucketAgeMs = Math.max(0, now - bucket.bucketStartMs);
+  const maxWaitMs = justOpened ? 18_000 : bucketAgeMs > 120_000 ? 12_000 : 8_000;
+  const deadline = Date.now() + maxWaitMs;
+
+  const tryDerive = (): { value: number; source: string } | null => {
+    const hist = rtdsHistoryForSymbol(bucket.symbol);
+    const allowPreOpenFallback = bucketOpen;
+    const v = derivePtbFromRtdsHistory(hist, bucket.bucketStartMs, { allowPreOpenFallback, chainlinkOnly: bucket.symbol.endsWith('/usd') });
+    if (v == null) return null;
+    const hasOpenTick = hist.some((p) => p.t >= bucket.bucketStartMs && p.t <= bucket.bucketStartMs + 15_000);
+    const source = hasOpenTick ? 'rtds_chainlink_window_open' : 'rtds_chainlink_pre_open_tick';
+    return { value: v, source };
+  };
+
+  let out = tryDerive();
+  if (out && historyCoversBucketOpen(rtdsHistoryForSymbol(bucket.symbol), bucket.bucketStartMs)) {
+    return lockBucketPtb(cacheKey, out);
+  }
+
+  while (!out && Date.now() < deadline) {
+    await waitForRtdsPrice(bucket.symbol, 8, 100);
+    out = tryDerive();
+    if (out && historyCoversBucketOpen(rtdsHistoryForSymbol(bucket.symbol), bucket.bucketStartMs)) break;
+    out = null;
+    await new Promise<void>((r) => setTimeout(r, 120));
+  }
+
+  const hist = rtdsHistoryForSymbol(bucket.symbol);
+  if (!historyCoversBucketOpen(hist, bucket.bucketStartMs)) {
+    await awaitRtdsHistoryBatch(bucket.symbol, Math.min(8_000, Math.max(500, deadline - Date.now())));
+    out = tryDerive();
+  }
+
+  if (out && historyCoversBucketOpen(rtdsHistoryForSymbol(bucket.symbol), bucket.bucketStartMs)) {
+    return lockBucketPtb(cacheKey, out);
+  }
   return null;
 }
 
@@ -1411,17 +1558,26 @@ app.get('/api/price-to-beat/:slug', async (req, res) => {
   const rtdsP = bucket ? tryRtdsBucketPtb(bucket) : Promise.resolve(null);
 
   const [ssrOut, rtdsOut] = await Promise.all([ssrP, rtdsP]);
-  const chosen = ssrOut ?? rtdsOut;
+  const chosen = bucket ? (rtdsOut ?? ssrOut) : (ssrOut ?? rtdsOut);
   if (chosen) {
-    const payload = { price_to_beat: chosen.value, source: chosen.source };
-    ptbBySlugCache.set(cacheKey, cacheSet(payload));
+    const preview = chosen.source === 'rtds_chainlink_preview_pre_open';
+    const payload = {
+      price_to_beat: chosen.value,
+      source: chosen.source,
+      ...(preview && bucket ? { preview: true, opens_at_ms: bucket.bucketStartMs } : {}),
+    };
+    if (!preview) ptbBySlugCache.set(cacheKey, cacheSet({ price_to_beat: chosen.value, source: chosen.source }));
     return json(res, 200, { ok: true, data: { slug, ...payload } });
   }
 
   return json(res, 502, {
     ok: false,
     error: 'price_to_beat_failed',
-    details: { slug, err: String(ssrErr ?? 'no_ssr_or_rtds_ptb') },
+    details: {
+      slug,
+      err: String(ssrErr ?? 'no_ssr_or_rtds_ptb'),
+      ...(bucket != null && Date.now() < bucket.bucketStartMs ? { window_opens_at_ms: bucket.bucketStartMs } : {}),
+    },
   });
 });
 
@@ -1548,13 +1704,15 @@ app.get('/api/rtds/crypto', async (req, res) => {
     return json(res, 502, { ok: false, error: 'rtds_unavailable', details: String(e) });
   }
   // First ticks can lag a few hundred ms after subscribe; short wait avoids empty charts on cold load.
-  const v = await waitForRtdsPrice(symbol);
+  let v = symbol.endsWith('/usd') ? latestChainlinkUsdPrice(symbol) : rtdsCache.get(symbol) ?? null;
+  if (!v) v = await waitForRtdsPrice(symbol);
+  if (!v && symbol.endsWith('/usd')) v = latestChainlinkUsdPrice(symbol);
   if (!v) return json(res, 404, { ok: false, error: 'no_price_yet', details: { symbol } });
   // HTTP poll counts as a fresh read — otherwise `receivedAt` only moves on WS ticks and the UI
   // marks spot "stale" while the client polls every second.
   const fresh = { ...v, receivedAt: Date.now() };
-  rtdsCache.set(symbol, fresh);
-  const history = rtdsHistory.get(symbol) ?? [];
+  if (v.source === 'chainlink' || !symbol.endsWith('/usd')) rtdsCache.set(symbol, fresh);
+  const history = rtdsHistoryForSymbol(symbol);
   return json(res, 200, { ok: true, data: { ...fresh, history } });
 });
 

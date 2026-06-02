@@ -78,27 +78,26 @@ export function buildOperatorVerdict(input: OperatorVerdictInput): OperatorVerdi
   const blockers: string[] = [];
 
   // ─── Hard blockers (force STAND_DOWN) ───────────────────────────────────
-  // Tightened thresholds — prior version forced stand-down on the slightest
-  // whisper of friction (any whipsaw tier, any HIGH-discrepancy warning) which
-  // made the verdict gray-out even when sensors agreed. Now we only block when
-  // the friction is *severe* and also relevant to the requested action.
-  if (input.noTradeScore && input.noTradeScore.tier === 'RED' && input.noTradeScore.score >= 96) {
+  // Only block on *extreme* friction. The math (edge, pWin, book prices) is the
+  // primary authority. Guards exist to prevent catastrophic whipsaw / spam, not
+  // to second-guess valid +EV trades.
+  if (input.noTradeScore && input.noTradeScore.tier === 'RED' && input.noTradeScore.score >= 98) {
     blockers.push(`No-Trade ${input.noTradeScore.score}/100`);
   }
-  // Cross-check conflict: only block thin LOW-conviction INITIATEs — strong sensor
-  // consensus can disagree with Dual implied on rangy windows and still be tradable.
+  // Cross-check conflict: only block when confidence is LOW AND the directive has no edge.
   if (
     input.crossEngineLaneConflict &&
     input.directive?.action === 'INITIATE' &&
-    input.directive.confidence === 'LOW'
+    input.directive.confidence === 'LOW' &&
+    (input.directive.edgePerShareUsd == null || input.directive.edgePerShareUsd < 0.03)
   ) {
     blockers.push('Spot vs Dual lane mismatch');
   }
-  // Discrepancy: require a hard HIGH warning plus a high aggregate score.
-  if (input.discrepancy?.shouldBlock && input.discrepancy.score >= 92) {
+  // Discrepancy: only block on extreme score. Prior threshold of 92 was too strict.
+  if (input.discrepancy?.shouldBlock && input.discrepancy.score >= 96) {
     blockers.push('sensors disagree');
   }
-  // Whipsaw needs a very fast flip rate before blocking fresh INITIATE.
+  // Whipsaw: only block on extreme flip rates (was 12, keeping it).
   if (
     input.stability &&
     input.stability.tier === 'whipsaw' &&

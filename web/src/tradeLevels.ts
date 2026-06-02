@@ -78,10 +78,12 @@ function clamp01(x: number): number {
  * @param input.lane         The lane the directive is recommending entry on.
  * @param input.entry        Mid price to enter at (0..1).
  * @param input.edgeUsd      Per-share edge in $ from the model. When ≤ 0, bracket width
- *     still uses the **4¢ structural floor** (symmetric TP/SL) so operators have exit
- *     anchors even when the EV model disagrees with the tape.
+ *     still uses the **4¢ structural floor** so operators have exit anchors.
  * @param input.crossProb    Optional cross probability (0..1) — tightens levels when high.
  * @param input.endsInMs     Optional round time remaining; final ~15s pins TP/SL; 15–60s tightens band.
+ * @param input.bestAsk      Optional best ask for entry lane (actual price you'd buy at).
+ * @param input.bestBid      Optional best bid for entry lane (actual price you'd sell at / SL floor).
+ * @param input.pWin         Optional model win probability — drives asymmetric TP when +EV.
  */
 export function suggestTradeLevels(input: {
   lane: 'up' | 'down';
@@ -89,8 +91,17 @@ export function suggestTradeLevels(input: {
   edgeUsd: number;
   crossProb?: number | null;
   endsInMs?: number | null;
+  bestAsk?: number | null;
+  bestBid?: number | null;
+  pWin?: number | null;
 }): TradeLevels | null {
-  const { lane, entry, edgeUsd, crossProb, endsInMs } = input;
+  const { lane, edgeUsd, crossProb, endsInMs, bestAsk, bestBid, pWin } = input;
+
+  // Use the best ask as actual entry price (what you'd pay) when available, else fall back to mid.
+  let entry = input.entry;
+  if (bestAsk != null && Number.isFinite(bestAsk) && bestAsk > 0 && bestAsk < 1) {
+    entry = bestAsk;
+  }
 
   if (!Number.isFinite(entry) || entry <= 0 || entry >= 1 || !Number.isFinite(edgeUsd)) {
     return null;
@@ -98,38 +109,63 @@ export function suggestTradeLevels(input: {
 
   const horizonSec = endsInMs != null && Number.isFinite(endsInMs) ? Math.max(0, endsInMs / 1000) : Infinity;
 
-  // Final seconds — pin to mid (collapsed). Card + sell flow carry the decision.
   if (horizonSec > 0 && horizonSec < SETTLEMENT_PIN_BELOW_SEC) {
     return collapsedPin(lane, entry, horizonSec);
   }
 
-  // One bracket width for both legs (symmetric R:R ≈ 1 before boundary shrink).
-  const edgeShare = crossProb != null && crossProb >= 0.7 ? 0.42 : 0.55;
+  // Asymmetric TP/SL: when edge is positive, TP should be wider than SL (let winners run).
+  // The ratio is based on pWin: higher probability → more room for TP.
   const positiveEdgeUsd = Math.max(0, edgeUsd);
-  let leg = Math.max(0.04, positiveEdgeUsd * edgeShare);
+  const edgeShare = crossProb != null && crossProb >= 0.7 ? 0.42 : 0.55;
 
-  // Shrink both legs equally near 0.01 / 0.99 so cheap tokens do not get a tighter SL only.
+  // TP leg: wider when edge is positive (reward the +EV math).
+  let tpLeg: number;
+  let slLeg: number;
+
+  if (positiveEdgeUsd >= 0.04 && pWin != null && Number.isFinite(pWin) && pWin > entry) {
+    // Use the model fair value as TP ceiling: token should converge toward pWin.
+    // TP = halfway between entry and fair value (realistic target before settlement).
+    const fairTarget = Math.min(0.98, pWin);
+    tpLeg = Math.max(0.04, (fairTarget - entry) * 0.65);
+    // SL: tighter — risk less than the expected reward. Floor at 3¢ so tiny edges aren't stop-hunted.
+    slLeg = Math.max(0.03, positiveEdgeUsd * 0.5, tpLeg * 0.55);
+  } else {
+    // Neutral/negative edge: use symmetric with 4¢ floor.
+    const leg = Math.max(0.04, positiveEdgeUsd * edgeShare);
+    tpLeg = leg;
+    slLeg = leg;
+  }
+
+  // Use best bid as SL floor — don't set SL below where you can actually sell.
+  if (bestBid != null && Number.isFinite(bestBid) && bestBid > 0.01) {
+    const bidFloor = entry - bestBid;
+    if (bidFloor > 0 && bidFloor < slLeg) {
+      slLeg = Math.max(0.02, bidFloor + 0.005);
+    }
+  }
+
+  // Boundary clamp near 0/1.
   const roomUp = 0.99 - entry;
   const roomDn = entry - 0.01;
-  const k = Math.min(1, roomUp / Math.max(leg, 1e-9), roomDn / Math.max(leg, 1e-9));
-  leg *= k;
+  tpLeg = Math.min(tpLeg, roomUp);
+  slLeg = Math.min(slLeg, roomDn);
 
   let toBellBand = false;
-  // Last minute to bell: compress symmetric leg so TP/SL stay scalp-realistic (not full 8¢ swings).
   if (
     horizonSec >= SETTLEMENT_PIN_BELOW_SEC &&
     horizonSec < SETTLEMENT_TIGHTEN_BELOW_SEC &&
     Number.isFinite(horizonSec)
   ) {
     const span = SETTLEMENT_TIGHTEN_BELOW_SEC - SETTLEMENT_PIN_BELOW_SEC;
-    const t = (SETTLEMENT_TIGHTEN_BELOW_SEC - horizonSec) / span; // 0 @ 60s → 1 @ 15s
-    const maxLeg = 0.05 - t * (0.05 - 0.028); // 5.0¢ down to 2.8¢ approaching the pin
-    leg = Math.max(0.014, Math.min(leg, maxLeg));
+    const t = (SETTLEMENT_TIGHTEN_BELOW_SEC - horizonSec) / span;
+    const maxLeg = 0.05 - t * (0.05 - 0.028);
+    tpLeg = Math.max(0.014, Math.min(tpLeg, maxLeg));
+    slLeg = Math.max(0.014, Math.min(slLeg, maxLeg));
     toBellBand = true;
   }
 
-  const takeProfit = clamp01(entry + leg);
-  const stopLoss = clamp01(entry - leg);
+  const takeProfit = clamp01(entry + tpLeg);
+  const stopLoss = clamp01(entry - slLeg);
 
   const takeProfitGain = takeProfit - entry;
   const stopLossLoss = entry - stopLoss;
@@ -140,8 +176,9 @@ export function suggestTradeLevels(input: {
     toBellBand && Number.isFinite(horizonSec)
       ? ` · ~${Math.max(1, Math.round(horizonSec))}s to bell (tight band)`
       : '';
+  const entryNote = bestAsk != null && Number.isFinite(bestAsk) ? ' (ask)' : '';
   const summary =
-    `${laneWord} token @ ${entry.toFixed(2)} → ` +
+    `${laneWord} token @ ${entry.toFixed(2)}${entryNote} → ` +
     `TP ${takeProfit.toFixed(2)} (+${takeProfitGain.toFixed(2)}/sh) · ` +
     `SL ${stopLoss.toFixed(2)} (−${stopLossLoss.toFixed(2)}/sh) · ` +
     `R:R ${rrRatio.toFixed(2)}${bellHint}`;
@@ -171,6 +208,9 @@ export function suggestLevelsForLane(input: {
   laneEdges: LaneEdges | null;
   crossProb?: number | null;
   endsInMs?: number | null;
+  /** Actual book top-of-book for realistic entry/SL. */
+  bestAsk?: number | null;
+  bestBid?: number | null;
 }): TradeLevels | null {
   const edge = input.lane === 'up' ? input.laneEdges?.up : input.laneEdges?.down;
   if (!edge) return null;
@@ -180,6 +220,9 @@ export function suggestLevelsForLane(input: {
     edgeUsd: edge.edgePerShareUsd,
     crossProb: input.crossProb ?? null,
     endsInMs: input.endsInMs ?? null,
+    bestAsk: input.bestAsk ?? null,
+    bestBid: input.bestBid ?? null,
+    pWin: edge.pWin,
   });
 }
 
@@ -194,12 +237,15 @@ export function resolveTradeLevelsForDirective(args: {
   laneEdges: LaneEdges | null;
   crossProb: number | null;
   endsInMs: number | null;
+  /** Actual top-of-book for the entry lane — so TP/SL use real prices. */
+  bestAsk?: number | null;
+  bestBid?: number | null;
 }): TradeLevels | null {
-  const { directive, laneEdges, crossProb, endsInMs } = args;
+  const { directive, laneEdges, crossProb, endsInMs, bestAsk, bestBid } = args;
   if (!laneEdges) return null;
 
   const pick = (lane: 'up' | 'down') =>
-    suggestLevelsForLane({ lane, laneEdges, crossProb, endsInMs });
+    suggestLevelsForLane({ lane, laneEdges, crossProb, endsInMs, bestAsk, bestBid });
 
   if (!directive?.lane) {
     const best = laneEdges.bestLane;
@@ -220,12 +266,16 @@ export function resolveTradeLevelsForDirective(args: {
         : bookEdge != null && Number.isFinite(bookEdge)
           ? bookEdge
           : 0;
+    const pWin = directive.laneWinProb ?? (lane === 'up' ? laneEdges.up?.pWin : laneEdges.down?.pWin) ?? null;
     return suggestTradeLevels({
       lane,
       entry: laneMid,
       edgeUsd,
       crossProb,
       endsInMs,
+      bestAsk,
+      bestBid,
+      pWin,
     });
   }
 

@@ -36,6 +36,8 @@ export type TapeWindow = {
 export type TapeBurst = 'idle' | 'normal' | 'aggressive' | 'extreme';
 export type TapeDominance = 'buy' | 'sell' | 'mixed' | 'idle';
 
+export type TapeAcceleration = 'idle' | 'building' | 'surging' | 'fading';
+
 export type TapeVelocity = {
   /** Window we react to (default 30s). */
   recent: TapeWindow;
@@ -53,17 +55,37 @@ export type TapeVelocity = {
   reliable: boolean;
   /** Concise human summary for tooltips / banner. */
   summary: string;
+  /** Micro-window (10s) for early burst detection — fires before the 30s window confirms. */
+  micro: TapeWindow;
+  /** Micro-window burst ratio vs baseline. Detects early acceleration. */
+  microBurstRatio: number;
+  /** True when micro window alone has enough prints to be meaningful. */
+  microReliable: boolean;
+  /** Micro-window dominance — early directional read before full window confirms. */
+  microDominance: TapeDominance;
+  /** Is volume accelerating (micro hotter than rest of recent) or fading? */
+  acceleration: TapeAcceleration;
+  /** Micro net pressure (-100..100) — early directional signal. */
+  microNetPressure: number;
 };
 
+const EMPTY_WINDOW: TapeWindow = { buyVol: 0, sellVol: 0, count: 0, net: 0 };
+
 const EMPTY: TapeVelocity = {
-  recent: { buyVol: 0, sellVol: 0, count: 0, net: 0 },
-  baseline: { buyVol: 0, sellVol: 0, count: 0, net: 0 },
+  recent: EMPTY_WINDOW,
+  baseline: EMPTY_WINDOW,
   burstRatio: 0,
   burst: 'idle',
   netPressure: 0,
   dominance: 'idle',
   reliable: false,
   summary: 'Tape idle — no recent prints.',
+  micro: EMPTY_WINDOW,
+  microBurstRatio: 0,
+  microReliable: false,
+  microDominance: 'idle',
+  acceleration: 'idle',
+  microNetPressure: 0,
 };
 
 function aggregate(prints: TapePrint[]): TapeWindow {
@@ -112,6 +134,30 @@ function summarize(state: Omit<TapeVelocity, 'summary'>): string {
   return `Tape: ${dom} ${net} · ${burst} (×${state.burstRatio.toFixed(1)} baseline, ${state.recent.count} prints).`;
 }
 
+/** Micro-window size — 10s catches acceleration 20s before the full 30s window confirms. */
+const MICRO_WINDOW_MS = 10_000;
+/** Minimum prints for micro-window to be actionable. */
+const MICRO_MIN_PRINTS = 2;
+
+function classifyAcceleration(
+  microTotal: number,
+  recentRestTotal: number,
+  recentMs: number,
+  microMs: number,
+  microCount: number,
+): TapeAcceleration {
+  if (microCount < MICRO_MIN_PRINTS) return 'idle';
+  const restMs = Math.max(1, recentMs - microMs);
+  const microRate = microTotal / microMs;
+  const restRate = recentRestTotal / restMs;
+  if (restRate <= 0) return microTotal > 0 ? 'surging' : 'idle';
+  const ratio = microRate / restRate;
+  if (ratio >= 3.0) return 'surging';
+  if (ratio >= 1.6) return 'building';
+  if (ratio < 0.4 && recentRestTotal > 0) return 'fading';
+  return 'idle';
+}
+
 /**
  * @param prints   List of recent prints sorted newest-last is fine; we filter by ts.
  * @param now      Epoch ms — caller can pass `Date.now()` or a fixture in tests.
@@ -127,30 +173,52 @@ export function computeTapeVelocity(
   const recentMs = opts.recentMs ?? 30_000;
   const baselineMs = opts.baselineMs ?? 300_000;
   const minPrints = opts.minPrints ?? 4;
+  const microMs = Math.min(MICRO_WINDOW_MS, recentMs);
   const recentCutoff = opts.now - recentMs;
+  const microCutoff = opts.now - microMs;
   const baselineCutoff = opts.now - baselineMs;
 
   const recentPrints: TapePrint[] = [];
+  const microPrints: TapePrint[] = [];
   const baselinePrints: TapePrint[] = [];
   for (const p of prints) {
     if (!Number.isFinite(p.ts)) continue;
-    if (p.ts >= recentCutoff) recentPrints.push(p);
-    else if (p.ts >= baselineCutoff) baselinePrints.push(p);
+    if (p.ts >= microCutoff) {
+      microPrints.push(p);
+      recentPrints.push(p);
+    } else if (p.ts >= recentCutoff) {
+      recentPrints.push(p);
+    } else if (p.ts >= baselineCutoff) {
+      baselinePrints.push(p);
+    }
   }
 
   const recent = aggregate(recentPrints);
+  const micro = aggregate(microPrints);
   const baseline = aggregate(baselinePrints);
 
   const recentTotal = recent.buyVol + recent.sellVol;
+  const microTotal = micro.buyVol + micro.sellVol;
   const baselineTotal = baseline.buyVol + baseline.sellVol;
-  // Normalize baseline to a per-recent-window rate.
+
   const baselineWindowsInBaseline = Math.max(1, (baselineMs - recentMs) / recentMs);
   const baselineRatePerRecent = baselineTotal / baselineWindowsInBaseline;
   const burstRatio = baselineRatePerRecent > 0 ? recentTotal / baselineRatePerRecent : recentTotal > 0 ? 5 : 0;
 
+  const baselineWindowsForMicro = Math.max(1, (baselineMs - recentMs) / microMs);
+  const baselineRatePerMicro = baselineTotal / baselineWindowsForMicro;
+  const microBurstRatio = baselineRatePerMicro > 0 ? microTotal / baselineRatePerMicro : microTotal > 0 ? 5 : 0;
+
   const burst = classifyBurst(burstRatio, recent.count);
   const netPressure = recentTotal > 0 ? Math.max(-100, Math.min(100, (recent.net / recentTotal) * 100)) : 0;
   const dominance = classifyDominance(recent.net, recentTotal);
+
+  const microNetPressure = microTotal > 0 ? Math.max(-100, Math.min(100, (micro.net / microTotal) * 100)) : 0;
+  const microDominance = classifyDominance(micro.net, microTotal);
+  const microReliable = micro.count >= MICRO_MIN_PRINTS;
+
+  const recentRestTotal = Math.max(0, recentTotal - microTotal);
+  const acceleration = classifyAcceleration(microTotal, recentRestTotal, recentMs, microMs, micro.count);
 
   const state: Omit<TapeVelocity, 'summary'> = {
     recent,
@@ -160,6 +228,12 @@ export function computeTapeVelocity(
     netPressure,
     dominance,
     reliable: recent.count >= minPrints,
+    micro,
+    microBurstRatio,
+    microReliable,
+    microDominance,
+    acceleration,
+    microNetPressure,
   };
 
   return { ...state, summary: summarize(state) };

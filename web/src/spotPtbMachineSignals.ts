@@ -383,6 +383,19 @@ export function computeSpotPtbMachineReadout(args: {
     if (Math.abs(tape.netPressure) >= 35) w += 0.2;
     voteAdd(tl, w);
   }
+  // Micro-window leading indicator: 10s tape acceleration fires before full 30s confirms.
+  // Catches directional moves ~15-20s earlier than waiting for the full window.
+  if (tape?.microReliable && tapeLane) {
+    const microLane = tapeLaneVote(tapeLane, tape.microDominance);
+    if (microLane) {
+      let mw = 0;
+      if (tape.acceleration === 'surging') mw = 1.8;
+      else if (tape.acceleration === 'building') mw = 1.0;
+      if (tape.microBurstRatio >= 3) mw += 0.5;
+      if (Math.abs(tape.microNetPressure) >= 55) mw += 0.4;
+      if (mw > 0) voteAdd(microLane, mw);
+    }
+  }
   if (endingProb && endingProb.confidence !== 'low') {
     const pAbove = endingProb.endAboveProb;
     const endLane: L | null = pAbove >= 0.56 ? 'up' : pAbove <= 0.44 ? 'down' : null;

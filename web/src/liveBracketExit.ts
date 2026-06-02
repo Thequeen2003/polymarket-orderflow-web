@@ -8,18 +8,45 @@ export function isFakNoMatchMessage(msg: string): boolean {
   return /no orders found|no match|FAK|fully filled|FOK|killed/i.test(msg);
 }
 
-/** Live bracket exit: FAK limit at touch, refresh book + retry, then market sell shares. */
-export async function submitLiveBracketFakSell(params: {
+type LiveBracketExitBase = {
   token: string;
   marketSlug: string;
   outcome: string;
   lane: 'up' | 'down';
-  price01: number;
   sizeShares: number;
-  /** Minimum sell price (take level for TP; can be 0 for SL). */
-  floor01: number;
   signal?: AbortSignal;
   timeoutMs?: number;
+};
+
+/** Market sell immediately — used when SL/TP level is hit and speed matters most. */
+export async function submitLiveBracketMarketSell(
+  params: LiveBracketExitBase,
+): Promise<
+  | { ok: true; data: unknown; path: 'market' }
+  | { ok: false; error: string; apiErr?: ApiErr }
+> {
+  const marketRes = await tradeMarketOrderWithOpts(
+    {
+      token: params.token,
+      side: 'sell',
+      amount: params.sizeShares,
+      signatureType: null,
+      marketSlug: params.marketSlug,
+      outcome: params.outcome,
+      lane: params.lane,
+    },
+    { signal: params.signal, timeoutMs: params.timeoutMs ?? 25_000 },
+  );
+  if (marketRes.ok) return { ok: true, data: marketRes.data, path: 'market' };
+  const me = marketRes as ApiErr;
+  return { ok: false, error: me.error, apiErr: me };
+}
+
+/** Live bracket exit: FAK limit at touch, refresh book + retry, then market sell shares. */
+export async function submitLiveBracketFakSell(params: LiveBracketExitBase & {
+  price01: number;
+  /** Minimum sell price (take level for TP; can be 0 for SL). */
+  floor01: number;
 }): Promise<
   | { ok: true; data: unknown; path: 'fak' | 'fak_retry' | 'market' }
   | { ok: false; error: string; apiErr?: ApiErr }
@@ -79,19 +106,22 @@ export async function submitLiveBracketFakSell(params: {
     }
   }
 
-  const marketRes = await tradeMarketOrderWithOpts(
-    {
-      token: params.token,
-      side: 'sell',
-      amount: params.sizeShares,
-      signatureType: null,
-      marketSlug: params.marketSlug,
-      outcome: params.outcome,
-      lane: params.lane,
-    },
-    { signal: params.signal, timeoutMs: params.timeoutMs ?? 25_000 },
-  );
-  if (marketRes.ok) return { ok: true, data: marketRes.data, path: 'market' };
-  const me = marketRes as ApiErr;
-  return { ok: false, error: me.error, apiErr: me };
+  return submitLiveBracketMarketSell(params);
+}
+
+/** Bracket exit — `immediate` market sell on trigger; `limit_first` tries FAK then market. */
+export async function submitLiveBracketExit(
+  params: LiveBracketExitBase & {
+    price01: number;
+    floor01: number;
+    urgency?: 'immediate' | 'limit_first';
+  },
+): Promise<
+  | { ok: true; data: unknown; path: 'fak' | 'fak_retry' | 'market' }
+  | { ok: false; error: string; apiErr?: ApiErr }
+> {
+  if (params.urgency === 'immediate') {
+    return submitLiveBracketMarketSell(params);
+  }
+  return submitLiveBracketFakSell(params);
 }

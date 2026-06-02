@@ -85,7 +85,40 @@ describe('buildTradeDirective', () => {
     expect(d.action).toBe('STAND_DOWN');
   });
 
-  it('blocks INITIATE when focus lane fights tape/book flow', () => {
+  it('blocks INITIATE when focus lane fights tape/book flow AND agreement is weak AND no edge', () => {
+    const d = buildTradeDirective({
+      machine: mkMachine({
+        focusLane: 'up',
+        flowWinningLane: 'down',
+        agreementScore: 55,
+        sensors: {
+          spotVsPtb: 'up',
+          impliedLeader: 'up',
+          sectionalDrift: 'up',
+          bookControl: 'up',
+          microSlope: 'up',
+          dwellBias: 'up',
+          accel: 'accel-up',
+          mtfDominant: null,
+          overextended: null,
+          tapeDominance: 'sell',
+          tapeReliable: true,
+          upBidWall: false,
+          upAskWall: false,
+          downBidWall: true,
+          downAskWall: false,
+        },
+        wallFlow: { flowLane: 'down', pressure: 2, headline: 'Walls → DOWN', bidWarnings: [], askWarnings: [] },
+      }),
+      forecast: null,
+      currentPositionLane: null,
+      laneEdges: null,
+    });
+    expect(d.action).toBe('STAND_DOWN');
+    expect(d.headline).toMatch(/FLOW DOWN/i);
+  });
+
+  it('does NOT block INITIATE when flow conflicts but agreement is strong (math overrides)', () => {
     const d = buildTradeDirective({
       machine: mkMachine({
         focusLane: 'up',
@@ -113,8 +146,7 @@ describe('buildTradeDirective', () => {
       forecast: null,
       currentPositionLane: null,
     });
-    expect(d.action).toBe('STAND_DOWN');
-    expect(d.headline).toMatch(/FLOW DOWN/i);
+    expect(d.action).toBe('INITIATE');
   });
 
   it('INITIATE when flat and stack agrees strongly', () => {
@@ -131,11 +163,12 @@ describe('buildTradeDirective', () => {
     expect(d.headline).toContain('INITIATE');
   });
 
-  it('STAND_DOWN in chop regime with weak agreement', () => {
+  it('STAND_DOWN in chop regime with weak agreement and no edge', () => {
     const d = buildTradeDirective({
-      machine: mkMachine({ regime: 'chop', agreementScore: 36 }),
+      machine: mkMachine({ regime: 'chop', agreementScore: 30 }),
       forecast: mkForecast(),
       currentPositionLane: null,
+      laneEdges: null,
     });
     expect(d.action).toBe('STAND_DOWN');
     expect(d.reason).toMatch(/chop/i);
@@ -305,10 +338,10 @@ describe('buildTradeDirective', () => {
     expect(d.headline).toMatch(/SETTLEMENT/);
   });
 
-  it('STAND_DOWN with WATCH OVEREXTENDED only when agreement is below probe floor', () => {
+  it('STAND_DOWN with WATCH OVEREXTENDED only when agreement is below probe floor and no edge', () => {
     const d = buildTradeDirective({
       machine: mkMachine({
-        agreementScore: 48,
+        agreementScore: 40,
         overextension: {
           state: 'overextended',
           recentMoveUsd: 80,
@@ -321,6 +354,7 @@ describe('buildTradeDirective', () => {
       }),
       forecast: mkForecast(),
       currentPositionLane: null,
+      laneEdges: null,
     });
     expect(d.action).toBe('STAND_DOWN');
     expect(d.headline).toMatch(/OVEREXTENDED/);
@@ -346,10 +380,10 @@ describe('buildTradeDirective', () => {
     expect(d.action).toBe('INITIATE');
   });
 
-  it('STAND_DOWN with NEGATIVE EV only when conviction is meh', () => {
+  it('STAND_DOWN with NEGATIVE EV only when conviction is weak and edge is deeply negative', () => {
     const d = buildTradeDirective({
       machine: mkMachine({
-        agreementScore: 48,
+        agreementScore: 42,
         edges: {
           up: {
             lane: 'up',

@@ -19,13 +19,26 @@ describe('suggestTradeLevels', () => {
     expect(suggestTradeLevels({ lane: 'up', entry: 1, edgeUsd: 0.1 })).toBeNull();
   });
 
-  it('uses equal TP and SL distance from entry (symmetric bracket)', () => {
+  it('uses symmetric bracket when pWin is not above entry', () => {
     const r = suggestTradeLevels({ lane: 'up', entry: 0.55, edgeUsd: 0.15 });
     expect(r).not.toBeNull();
     expect(r!.takeProfitGain).toBeCloseTo(r!.stopLossLoss, 5);
     expect(r!.takeProfitGain).toBeCloseTo(0.0825, 3);
     expect(r!.takeProfit).toBeCloseTo(0.6325, 3);
     expect(r!.stopLoss).toBeCloseTo(0.4675, 3);
+  });
+
+  it('widens TP vs SL when +EV and pWin > entry', () => {
+    const r = suggestTradeLevels({ lane: 'up', entry: 0.52, edgeUsd: 0.1, pWin: 0.62 });
+    expect(r).not.toBeNull();
+    expect(r!.takeProfitGain).toBeGreaterThan(r!.stopLossLoss);
+    expect(r!.rrRatio).toBeGreaterThan(1);
+  });
+
+  it('uses best ask as entry when provided', () => {
+    const r = suggestTradeLevels({ lane: 'up', entry: 0.5, edgeUsd: 0.1, bestAsk: 0.53, pWin: 0.62 });
+    expect(r!.entry).toBeCloseTo(0.53, 4);
+    expect(r!.summary).toContain('(ask)');
   });
 
   it('uses 4¢ floor on both legs when edge is small', () => {
@@ -36,8 +49,8 @@ describe('suggestTradeLevels', () => {
     expect(r!.stopLoss).toBeCloseTo(0.46, 3);
   });
 
-  it('R:R is ~1 on a fat edge (symmetric legs)', () => {
-    const r = suggestTradeLevels({ lane: 'up', entry: 0.5, edgeUsd: 0.2 });
+  it('R:R is ~1 on a fat edge without pWin lift', () => {
+    const r = suggestTradeLevels({ lane: 'up', entry: 0.5, edgeUsd: 0.2, pWin: 0.48 });
     expect(r!.rrRatio).toBeCloseTo(1, 2);
   });
 
