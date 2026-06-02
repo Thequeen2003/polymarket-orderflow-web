@@ -52,5 +52,7 @@ describe('probabilityEdgeScalp', () => {
   it('repricing requires token move toward model', () => {
     expect(marketRepricingIntoEdge(0.05, 0.01).intoEdge).toBe(true);
     expect(marketRepricingIntoEdge(0.05, -0.01).intoEdge).toBe(false);
+    expect(marketRepricingIntoEdge(-0.05, null, 0.01).intoEdge).toBe(true);
+    expect(marketRepricingIntoEdge(-0.05, -0.01, 0).intoEdge).toBe(true);
   });
 });

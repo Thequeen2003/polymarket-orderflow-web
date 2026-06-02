@@ -3,7 +3,9 @@ import {
   bracketAuxFromCents,
   bracketConversionFromInput,
   bracketRef01,
+  bracketTriggerFromTotalUsdDraft,
   centsStrFromTarget01,
+  isBracketTotalUsdDraft,
   resolveBracketRef,
   target01FromBracketInput,
 } from './bracketLevelInput';
@@ -76,6 +78,17 @@ describe('bracketLevelInput', () => {
       usdUsesTotal: true,
       usdDetail: '≈ $0.025/sh · 2,000 sh',
     });
+  });
+
+  it('treats 100+ in cents field as total $ loss/gain when shares are known', () => {
+    expect(isBracketTotalUsdDraft('100')).toBe(true);
+    expect(isBracketTotalUsdDraft('99')).toBe(false);
+    expect(isBracketTotalUsdDraft('58')).toBe(false);
+    const sl = bracketTriggerFromTotalUsdDraft({ raw: '100', kind: 'sl', ref01: 0.5, shares: 2000 });
+    expect(sl).toEqual({ centsStr: '45', usdRaw: '100' });
+    expect(
+      bracketConversionFromInput({ mode: 'cents', raw: '100', kind: 'sl', ref01: 0.5, shares: 2000 }),
+    ).toMatchObject({ centsLabel: '45¢', usdLabel: '$100', usdUsesTotal: true });
   });
 
   it('buy-bundle: total $ uses est order shares, not held shares', () => {

@@ -35,12 +35,18 @@ function isRetryableFetchFailure(err: ApiErr): boolean {
 }
 
 /** Transient upstream failures (Gamma warming up, brief 502s) — safe to retry market loads. */
-function isRetryableApiErr(err: ApiErr): boolean {
+export function isRetryableApiErr(err: ApiErr): boolean {
   if (
     err.error === 'market_get_failed' ||
+    err.error === 'markets_failed' ||
+    err.error === 'search_failed' ||
     err.error === 'updown_shortcut_failed' ||
-    err.error === 'price_to_beat_failed'
+    err.error === 'price_to_beat_failed' ||
+    err.error === 'bad_gateway'
   ) {
+    return true;
+  }
+  if (err.error.startsWith('http_502') || err.error.startsWith('http_503') || err.error.startsWith('http_504')) {
     return true;
   }
   return isRetryableFetchFailure(err);
@@ -389,13 +395,17 @@ export function polymarketLiveClobBook(tokenId: string) {
 }
 
 export function marketsList(limit = 20) {
-  return getJson<unknown[]>(`/api/markets?limit=${encodeURIComponent(String(limit))}`, { timeoutMs: 12_000 });
+  return getJsonWithRetry<unknown[]>(`/api/markets?limit=${encodeURIComponent(String(limit))}`, {
+    timeoutMs: 12_000,
+    retries: 2,
+    retryDelayMs: 450,
+  });
 }
 
 export function marketsSearch(q: string, limit = 20) {
-  return getJson<unknown[]>(
+  return getJsonWithRetry<unknown[]>(
     `/api/markets/search?q=${encodeURIComponent(q)}&limit=${encodeURIComponent(String(limit))}`,
-    { timeoutMs: 12_000 },
+    { timeoutMs: 12_000, retries: 2, retryDelayMs: 450 },
   );
 }
 

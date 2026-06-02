@@ -7,6 +7,8 @@ import {
   marketsList,
   marketsSearch,
   marketsUpdownShortcut,
+  priceToBeat,
+  rtdsCrypto,
   type ApiErr,
   type ApiOk,
   type ClobBookEntry,
@@ -27,7 +29,6 @@ import { TradePanelBody, TradePanelShell } from './TradePanelBody';
 import { SignalsTradePanel } from './SignalsTradePanel';
 import { TradeSegmentedControl } from './tradeUi';
 import { loadTradeUiPreferences, saveTradeUiPreferences } from './tradeUiPreferences';
-import { priceToBeat, rtdsCrypto } from './lib/api';
 import { pickMarketSlug } from './gammaMarketSlug';
 import { TradeSlidePanel, TRADE_SLIDE_PANEL_WIDTH_PX } from './TradeSlidePanel';
 const PositionsCommandPanel = lazy(() =>
@@ -74,7 +75,7 @@ import { TradingViewBtcUsdtTab } from './TradingViewBtcUsdtTab';
 import { PerpsCommandCenter } from './PerpsCommandCenter';
 import { BinanceBtcUsdtMarketView } from './BinanceBtcUsdtMarketView';
 import { useTradeAccountMode } from './useTradeAccountMode';
-import { appendLiveMidSeries, lastPointMs, maxFeedMs, normalizeEpochMs } from './feedFreshness';
+import { appendLiveMidSeries, appendLiveSpotSeries, lastPointMs, maxFeedMs, normalizeEpochMs } from './feedFreshness';
 
 function pretty(value: unknown) {
   return JSON.stringify(value, null, 2);
@@ -100,6 +101,26 @@ function apiReachabilityHint(err: ApiErr): string {
     '• vite preview / static dist: create web/.env with VITE_API_BASE=http://127.0.0.1:8787, rebuild, and keep the API running.\n' +
     (d ? `Details: ${d}\n` : '')
   );
+}
+
+function isRetryableMarketMetaError(errorJson: string | null): boolean {
+  if (!errorJson) return false;
+  if (
+    errorJson.includes('market_get_failed') ||
+    errorJson.includes('fetch_failed') ||
+    errorJson.includes('markets_failed') ||
+    errorJson.includes('bad_gateway') ||
+    errorJson.includes('search_failed')
+  ) {
+    return true;
+  }
+  return /http_50[234]/.test(errorJson) || /bad_json_http_50[234]/.test(errorJson);
+}
+
+async function fetchMarketsListRows(limit: number): Promise<{ rows: unknown[]; err: ApiErr | null }> {
+  const list = await marketsList(limit);
+  if (isOk(list)) return { rows: asMarketRows(list.data), err: null };
+  return { rows: [], err: list };
 }
 
 const PTB_WATCH_SLUGS_KEY = 'ptbWatchSlugs.v1';
@@ -583,6 +604,7 @@ function App() {
   const [booksLoading, setBooksLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [marketsError, setMarketsError] = useState<string | null>(null);
+  const [marketsNotice, setMarketsNotice] = useState<string | null>(null);
   const [marketsListLoading, setMarketsListLoading] = useState(true);
   const [slugInput, setSlugInput] = useState('');
   const [outcomeTab, setOutcomeTab] = useState(0);
@@ -843,6 +865,23 @@ function App() {
     return maxFeedMs(booksFetchedAt, lastPointMs(up), lastPointMs(down));
   }, [booksFetchedAt, signalsProbMids.down, signalsProbMids.up]);
 
+  /** Spot chart series with live RTDS value pinned on each book/RTDS tick. */
+  const signalsSpotSeries = useMemo(() => {
+    const slug = selectedSlug.trim();
+    if (!slug) return [] as SpotPoint[];
+    const base = spotSeriesBySlug[slug] ?? [];
+    const anchorMs = maxFeedMs(booksFetchedAt, rtdsTickAt, rtdsReceivedAt, rtdsLastPollMs) ?? Date.now();
+    return appendLiveSpotSeries(base, rtdsSpot, anchorMs);
+  }, [
+    selectedSlug,
+    spotSeriesBySlug,
+    rtdsSpot,
+    rtdsTickAt,
+    rtdsReceivedAt,
+    rtdsLastPollMs,
+    booksFetchedAt,
+  ]);
+
   /** Spot feed freshness — RTDS tick, server receive, and last successful poll. */
   const signalsSpotFeedLastMs = useMemo(() => {
     const slug = selectedSlug.trim();
@@ -956,6 +995,8 @@ function App() {
             updateFlow: wantFlowRef.current,
           });
         });
+      } else {
+        setBooksLoading(false);
       }
       return { ok: true, slug: clean, data: res.data };
     }
@@ -1525,23 +1566,44 @@ function App() {
       defer(() => {
         void (async () => {
           setMarketsListLoading(true);
-          const list = await marketsList(25);
+          const { rows, err } = await fetchMarketsListRows(25);
           setMarketsListLoading(false);
-          if (isOk(list)) {
-            setMarkets(asMarketRows(list.data));
-            if (asMarketRows(list.data).length === 0) {
+          if (!err) {
+            setMarkets(rows);
+            if (rows.length === 0) {
               setMarketsError('Markets list returned zero rows. Start the API (`npm run dev`) and hard-refresh, or open a market by slug below.');
             } else {
               setMarketsError(null);
             }
           } else {
             setMarkets([]);
-            setMarketsError(pretty(list) + apiReachabilityHint(list));
+            setMarketsError(pretty(err) + apiReachabilityHint(err));
           }
         })();
       });
     })();
   }, []);
+
+  /** API was down on first paint — reload sidebar list once health is OK. */
+  useEffect(() => {
+    if (!apiHealth.startsWith('API OK')) return;
+    if (marketsListLoading || markets.length > 0) return;
+    if (!marketsError) return;
+    let cancelled = false;
+    void (async () => {
+      setMarketsListLoading(true);
+      const { rows, err } = await fetchMarketsListRows(25);
+      if (cancelled) return;
+      setMarketsListLoading(false);
+      if (!err) {
+        setMarkets(rows);
+        if (rows.length > 0) setMarketsError(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [apiHealth, markets.length, marketsListLoading, marketsError]);
 
   useEffect(() => {
     if (binanceSpotActive) return;
@@ -1578,7 +1640,10 @@ function App() {
     const params = new URLSearchParams(window.location.search);
     const slug = (params.get('slug') ?? params.get('market') ?? '').trim();
     if (slug) {
-      void loadMarket(slug);
+      void (async () => {
+        const opened = await loadMarket(slug);
+        if (!opened.ok) marketBootRef.current = false;
+      })();
       return;
     }
     let cancelled = false;
@@ -1616,7 +1681,7 @@ function App() {
   useEffect(() => {
     const slug = selectedSlug.trim();
     if (!slug || marketJson) return;
-    if (!error || (!error.includes('market_get_failed') && !error.includes('fetch_failed'))) return;
+    if (!isRetryableMarketMetaError(error)) return;
     if (marketLoadRetryRef.current >= 4) return;
     const delayMs = 800 + marketLoadRetryRef.current * 900;
     const id = window.setTimeout(() => {
@@ -2134,6 +2199,7 @@ function App() {
     releaseOrphanPointerCapture();
     setError(null);
     setMarketsError(null);
+    setMarketsNotice(null);
     setShortcutBusy({ asset, interval });
     setLastShortcut({ asset, interval });
     try {
@@ -2165,11 +2231,11 @@ function App() {
       }
 
       if (okRes.data.start && okRes.data.end) {
-        setMarketsError(
+        setMarketsNotice(
           `${asset.toUpperCase()} ${interval} window: ${new Date(okRes.data.start).toLocaleTimeString()}–${new Date(okRes.data.end).toLocaleTimeString()} · slug ${okRes.data.slug}`,
         );
       } else {
-        setMarketsError(null);
+        setMarketsNotice(null);
       }
       let slugToOpen = okRes.data.trading_slug?.trim() || okRes.data.slug.trim();
       if (interval === '5m' && !okRes.data.trading_slug?.trim() && !okRes.data.market) {
@@ -2193,19 +2259,19 @@ function App() {
   async function runSearch() {
     setError(null);
     setMarketsError(null);
+    setMarketsNotice(null);
     const term = q.trim();
     if (!term) {
       setMarketsListLoading(true);
-      const list = await marketsList(25);
+      const { rows, err } = await fetchMarketsListRows(25);
       setMarketsListLoading(false);
-      if (isOk(list)) {
-        const rows = asMarketRows(list.data);
+      if (!err) {
         setMarkets(rows);
         if (rows.length === 0) setMarketsError('No markets in this page of results.');
         else setMarketsError(null);
       } else {
         setMarkets([]);
-        setMarketsError(pretty(list) + apiReachabilityHint(list));
+        setMarketsError(pretty(err) + apiReachabilityHint(err));
       }
       return;
     }
@@ -2365,6 +2431,11 @@ function App() {
       </div>
 
       <div className="mt-4 text-xs leading-relaxed text-zinc-500">Choose a row to load both token books.</div>
+      {marketsNotice ? (
+        <p className="mt-3 rounded-xl border border-indigo-800/35 bg-indigo-950/20 px-3 py-2 text-xs leading-relaxed text-indigo-100/90">
+          {marketsNotice}
+        </p>
+      ) : null}
       {marketsError ? (
         <pre className="mt-3 overflow-auto rounded-xl border border-amber-800/30 bg-amber-950/15 p-3 text-xs leading-relaxed text-amber-100/90">{marketsError}</pre>
       ) : null}
@@ -3002,7 +3073,7 @@ function App() {
                   books={books}
                   outcomeLabels={outcomeLabels}
                   priceToBeat={ssrPriceToBeat}
-                  spot={spotSeriesBySlug[selectedSlug] ?? []}
+                  spot={signalsSpotSeries}
                   spotLastUpdateMs={signalsSpotFeedLastMs}
                   probUp={signalsProbMids.up}
                   probDown={signalsProbMids.down}

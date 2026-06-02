@@ -2071,6 +2071,9 @@ export function SignalsPtbOnly(props: {
           downLabel={downLabel}
           lastProbUp={probUp.length ? (probUp[probUp.length - 1]!.v ?? null) : null}
           lastProbDown={probDown.length ? (probDown[probDown.length - 1]!.v ?? null) : null}
+          probUp={probUp}
+          probDown={probDown}
+          probLastUpdateMs={probLastUpdateMs}
           bookFlow={spotChartBookFlow}
           upOutcomeToken={upToken}
           downOutcomeToken={downToken}
@@ -2516,6 +2519,7 @@ export function SignalsPtbOnly(props: {
         ) : null}
         <div className={chartTab === 'now' ? 'flex min-w-0 flex-col' : 'hidden'}>
           <NowPriceSignalsPanel
+            slug={slug ?? 'unknown'}
             spot={spot}
             priceToBeat={priceToBeat}
             endsInMs={endsInMs}
@@ -2529,6 +2533,7 @@ export function SignalsPtbOnly(props: {
             downLabel={downLabel}
             spotBookAlignment={spotBookAlignment}
             physicsLine={causalHeadline ?? entryPhysicsLine}
+            probLastUpdateMs={probLastUpdateMs}
           />
         </div>
         <div className={chartTab === 'plm' ? 'flex min-w-0 flex-col' : 'hidden'}>

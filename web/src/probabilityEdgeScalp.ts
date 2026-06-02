@@ -4,6 +4,7 @@
 
 import type { BinaryOutcomeEstimate } from './binaryOutcomeBias';
 import { normalizedSpotMomentum, ptbDistanceRatio } from './binaryOutcomeBias';
+import { tradeEdgeFromFairValueGap, type FairValueGapReadout } from './fairValueGap';
 
 export const EDGE_TRADE_THRESHOLD = 0.03;
 
@@ -39,6 +40,10 @@ export type ProbabilityEdgeScalp = {
   pMkt: number;
   pModel: number;
   edge: number;
+  /** Mean-adjusted fair value edge vs market (half of gap-from-mean when FVG mean ready). */
+  fairEdge: number | null;
+  fairValueUp: number | null;
+  gapFromMeanPp: number | null;
   edgeTrade: EdgeTradeSide;
   edgeTradeLabel: string;
   mNorm: number | null;
@@ -132,14 +137,15 @@ export function classifyPtbStretchSetup(
 export function marketRepricingIntoEdge(
   edge: number,
   probUpDelta01: number | null,
+  probDownDelta01?: number | null,
 ): { intoEdge: boolean; note: string } {
-  if (probUpDelta01 == null || !Number.isFinite(probUpDelta01)) {
-    return { intoEdge: false, note: 'Need projected UP Δ to confirm repricing' };
-  }
   if (Math.abs(edge) <= EDGE_TRADE_THRESHOLD) {
     return { intoEdge: false, note: 'No edge — repricing rule idle' };
   }
   if (edge > EDGE_TRADE_THRESHOLD) {
+    if (probUpDelta01 == null || !Number.isFinite(probUpDelta01)) {
+      return { intoEdge: false, note: 'Need recent UP Δ to confirm repricing' };
+    }
     const into = probUpDelta01 > 0.002;
     return {
       intoEdge: into,
@@ -148,12 +154,20 @@ export function marketRepricingIntoEdge(
         : 'UP mid flat/falling — do not lean into reversal',
     };
   }
-  const into = probUpDelta01 < -0.002;
+  const upFall = probUpDelta01 != null && Number.isFinite(probUpDelta01) && probUpDelta01 < -0.002;
+  const downRise =
+    probDownDelta01 != null && Number.isFinite(probDownDelta01) && probDownDelta01 > 0.002;
+  if (probUpDelta01 == null && probDownDelta01 == null) {
+    return { intoEdge: false, note: 'Need recent UP/DOWN Δ to confirm repricing' };
+  }
+  const into = upFall || downRise;
   return {
     intoEdge: into,
     note: into
-      ? 'UP mid falling toward model — repricing into edge'
-      : 'UP mid rising away — wait for catch-up',
+      ? downRise
+        ? 'DOWN mid rising toward model — repricing into edge'
+        : 'UP mid falling toward model — repricing into edge'
+      : 'Mids not catching up — wait for book to move',
   };
 }
 
@@ -247,15 +261,20 @@ export function evaluateProbabilityEdgeScalp(params: {
   now: number;
   ptb: number;
   probUpDelta01?: number | null;
+  probDownDelta01?: number | null;
   upLabel?: string;
   downLabel?: string;
   edgeThreshold?: number;
   scalpTheta?: number;
   scalpWeights?: ScalpWeights;
+  /** Expected vs actual gap demeaned and averaged vs odds — drives edge when mean is ready. */
+  fairValueGap?: FairValueGapReadout | null;
 }): ProbabilityEdgeScalp | null {
   const pMkt = Math.max(0.01, Math.min(0.99, params.pMkt));
   const pModel = params.estimate.probUp;
-  const edge = pModel - pMkt;
+  const rawEdge = pModel - pMkt;
+  const fvg = params.fairValueGap;
+  const edge = fvg != null && fvg.meanReady ? tradeEdgeFromFairValueGap(fvg) : rawEdge;
   const edgeThreshold = params.edgeThreshold ?? EDGE_TRADE_THRESHOLD;
   const scalpTheta = params.scalpTheta ?? DEFAULT_SCALP_THETA;
   const weights = params.scalpWeights ?? DEFAULT_SCALP_WEIGHTS;
@@ -271,7 +290,11 @@ export function evaluateProbabilityEdgeScalp(params: {
 
   const momFilter = momentumAlignsWithEdge(edge, mom.mNorm);
   const ptbClass = classifyPtbStretchSetup(deltaPtb, edge);
-  const repricing = marketRepricingIntoEdge(edge, params.probUpDelta01 ?? null);
+  const repricing = marketRepricingIntoEdge(
+    edge,
+    params.probUpDelta01 ?? null,
+    params.probDownDelta01 ?? null,
+  );
 
   let filteredTrade: EdgeTradeSide = edgeTrade;
   if (edgeTrade !== 'NO_TRADE' && !momFilter.ok) filteredTrade = 'NO_TRADE';
@@ -307,6 +330,9 @@ export function evaluateProbabilityEdgeScalp(params: {
     pMkt,
     pModel,
     edge,
+    fairEdge: fvg?.fairEdge ?? null,
+    fairValueUp: fvg?.fairValueUp ?? null,
+    gapFromMeanPp: fvg?.gapFromMeanPp ?? null,
     edgeTrade,
     edgeTradeLabel: edgeTradeLabel(edgeTrade, upLabel, downLabel),
     mNorm: mom.mNorm,

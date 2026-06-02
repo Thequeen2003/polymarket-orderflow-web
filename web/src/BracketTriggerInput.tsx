@@ -1,8 +1,14 @@
 import { type ReactElement, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import {
+  formatBracketCentsFromRaw,
+  sanitizeBracketCentsDraft,
+  shouldCommitBracketCentsOnBlur,
+} from './bracketCentsInput';
+import {
   bracketAuxFromCents,
   bracketConversionFromInput,
   bracketRefLabel,
+  bracketTriggerFromTotalUsdDraft,
   centsStrFromTarget01,
   resolveBracketRef,
   target01FromBracketInput,
@@ -56,8 +62,10 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
 
   const [mode, setMode] = useState<BracketInputMode>('cents');
   const [draft, setDraft] = useState(centsValue);
+  const [editing, setEditing] = useState(false);
   const id = useId();
   const applyTimerRef = useRef<number | null>(null);
+  const enterCommitRef = useRef(false);
 
   const { ref01, source: refSource } = useMemo(
     () => resolveBracketRef({ avgEntry01, plannedEntry01, mid01 }),
@@ -81,7 +89,9 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
       ? orderShares * ref01
       : null;
 
+  /** Sync from parent when not focused — ref/mid ticks must not wipe in-progress edits. */
   useEffect(() => {
+    if (editing) return;
     if (mode === 'cents') {
       setDraft(centsValue);
       return;
@@ -99,7 +109,7 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
         shares: orderShares,
       }),
     );
-  }, [centsValue, kind, mode, orderShares, ref01]);
+  }, [centsValue, editing, kind, mode, orderShares, ref01]);
 
   useEffect(
     () => () => {
@@ -108,20 +118,87 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
     [],
   );
 
+  const commitCentsDraft = useCallback(
+    (raw: string, viaEnter: boolean) => {
+      const trimmed = raw.trim();
+      if (!trimmed) {
+        setDraft('');
+        onCentsChange('');
+        onAfterChange?.();
+        return;
+      }
+      if (ref01 != null && usdModeUsesTotal(orderShares)) {
+        const usdCommit = bracketTriggerFromTotalUsdDraft({
+          raw: trimmed,
+          kind,
+          ref01,
+          shares: orderShares!,
+        });
+        if (usdCommit) {
+          setMode('usd');
+          setDraft(usdCommit.usdRaw);
+          onCentsChange(usdCommit.centsStr);
+          onAfterChange?.();
+          return;
+        }
+      }
+      const formatted = formatBracketCentsFromRaw(trimmed);
+      if (formatted == null) {
+        setDraft(centsValue);
+        return;
+      }
+      if (
+        !shouldCommitBracketCentsOnBlur({
+          draftRaw: trimmed,
+          committedRaw: centsValue,
+          pressedEnter: viaEnter,
+        })
+      ) {
+        setDraft(centsValue);
+        return;
+      }
+      setDraft(formatted);
+      onCentsChange(formatted);
+      onAfterChange?.();
+    },
+    [centsValue, kind, onAfterChange, onCentsChange, orderShares, ref01],
+  );
+
   const applyFromDraft = useCallback(
     (raw: string, inputMode: BracketInputMode) => {
       if (inputMode === 'cents') {
-        onCentsChange(raw);
-        onAfterChange?.();
+        commitCentsDraft(raw, true);
         return;
       }
       if (ref01 == null) return;
       const target01 = target01FromBracketInput({ mode: inputMode, raw, kind, ref01, shares: orderShares });
       if (target01 == null) return;
-      onCentsChange(centsStrFromTarget01(target01));
+      const cents = centsStrFromTarget01(target01);
+      setDraft(
+        inputMode === 'pct' || inputMode === 'usd'
+          ? bracketAuxFromCents({ mode: inputMode, centsStr: cents, kind, ref01, shares: orderShares })
+          : cents,
+      );
+      onCentsChange(cents);
       onAfterChange?.();
     },
-    [kind, onAfterChange, onCentsChange, orderShares, ref01],
+    [commitCentsDraft, kind, onAfterChange, onCentsChange, orderShares, ref01],
+  );
+
+  const finishEditing = useCallback(
+    (viaEnter: boolean) => {
+      if (applyTimerRef.current != null) {
+        window.clearTimeout(applyTimerRef.current);
+        applyTimerRef.current = null;
+      }
+      if (mode === 'cents') {
+        commitCentsDraft(draft, viaEnter);
+      } else {
+        applyFromDraft(draft, mode);
+      }
+      setEditing(false);
+    },
+    [applyFromDraft, commitCentsDraft, draft, mode],
   );
 
   const queueApply = useCallback(
@@ -217,6 +294,7 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
 
   const switchMode = (next: BracketInputMode) => {
     if (next !== 'cents' && ref01 == null) return;
+    if (editing) finishEditing(true);
     if (applyTimerRef.current != null) {
       window.clearTimeout(applyTimerRef.current);
       applyTimerRef.current = null;
@@ -310,30 +388,41 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
           <input
             id={id}
             value={draft}
+            onFocus={() => {
+              setEditing(true);
+              enterCommitRef.current = false;
+            }}
             onChange={(e) => {
-              const v = e.target.value;
+              setEditing(true);
+              const v = mode === 'cents' ? sanitizeBracketCentsDraft(e.target.value) : e.target.value;
               setDraft(v);
-              if (mode === 'cents') {
-                applyFromDraft(v, 'cents');
-                return;
-              }
-              queueApply(v, mode);
+              if (mode !== 'cents') queueApply(v, mode);
             }}
             onBlur={() => {
-              if (applyTimerRef.current != null) {
-                window.clearTimeout(applyTimerRef.current);
-                applyTimerRef.current = null;
-              }
-              if (mode !== 'cents') applyFromDraft(draft, mode);
+              const viaEnter = enterCommitRef.current;
+              enterCommitRef.current = false;
+              finishEditing(viaEnter);
             }}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' && mode !== 'cents') {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                enterCommitRef.current = true;
+                (e.target as HTMLInputElement).blur();
+              } else if (e.key === 'Escape') {
                 e.preventDefault();
                 if (applyTimerRef.current != null) {
                   window.clearTimeout(applyTimerRef.current);
                   applyTimerRef.current = null;
                 }
-                applyFromDraft(draft, mode);
+                setDraft(
+                  mode === 'cents'
+                    ? centsValue
+                    : ref01 != null
+                      ? bracketAuxFromCents({ mode, centsStr: centsValue, kind, ref01, shares: orderShares })
+                      : '',
+                );
+                setEditing(false);
+                (e.target as HTMLInputElement).blur();
               }
             }}
             inputMode="decimal"

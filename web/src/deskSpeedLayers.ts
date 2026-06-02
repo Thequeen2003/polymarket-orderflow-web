@@ -40,6 +40,32 @@ export type OutcomeLaneSpeed = {
   supportScore: number;
 };
 
+/** Which outcome lane has stronger tailwind alignment (for glance UI). */
+export function pickSpeedFavoredLane(speed: DeskSpeedSnapshot): {
+  lane: 'up' | 'down' | 'split';
+  label: string;
+  short: string;
+} {
+  const u = speed.lanes.up;
+  const d = speed.lanes.down;
+  const gap = d.supportScore - u.supportScore;
+  if (gap >= 2) {
+    return {
+      lane: 'down',
+      label: d.label,
+      short: `${d.alignment.replace('_', ' ')} · +${d.supportScore}`,
+    };
+  }
+  if (gap <= -2) {
+    return {
+      lane: 'up',
+      label: u.label,
+      short: `${u.alignment.replace('_', ' ')} · +${u.supportScore}`,
+    };
+  }
+  return { lane: 'split', label: 'Mixed', short: 'UP/DOWN speeds split' };
+}
+
 export type DeskSpeedSnapshot = {
   horizonSec: number;
   /** Shared spot velocity (same for both outcomes). */

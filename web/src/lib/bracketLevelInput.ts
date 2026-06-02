@@ -53,6 +53,32 @@ function parseCentsStr(raw: string): number | null {
   return clampTarget01(n / 100);
 }
 
+/** True when the draft looks like total $ P&L (e.g. 100) rather than trigger ¢ (1–99). */
+export function isBracketTotalUsdDraft(raw: string): boolean {
+  const n = parsePositive(raw);
+  return n != null && n > 99;
+}
+
+/** Commit values above 99 as total $ loss/gain when shares + ref are known; returns trigger ¢. */
+export function bracketTriggerFromTotalUsdDraft(params: {
+  raw: string;
+  kind: BracketLegKind;
+  ref01: number;
+  shares: number;
+}): { centsStr: string; usdRaw: string } | null {
+  const usdRaw = params.raw.trim();
+  if (!isBracketTotalUsdDraft(usdRaw)) return null;
+  const target01 = target01FromBracketInput({
+    mode: 'usd',
+    raw: usdRaw,
+    kind: params.kind,
+    ref01: params.ref01,
+    shares: params.shares,
+  });
+  if (target01 == null) return null;
+  return { centsStr: centsStrFromTarget01(target01), usdRaw };
+}
+
 export function usdPerShareDelta(target01: number, ref01: number): number {
   return Math.abs(target01 - ref01);
 }
@@ -174,7 +200,21 @@ export function bracketConversionFromInput(params: {
 
   let target01: number | null = null;
   if (params.mode === 'cents') {
-    target01 = parseCentsStr(trimmed);
+    if (
+      isBracketTotalUsdDraft(trimmed) &&
+      params.ref01 != null &&
+      usdModeUsesTotal(shares)
+    ) {
+      target01 = target01FromBracketInput({
+        mode: 'usd',
+        raw: trimmed,
+        kind: params.kind,
+        ref01: params.ref01,
+        shares,
+      });
+    } else {
+      target01 = parseCentsStr(trimmed);
+    }
   } else if (params.ref01 != null) {
     target01 = target01FromBracketInput({
       mode: params.mode,

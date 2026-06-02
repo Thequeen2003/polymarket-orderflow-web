@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, type PointerEvent, type ReactElement } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type PointerEvent, type ReactElement } from 'react';
 import {
   BPX_BRACKET_DRAG_EVENT,
   BPX_BRACKET_OVERLAY_EVENT,
@@ -407,7 +407,7 @@ function SpotBandPlayCardRow(props: {
   );
 }
 
-export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(props: {
+export function PtbOpportunityModeChart(props: {
   mode: Mode;
   spot: SpotPoint[];
   priceToBeat: number | null;
@@ -715,7 +715,12 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
       ? Math.max(lastUpdateMs, spotLastPointMs)
       : lastUpdateMs ?? spotLastPointMs;
   const staleAfterMs = signalsEmbed ? 90_000 : 55_000;
-  const stale = feedLastMs == null ? pts.length < 2 : Date.now() - feedLastMs > staleAfterMs;
+  const [chartNow, setChartNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setChartNow(Date.now()), 1_000);
+    return () => window.clearInterval(id);
+  }, []);
+  const stale = feedLastMs == null ? pts.length < 2 : chartNow - feedLastMs > staleAfterMs;
 
   const model = useMemo(() => {
     if (priceToBeat == null || !Number.isFinite(priceToBeat) || pts.length < 2) return null;
@@ -2622,6 +2627,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
             {stableProjectedHeader ? (
               <StableProjectedHeaderDisplay
                 snapshot={stableProjectedHeader}
+                liveNowSpotUsd={model.last}
                 confirmedBand={
                   bandGaugeSnapshot
                     ? {
@@ -4375,7 +4381,7 @@ export const PtbOpportunityModeChart = memo(function PtbOpportunityModeChart(pro
       ) : null}
     </div>
   );
-});
+}
 
 // =====================================================================================
 // Decision banner — big, prominent block above the chart on 1h / 4h windows.

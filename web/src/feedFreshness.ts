@@ -51,6 +51,32 @@ export function appendLiveMidSeries(series: SpotPoint[], liveMid: number | null,
   const t = anchorMs > 0 ? anchorMs : Date.now();
   const last = base[base.length - 1]!;
   const lastT = normalizeEpochMs(last.t) ?? last.t;
-  if (t <= lastT + 400 && Math.abs((last.v ?? 0) - liveMid) < 0.0002) return base;
+  const midDelta = Math.abs((last.v ?? 0) - liveMid);
+  if (t <= lastT + 400) {
+    if (midDelta < 0.0002) return base;
+    // Same poll window but mid moved — refresh last point so lag/delta readouts tick live.
+    return [...base.slice(0, -1), { t: last.t, v: liveMid }];
+  }
   return [...base.slice(-479), { t, v: liveMid }];
+}
+
+/** Pin latest RTDS spot onto slug series so the PTB chart line ticks with live spot. */
+export function appendLiveSpotSeries(series: SpotPoint[], liveSpot: number | null, anchorMs: number): SpotPoint[] {
+  if (liveSpot == null || !Number.isFinite(liveSpot)) return series;
+  const t = anchorMs > 0 ? anchorMs : Date.now();
+  if (!series.length) {
+    return [
+      { t: t - 2000, v: liveSpot },
+      { t: t - 1000, v: liveSpot },
+      { t, v: liveSpot },
+    ];
+  }
+  const last = series[series.length - 1]!;
+  const lastT = normalizeEpochMs(last.t) ?? last.t;
+  const delta = Math.abs(last.v - liveSpot);
+  if (t <= lastT + 400) {
+    if (delta < 0.01) return series;
+    return [...series.slice(0, -1), { t: last.t, v: liveSpot }];
+  }
+  return [...series.slice(-479), { t, v: liveSpot }];
 }

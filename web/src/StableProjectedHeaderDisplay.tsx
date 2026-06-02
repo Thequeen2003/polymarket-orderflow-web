@@ -38,10 +38,28 @@ export function useStableProjectedHeaderDisplay(
   const ref = useRef<{ key: string; value: StableProjectedHeaderSnapshot } | null>(null);
   if (!live) return null;
   const key = stableProjectedHeaderKey(live);
-  if (ref.current?.key !== key) {
+  const prev = ref.current;
+  if (prev?.key !== key) {
     ref.current = { key, value: live };
+    return live;
   }
-  return ref.current.value;
+  if (
+    prev.value.nowSpotUsd !== live.nowSpotUsd ||
+    prev.value.up.probCents !== live.up.probCents ||
+    prev.value.down.probCents !== live.down.probCents
+  ) {
+    ref.current = {
+      key,
+      value: {
+        ...prev.value,
+        nowSpotUsd: live.nowSpotUsd,
+        deltaVsNowUsd: prev.value.projectedSpotUsd - live.nowSpotUsd,
+        up: live.up,
+        down: live.down,
+      },
+    };
+  }
+  return ref.current!.value;
 }
 
 function fmtDistFromPtb(n: number): string {
@@ -125,19 +143,24 @@ function NowBandDistanceChip(props: {
 
 export function StableProjectedHeaderDisplay(props: {
   snapshot: StableProjectedHeaderSnapshot;
+  /** Raw spot for the headline — stable snapshot quantizes to reduce flicker on Proj/Δ only. */
+  liveNowSpotUsd?: number | null;
   /** PTB separation band edges — shown beside UP/DOWN arrow chips. */
   confirmedBand?: { bandHi: number; bandLo: number; ptb: number } | null;
 }): ReactElement {
-  const { snapshot: s, confirmedBand } = props;
-  const deltaUp = s.deltaVsNowUsd > 0.005;
-  const deltaDown = s.deltaVsNowUsd < -0.005;
+  const { snapshot: s, confirmedBand, liveNowSpotUsd } = props;
+  const nowUsd =
+    liveNowSpotUsd != null && Number.isFinite(liveNowSpotUsd) ? liveNowSpotUsd : s.nowSpotUsd;
+  const deltaVsNowUsd = s.projectedSpotUsd - nowUsd;
+  const deltaUp = deltaVsNowUsd > 0.005;
+  const deltaDown = deltaVsNowUsd < -0.005;
 
   return (
     <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2">
       <div className="min-w-0">
         <div className="text-[9px] font-bold uppercase tracking-[0.14em] text-zinc-400">Now</div>
         <div className="font-mono text-2xl font-semibold tabular-nums tracking-tight text-zinc-50 sm:text-3xl">
-          {fmtUsd(s.nowSpotUsd)}
+          {fmtUsd(nowUsd)}
         </div>
         <div className="mt-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
           <span className="text-[9px] font-bold uppercase tracking-[0.14em] text-indigo-300/80">
@@ -152,7 +175,7 @@ export function StableProjectedHeaderDisplay(props: {
             }`}
             title="Projected move vs current spot (stable, not tick noise)"
           >
-            {fmtUsdSigned(s.deltaVsNowUsd)}
+            {fmtUsdSigned(deltaVsNowUsd)}
           </span>
         </div>
       </div>
@@ -167,7 +190,7 @@ export function StableProjectedHeaderDisplay(props: {
             <ConfirmedBandChip kind="above" priceUsd={confirmedBand.bandHi} ptbUsd={confirmedBand.ptb} />
             <ConfirmedBandChip kind="below" priceUsd={confirmedBand.bandLo} ptbUsd={confirmedBand.ptb} />
             <NowBandDistanceChip
-              nowUsd={s.nowSpotUsd}
+              nowUsd={nowUsd}
               bandHi={confirmedBand.bandHi}
               bandLo={confirmedBand.bandLo}
               ptbUsd={confirmedBand.ptb}

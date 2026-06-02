@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
-import { appendLiveMidSeries, maxFeedMs, normalizeEpochMs, seedProbSeriesFromLiveMid } from './feedFreshness';
+import {
+  appendLiveMidSeries,
+  appendLiveSpotSeries,
+  maxFeedMs,
+  normalizeEpochMs,
+  seedProbSeriesFromLiveMid,
+} from './feedFreshness';
 
 describe('feedFreshness', () => {
   it('normalizes epoch seconds to ms', () => {
@@ -15,6 +21,25 @@ describe('feedFreshness', () => {
   it('appendLiveMidSeries adds a point when anchor is newer', () => {
     const out = appendLiveMidSeries([{ t: 1000, v: 0.5 }], 0.55, 10_000);
     expect(out[out.length - 1]).toEqual({ t: 10_000, v: 0.55 });
+  });
+
+  it('appendLiveMidSeries refreshes last point when mid moves inside debounce window', () => {
+    const out = appendLiveMidSeries(
+      [
+        { t: 9_000, v: 0.48 },
+        { t: 10_000, v: 0.5 },
+      ],
+      0.52,
+      10_200,
+    );
+    expect(out).toHaveLength(2);
+    expect(out[1]).toEqual({ t: 10_000, v: 0.52 });
+  });
+
+  it('appendLiveSpotSeries refreshes last point when spot moves', () => {
+    const out = appendLiveSpotSeries([{ t: 1000, v: 100 }], 101, 1500);
+    expect(out).toHaveLength(1);
+    expect(out[0]!.v).toBe(101);
   });
 
   it('seedProbSeriesFromLiveMid seeds cold buffer', () => {

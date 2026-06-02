@@ -73,9 +73,10 @@ export function MomentumProjectionStrip(props: {
 }): ReactElement | null {
   const { pts, tapeNetPressure, outcomeLabel } = props;
 
+  const lastPt = pts.length ? pts[pts.length - 1]! : null;
   const projection = useMemo(
     () => computeMomentumProjection({ pts, tapeNetPressure }),
-    [pts, tapeNetPressure],
+    [pts, tapeNetPressure, lastPt?.t, lastPt?.v],
   );
 
   if (!projection) return null;

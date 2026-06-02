@@ -86,6 +86,7 @@ export function computeStableProjectedHeader(params: {
 export function stableProjectedHeaderKey(s: StableProjectedHeaderSnapshot): string {
   return [
     s.horizonSec,
+    s.nowSpotUsd.toFixed(2),
     s.projectedSpotUsd.toFixed(2),
     s.deltaVsNowUsd.toFixed(2),
     s.up.probCents ?? '-',
