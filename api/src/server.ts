@@ -930,6 +930,19 @@ function cacheGet<T>(entry: CacheEntry<T> | null, ttlMs: number): T | null {
   return entry.value;
 }
 
+/** Stale-while-revalidate — return expired cache during upstream stalls instead of failing open. */
+function cacheGetStale<T>(
+  entry: CacheEntry<T> | null,
+  freshMs: number,
+  staleMaxMs: number,
+): { value: T; stale: boolean } | null {
+  if (!entry) return null;
+  const age = Date.now() - entry.ts;
+  if (age <= freshMs) return { value: entry.value, stale: false };
+  if (age <= staleMaxMs) return { value: entry.value, stale: true };
+  return null;
+}
+
 function cacheSet<T>(value: T): CacheEntry<T> {
   return { ts: Date.now(), value };
 }
@@ -1139,7 +1152,8 @@ app.get('/api/markets/search', async (req, res) => {
   }
 });
 
-const UPDOWN_SHORTCUT_CACHE_MS = 8_000;
+const UPDOWN_SHORTCUT_CACHE_MS = 45_000;
+const UPDOWN_SHORTCUT_STALE_MS = 15 * 60_000;
 const updownShortcutCache = new Map<string, CacheEntry<Record<string, unknown>>>();
 
 function shortcutCacheKey(asset: string, interval: string) {
@@ -1188,7 +1202,8 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
   if (asset !== 'btc' && asset !== 'eth' && asset !== 'sol' && asset !== 'hype') {
     return json(res, 400, { ok: false, error: 'bad_asset', details: { allowed: ['btc', 'eth', 'sol', 'hype'] } });
   }
-  const cachedShortcut = cacheGet(updownShortcutCache.get(shortcutCacheKey(asset, interval)) ?? null, UPDOWN_SHORTCUT_CACHE_MS);
+  const shortcutKey = shortcutCacheKey(asset, interval);
+  const cachedShortcut = cacheGet(updownShortcutCache.get(shortcutKey) ?? null, UPDOWN_SHORTCUT_CACHE_MS);
   if (cachedShortcut) return json(res, 200, { ok: true, data: cachedShortcut });
   try {
     const b = nowBucketSec(stepSec);
@@ -1493,6 +1508,17 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
       bucket_ceil_unix: b.ceil,
     });
   } catch (e) {
+    const stale = cacheGetStale(
+      updownShortcutCache.get(shortcutKey) ?? null,
+      UPDOWN_SHORTCUT_CACHE_MS,
+      UPDOWN_SHORTCUT_STALE_MS,
+    );
+    if (stale) {
+      return json(res, 200, {
+        ok: true,
+        data: { ...stale.value, cache_stale: true, cache_age_ms: Date.now() - (updownShortcutCache.get(shortcutKey)?.ts ?? Date.now()) },
+      });
+    }
     return json(res, 502, { ok: false, error: 'updown_shortcut_failed', details: { asset, interval, http: String(e) } });
   }
 });

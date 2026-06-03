@@ -404,6 +404,10 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
               finishEditing(viaEnter);
             }}
             onKeyDown={(e) => {
+              if (e.key === 'Tab') {
+                enterCommitRef.current = true;
+                return;
+              }
               if (e.key === 'Enter') {
                 e.preventDefault();
                 enterCommitRef.current = true;

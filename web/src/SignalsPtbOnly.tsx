@@ -2534,6 +2534,7 @@ export function SignalsPtbOnly(props: {
             spotBookAlignment={spotBookAlignment}
             physicsLine={causalHeadline ?? entryPhysicsLine}
             probLastUpdateMs={probLastUpdateMs}
+            booksFetchedAt={booksFetchedAt}
           />
         </div>
         <div className={chartTab === 'plm' ? 'flex min-w-0 flex-col' : 'hidden'}>

@@ -26,6 +26,7 @@ import {
   type FvgSignalTier,
 } from './fairValueGap';
 import { computeContractLagReadout, CONTRACT_LAG_STALE_MS, recentProbDelta01, type ContractLagPhase, type ContractLagReadout } from './contractLag';
+import { lastPointMs, maxFeedMs } from './feedFreshness';
 import type { StableProjectedHeaderSnapshot } from './chartStableProjectedHeader';
 import type { GlanceTone } from './nowPriceGlance';
 import { useFairValueGap } from './useFairValueGap';
@@ -46,6 +47,17 @@ import {
   type SpeedAlignment,
   type LaneSupport,
 } from './deskSpeedLayers';
+import { computeDirectionScore, directionScoreShortLabel, type DirectionScoreSnapshot } from './deskDirectionScore';
+import { buildMtfConsensus } from './multiTimeframeConsensus';
+import { formatCentsFrom01 } from './deskSpeedGainPct';
+import {
+  computePressureBuildup,
+  PRESSURE_CONFIRM_HORIZON_SEC,
+  PRESSURE_EARLY_HORIZON_SEC,
+  pressureBuildupShortLabel,
+  type PressureBuildupSnapshot,
+  type PressureVerdict,
+} from './pressureBuildupScore';
 
 function fmtUsd(n: number | null | undefined): string {
   if (n == null || !Number.isFinite(n)) return '—';
@@ -373,6 +385,271 @@ function OutcomeLaneColumn(props: { lane: OutcomeLaneSpeed; accent: 'emerald' | 
         <div className="text-[9px] font-semibold text-orange-200/80">{lane.mode.replace('_', ' ')}</div>
         <p className="mt-0.5 text-[9px] leading-snug text-zinc-500">{lane.alignmentNote}</p>
       </div>
+    </div>
+  );
+}
+
+function directionScoreTone(v: DirectionScoreSnapshot['verdict']): GlanceTone {
+  if (v === 'STRONG_UP' || v === 'UP') return 'up';
+  if (v === 'STRONG_DOWN' || v === 'DOWN') return 'down';
+  if (v === 'WEAK_UP' || v === 'WEAK_DOWN') return 'warn';
+  return 'flat';
+}
+
+function ScoreMetricValues(props: { detail: string; gainPct: string | null; active?: boolean }): ReactElement {
+  const { detail, gainPct, active = false } = props;
+  return (
+    <div className="min-w-0 text-right">
+      <div className="font-mono text-[10px] tabular-nums text-zinc-400">{detail}</div>
+      {gainPct ? (
+        <div className={`font-mono text-[9px] tabular-nums leading-tight ${active ? 'text-emerald-400/95' : 'text-zinc-500'}`}>
+          {gainPct}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function pressureVerdictTone(
+  v: PressureVerdict,
+  kind: 'BUY' | 'SELL',
+  timing?: PressureBuildupSnapshot['timing'],
+): GlanceTone {
+  if (timing === 'CHASING' || timing === 'EXTENDED') return 'warn';
+  if (v === 'NO_TRADE') return 'flat';
+  if (v === 'WATCH') return 'warn';
+  if (kind === 'BUY') return 'up';
+  return 'down';
+}
+
+function PressureBuildupCard(props: {
+  pressure: PressureBuildupSnapshot;
+  upLabel: string;
+  downLabel: string;
+}): ReactElement {
+  const { pressure, upLabel, downLabel } = props;
+  const active = pressure.active;
+  const tone = pressureVerdictTone(pressure.verdict, active.kind, pressure.timing);
+  const shell =
+    tone === 'up'
+      ? 'border-emerald-700/50 bg-emerald-950/25 ring-1 ring-emerald-500/15'
+      : tone === 'down'
+        ? 'border-rose-700/50 bg-rose-950/25 ring-1 ring-rose-500/15'
+        : tone === 'warn'
+          ? 'border-amber-700/45 bg-amber-950/18 ring-1 ring-amber-500/12'
+          : 'border-zinc-700/50 bg-zinc-950/30';
+  const head =
+    tone === 'up' ? 'text-emerald-200' : tone === 'down' ? 'text-rose-200' : tone === 'warn' ? 'text-amber-200' : 'text-zinc-300';
+
+  return (
+    <div className={`rounded-xl border px-3 py-3 sm:px-4 ${shell}`}>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-[9px] font-black uppercase tracking-[0.14em] text-violet-300/80">Pressure buildup</div>
+          <div className={`mt-1 text-xl font-black tracking-tight sm:text-2xl ${head}`}>
+            <span className="mr-1.5" aria-hidden>
+              {pressure.emoji}
+            </span>
+            {pressure.headline}
+          </div>
+          <p className="mt-1 text-[10px] leading-snug text-zinc-500">{pressure.tagline}</p>
+          {pressure.leadNote ? (
+            <p className="mt-1 text-[10px] font-semibold leading-snug text-cyan-300/90">{pressure.leadNote}</p>
+          ) : null}
+          <p className="mt-1 font-mono text-[9px] tabular-nums leading-snug text-zinc-500">
+            {pressure.earlyHorizonSec}s lead {pressure.scoreLine}
+            {' · '}
+            {pressure.confirmHorizonSec}s confirm {pressure.confirmActive.score}/{pressure.confirmActive.max}
+            {pressure.timing !== 'EARLY' ? ` · ${pressure.timing}` : ''}
+          </p>
+          {pressure.gainSummary ? (
+            <p className="mt-1 font-mono text-[9px] tabular-nums leading-snug text-violet-300/75">{pressure.gainSummary}</p>
+          ) : null}
+        </div>
+        <div className="text-right">
+          <div className="font-mono text-3xl font-black tabular-nums text-zinc-50">{pressure.scoreLine}</div>
+          <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
+            {pressure.verdict.replace('_', ' ')}
+            {pressure.timing === 'CHASING' ? ' · LATE' : ''}
+          </div>
+        </div>
+      </div>
+
+      <p className="mt-2 text-[11px] leading-snug text-zinc-300">{active.interpretation}</p>
+
+      {pressure.entryJump ? (
+        <div
+          className={`mt-3 rounded-xl border px-3 py-2.5 ${
+            tone === 'up'
+              ? 'border-emerald-600/45 bg-emerald-950/30'
+              : tone === 'down'
+                ? 'border-rose-600/45 bg-rose-950/30'
+                : 'border-violet-700/40 bg-violet-950/20'
+          }`}
+        >
+          <div className="text-[9px] font-black uppercase tracking-[0.12em] text-zinc-400">
+            Live jump · contract ¢ · {pressure.confirmHorizonSec}s confirm
+          </div>
+          {pressure.timing === 'CHASING' || pressure.timing === 'EXTENDED' ? (
+            <p className="mt-1 text-[10px] font-semibold text-amber-300/95">{pressure.timingReadout.note}</p>
+          ) : null}
+          <p className="mt-1.5 text-[12px] font-semibold leading-snug text-zinc-100">{pressure.entryJump.headline}</p>
+          <p className="mt-1 text-[11px] leading-snug text-zinc-400">{pressure.entryJump.projLine}</p>
+          <div className="mt-2 flex flex-wrap gap-3 font-mono text-[11px] tabular-nums">
+            <span className="text-zinc-500">
+              {pressure.confirmHorizonSec}s ago{' '}
+              <span className="text-zinc-300">{formatCentsFrom01(pressure.entryJump.entry01)}</span>
+            </span>
+            <span className="text-zinc-500">
+              Now <span className="font-bold text-zinc-50">{formatCentsFrom01(pressure.entryJump.now01)}</span>
+            </span>
+            <span className={pressure.entryJump.gainCents >= 0 ? 'text-emerald-300' : 'text-rose-300'}>
+              Move{' '}
+              <span className="font-bold">
+                {pressure.entryJump.gainCents >= 0 ? '+' : ''}
+                {pressure.entryJump.gainCents.toFixed(1)}¢ ({pressure.entryJump.gainPct >= 0 ? '+' : ''}
+                {pressure.entryJump.gainPct.toFixed(1)}%)
+              </span>
+            </span>
+          </div>
+        </div>
+      ) : null}
+
+      {pressure.spotJumpLine ? (
+        <p className="mt-2 font-mono text-[10px] tabular-nums leading-snug text-zinc-500">{pressure.spotJumpLine}</p>
+      ) : null}
+
+      <ul className="mt-2 space-y-0.5">
+        {active.rows.map((row) => (
+          <li
+            key={row.id}
+            className={`text-[11px] leading-snug ${row.point ? 'text-emerald-300/95' : 'text-zinc-600'}`}
+          >
+            {row.point ? '✓' : '○'} {row.hitLine}
+          </li>
+        ))}
+      </ul>
+
+      <div className="mt-3 grid gap-1.5 sm:grid-cols-2">
+        {active.rows.map((row) => (
+          <div
+            key={`grid-${row.id}`}
+            className={`flex items-center justify-between gap-2 rounded-lg border px-2 py-1.5 ${
+              row.point ? 'border-violet-800/35 bg-black/20' : 'border-zinc-800/50 bg-black/10'
+            }`}
+          >
+            <span className={`text-[10px] font-semibold ${row.point ? 'text-violet-200/90' : 'text-zinc-500'}`}>
+              {row.point ? '+1' : '0'} {row.label}
+            </span>
+            <ScoreMetricValues detail={row.detail} gainPct={row.gainPct} active={row.point === 1} />
+          </div>
+        ))}
+      </div>
+
+      {pressure.mtfSummary ? (
+        <p className="mt-2 text-[10px] leading-snug text-zinc-500">MTF: {pressure.mtfSummary}</p>
+      ) : null}
+
+      <details className="mt-2">
+        <summary className="cursor-pointer text-[10px] font-semibold text-zinc-500 hover:text-zinc-300">
+          {active.kind === 'BUY' ? 'Sell' : 'Buy'} pressure · opposite side
+        </summary>
+        <div className="mt-2 rounded-lg border border-zinc-800/50 bg-black/15 px-2.5 py-2">
+          <div className="text-[9px] font-bold uppercase text-zinc-500">
+            {pressure.buy.kind === 'BUY' ? 'Buy' : 'Sell'} {pressure.buy.score}/{pressure.buy.max} ·{' '}
+            {pressure.sell.kind === 'SELL' ? 'Sell' : 'Buy'} {pressure.sell.score}/{pressure.sell.max}
+          </div>
+          <ul className="mt-1.5 space-y-0.5 text-[10px] text-zinc-500">
+            {(active.kind === 'BUY' ? pressure.sell : pressure.buy).rows.map((row) => (
+              <li key={`opp-${row.id}`}>
+                {row.point ? '✓' : '○'} {row.hitLine}
+              </li>
+            ))}
+          </ul>
+        </div>
+      </details>
+    </div>
+  );
+}
+
+function DirectionScoreCard(props: {
+  score: DirectionScoreSnapshot;
+  upLabel: string;
+  downLabel: string;
+}): ReactElement {
+  const { score, upLabel, downLabel } = props;
+  const tone = directionScoreTone(score.verdict);
+  const shell =
+    tone === 'up'
+      ? 'border-emerald-700/45 bg-emerald-950/20'
+      : tone === 'down'
+        ? 'border-rose-700/45 bg-rose-950/20'
+        : tone === 'warn'
+          ? 'border-amber-700/40 bg-amber-950/15'
+          : 'border-zinc-700/50 bg-zinc-950/30';
+  const head =
+    tone === 'up' ? 'text-emerald-200' : tone === 'down' ? 'text-rose-200' : tone === 'warn' ? 'text-amber-200' : 'text-zinc-300';
+
+  return (
+    <div className={`rounded-xl border px-3 py-3 sm:px-4 ${shell}`}>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-[9px] font-black uppercase tracking-[0.14em] text-zinc-500">Direction score · {score.horizonSec}s</div>
+          <div className={`mt-1 text-2xl font-black tracking-tight sm:text-3xl ${head}`}>
+            <span className="mr-1.5" aria-hidden>
+              {score.emoji}
+            </span>
+            {score.headline}
+          </div>
+        </div>
+        <div className="text-right">
+          <div className="font-mono text-3xl font-black tabular-nums text-zinc-50">{score.scoreLine}</div>
+          <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Bias {score.bias}</div>
+        </div>
+      </div>
+
+      <ul className="mt-2 space-y-0.5 text-[11px] leading-snug text-zinc-300">
+        {score.activeBullets.map((line) => (
+          <li key={line}>· {line}</li>
+        ))}
+        {score.activeBullets.length === 0 ? (
+          <li className="text-zinc-500">No aligned speed signals — wait for clearer repricing.</li>
+        ) : null}
+      </ul>
+
+      <div className="mt-3 grid gap-1.5 sm:grid-cols-2">
+        {score.activeRows.map((row) => (
+          <div
+            key={row.id}
+            className={`flex items-center justify-between gap-2 rounded-lg border px-2 py-1.5 ${
+              row.point ? 'border-emerald-800/35 bg-black/20' : 'border-zinc-800/50 bg-black/10'
+            }`}
+          >
+            <span className={`text-[10px] font-semibold ${row.point ? 'text-emerald-300/90' : 'text-zinc-500'}`}>
+              {row.point ? '+1' : '0'} {row.label}
+            </span>
+            <ScoreMetricValues detail={row.detail} gainPct={row.gainPct} active={row.point === 1} />
+          </div>
+        ))}
+      </div>
+
+      <details className="mt-2">
+        <summary className="cursor-pointer text-[10px] font-semibold text-zinc-500 hover:text-zinc-300">Opposite side · full breakdown</summary>
+        <div className="mt-2 grid gap-2 sm:grid-cols-2">
+          <div className="rounded-lg border border-emerald-900/30 bg-black/15 px-2 py-2">
+            <div className="text-[9px] font-bold uppercase text-emerald-400/80">{upLabel} score</div>
+            <div className="font-mono text-lg font-bold text-zinc-100">
+              {score.up.score}/{score.up.max}
+            </div>
+          </div>
+          <div className="rounded-lg border border-rose-900/30 bg-black/15 px-2 py-2">
+            <div className="text-[9px] font-bold uppercase text-rose-400/80">{downLabel} score</div>
+            <div className="font-mono text-lg font-bold text-zinc-100">
+              {score.down.score}/{score.down.max}
+            </div>
+          </div>
+        </div>
+      </details>
     </div>
   );
 }
@@ -1351,6 +1628,7 @@ export function NowPriceSignalsPanel(props: {
   spotBookAlignment?: { align: string; above: boolean; below: boolean } | null;
   physicsLine?: string | null;
   probLastUpdateMs?: number | null;
+  booksFetchedAt?: number | null;
 }): ReactElement {
   const {
     slug = 'unknown',
@@ -1368,6 +1646,7 @@ export function NowPriceSignalsPanel(props: {
     spotBookAlignment,
     physicsLine,
     probLastUpdateMs,
+    booksFetchedAt = null,
   } = props;
 
   const spotLast = spot.length ? spot[spot.length - 1]!.v : null;
@@ -1467,13 +1746,10 @@ export function NowPriceSignalsPanel(props: {
   const recentDeltaUp01 = useMemo(() => recentProbDelta01(probTicksUp, 30_000), [probTicksUp]);
   const recentDeltaDown01 = useMemo(() => recentProbDelta01(probTicksDown, 30_000), [probTicksDown]);
 
-  const marketUpdatedAtMs = useMemo(() => {
-    const tickMs = Math.max(probTicksUp.at(-1)?.t ?? 0, probTicksDown.at(-1)?.t ?? 0);
-    if (probLastUpdateMs != null && Number.isFinite(probLastUpdateMs)) {
-      return Math.max(probLastUpdateMs, tickMs || 0);
-    }
-    return tickMs > 0 ? tickMs : null;
-  }, [probLastUpdateMs, probTicksUp, probTicksDown]);
+  const marketUpdatedAtMs = useMemo(
+    () => maxFeedMs(probLastUpdateMs, booksFetchedAt, lastPointMs(probTicksUp), lastPointMs(probTicksDown)),
+    [booksFetchedAt, probLastUpdateMs, probTicksDown, probTicksUp],
+  );
 
   const normNow = normLive;
   const norm30 = useMemo(() => {
@@ -1524,7 +1800,7 @@ export function NowPriceSignalsPanel(props: {
     });
   }, [binaryBias, pMktUp, spot, spotLast, priceToBeat, recentDeltaUp01, recentDeltaDown01, upLabel, downLabel, fairValueGap]);
 
-  const deskSpeed = useMemo(() => {
+  const deskSpeedConfirm = useMemo(() => {
     if (spotLast == null || priceToBeat == null) return null;
     return computeDeskSpeedSnapshot({
       spotPts: spot,
@@ -1536,9 +1812,27 @@ export function NowPriceSignalsPanel(props: {
       pMktDown,
       upLabel,
       downLabel,
-      horizonSec: 30,
+      horizonSec: PRESSURE_CONFIRM_HORIZON_SEC,
     });
   }, [spotLast, priceToBeat, spot, probUp, probDown, pMktUp, pMktDown, upLabel, downLabel]);
+
+  const deskSpeedEarly = useMemo(() => {
+    if (spotLast == null || priceToBeat == null) return null;
+    return computeDeskSpeedSnapshot({
+      spotPts: spot,
+      nowSpot: spotLast,
+      ptb: priceToBeat,
+      probUpPts: probUp.map((p) => ({ t: p.t, v: p.v ?? null })),
+      probDownPts: probDown.map((p) => ({ t: p.t, v: p.v ?? null })),
+      pMktUp,
+      pMktDown,
+      upLabel,
+      downLabel,
+      horizonSec: PRESSURE_EARLY_HORIZON_SEC,
+    });
+  }, [spotLast, priceToBeat, spot, probUp, probDown, pMktUp, pMktDown, upLabel, downLabel]);
+
+  const deskSpeed = deskSpeedConfirm;
 
   const fvgSignal = useMemo(() => {
     if (fairValueGap == null) return null;
@@ -1592,6 +1886,44 @@ export function NowPriceSignalsPanel(props: {
     };
   }, [binaryBias, fairValueGap?.pExpected, pMktUp, upLabel, downLabel]);
 
+  const mtfConsensus = useMemo(() => {
+    if (bandUsd == null || spot.length < 4) return null;
+    return buildMtfConsensus(spot, bandUsd);
+  }, [spot, bandUsd]);
+
+  const pressureBuildup = useMemo(
+    () =>
+      deskSpeedEarly && deskSpeedConfirm && spotLast != null
+        ? computePressureBuildup(deskSpeedEarly, deskSpeedConfirm, {
+            mtf: mtfConsensus,
+            upLabel,
+            downLabel,
+            nowSpot: spotLast,
+            pMktUp: pMktUp,
+            pMktDown: pMktDown,
+          })
+        : null,
+    [deskSpeedEarly, deskSpeedConfirm, mtfConsensus, upLabel, downLabel, spotLast, pMktUp, pMktDown],
+  );
+
+  const directionScore = useMemo(
+    () =>
+      deskSpeed && spotLast != null
+        ? computeDirectionScore(deskSpeed, upLabel, downLabel, {
+            nowSpot: spotLast,
+            pMktUp: pMktUp,
+            pMktDown: pMktDown,
+          })
+        : null,
+    [deskSpeed, upLabel, downLabel, spotLast, pMktUp, pMktDown],
+  );
+
+  const speedHint = pressureBuildup
+    ? pressureBuildupShortLabel(pressureBuildup)
+    : directionScore
+      ? directionScoreShortLabel(directionScore)
+      : null;
+
   if (spotLast == null || priceToBeat == null || bandDistances == null || !glance) {
     return (
       <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/40 px-4 py-8 text-center text-sm text-zinc-500">
@@ -1619,18 +1951,6 @@ export function NowPriceSignalsPanel(props: {
       : edgeScalp?.scalpSignal === 'LONG_DOWN' || machineReadout?.focusLane === 'down'
         ? 'down'
         : 'flat';
-
-  const speedHint = deskSpeed
-    ? (() => {
-        const fav =
-          deskSpeed.lanes.down.supportScore > deskSpeed.lanes.up.supportScore + 1
-            ? downLabel
-            : deskSpeed.lanes.up.supportScore > deskSpeed.lanes.down.supportScore + 1
-              ? upLabel
-              : null;
-        return fav ? `Speed → ${fav}` : 'Speed split';
-      })()
-    : null;
 
   const upMidSnap =
     pMktUp != null
@@ -1683,6 +2003,12 @@ export function NowPriceSignalsPanel(props: {
           noLabel={downLabel.toLowerCase() === 'down' ? 'NO' : downLabel}
         />
       ) : null}
+
+      {pressureBuildup ? (
+        <PressureBuildupCard pressure={pressureBuildup} upLabel={upLabel} downLabel={downLabel} />
+      ) : null}
+
+      {directionScore ? <DirectionScoreCard score={directionScore} upLabel={upLabel} downLabel={downLabel} /> : null}
 
       <CompactSnapshotStrip
         geo={bandDistances.geo.replace('_', ' ')}

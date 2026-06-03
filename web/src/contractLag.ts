@@ -12,7 +12,7 @@ import { EDGE_TRADE_THRESHOLD } from './probabilityEdgeScalp';
 export const CONTRACT_LAG_MIN_CENTS = 5;
 export const CONTRACT_LAG_STRONG_CENTS = 10;
 /** CLOB mid older than this is flagged stale in the UI. */
-export const CONTRACT_LAG_STALE_MS = 10_000;
+export const CONTRACT_LAG_STALE_MS = 25_000;
 
 export type ProbTick = { t: number; v: number };
 

@@ -76,6 +76,13 @@ import { PerpsCommandCenter } from './PerpsCommandCenter';
 import { BinanceBtcUsdtMarketView } from './BinanceBtcUsdtMarketView';
 import { useTradeAccountMode } from './useTradeAccountMode';
 import { appendLiveMidSeries, appendLiveSpotSeries, lastPointMs, maxFeedMs, normalizeEpochMs } from './feedFreshness';
+import {
+  fallbackUpdownSlug,
+  readUpdownShortcutCache,
+  slugToOpenFromShortcut,
+  writeUpdownShortcutCache,
+  type CachedUpdownShortcut,
+} from './updownShortcutCache';
 
 function pretty(value: unknown) {
   return JSON.stringify(value, null, 2);
@@ -101,6 +108,21 @@ function apiReachabilityHint(err: ApiErr): string {
     '• vite preview / static dist: create web/.env with VITE_API_BASE=http://127.0.0.1:8787, rebuild, and keep the API running.\n' +
     (d ? `Details: ${d}\n` : '')
   );
+}
+
+function spotSymbolForSlug(
+  slug: string,
+  hints: Readonly<Record<string, UpdownSlugHint>> | null | undefined,
+  market: unknown | null,
+): string | null {
+  const p = parseUpdownSlugWithHints(slug, hints);
+  if (p) return `${p.asset}/usd`;
+  if (market && typeof market === 'object') {
+    const hint = inferUpdownHintFromMarketJson(slug, market as Record<string, unknown>);
+    if (hint) return `${hint.asset}/usd`;
+  }
+  const titled = titledUpdownAssetFromSlug(slug);
+  return titled ? `${titled}/usd` : null;
 }
 
 function isRetryableMarketMetaError(errorJson: string | null): boolean {
@@ -227,6 +249,11 @@ function normalizeMarketLookupRef(raw: string): string {
   } catch {
     return s;
   }
+}
+
+/** Canonical slug for URL, tabs, and same-market checks (Polymarket slugs are lowercase). */
+function canonicalMarketSlug(raw: string): string {
+  return normalizeMarketLookupRef(raw).trim().toLowerCase();
 }
 
 function pickMarketQuestion(m: unknown): string {
@@ -507,6 +534,13 @@ function OrderFlowAssistant({ apiAvailable, context }: { apiAvailable: boolean; 
 }
 
 type LoadMarketResult = { ok: true; slug: string; data: unknown } | { ok: false };
+type LoadMarketOpts = {
+  market?: unknown;
+  /** Set when the user picked a trade session tab (coordinates pending slug sync). */
+  fromTab?: boolean;
+  /** Re-fetch metadata/books even when slug is unchanged (tab re-select). */
+  force?: boolean;
+};
 type MainTab =
   | 'book'
   | 'flowzones'
@@ -667,6 +701,12 @@ function App() {
   const loadBooksRef = useRef<
     (ids: string[], opts?: { updateSeries?: boolean; updateFlow?: boolean }) => Promise<void>
   >(async () => {});
+  /** True once CLOB books have hydrated — background polls must not flash the loading shell. */
+  const booksHydratedRef = useRef(false);
+  /** Last RTDS underlying symbol — only cold-reset spot ring when asset changes, not every slug tick. */
+  const spotSymbolRef = useRef<string | null>(null);
+  /** Last slug PTB poll was started for — avoid clearing PTB on soft reload / duplicate effect runs. */
+  const ptbPollSlugRef = useRef('');
 
   const [globalTradeLane, setGlobalTradeLane] = useState<'up' | 'down'>('up');
   /** Operator picked UP/DOWN on the trade panel — block card lane sync until Take signal or lock expires. */
@@ -694,6 +734,8 @@ function App() {
   const [tradeSessionTabs, setTradeSessionTabs] = useState<TradeSessionTab[]>([]);
   const [activeTradeSessionTabId, setActiveTradeSessionTabId] = useState<string | null>(null);
   const pendingTradeTabSlugRef = useRef<string | null>(null);
+  /** Cancels stale shortcut navigates when the user taps another asset/interval quickly. */
+  const shortcutOpenSeqRef = useRef(0);
   /** So closing all tabs does not immediately auto-reseed (user can run empty, then add a new tab). */
   const tradeSessionAutoSeededRef = useRef(false);
   const [globalTradeContext, setGlobalTradeContext] = useState<{
@@ -869,12 +911,20 @@ function App() {
   const signalsSpotSeries = useMemo(() => {
     const slug = selectedSlug.trim();
     if (!slug) return [] as SpotPoint[];
-    const base = spotSeriesBySlug[slug] ?? [];
+    let base = spotSeriesBySlug[slug] ?? [];
+    if (base.length < 2) {
+      const sym = spotSymbolForSlug(slug, updownSlugHints, marketJson);
+      const assetSeries = sym ? (spotBySymbol[sym] ?? []) : [];
+      if (assetSeries.length > base.length) base = assetSeries;
+    }
     const anchorMs = maxFeedMs(booksFetchedAt, rtdsTickAt, rtdsReceivedAt, rtdsLastPollMs) ?? Date.now();
     return appendLiveSpotSeries(base, rtdsSpot, anchorMs);
   }, [
     selectedSlug,
     spotSeriesBySlug,
+    spotBySymbol,
+    updownSlugHints,
+    marketJson,
     rtdsSpot,
     rtdsTickAt,
     rtdsReceivedAt,
@@ -882,12 +932,16 @@ function App() {
     booksFetchedAt,
   ]);
 
-  /** Spot feed freshness — RTDS tick, server receive, and last successful poll. */
+  /** Spot feed freshness — RTDS tick, server receive, pinned chart series, and book poll. */
   const signalsSpotFeedLastMs = useMemo(() => {
-    const slug = selectedSlug.trim();
-    const spotPts = slug ? (spotSeriesBySlug[slug] ?? []) : [];
-    return maxFeedMs(rtdsTickAt, rtdsReceivedAt, rtdsLastPollMs, lastPointMs(spotPts));
-  }, [rtdsTickAt, rtdsReceivedAt, rtdsLastPollMs, selectedSlug, spotSeriesBySlug]);
+    return maxFeedMs(
+      rtdsTickAt,
+      rtdsReceivedAt,
+      rtdsLastPollMs,
+      booksFetchedAt,
+      lastPointMs(signalsSpotSeries),
+    );
+  }, [booksFetchedAt, rtdsTickAt, rtdsReceivedAt, rtdsLastPollMs, signalsSpotSeries]);
 
   const tradePanelBookMids = useMemo(() => {
     if (!books || books.length < 2 || outcomeLabels.length < 2) {
@@ -917,43 +971,66 @@ function App() {
     };
   }, [books, marketJson, outcomeLabels]);
 
-  const loadMarket = useCallback(async (slug: string, opts?: { market?: unknown }): Promise<LoadMarketResult> => {
+  const loadMarket = useCallback(async (slug: string, opts?: LoadMarketOpts): Promise<LoadMarketResult> => {
     releaseOrphanPointerCapture();
-    const syncGen = ++marketSyncGenRef.current;
+    const clean = canonicalMarketSlug(slug);
+    const prevClean = selectedSlugRef.current.trim().toLowerCase();
+    const sameMarket = Boolean(clean && prevClean && clean === prevClean);
+    const force = opts?.force === true;
+    const clearPendingTab = () => {
+      if (opts?.fromTab) pendingTradeTabSlugRef.current = null;
+    };
+    if (opts?.fromTab) {
+      pendingTradeTabSlugRef.current = clean;
+    } else {
+      pendingTradeTabSlugRef.current = null;
+    }
+    if (!sameMarket) {
+      marketSyncGenRef.current += 1;
+    } else if (force) {
+      marketSyncGenRef.current += 1;
+    }
+    const syncGen = marketSyncGenRef.current;
     setBinanceSpotActive(false);
-    const clean = normalizeMarketLookupRef(slug);
     setSelectedSlug(clean);
     selectedSlugRef.current = clean;
     setSlugInput(clean || slug.trim());
-    setError(null);
-    setMarketJson(null);
-    setBooks(null);
-    setBooksFetchedAt(null);
-    setBooksLoading(Boolean(clean));
-    setGlobalTradeLocked(false);
-    setSsrPriceToBeat(null);
-    setSsrPtbSource(null);
-    setPtbError(null);
-    setRtdsSpot(null);
-    setRtdsTickAt(null);
-    setRtdsReceivedAt(null);
-    setRtdsLastPollMs(null);
+    if (!sameMarket) {
+      setError(null);
+      setMarketJson(null);
+      setBooks(null);
+      setBooksFetchedAt(null);
+      setBooksLoading(Boolean(clean));
+      booksHydratedRef.current = false;
+      setGlobalTradeLocked(false);
+      setSsrPriceToBeat(null);
+      setSsrPtbSource(null);
+      setPtbError(null);
+      setRtdsSpot(null);
+      setRtdsTickAt(null);
+      setRtdsReceivedAt(null);
+      setRtdsLastPollMs(null);
+      if (clean) {
+        setChartSeriesBySlug((m) => {
+          const next = { ...m };
+          delete next[clean];
+          return next;
+        });
+        setFlowSeriesBySlug((m) => {
+          const next = { ...m };
+          delete next[clean];
+          return next;
+        });
+        setSpotSeriesBySlug((m) => {
+          const next = { ...m };
+          delete next[clean];
+          return next;
+        });
+      }
+    } else if (clean && (!booksHydratedRef.current || force)) {
+      setBooksLoading(true);
+    }
     if (clean) {
-      setChartSeriesBySlug((m) => {
-        const next = { ...m };
-        delete next[clean];
-        return next;
-      });
-      setFlowSeriesBySlug((m) => {
-        const next = { ...m };
-        delete next[clean];
-        return next;
-      });
-      setSpotSeriesBySlug((m) => {
-        const next = { ...m };
-        delete next[clean];
-        return next;
-      });
       try {
         const u = new URL(window.location.href);
         u.searchParams.set('slug', clean);
@@ -964,11 +1041,15 @@ function App() {
     }
     if (!clean) {
       setBooksLoading(false);
+      clearPendingTab();
       return { ok: false };
     }
     const preloaded = opts?.market;
-    if (preloaded != null && typeof preloaded === 'object') {
-      if (syncGen !== marketSyncGenRef.current) return { ok: false };
+    if (preloaded != null && typeof preloaded === 'object' && (!sameMarket || force)) {
+      if (syncGen !== marketSyncGenRef.current) {
+        clearPendingTab();
+        return { ok: false };
+      }
       setMarketJson(preloaded);
       const ids = pickTokenIds(preloaded);
       if (ids.length >= 2) {
@@ -978,13 +1059,16 @@ function App() {
             updateFlow: wantFlowRef.current,
           });
         });
-      } else {
+      } else if (!sameMarket || force) {
         setBooksLoading(false);
       }
       return { ok: true, slug: clean, data: preloaded };
     }
     const res = await marketsGet(clean);
-    if (syncGen !== marketSyncGenRef.current) return { ok: false };
+    if (syncGen !== marketSyncGenRef.current) {
+      clearPendingTab();
+      return { ok: false };
+    }
     if (isOk(res)) {
       setMarketJson(res.data);
       const ids = pickTokenIds(res.data);
@@ -1002,8 +1086,36 @@ function App() {
     }
     setError(pretty(res));
     setBooksLoading(false);
+    clearPendingTab();
     return { ok: false };
   }, []);
+
+  /** Sidebar shortcuts, search, and prev/next — switch trade tab when slug already open elsewhere. */
+  const navigateToMarket = useCallback(
+    (slug: string, opts?: { market?: unknown; lane?: 'up' | 'down' }): Promise<LoadMarketResult> => {
+      const clean = canonicalMarketSlug(slug);
+      if (!clean) {
+        setMarketsError('Enter a Polymarket slug, market id, or paste an event URL.');
+        return Promise.resolve({ ok: false });
+      }
+      const existing = tradeSessionTabs.find((t) => t.slug.trim().toLowerCase() === clean);
+      const alreadyOn = selectedSlugRef.current.trim().toLowerCase() === clean;
+      const switchingTab = Boolean(existing && existing.id !== activeTradeSessionTabId);
+      if (existing) {
+        setActiveTradeSessionTabId(existing.id);
+        setGlobalTradeLane(opts?.lane ?? existing.lane);
+      } else if (!activeTradeSessionTabId && tradeSessionTabs.length > 0) {
+        setActiveTradeSessionTabId(tradeSessionTabs[0]!.id);
+      }
+      if (mobileLayout) setMobileMarketPanelOpen(false);
+      return loadMarket(clean, {
+        market: opts?.market,
+        force: alreadyOn && !switchingTab,
+        fromTab: switchingTab,
+      });
+    },
+    [loadMarket, tradeSessionTabs, activeTradeSessionTabId, mobileLayout],
+  );
 
   const onGlobalTradeLaneChange = useCallback(
     (lane: 'up' | 'down') => {
@@ -1088,10 +1200,10 @@ function App() {
     (id: string) => {
       const t = tradeSessionTabs.find((x) => x.id === id);
       if (!t?.slug) return;
-      pendingTradeTabSlugRef.current = t.slug;
+      const alreadyOn = selectedSlugRef.current.trim().toLowerCase() === t.slug.trim().toLowerCase();
       setActiveTradeSessionTabId(id);
       setGlobalTradeLane(t.lane);
-      void loadMarket(t.slug);
+      void loadMarket(t.slug, { fromTab: true, force: alreadyOn });
     },
     [tradeSessionTabs, loadMarket],
   );
@@ -1116,10 +1228,9 @@ function App() {
           const pick = next[0];
           queueMicrotask(() => {
             if (pick) {
-              pendingTradeTabSlugRef.current = pick.slug;
               setActiveTradeSessionTabId(pick.id);
               setGlobalTradeLane(pick.lane);
-              void loadMarket(pick.slug);
+              void loadMarket(pick.slug, { fromTab: true });
             } else {
               pendingTradeTabSlugRef.current = null;
               setActiveTradeSessionTabId(null);
@@ -1153,9 +1264,9 @@ function App() {
     if (!slug) return;
 
     if (pendingTradeTabSlugRef.current) {
-      if (selectedSlug.trim() !== pendingTradeTabSlugRef.current) {
-        return;
-      }
+      const pending = pendingTradeTabSlugRef.current.trim().toLowerCase();
+      const loaded = selectedSlug.trim().toLowerCase();
+      if (loaded !== pending) return;
       pendingTradeTabSlugRef.current = null;
     }
 
@@ -1184,18 +1295,23 @@ function App() {
     if (ids.length === 0) {
       setBooks(null);
       setBooksLoading(false);
+      booksHydratedRef.current = false;
       return;
     }
     const syncGen = marketSyncGenRef.current;
     const reqKey = `${selectedSlugRef.current}:${ids.join(',')}`;
-    setBooksLoading(true);
-    setError(null);
+    const initialLoad = !booksHydratedRef.current;
+    if (initialLoad) {
+      setBooksLoading(true);
+      setError(null);
+    }
     try {
       const res = await clobBooks(ids);
       if (syncGen !== marketSyncGenRef.current) return;
       if (`${selectedSlugRef.current}:${ids.join(',')}` !== reqKey) return;
       if (isOk(res)) {
         setBooks(res.data);
+        booksHydratedRef.current = true;
         const ts = Date.now();
         setBooksFetchedAt(ts);
         const updateSeries = opts?.updateSeries === true;
@@ -1234,7 +1350,7 @@ function App() {
             return { ...m, [slug]: nextForSlug };
           });
         }
-      } else setError(pretty(res));
+      } else if (initialLoad) setError(pretty(res));
     } finally {
       if (syncGen === marketSyncGenRef.current && `${selectedSlugRef.current}:${ids.join(',')}` === reqKey) {
         setBooksLoading(false);
@@ -1286,7 +1402,7 @@ function App() {
     booksWsIdsRef.current = key;
 
     // Keep UI responsive while we wait for first WS book snapshot.
-    setBooksLoading(true);
+    if (!booksHydratedRef.current) setBooksLoading(true);
     setError(null);
 
     const toEntries = () => {
@@ -1306,6 +1422,7 @@ function App() {
       const ts = Date.now();
       const entries = toEntries();
       setBooks(entries);
+      booksHydratedRef.current = true;
       setBooksFetchedAt(ts);
       setBooksLoading(false);
 
@@ -1608,21 +1725,18 @@ function App() {
   useEffect(() => {
     if (binanceSpotActive) return;
     if (tokenIds.length === 0) {
-      queueMicrotask(() => setBooks(null));
+      if (!selectedSlug.trim()) {
+        queueMicrotask(() => {
+          setBooks(null);
+          booksHydratedRef.current = false;
+        });
+      }
       return;
     }
     const wantSeries = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals';
     const wantFlow = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals';
     queueMicrotask(() => void loadBooks(tokenIds, { updateSeries: wantSeries, updateFlow: wantFlow }));
-  }, [tokenIds, loadBooks, mainTab, binanceSpotActive]);
-
-  /** Signals tab: immediately hydrate implied-prob + flow rings (do not wait for the 6.5s poll). */
-  useEffect(() => {
-    if (binanceSpotActive) return;
-    if (mainTab !== 'signals') return;
-    if (!selectedSlug.trim() || tokenIds.length === 0) return;
-    void loadBooks(tokenIds, { updateSeries: true, updateFlow: true });
-  }, [binanceSpotActive, loadBooks, mainTab, selectedSlug, tokenIds]);
+  }, [tokenIds, loadBooks, mainTab, binanceSpotActive, selectedSlug]);
 
   useEffect(() => {
     if (!books || books.length === 0) {
@@ -1686,7 +1800,7 @@ function App() {
     const delayMs = 800 + marketLoadRetryRef.current * 900;
     const id = window.setTimeout(() => {
       marketLoadRetryRef.current += 1;
-      void loadMarket(slug);
+      void loadMarket(slug, { force: true });
     }, delayMs);
     return () => window.clearTimeout(id);
   }, [selectedSlug, marketJson, error, loadMarket]);
@@ -1701,23 +1815,28 @@ function App() {
     void openUpdownShortcut('btc', '5m');
   }, [apiHealth, selectedSlug, shortcutBusy]);
 
-  /** PTB poll — depends on slug only. Do not list `ssrPriceToBeat` in deps: clearing PTB when it
-   *  updates caused the Signals chart to flicker between live data and the SSR skeleton. */
+  /** PTB poll — depends on slug only. Clear PTB only when slug changes, not on every poll setup. */
   useEffect(() => {
     const slug = selectedSlug.trim();
     if (!slug) {
+      ptbPollSlugRef.current = '';
       queueMicrotask(() => {
         setSsrPriceToBeat(null);
         setSsrPtbSource(null);
+        setPtbError(null);
       });
       return;
     }
     const ptbGen = marketSyncGenRef.current;
-    queueMicrotask(() => {
-      setSsrPriceToBeat(null);
-      setSsrPtbSource(null);
-      setPtbError(null);
-    });
+    if (ptbPollSlugRef.current !== slug) {
+      ptbPollSlugRef.current = slug;
+      queueMicrotask(() => {
+        if (selectedSlugRef.current.trim() !== slug) return;
+        setSsrPriceToBeat(null);
+        setSsrPtbSource(null);
+        setPtbError(null);
+      });
+    }
     let stopped = false;
     let intervalId: ReturnType<typeof window.setInterval> | null = null;
     let slowPoll = false;
@@ -1749,19 +1868,13 @@ function App() {
   }, [selectedSlug]);
 
   useEffect(() => {
+    const sym = spotSymbolForSlug(selectedSlug, updownSlugHints, marketJson);
+    if (!sym?.endsWith('/usd')) return;
+    if (spotSymbolRef.current === sym) return;
+    spotSymbolRef.current = sym;
     setRtdsSpotFeedSource(null);
-    setSpotBySymbol((m) => {
-      const sym = (() => {
-        const p = parseUpdownSlugWithHints(selectedSlug, updownSlugHints);
-        if (p) return `${p.asset}/usd`;
-        const titled = titledUpdownAssetFromSlug(selectedSlug);
-        if (titled) return `${titled}/usd`;
-        return null;
-      })();
-      if (!sym?.endsWith('/usd')) return m;
-      return { ...m, [sym]: [] };
-    });
-  }, [selectedSlug, updownSlugHints]);
+    setSpotBySymbol((m) => ({ ...m, [sym]: m[sym] ?? [] }));
+  }, [selectedSlug, updownSlugHints, marketJson]);
 
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 5_000);
@@ -2197,51 +2310,93 @@ function App() {
 
   async function openUpdownShortcut(asset: UpdownShortcutAsset, interval: UpdownInterval) {
     releaseOrphanPointerCapture();
+    const openSeq = ++shortcutOpenSeqRef.current;
     setError(null);
     setMarketsError(null);
     setMarketsNotice(null);
     setShortcutBusy({ asset, interval });
     setLastShortcut({ asset, interval });
+
+    const openFromShortcut = (data: CachedUpdownShortcut, notice?: string) => {
+      if (openSeq !== shortcutOpenSeqRef.current) return;
+      const slugToOpen = slugToOpenFromShortcut(data, interval);
+      const iw = data.inferred_window_start_unix;
+      if (typeof iw === 'number') {
+        setUpdownSlugHints((m) => ({
+          ...m,
+          [slugToOpen.trim().toLowerCase()]: { asset, interval, bucketStartSec: iw },
+        }));
+      }
+      if (notice) setMarketsNotice(notice);
+      void navigateToMarket(slugToOpen, { market: data.market });
+    };
+
+    const cached = readUpdownShortcutCache(asset, interval);
+    const currentSlug = selectedSlugRef.current.trim().toLowerCase();
+    if (cached) {
+      const cachedSlug = canonicalMarketSlug(slugToOpenFromShortcut(cached, interval));
+      const needsCacheOpen = currentSlug !== cachedSlug || !marketJson;
+      if (needsCacheOpen) {
+        openFromShortcut(
+          cached,
+          `${asset.toUpperCase()} ${interval} · cached shortcut (refreshing…)`,
+        );
+      }
+    }
+
     try {
       const first = await marketsUpdownShortcut(asset, interval);
-      let okRes: ApiOk<{
-        slug: string;
-        trading_slug?: string;
-        market?: unknown;
-        asset: string;
-        interval?: string;
-        window: string;
-        tested?: boolean;
-        active?: boolean;
-        closed?: boolean;
-        start?: string | null;
-        end?: string | null;
-      }> | null = null;
-
-      if (isOk(first)) okRes = first;
-      else {
-        setMarketsError(pretty(first));
+      if (openSeq !== shortcutOpenSeqRef.current) return;
+      if (!isOk(first)) {
+        if (cached) {
+          const cachedSlug = canonicalMarketSlug(slugToOpenFromShortcut(cached, interval));
+          if (currentSlug !== cachedSlug || !marketJson) {
+            openFromShortcut(
+              cached,
+              `Shortcut API slow — opened cached ${asset.toUpperCase()} ${interval}. ${pretty(first)}`,
+            );
+          } else {
+            setMarketsError(
+              `Shortcut API slow — kept ${asset.toUpperCase()} ${interval}. ${pretty(first)}`,
+            );
+          }
+          setShortcutBusy(null);
+          return;
+        }
+        const fallbackSlug = fallbackUpdownSlug(asset, interval);
+        setMarketsError(
+          `Shortcut API failed — trying ${fallbackSlug}. ${pretty(first)}`,
+        );
+        void navigateToMarket(fallbackSlug);
         setShortcutBusy(null);
         return;
       }
 
-      if (!okRes) {
-        setShortcutBusy(null);
-        return;
-      }
+      const data = first.data;
+      writeUpdownShortcutCache(asset, interval, {
+        slug: data.slug,
+        trading_slug: data.trading_slug,
+        market: data.market,
+        asset: data.asset,
+        interval: data.interval,
+        window: data.window,
+        inferred_window_start_unix: (data as { inferred_window_start_unix?: number }).inferred_window_start_unix,
+        start: data.start,
+        end: data.end,
+      });
 
-      if (okRes.data.start && okRes.data.end) {
+      if (data.start && data.end) {
         setMarketsNotice(
-          `${asset.toUpperCase()} ${interval} window: ${new Date(okRes.data.start).toLocaleTimeString()}–${new Date(okRes.data.end).toLocaleTimeString()} · slug ${okRes.data.slug}`,
+          `${asset.toUpperCase()} ${interval} window: ${new Date(data.start).toLocaleTimeString()}–${new Date(data.end).toLocaleTimeString()} · slug ${data.slug}`,
         );
       } else {
         setMarketsNotice(null);
       }
-      let slugToOpen = okRes.data.trading_slug?.trim() || okRes.data.slug.trim();
-      if (interval === '5m' && !okRes.data.trading_slug?.trim() && !okRes.data.market) {
-        slugToOpen = await updownSlugToOpen(okRes.data, interval);
+      let slugToOpen = data.trading_slug?.trim() || data.slug.trim();
+      if (interval === '5m' && !data.trading_slug?.trim() && !data.market) {
+        slugToOpen = await updownSlugToOpen(data, interval);
       }
-      const iw = (okRes.data as { inferred_window_start_unix?: number }).inferred_window_start_unix;
+      const iw = (data as { inferred_window_start_unix?: number }).inferred_window_start_unix;
       if (typeof iw === 'number') {
         setUpdownSlugHints((m) => ({
           ...m,
@@ -2249,9 +2404,30 @@ function App() {
         }));
       }
       setShortcutBusy(null);
-      void loadMarket(slugToOpen, { market: okRes.data.market });
+      if (openSeq === shortcutOpenSeqRef.current) {
+        void navigateToMarket(slugToOpen, { market: data.market });
+      }
     } catch (e) {
-      setMarketsError(e instanceof Error ? e.message : String(e));
+      if (openSeq !== shortcutOpenSeqRef.current) return;
+      if (cached) {
+        const cachedSlug = canonicalMarketSlug(slugToOpenFromShortcut(cached, interval));
+        if (currentSlug !== cachedSlug || !marketJson) {
+          openFromShortcut(
+            cached,
+            `Shortcut error — opened cached ${asset.toUpperCase()} ${interval}. ${e instanceof Error ? e.message : String(e)}`,
+          );
+        } else {
+          setMarketsError(
+            `Shortcut error — kept cached ${asset.toUpperCase()} ${interval}. ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+      } else {
+        const fallbackSlug = fallbackUpdownSlug(asset, interval);
+        setMarketsError(
+          `${e instanceof Error ? e.message : String(e)} — trying ${fallbackSlug}`,
+        );
+        void navigateToMarket(fallbackSlug);
+      }
       setShortcutBusy(null);
     }
   }
@@ -2282,7 +2458,7 @@ function App() {
         const asRef = normalizeMarketLookupRef(term);
         if (asRef) {
           setMarketsError(null);
-          const opened = await loadMarket(asRef);
+          const opened = await navigateToMarket(asRef);
           if (opened.ok) setMarkets([opened.data]);
           return;
         }
@@ -2295,7 +2471,7 @@ function App() {
       if (rows.length === 1) {
         const only = pickMarketSlug(rows[0]);
         if (only) {
-          const opened = await loadMarket(only);
+          const opened = await navigateToMarket(only);
           if (opened.ok) setMarkets(rows);
         }
       }
@@ -2313,6 +2489,21 @@ function App() {
 
   const marketControls = (
     <>
+      {tradeSessionTabs.length > 0 ? (
+        <div className="mb-4">
+          <div className="mb-2 text-xs font-medium uppercase tracking-wide text-zinc-500">Market tabs</div>
+          <TradeSessionTabsBar
+            tabs={tradeSessionTabs}
+            activeId={activeTradeSessionTabId}
+            onSelect={onSelectTradeSessionTab}
+            onAdd={onAddTradeSessionTab}
+            onClose={onCloseTradeSessionTab}
+          />
+          <p className="mt-2 text-[10px] leading-snug text-zinc-600">
+            Switch tabs like Polymarket sessions — shortcuts and search jump to an existing tab when that slug is already open.
+          </p>
+        </div>
+      ) : null}
       <div className="mb-4 flex flex-col gap-2">
         <div className="text-xs font-medium uppercase tracking-wide text-zinc-500">Open market</div>
         <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-amber-200/70">Polymarket · prediction</div>
@@ -2397,14 +2588,14 @@ function App() {
             value={slugInput}
             onChange={(e) => setSlugInput(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter') void loadMarket(slugInput.trim());
+              if (e.key === 'Enter') void navigateToMarket(slugInput.trim());
             }}
             placeholder="Slug, id, or polymarket.com/event/…"
             className="w-full rounded-xl border border-zinc-700/50 bg-zinc-900/35 px-3 py-2.5 text-sm text-zinc-100 outline-none ring-indigo-500/0 transition-shadow placeholder:text-zinc-600 focus:border-indigo-500/40 focus:ring-2 focus:ring-indigo-500/20"
           />
           <button
             type="button"
-            onClick={() => void loadMarket(slugInput.trim())}
+            onClick={() => void navigateToMarket(slugInput.trim())}
             className="shrink-0 rounded-xl border border-zinc-600/60 bg-zinc-800/80 px-4 py-2.5 text-sm font-medium text-zinc-100 shadow-sm transition-colors hover:border-zinc-500 hover:bg-zinc-700/90"
           >
             Open
@@ -2459,7 +2650,7 @@ function App() {
                     className={`w-full px-3 py-2.5 text-left text-sm transition-colors hover:bg-zinc-800/35 disabled:cursor-not-allowed disabled:opacity-40 ${
                       active ? 'border-l-2 border-indigo-400 bg-indigo-950/15' : 'border-l-2 border-transparent'
                     }`}
-                    onClick={() => void loadMarket(slug)}
+                    onClick={() => void navigateToMarket(slug)}
                   >
                     <div className="truncate font-medium text-zinc-100">{label}</div>
                     <div className="truncate font-mono text-[11px] text-zinc-500">{slug || '— no slug/id'}</div>
@@ -2735,7 +2926,7 @@ function App() {
                   {nextUpdownSlug(selectedSlug, -1) ? (
                     <button
                       type="button"
-                      onClick={() => void loadMarket(nextUpdownSlug(selectedSlug, -1)!)}
+                      onClick={() => void navigateToMarket(nextUpdownSlug(selectedSlug, -1)!)}
                       className="rounded-lg border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
                     >
                       Prev
@@ -2753,7 +2944,7 @@ function App() {
                   {nextUpdownSlug(selectedSlug, 1) ? (
                     <button
                       type="button"
-                      onClick={() => void loadMarket(nextUpdownSlug(selectedSlug, 1)!)}
+                      onClick={() => void navigateToMarket(nextUpdownSlug(selectedSlug, 1)!)}
                       className="rounded-lg border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
                     >
                       +{updownParsed.stepSec}s
@@ -2771,7 +2962,7 @@ function App() {
                   {nextUpdownSlug(selectedSlug, -1) ? (
                     <button
                       type="button"
-                      onClick={() => void loadMarket(nextUpdownSlug(selectedSlug, -1)!)}
+                      onClick={() => void navigateToMarket(nextUpdownSlug(selectedSlug, -1)!)}
                       className="rounded-lg border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
                     >
                       Prev
@@ -2780,7 +2971,7 @@ function App() {
                   {nextUpdownSlug(selectedSlug, 1) ? (
                     <button
                       type="button"
-                      onClick={() => void loadMarket(nextUpdownSlug(selectedSlug, 1)!)}
+                      onClick={() => void navigateToMarket(nextUpdownSlug(selectedSlug, 1)!)}
                       className="rounded-lg border border-amber-700/40 bg-amber-950/30 px-3 py-2 text-xs font-semibold text-amber-100 hover:bg-amber-950/50"
                     >
                       Next
@@ -2836,7 +3027,7 @@ function App() {
                         type="button"
                         onClick={() => {
                           setUpdownPickerOpen(false);
-                          void loadMarket(it.slug);
+                          void navigateToMarket(it.slug);
                         }}
                         className={`rounded-lg border px-2 py-2 text-[11px] font-semibold transition-colors ${
                           it.slug === selectedSlug
@@ -3031,7 +3222,7 @@ function App() {
                     ) : null}
                     <button
                       type="button"
-                      onClick={() => void loadMarket(selectedSlug.trim())}
+                      onClick={() => void loadMarket(selectedSlug.trim(), { force: true })}
                       className="mt-3 rounded-xl border border-amber-600/50 bg-amber-950/40 px-4 py-2 text-xs font-semibold text-amber-50 hover:bg-amber-950/55"
                     >
                       Retry load
@@ -3067,7 +3258,6 @@ function App() {
                   </div>
                 ) : null}
                 <SignalsPtbOnly
-                  key={selectedSlug ?? ''}
                   slug={selectedSlug}
                   market={marketJson}
                   books={books}
@@ -3132,7 +3322,7 @@ function App() {
                 <PtbMultiAssetGrid
                   rows={multiScanRows}
                   onOpenSlug={(slug) => {
-                    void loadMarket(slug);
+                    void navigateToMarket(slug);
                     setMainTab('signals');
                   }}
                   onAddMarkets={() => {
@@ -3302,8 +3492,7 @@ function App() {
               selectedSlug={selectedSlug}
               booksFetchedAt={booksFetchedAt}
               onNavigate={(slug, lane) => {
-                void loadMarket(slug);
-                setGlobalTradeLane(lane);
+                void navigateToMarket(slug, { lane });
                 setMainTab('signals');
               }}
             />

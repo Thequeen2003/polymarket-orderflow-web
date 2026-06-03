@@ -3,7 +3,8 @@
  */
 
 import type { DeskSpeedSnapshot } from './deskSpeedLayers';
-import { pickSpeedFavoredLane } from './deskSpeedLayers';
+import type { MtfConsensus } from './multiTimeframeConsensus';
+import { computePressureBuildup, pressureBuildupShortLabel } from './pressureBuildupScore';
 import type { NowPriceBandDistances, SpotBandGlance } from './nowPriceSignals';
 import type { FairValueGapReadout, FairValueGapSignalReadout } from './fairValueGap';
 import type { ProbabilityEdgeScalp } from './probabilityEdgeScalp';
@@ -115,6 +116,9 @@ export function buildNowPriceGlanceSummary(params: {
   fairValueGap: FairValueGapReadout | null;
   fvgSignal: FairValueGapSignalReadout | null;
   deskSpeed: DeskSpeedSnapshot | null;
+  /** 10s lead window for pressure; defaults to deskSpeed when omitted. */
+  deskSpeedEarly?: DeskSpeedSnapshot | null;
+  mtfConsensus?: MtfConsensus | null;
   machineReadout: SpotPtbMachineReadout | null;
   bandGauge: SpotBandGaugeSnapshot | null;
   physicsLine: string | null;
@@ -132,6 +136,8 @@ export function buildNowPriceGlanceSummary(params: {
     fairValueGap,
     fvgSignal,
     deskSpeed,
+    deskSpeedEarly,
+    mtfConsensus,
     machineReadout,
     bandGauge,
     physicsLine,
@@ -147,11 +153,19 @@ export function buildNowPriceGlanceSummary(params: {
       ? tradeFromMachine(machineReadout, upLabel, downLabel)
       : { call: 'WAIT', tone: 'flat' as const, detail: 'Need edge or sensor readout' };
 
-  const speedFav = deskSpeed ? pickSpeedFavoredLane(deskSpeed) : null;
-  const speedLabel = speedFav
-    ? speedFav.lane === 'split'
-      ? `Speed split · ${speedFav.short}`
-      : `Speed → ${speedFav.label} · ${speedFav.short}`
+  const speedLabel = deskSpeed
+    ? (() => {
+        const early = deskSpeedEarly ?? deskSpeed;
+        const pressure = computePressureBuildup(early, deskSpeed, {
+          mtf: mtfConsensus ?? null,
+          upLabel,
+          downLabel,
+          nowSpot: band.now,
+          pMktUp: probUp01,
+          pMktDown: probDown01,
+        });
+        return pressureBuildupShortLabel(pressure);
+      })()
     : null;
 
   const upBreakShort = glance.upBreak.cleared

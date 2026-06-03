@@ -433,9 +433,9 @@ export function marketsUpdownShortcut(asset: UpdownShortcutAsset, interval: Updo
     /** Gamma market payload when shortcut already resolved it — skips a second `/api/markets/get`. */
     market?: unknown;
   }>(`/api/markets/updown-shortcut?asset=${encodeURIComponent(asset)}&interval=${encodeURIComponent(interval)}`, {
-    timeoutMs: 18_000,
-    retries: 2,
-    retryDelayMs: 500,
+    timeoutMs: 35_000,
+    retries: 3,
+    retryDelayMs: 700,
   });
 }
 
@@ -481,9 +481,9 @@ export type ClobBookEntry = { token: string; book: unknown; error: string | null
 export function clobBooks(tokenIds: string[]) {
   const q = tokenIds.join(',');
   return getJsonWithRetry<ClobBookEntry[]>(`/api/clob/books?tokens=${encodeURIComponent(q)}`, {
-    timeoutMs: 24_000,
-    retries: 1,
-    retryDelayMs: 600,
+    timeoutMs: 28_000,
+    retries: 2,
+    retryDelayMs: 650,
   });
 }
 

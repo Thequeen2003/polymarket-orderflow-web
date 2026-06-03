@@ -94,6 +94,7 @@ import {
   formatBracketCentsFromNumber,
   resolveArmRiskCentsAfterBuy,
   resolveArmRiskCentsForEntry,
+  spreadBracketFromFillPrice01,
   type SignalRiskLevelsDetail,
   type SignalRiskSnapshot,
 } from './armRiskFromSignal';
@@ -126,6 +127,7 @@ import {
 } from './signalsDeskHold';
 import { dispatchOutcomePositions } from './signalsDeskPosition';
 import { BracketTriggerInput } from './BracketTriggerInput';
+import { loadBracketLevelsDraft, saveBracketLevelsDraft } from './bracketLevelDraft';
 import { resolveBracketRef } from './lib/bracketLevelInput';
 
 function isOk<T>(res: { ok: boolean } & Record<string, unknown>): res is { ok: true; data: T } {
@@ -157,6 +159,89 @@ type TakeProfitConfig = {
   /** Poll book; trigger if bid or ask crosses up through take level. */
   dualBook?: boolean;
 };
+
+type BuyBundleLaneDraft = { sl: string; tp: string };
+
+const EMPTY_BUY_BUNDLE_BY_LANE: { up: BuyBundleLaneDraft; down: BuyBundleLaneDraft } = {
+  up: { sl: '', tp: '' },
+  down: { sl: '', tp: '' },
+};
+
+function stopLossStorageKey(tokenId: string): string {
+  return `pm:stoploss:v1:${tokenId.trim()}`;
+}
+
+function takeProfitStorageKey(tokenId: string): string {
+  return `pm:takeprofit:v1:${tokenId.trim()}`;
+}
+
+function loadStopLossConfigFromStorage(tokenId: string): StopLossConfig | null {
+  const tok = tokenId.trim();
+  if (!tok) return null;
+  try {
+    const raw = window.localStorage.getItem(stopLossStorageKey(tok));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object') return null;
+    const o = parsed as Partial<StopLossConfig> & Record<string, unknown>;
+    if (o.enabled !== true) return null;
+    const stop01 = typeof o.stop01 === 'number' && Number.isFinite(o.stop01) ? o.stop01 : null;
+    const limit01 = typeof o.limit01 === 'number' && Number.isFinite(o.limit01) ? o.limit01 : null;
+    const shares = typeof o.shares === 'number' && Number.isFinite(o.shares) ? o.shares : null;
+    if (stop01 == null || limit01 == null || shares == null || shares <= 0) return null;
+    return {
+      enabled: true,
+      stop01,
+      limit01,
+      shares,
+      simple: o.simple !== false,
+      dualBook: o.dualBook === true,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function loadTakeProfitConfigFromStorage(tokenId: string): TakeProfitConfig | null {
+  const tok = tokenId.trim();
+  if (!tok) return null;
+  try {
+    const raw = window.localStorage.getItem(takeProfitStorageKey(tok));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object') return null;
+    const o = parsed as Partial<TakeProfitConfig> & Record<string, unknown>;
+    if (o.enabled !== true) return null;
+    const take01 = typeof o.take01 === 'number' && Number.isFinite(o.take01) ? o.take01 : null;
+    const limit01 = typeof o.limit01 === 'number' && Number.isFinite(o.limit01) ? o.limit01 : null;
+    const shares = typeof o.shares === 'number' && Number.isFinite(o.shares) ? o.shares : null;
+    if (take01 == null || limit01 == null || shares == null || shares <= 0) return null;
+    return {
+      enabled: true,
+      take01,
+      limit01,
+      shares,
+      simple: o.simple !== false,
+      dualBook: o.dualBook === true,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function bracketAutomationActive(args: {
+  bracketPollToken: string | null;
+  stopLossEnabled: boolean;
+  takeProfitEnabled: boolean;
+}): boolean {
+  const armedTok = args.bracketPollToken?.trim();
+  if (armedTok) {
+    const sl = loadStopLossConfigFromStorage(armedTok);
+    const tp = loadTakeProfitConfigFromStorage(armedTok);
+    return Boolean(sl?.enabled || tp?.enabled);
+  }
+  return args.stopLossEnabled || args.takeProfitEnabled;
+}
 
 function parseUsdcBalance(raw: string): number | null {
   if (raw.trim() === '') return null;
@@ -680,6 +765,14 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
    * Blocks card prefill, applyArmRiskNow, and fill-time spread re-arm from moving TP/SL.
    */
   const operatorSlTpLockedRef = useRef(false);
+  /** In-session SL/TP drafts per UP/DOWN tab — survives lane switches before localStorage/arm. */
+  const bracketLaneDraftRef = useRef<{ up: { sl: string; tp: string }; down: { sl: string; tp: string } }>({
+    up: { sl: '', tp: '' },
+    down: { sl: '', tp: '' },
+  });
+  const prevBracketLaneRef = useRef<'up' | 'down'>(lane);
+  const stopLossStopCentsRef = useRef('');
+  const takeProfitTakeCentsRef = useRef('');
   /** One-click buy: SL/TP cents staged on Buy click, applied on fill reconcile. */
   const buyBundleArmRef = useRef<{
     sl: string;
@@ -1002,8 +1095,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   /** Re-run bracket triggers on a timer while armed (live mids can update without React state churn). */
   /** CLOB poll target while SL/TP armed — tracks bracket token even when the UP/DOWN tab differs. */
   const [bracketPollToken, setBracketPollToken] = useState<string | null>(null);
-  /** SL/TP localStorage + poll follow the armed position token, not the visible UP/DOWN tab. */
-  const riskPrefsToken = bracketPollToken?.trim() || token?.trim() || '';
+  /** SL/TP editor + localStorage follow the visible UP/DOWN tab (like limit price). */
+  const riskPrefsToken = token?.trim() || '';
   const armedBracketLane = useMemo((): 'up' | 'down' | null => {
     const pt = bracketPollToken?.trim();
     if (!pt) return null;
@@ -1053,15 +1146,34 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const [takeProfitEnabled, setTakeProfitEnabled] = useState(false);
   const [takeProfitTakeCents, setTakeProfitTakeCents] = useState('');
   const [takeProfitLimitCents, setTakeProfitLimitCents] = useState('');
+  stopLossStopCentsRef.current = stopLossStopCents;
+  takeProfitTakeCentsRef.current = takeProfitTakeCents;
+
+  /** Swap bracket editor fields when UP/DOWN tab changes without wiping in-session drafts. */
+  useEffect(() => {
+    const prev = prevBracketLaneRef.current;
+    if (prev === lane) return;
+    bracketLaneDraftRef.current[prev] = {
+      sl: stopLossStopCentsRef.current,
+      tp: takeProfitTakeCentsRef.current,
+    };
+    prevBracketLaneRef.current = lane;
+    const d = bracketLaneDraftRef.current[lane];
+    setStopLossStopCents(d.sl);
+    setStopLossLimitCents(d.sl);
+    setTakeProfitTakeCents(d.tp);
+    setTakeProfitLimitCents(d.tp);
+  }, [lane]);
   const [takeProfitShares, setTakeProfitShares] = useState('');
   const [takeProfitStatus, setTakeProfitStatus] = useState<'OFF' | 'ARMED' | 'TRIGGERED'>('OFF');
 
   /** Suggested TP/SL levels (displayed as hints — never auto-filled into the inputs). */
   const [suggestedSlCents, setSuggestedSlCents] = useState('');
   const [suggestedTpCents, setSuggestedTpCents] = useState('');
-  /** Buy-on-fill panel only — isolated from persisted/armed bracket automation. */
-  const [buyBundleSlCents, setBuyBundleSlCents] = useState('');
-  const [buyBundleTpCents, setBuyBundleTpCents] = useState('');
+  /** Buy-on-fill SL/TP drafts — one pair per UP/DOWN lane (survives lane switches). */
+  const [buyBundleByLane, setBuyBundleByLane] = useState(EMPTY_BUY_BUNDLE_BY_LANE);
+  const buyBundleSlCents = buyBundleByLane[lane].sl;
+  const buyBundleTpCents = buyBundleByLane[lane].tp;
   const [takeProfitSimple, setTakeProfitSimple] = useState(true);
   const [takeProfitDualBook, setTakeProfitDualBook] = useState(false);
   const takeProfitFireLockRef = useRef(false);
@@ -2912,27 +3024,41 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const applyStopLossTriggerCents = useCallback(
     (v: string) => {
       operatorSlTpLockedRef.current = true;
+      bracketLaneDraftRef.current[lane] = { ...bracketLaneDraftRef.current[lane], sl: v };
       setStopLossStopCents(v);
       setStopLossLimitCents(v);
       syncBracketPinFromOperatorEdits({ stopCents: v });
+      if (riskPrefsToken) {
+        saveBracketLevelsDraft(riskPrefsToken, {
+          sl: v,
+          tp: takeProfitTakeCentsRef.current,
+        });
+      }
       if (positionShares != null && positionShares > 0) {
         setStopLossShares(String(floorShares4(positionShares)));
       }
     },
-    [positionShares, syncBracketPinFromOperatorEdits],
+    [lane, positionShares, riskPrefsToken, syncBracketPinFromOperatorEdits],
   );
 
   const applyTakeProfitTriggerCents = useCallback(
     (v: string) => {
       operatorSlTpLockedRef.current = true;
+      bracketLaneDraftRef.current[lane] = { ...bracketLaneDraftRef.current[lane], tp: v };
       setTakeProfitTakeCents(v);
       setTakeProfitLimitCents(v);
       syncBracketPinFromOperatorEdits({ tpCents: v });
+      if (riskPrefsToken) {
+        saveBracketLevelsDraft(riskPrefsToken, {
+          sl: stopLossStopCentsRef.current,
+          tp: v,
+        });
+      }
       if (positionShares != null && positionShares > 0) {
         setTakeProfitShares(String(floorShares4(positionShares)));
       }
     },
-    [positionShares, syncBracketPinFromOperatorEdits],
+    [lane, positionShares, riskPrefsToken, syncBracketPinFromOperatorEdits],
   );
 
   const bidTouch01ForExplain = useMemo(() => {
@@ -3411,8 +3537,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         buyBundleArmRef.current = null;
         buyRiskArmedRowIdsRef.current.add(rowId);
         applyFilledBuyBundle({ rowTok, riskLane, shares: sh, sl: bundle.sl, tp: bundle.tp });
-        setBuyBundleSlCents('');
-        setBuyBundleTpCents('');
+        setBuyBundleByLane((prev) => ({ ...prev, [riskLane]: { sl: '', tp: '' } }));
         if (firstToast) {
           const parts: string[] = [];
           if (bundle.sl) parts.push(`SL ${bundle.sl}¢`);
@@ -3963,8 +4088,14 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     }
     try {
       const raw = window.localStorage.getItem(stopLossKey);
+      const draft = loadBracketLevelsDraft(tok);
+      const laneDraft = bracketLaneDraftRef.current[lane];
       if (!raw) {
+        const sl = laneDraft.sl || draft?.sl || '';
         setStopLossEnabled(false);
+        setStopLossStopCents(sl);
+        setStopLossLimitCents(sl);
+        setStopLossShares('');
         setStopLossStatus('OFF');
         setStopLossSimple(true);
         setStopLossDualBook(false);
@@ -3985,8 +4116,12 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       setStopLossDualBook(dualBook);
       setStopLossSimple(simple);
       setStopLossEnabled(enabled);
-      setStopLossStopCents(stop01 != null ? (stop01 * 100).toFixed(1) : '');
-      setStopLossLimitCents(limit01 != null ? (limit01 * 100).toFixed(1) : '');
+      setStopLossStopCents(
+        stop01 != null ? formatBracketCentsFromNumber(Math.round(stop01 * 100)) : laneDraft.sl || draft?.sl || '',
+      );
+      setStopLossLimitCents(
+        limit01 != null ? formatBracketCentsFromNumber(Math.round(limit01 * 100)) : laneDraft.sl || draft?.sl || '',
+      );
       setStopLossShares(shares != null ? String(shares) : '');
       setStopLossStatus(enabled ? 'ARMED' : 'OFF');
     } catch {
@@ -4019,8 +4154,14 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     }
     try {
       const raw = window.localStorage.getItem(takeProfitKey);
+      const draft = loadBracketLevelsDraft(tok);
+      const laneDraft = bracketLaneDraftRef.current[lane];
       if (!raw) {
+        const tp = laneDraft.tp || draft?.tp || '';
         setTakeProfitEnabled(false);
+        setTakeProfitTakeCents(tp);
+        setTakeProfitLimitCents(tp);
+        setTakeProfitShares('');
         setTakeProfitStatus('OFF');
         setTakeProfitSimple(true);
         setTakeProfitDualBook(false);
@@ -4041,8 +4182,12 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       setTakeProfitDualBook(dualBook);
       setTakeProfitSimple(simple);
       setTakeProfitEnabled(enabled);
-      setTakeProfitTakeCents(take01 != null ? (take01 * 100).toFixed(1) : '');
-      setTakeProfitLimitCents(limit01 != null ? (limit01 * 100).toFixed(1) : '');
+      setTakeProfitTakeCents(
+        take01 != null ? formatBracketCentsFromNumber(Math.round(take01 * 100)) : laneDraft.tp || draft?.tp || '',
+      );
+      setTakeProfitLimitCents(
+        limit01 != null ? formatBracketCentsFromNumber(Math.round(limit01 * 100)) : laneDraft.tp || draft?.tp || '',
+      );
       setTakeProfitShares(shares != null ? String(shares) : '');
       setTakeProfitStatus(enabled ? 'ARMED' : 'OFF');
     } catch {
@@ -4261,16 +4406,18 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   // Re-run bracket triggers on a timer while armed (live mids can update without React state churn).
   useEffect(() => {
     const armed =
-      (accountMode === 'live' || accountMode === 'paper') && (stopLossEnabled || takeProfitEnabled);
+      (accountMode === 'live' || accountMode === 'paper') &&
+      bracketAutomationActive({ bracketPollToken, stopLossEnabled, takeProfitEnabled });
     if (!armed) return;
     const id = window.setInterval(() => setBracketEvalTick((t) => t + 1), BRACKET_EVAL_MS);
     return () => window.clearInterval(id);
-  }, [accountMode, stopLossEnabled, takeProfitEnabled]);
+  }, [accountMode, bracketPollToken, stopLossEnabled, takeProfitEnabled]);
 
   // Fast REST top-of-book while SL/TP armed — bid can move faster than chart-driven props.
   useEffect(() => {
     const needPoll =
-      (accountMode === 'live' || accountMode === 'paper') && (stopLossEnabled || takeProfitEnabled);
+      (accountMode === 'live' || accountMode === 'paper') &&
+      bracketAutomationActive({ bracketPollToken, stopLossEnabled, takeProfitEnabled });
     if (!needPoll) {
       setStopPollBid01(null);
       setStopPollAsk01(null);
@@ -4320,13 +4467,18 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   useEffect(() => {
     const tok = bracketOutcomeTokenRef.current?.trim() || token?.trim();
     if (!tok) return;
-    if (!stopLossEnabled) {
+    const automationTok = bracketPollToken?.trim() || tok;
+    const useStoredCfg = Boolean(bracketPollToken?.trim() && bracketPollToken.trim() !== token?.trim());
+    const storedSl = useStoredCfg ? loadStopLossConfigFromStorage(automationTok) : null;
+    const slEnabled = storedSl?.enabled ?? stopLossEnabled;
+    if (!slEnabled) {
       setStopLossStatus('OFF');
       return;
     }
-    const stop01 = centsStrTo01(stopLossStopCents);
-    const limit01 = centsStrTo01(stopLossLimitCents);
-    const shReq = Number(stopLossShares);
+    const stop01 = storedSl?.stop01 ?? centsStrTo01(stopLossStopCents);
+    const limit01 = storedSl?.limit01 ?? centsStrTo01(stopLossLimitCents);
+    const shReq = storedSl?.shares ?? Number(stopLossShares);
+    const slSimple = storedSl?.simple ?? stopLossSimple;
     if (stop01 == null || limit01 == null || !Number.isFinite(shReq) || shReq <= 0) {
       setStopLossStatus('ARMED');
       return;
@@ -4399,7 +4551,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     void (async () => {
       try {
         let sellable = positionForSl;
-        const px = stopLossExecLimit01({ stop01, limit01, ref01: execRef01, simple: stopLossSimple });
+        const px = stopLossExecLimit01({ stop01, limit01, ref01: execRef01, simple: slSimple });
         const quoted01 = execRef01;
 
         if (accountMode === 'paper') {
@@ -4647,6 +4799,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     refreshPositionAndMaxSell,
     resolvedBullpenOutcome,
     afterLiveSellRowReconcile,
+    bracketPollToken,
     scheduleTruthRefreshBurst,
     stopLossDualBook,
     stopLossEnabled,
@@ -4666,13 +4819,20 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   useEffect(() => {
     const tok = bracketOutcomeTokenRef.current?.trim() || token?.trim();
     if (!tok) return;
-    if (!takeProfitEnabled) {
+    const automationTok = bracketPollToken?.trim() || tok;
+    const useStoredCfg = Boolean(bracketPollToken?.trim() && bracketPollToken.trim() !== token?.trim());
+    const storedTp = useStoredCfg ? loadTakeProfitConfigFromStorage(automationTok) : null;
+    const storedSl = useStoredCfg ? loadStopLossConfigFromStorage(automationTok) : null;
+    const tpEnabled = storedTp?.enabled ?? takeProfitEnabled;
+    if (!tpEnabled) {
       setTakeProfitStatus('OFF');
       return;
     }
-    const take01 = centsStrTo01(takeProfitTakeCents);
-    const limit01 = centsStrTo01(takeProfitLimitCents);
-    const shReq = Number(takeProfitShares);
+    const take01 = storedTp?.take01 ?? centsStrTo01(takeProfitTakeCents);
+    const limit01 = storedTp?.limit01 ?? centsStrTo01(takeProfitLimitCents);
+    const shReq = storedTp?.shares ?? Number(takeProfitShares);
+    const tpSimple = storedTp?.simple ?? takeProfitSimple;
+    const slEnabledForLock = storedSl?.enabled ?? stopLossEnabled;
     if (take01 == null || limit01 == null || !Number.isFinite(shReq) || shReq <= 0) {
       setTakeProfitStatus('ARMED');
       return;
@@ -4732,7 +4892,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       return;
     }
     if (takeProfitFireLockRef.current) return;
-    if (stopLossEnabled && stopLossFireLockRef.current) return;
+    if (slEnabledForLock && stopLossFireLockRef.current) return;
     if (takeProfitLastFireTokRef.current === tok) return;
     if (bracketExitCooldownActive(takeProfitLastAttemptMsRef.current)) return;
 
@@ -4742,7 +4902,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
 
     void (async () => {
       try {
-        const px = takeProfitExecLimit01({ take01, limit01, ref01: execRef01, simple: takeProfitSimple });
+        const px = takeProfitExecLimit01({ take01, limit01, ref01: execRef01, simple: tpSimple });
         const quoted01 = execRef01;
 
         if (accountMode === 'paper') {
@@ -4990,6 +5150,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     refreshPositionAndMaxSell,
     resolvedBullpenOutcome,
     afterLiveSellRowReconcile,
+    bracketPollToken,
+    stopLossEnabled,
     stopPollAsk01,
     stopPollBid01,
     stopPollAtMs,
@@ -5473,18 +5635,66 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     [avgEntry, bracketPlannedEntry01, mid01],
   );
 
-  const applyBuyBundleSlCents = useCallback((v: string) => {
-    setBuyBundleSlCents(v);
-  }, []);
+  /** Live SL/TP hints for the visible UP/DOWN lane — tracks quote/limit as the book moves. */
+  const liveSuggestedLevels = useMemo(() => {
+    const entry01 =
+      action === 'buy'
+        ? bracketPlannedEntry01 ??
+          executableQuote01 ??
+          (mid01 != null && mid01 > 0 && mid01 < 1 ? mid01 : null)
+        : avgEntry ??
+          executableQuote01 ??
+          (mid01 != null && mid01 > 0 && mid01 < 1 ? mid01 : null);
+    if (entry01 == null || !(entry01 > 0) || entry01 >= 1) return null;
+    const laneTouch = lane === 'up' ? (bookTouchUp ?? null) : (bookTouchDown ?? null);
+    const { stopCents, tpCents } = spreadBracketFromFillPrice01(entry01, laneTouch);
+    return {
+      stopCents,
+      tpCents,
+      entryCents: (entry01 * 100).toFixed(1),
+    };
+  }, [
+    action,
+    avgEntry,
+    bookTouchDown,
+    bookTouchUp,
+    bracketPlannedEntry01,
+    executableQuote01,
+    lane,
+    mid01,
+  ]);
 
-  const applyBuyBundleTpCents = useCallback((v: string) => {
-    setBuyBundleTpCents(v);
-  }, []);
+  const suggestedSlDisplay =
+    liveSuggestedLevels?.stopCents ?? riskTargetsFromEntry?.stopCents ?? targets?.stopCents ?? '';
+  const suggestedTpDisplay =
+    liveSuggestedLevels?.tpCents ?? riskTargetsFromEntry?.tpCents ?? targets?.tpCents ?? '';
 
-  useEffect(() => {
-    setBuyBundleSlCents('');
-    setBuyBundleTpCents('');
-  }, [token?.trim(), lane]);
+  const applyBuyBundleSlCents = useCallback(
+    (v: string) => {
+      setBuyBundleByLane((prev) => ({ ...prev, [lane]: { ...prev[lane], sl: v } }));
+    },
+    [lane],
+  );
+
+  const applyBuyBundleTpCents = useCallback(
+    (v: string) => {
+      setBuyBundleByLane((prev) => ({ ...prev, [lane]: { ...prev[lane], tp: v } }));
+    },
+    [lane],
+  );
+
+  const applySuggestedBuyBundleLevels = useCallback(() => {
+    const sl = suggestedSlDisplay.trim();
+    const tp = suggestedTpDisplay.trim();
+    if (!sl && !tp) return;
+    setBuyBundleByLane((prev) => ({
+      ...prev,
+      [lane]: {
+        sl: sl || prev[lane].sl,
+        tp: tp || prev[lane].tp,
+      },
+    }));
+  }, [lane, suggestedSlDisplay, suggestedTpDisplay]);
 
   const buyBundleStaged = Boolean(buyBundleSlCents.trim() || buyBundleTpCents.trim());
 
@@ -6296,21 +6506,20 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                             />
                           </label>
 
-                          {(suggestedSlCents || riskTargetsFromEntry?.stopCents) && !stopLossStopCents.trim() ? (
+                          {suggestedSlDisplay && !stopLossStopCents.trim() ? (
                             <div className="flex items-center justify-between rounded-md border border-rose-800/20 bg-rose-950/10 px-2.5 py-1">
                               <span className="text-[10px] text-rose-300/80">
-                                Suggested <span className="font-mono font-bold text-rose-200">{suggestedSlCents || riskTargetsFromEntry?.stopCents}¢</span>
+                                Suggested <span className="font-mono font-bold text-rose-200">{suggestedSlDisplay}¢</span>
+                                {liveSuggestedLevels ? (
+                                  <span className="text-zinc-600"> · ref {liveSuggestedLevels.entryCents}¢</span>
+                                ) : null}
                               </span>
                               <button
                                 type="button"
                                 className="rounded border border-rose-700/40 bg-rose-950/30 px-1.5 py-0.5 text-[9px] font-bold text-rose-100 hover:bg-rose-900/40"
                                 onClick={() => {
-                                  const v = suggestedSlCents || riskTargetsFromEntry?.stopCents || '';
-                                  setStopLossStopCents(v);
-                                  setStopLossLimitCents(v);
-                                  operatorSlTpLockedRef.current = true;
-                                  syncBracketPinFromOperatorEdits({ stopCents: v });
-                                  if (positionShares != null && positionShares > 0) setStopLossShares(String(floorShares4(positionShares)));
+                                  const v = suggestedSlDisplay;
+                                  applyStopLossTriggerCents(v);
                                 }}
                               >
                                 Use
@@ -6320,6 +6529,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
 
                           {/* Trigger: ¢, % off ref, or $/sh — stored as cents for automation. */}
                           <BracketTriggerInput
+                            key={`bracket-sl-${lane}`}
                             kind="sl"
                             centsValue={stopLossStopCents}
                             onCentsChange={applyStopLossTriggerCents}
@@ -6328,6 +6538,12 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                             orderShares={bracketOrderShares}
                             mid01={mid ?? null}
                             placeholderCents={targets?.stopCents}
+                            suggestedCents={suggestedSlDisplay || undefined}
+                            onApplySuggested={() => {
+                              const v = suggestedSlDisplay;
+                              if (!v) return;
+                              applyStopLossTriggerCents(v);
+                            }}
                           />
 
                           <details className="rounded-lg border border-zinc-800/60 bg-black/15 px-3 py-2">
@@ -6437,21 +6653,20 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                             />
                           </label>
 
-                          {(suggestedTpCents || riskTargetsFromEntry?.tpCents) && !takeProfitTakeCents.trim() ? (
+                          {suggestedTpDisplay && !takeProfitTakeCents.trim() ? (
                             <div className="flex items-center justify-between rounded-md border border-emerald-800/20 bg-emerald-950/10 px-2.5 py-1">
                               <span className="text-[10px] text-emerald-300/80">
-                                Suggested <span className="font-mono font-bold text-emerald-200">{suggestedTpCents || riskTargetsFromEntry?.tpCents}¢</span>
+                                Suggested <span className="font-mono font-bold text-emerald-200">{suggestedTpDisplay}¢</span>
+                                {liveSuggestedLevels ? (
+                                  <span className="text-zinc-600"> · ref {liveSuggestedLevels.entryCents}¢</span>
+                                ) : null}
                               </span>
                               <button
                                 type="button"
                                 className="rounded border border-emerald-700/40 bg-emerald-950/30 px-1.5 py-0.5 text-[9px] font-bold text-emerald-100 hover:bg-emerald-900/40"
                                 onClick={() => {
-                                  const v = suggestedTpCents || riskTargetsFromEntry?.tpCents || '';
-                                  setTakeProfitTakeCents(v);
-                                  setTakeProfitLimitCents(v);
-                                  operatorSlTpLockedRef.current = true;
-                                  syncBracketPinFromOperatorEdits({ tpCents: v });
-                                  if (positionShares != null && positionShares > 0) setTakeProfitShares(String(floorShares4(positionShares)));
+                                  const v = suggestedTpDisplay;
+                                  applyTakeProfitTriggerCents(v);
                                 }}
                               >
                                 Use
@@ -6461,6 +6676,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
 
                           {/* Trigger: ¢, % off ref, or $/sh — stored as cents for automation. */}
                           <BracketTriggerInput
+                            key={`bracket-tp-${lane}`}
                             kind="tp"
                             centsValue={takeProfitTakeCents}
                             onCentsChange={applyTakeProfitTriggerCents}
@@ -6469,6 +6685,12 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                             orderShares={bracketOrderShares}
                             mid01={mid ?? null}
                             placeholderCents={riskTargetsFromEntry?.tpCents ?? targets?.tpCents}
+                            suggestedCents={suggestedTpDisplay || undefined}
+                            onApplySuggested={() => {
+                              const v = suggestedTpDisplay;
+                              if (!v) return;
+                              applyTakeProfitTriggerCents(v);
+                            }}
                           />
 
                           <details className="rounded-lg border border-zinc-800/60 bg-black/15 px-3 py-2">
@@ -8567,6 +8789,17 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   >
                     Use as limit price
                   </button>
+                  <button
+                    type="button"
+                    className="mt-2 w-full rounded-lg border border-emerald-700/30 bg-emerald-950/20 px-3 py-2 text-[11px] font-bold text-emerald-100 hover:bg-emerald-950/35"
+                    onClick={() => {
+                      applyBuyBundleTpCents(targets.tpCents);
+                      setErr(null);
+                      setOkMsg(null);
+                    }}
+                  >
+                    Set TP on fill
+                  </button>
                   {positionShares != null && positionShares > 0 ? (
                     <div className="mt-2 grid grid-cols-3 gap-2">
                       {[0.25, 0.5, 1].map((pct) => (
@@ -8611,6 +8844,17 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   >
                     Use as limit price
                   </button>
+                  <button
+                    type="button"
+                    className="mt-2 w-full rounded-lg border border-rose-700/30 bg-rose-950/20 px-3 py-2 text-[11px] font-bold text-rose-100 hover:bg-rose-950/35"
+                    onClick={() => {
+                      applyBuyBundleSlCents(targets.stopCents);
+                      setErr(null);
+                      setOkMsg(null);
+                    }}
+                  >
+                    Set SL on fill
+                  </button>
                   {positionShares != null && positionShares > 0 ? (
                     <div className="mt-2 grid grid-cols-3 gap-2">
                       {[0.25, 0.5, 1].map((pct) => (
@@ -8650,8 +8894,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                       className="rounded-lg border border-rose-800/35 bg-rose-950/15 px-2.5 py-1.5 text-[10px] font-bold text-rose-100 hover:bg-rose-950/25"
                       title="Fill stop-loss trigger/limit fields (live: open Sell → Stop-loss)"
                       onClick={() => {
-                        setStopLossStopCents(riskTargetsFromEntry.stopCents);
-                        setStopLossLimitCents(riskTargetsFromEntry.stopCents);
+                        applyStopLossTriggerCents(riskTargetsFromEntry.stopCents);
                       }}
                     >
                       Apply to SL fields
@@ -8661,8 +8904,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                       className="rounded-lg border border-emerald-800/35 bg-emerald-950/15 px-2.5 py-1.5 text-[10px] font-bold text-emerald-100 hover:bg-emerald-950/25"
                       title="Fill take-profit trigger/limit fields (live: open Sell → Take-profit)"
                       onClick={() => {
-                        setTakeProfitTakeCents(riskTargetsFromEntry.tpCents);
-                        setTakeProfitLimitCents(riskTargetsFromEntry.tpCents);
+                        applyTakeProfitTriggerCents(riskTargetsFromEntry.tpCents);
                       }}
                     >
                       Apply to TP fields
@@ -8677,9 +8919,23 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
           ) : null}
 
           <div className="mt-2 rounded-lg border border-zinc-800/55 bg-zinc-900/20 px-2 py-1.5">
-            <div className="text-[9px] font-semibold uppercase tracking-wide text-zinc-500">SL / TP on fill</div>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="text-[9px] font-semibold uppercase tracking-wide text-zinc-500">SL / TP on fill</div>
+              {(suggestedSlDisplay || suggestedTpDisplay) &&
+              !buyBundleSlCents.trim() &&
+              !buyBundleTpCents.trim() ? (
+                <button
+                  type="button"
+                  className="rounded border border-zinc-700/50 bg-black/25 px-2 py-0.5 text-[9px] font-bold text-zinc-200 hover:bg-black/35"
+                  onClick={applySuggestedBuyBundleLevels}
+                >
+                  Use suggested
+                </button>
+              ) : null}
+            </div>
             <div className="mt-1 flex flex-col gap-1">
               <BracketTriggerInput
+                key={`buy-sl-${lane}`}
                 compact
                 kind="sl"
                 centsValue={buyBundleSlCents}
@@ -8689,14 +8945,15 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                 orderShares={buyBundleShares}
                 mid01={mid ?? null}
                 placeholderCents={targets?.stopCents}
-                suggestedCents={suggestedSlCents || riskTargetsFromEntry?.stopCents}
+                suggestedCents={suggestedSlDisplay || undefined}
                 onApplySuggested={() => {
-                  const v = suggestedSlCents || riskTargetsFromEntry?.stopCents || '';
+                  const v = suggestedSlDisplay;
                   if (!v) return;
                   applyBuyBundleSlCents(v);
                 }}
               />
               <BracketTriggerInput
+                key={`buy-tp-${lane}`}
                 compact
                 kind="tp"
                 centsValue={buyBundleTpCents}
@@ -8706,9 +8963,9 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                 orderShares={buyBundleShares}
                 mid01={mid ?? null}
                 placeholderCents={riskTargetsFromEntry?.tpCents ?? targets?.tpCents}
-                suggestedCents={suggestedTpCents || riskTargetsFromEntry?.tpCents}
+                suggestedCents={suggestedTpDisplay || undefined}
                 onApplySuggested={() => {
-                  const v = suggestedTpCents || riskTargetsFromEntry?.tpCents || '';
+                  const v = suggestedTpDisplay;
                   if (!v) return;
                   applyBuyBundleTpCents(v);
                 }}
@@ -8854,8 +9111,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                             tp: bundle?.tp ?? buyBundleTpCents.trim(),
                           });
                           buyBundleArmRef.current = null;
-                          setBuyBundleSlCents('');
-                          setBuyBundleTpCents('');
+                          setBuyBundleByLane((prev) => ({ ...prev, [submitLane]: { sl: '', tp: '' } }));
                         } else {
                           applyArmRiskAfterBuyFill(r.fill.price01, r.fill.shares, submitLane);
                         }

@@ -25,7 +25,8 @@ export function lastPointMs(points: readonly { t: number }[]): number | null {
 export function seedProbSeriesFromLiveMid(series: SpotPoint[], liveMid: number | null, anchorMs: number): SpotPoint[] {
   if (series.length >= 2) return series;
   if (liveMid == null || !Number.isFinite(liveMid) || liveMid <= 0 || liveMid >= 1) return series;
-  const t = anchorMs > 0 ? anchorMs : Date.now();
+  const tRaw = anchorMs > 0 ? anchorMs : Date.now();
+  const t = normalizeEpochMs(tRaw) ?? tRaw;
   if (series.length === 1) {
     const p = series[0]!;
     return [
@@ -48,14 +49,19 @@ export function appendLiveMidSeries(series: SpotPoint[], liveMid: number | null,
   if (!base.length) {
     return seedProbSeriesFromLiveMid([], liveMid, anchorMs);
   }
-  const t = anchorMs > 0 ? anchorMs : Date.now();
+  const tRaw = anchorMs > 0 ? anchorMs : Date.now();
+  const t = normalizeEpochMs(tRaw) ?? tRaw;
   const last = base[base.length - 1]!;
   const lastT = normalizeEpochMs(last.t) ?? last.t;
   const midDelta = Math.abs((last.v ?? 0) - liveMid);
   if (t <= lastT + 400) {
-    if (midDelta < 0.0002) return base;
+    if (midDelta < 0.0002) {
+      // Mid flat but poll is fresh — bump timestamp so stale badges stay live.
+      if (t > lastT) return [...base.slice(0, -1), { t, v: last.v ?? liveMid }];
+      return base;
+    }
     // Same poll window but mid moved — refresh last point so lag/delta readouts tick live.
-    return [...base.slice(0, -1), { t: last.t, v: liveMid }];
+    return [...base.slice(0, -1), { t: Math.max(lastT, t), v: liveMid }];
   }
   return [...base.slice(-479), { t, v: liveMid }];
 }
@@ -63,7 +69,8 @@ export function appendLiveMidSeries(series: SpotPoint[], liveMid: number | null,
 /** Pin latest RTDS spot onto slug series so the PTB chart line ticks with live spot. */
 export function appendLiveSpotSeries(series: SpotPoint[], liveSpot: number | null, anchorMs: number): SpotPoint[] {
   if (liveSpot == null || !Number.isFinite(liveSpot)) return series;
-  const t = anchorMs > 0 ? anchorMs : Date.now();
+  const tRaw = anchorMs > 0 ? anchorMs : Date.now();
+  const t = normalizeEpochMs(tRaw) ?? tRaw;
   if (!series.length) {
     return [
       { t: t - 2000, v: liveSpot },
@@ -75,8 +82,13 @@ export function appendLiveSpotSeries(series: SpotPoint[], liveSpot: number | nul
   const lastT = normalizeEpochMs(last.t) ?? last.t;
   const delta = Math.abs(last.v - liveSpot);
   if (t <= lastT + 400) {
-    if (delta < 0.01) return series;
-    return [...series.slice(0, -1), { t: last.t, v: liveSpot }];
+    if (delta < 1e-9) {
+      // Spot flat but poll is fresh — bump timestamp so stale badges stay live.
+      if (t > lastT) return [...series.slice(0, -1), { t, v: last.v }];
+      return series;
+    }
+    // Same poll window — refresh last point so the chart line tracks live spot.
+    return [...series.slice(0, -1), { t: Math.max(lastT, t), v: liveSpot }];
   }
   return [...series.slice(-479), { t, v: liveSpot }];
 }

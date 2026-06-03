@@ -80,7 +80,7 @@ describe('buildNowPriceGlanceSummary', () => {
     expect(g.tradeCall).toBe('NO TRADE');
     expect(g.upBreakShort).toContain('below');
     expect(g.downBreakShort).toContain('above');
-    expect(g.speedLabel).toContain('Down');
+    expect(g.speedLabel).toMatch(/CHASING|SELL PRESSURE|NO TRADE/i);
     expect(g.bannerLine).toContain('Signal: Down');
     expect(edgeScalp).not.toBeNull();
     expect(g.edgeLabel).toMatch(/^Edge /);
