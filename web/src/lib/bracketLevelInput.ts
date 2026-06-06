@@ -47,6 +47,19 @@ function parsePositive(raw: string): number | null {
   return n;
 }
 
+/** USD / Total $ field — digits with optional decimal (max 2 places for total $). */
+export function sanitizeUsdBracketDraft(raw: string, usesTotal: boolean): string {
+  let s = raw.replace(/[^\d.]/g, '');
+  const firstDot = s.indexOf('.');
+  if (firstDot >= 0) {
+    const head = s.slice(0, firstDot + 1);
+    const tail = s.slice(firstDot + 1).replace(/\./g, '');
+    const maxFrac = usesTotal ? 2 : 4;
+    s = head + tail.slice(0, maxFrac);
+  }
+  return s;
+}
+
 function parseCentsStr(raw: string): number | null {
   const n = parsePositive(raw);
   if (n == null || n <= 0 || n >= 100) return null;

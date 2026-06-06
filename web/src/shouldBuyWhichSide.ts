@@ -14,6 +14,7 @@
  */
 
 import { tapeLaneVote, type SpotPtbMachineReadout } from './spotPtbMachineSignals';
+import type { DualOutcomeWallFlow } from './dualOutcomeWalls';
 import type { TapeVelocity } from './tapeVelocity';
 import type { SwitchForecast } from './sectionalMomentum';
 import type { TradeDirective } from './tradeDirective';
@@ -46,8 +47,33 @@ export type BuySideAdvisory = {
   cautionFresh: boolean;
 };
 
+export type ShouldBuyBookDualCall = {
+  lane: 'up' | 'down';
+  verdict: 'ENTER' | 'SCALP' | 'WATCH' | 'WAIT';
+  gate: 'ARMED' | 'PARTIAL' | 'NOT_ARMED';
+  go: boolean;
+  enterOnlyIf: string;
+  laneLock: {
+    lane: 'up' | 'down' | null;
+    status: 'LOCKED' | 'FORMING' | 'WAIT';
+    confidence: 'HIGH' | 'MED' | 'LOW';
+    reason: string;
+  };
+};
+
+export type ShouldBuyBookContext = {
+  dual: ShouldBuyBookDualCall | null;
+  wallFlow: DualOutcomeWallFlow | null;
+  probUp: number | null;
+  probDown: number | null;
+  midUp: number | null;
+  midDown: number | null;
+};
+
 export type ShouldBuyInput = {
   machine: SpotPtbMachineReadout | null;
+  /** Sports / book-only desk when spot+PTB machine is unavailable. */
+  book?: ShouldBuyBookContext | null;
   tape: TapeVelocity | null;
   tapeLane: 'up' | 'down' | null;
   forecast: SwitchForecast | null;
@@ -88,11 +114,151 @@ function cap(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
 }
 
+function shouldBuyWhichSideFromBook(input: ShouldBuyInput): BuySideAdvisory {
+  const { book, tape, tapeLane, directive, stability, upLabel, downLabel } = input;
+  if (!book) {
+    return {
+      ...NEITHER_ADVISORY,
+      recommendation: 'Waiting for order-book data — open the Book tab briefly.',
+    };
+  }
+
+  const { dual, wallFlow, probUp, probDown, midUp, midDown } = book;
+  const scores = { up: 0, down: 0 };
+  const addVote = (lane: 'up' | 'down' | null, weight: number) => {
+    if (lane === 'up') scores.up += weight;
+    else if (lane === 'down') scores.down += weight;
+  };
+
+  if (dual?.go) {
+    const base = dual.verdict === 'ENTER' ? 3.2 : dual.verdict === 'SCALP' ? 2.2 : 1.4;
+    addVote(dual.lane, base);
+    if (dual.laneLock.status === 'LOCKED') {
+      addVote(dual.lane, dual.laneLock.confidence === 'HIGH' ? 1.8 : dual.laneLock.confidence === 'MED' ? 1.0 : 0.4);
+    }
+  } else if (dual?.lane) {
+    addVote(dual.lane, 0.6);
+  }
+
+  if (wallFlow?.flowLane) {
+    addVote(wallFlow.flowLane, 1.4 + cap(wallFlow.pressure / 100, 0, 0.8));
+  }
+
+  if (probUp != null && probDown != null && Number.isFinite(probUp) && Number.isFinite(probDown)) {
+    const spread = probUp - probDown;
+    if (Math.abs(spread) >= 0.012) {
+      addVote(spread > 0 ? 'up' : 'down', 0.8 + Math.min(2, Math.abs(spread) * 12));
+    }
+  }
+
+  if (tape && tape.reliable && tapeLane) {
+    const tl = tapeLaneVote(tapeLane, tape.dominance);
+    if (tl) {
+      let w = 1.4;
+      if (tape.burst === 'aggressive') w += 0.35;
+      if (tape.burst === 'extreme') w += 0.6;
+      addVote(tl, w);
+    }
+  }
+
+  if (directive && (directive.action === 'INITIATE' || directive.action === 'ADD') && directive.lane) {
+    addVote(directive.lane, 1.2);
+  }
+
+  const margin = scores.up - scores.down;
+  const absMargin = Math.abs(margin);
+  const winner: 'up' | 'down' | null = absMargin >= MIN_SCORE_MARGIN ? (margin > 0 ? 'up' : 'down') : null;
+
+  let agreementScore = 42;
+  if (dual?.go) {
+    agreementScore =
+      dual.laneLock.confidence === 'HIGH' ? 78 : dual.laneLock.confidence === 'MED' ? 64 : 52;
+    if (dual.gate === 'ARMED') agreementScore += 4;
+  }
+  if (wallFlow?.flowLane && wallFlow.flowLane === winner) agreementScore += 6;
+  if (tape?.reliable && tape.dominance !== 'idle' && tape.dominance !== 'mixed') agreementScore += 4;
+
+  if (!winner || agreementScore < MIN_AGREEMENT) {
+    const reasons: string[] = [];
+    if (!winner) reasons.push(`Book scores too close: ${scores.up.toFixed(1)} vs ${scores.down.toFixed(1)}.`);
+    else reasons.push(`Conviction ${agreementScore}% — below ${MIN_AGREEMENT}% threshold.`);
+    if (dual && !dual.go) reasons.push(`Dual belief ${dual.verdict} · gate ${dual.gate.replace('_', ' ')} — not GO yet.`);
+    return {
+      ...NEITHER_ADVISORY,
+      scores,
+      reasons,
+      recommendation: reasons[0] ?? 'No clear side from the book yet.',
+      cautionFresh: stability?.warnFresh === true || stability?.whipsaw === true,
+    };
+  }
+
+  const loser: 'up' | 'down' = winner === 'up' ? 'down' : 'up';
+  const winLabel = label(winner, upLabel, downLabel);
+  const winMid = winner === 'up' ? midUp : midDown;
+  const winProb = winner === 'up' ? probUp : probDown;
+
+  const confidence: BuySideConfidence =
+    agreementScore >= HIGH_CONF_AGREEMENT && absMargin >= 2.8 && dual?.go
+      ? 'HIGH'
+      : agreementScore >= MED_CONF_AGREEMENT && absMargin >= 1.8
+        ? 'MED'
+        : 'LOW';
+
+  let size = cap((agreementScore - 35) / 55, 0.1, 1);
+  if (confidence === 'LOW') size *= 0.55;
+  if (!dual?.go) size *= 0.65;
+
+  const reasons: string[] = [];
+  if (dual?.go) {
+    reasons.push(`Dual belief GO on ${winLabel} (${dual.verdict}, gate ${dual.gate.replace('_', ' ')}).`);
+  }
+  if (wallFlow?.flowLane === winner && wallFlow.headline.trim()) {
+    reasons.push(wallFlow.headline.trim());
+  }
+  if (winProb != null && winMid != null) {
+    reasons.push(`Implied ${winLabel} ${(winProb * 100).toFixed(1)}% · mid ${(winMid * 100).toFixed(1)}¢.`);
+  }
+  if (dual?.enterOnlyIf.trim()) reasons.push(dual.enterOnlyIf.trim());
+  if (reasons.length > 4) reasons.splice(4);
+
+  const risks: string[] = [];
+  if (dual && !dual.go) risks.push('Dual chart has not armed GO — confirm on Dual belief tab.');
+  if (wallFlow?.flowLane && wallFlow.flowLane !== winner) {
+    risks.push(`Wall flow favors ${label(wallFlow.flowLane, upLabel, downLabel)} — may oppose this lean.`);
+  }
+  if (risks.length > 2) risks.splice(2);
+
+  const recommendation =
+    confidence === 'HIGH'
+      ? `BUY ${winLabel} — dual belief + book flow align.`
+      : confidence === 'MED'
+        ? `Lean ${winLabel} — book momentum favors this side; confirm tape.`
+        : `Slight lean ${winLabel} — probe size only until dual GO.`;
+
+  return {
+    verdict: winner === 'up' ? 'BUY_UP' : 'BUY_DOWN',
+    confidence,
+    recommendation,
+    reasons,
+    risks,
+    suggestedSize: size,
+    edgePerShareUsd: null,
+    winProb: winProb ?? null,
+    mid: winMid ?? null,
+    scores,
+    cautionFresh: stability?.warnFresh === true || stability?.whipsaw === true,
+  };
+}
+
 /**
  * Ask the machine: should I buy UP or DOWN right now?
  */
 export function shouldBuyWhichSide(input: ShouldBuyInput): BuySideAdvisory {
-  const { machine, tape, tapeLane, forecast, directive, stability, upLabel, downLabel } = input;
+  const { machine, book, tape, tapeLane, forecast, directive, stability, upLabel, downLabel } = input;
+
+  if (!machine && book) {
+    return shouldBuyWhichSideFromBook(input);
+  }
 
   if (!machine) {
     return {

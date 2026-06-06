@@ -675,3 +675,158 @@ export function buildTradeDirective(input: TradeDirectiveInput): TradeDirective 
     evidence: [`Agreement ${agreement}%`, `Regime: ${regime}`],
   };
 }
+
+/** Dual implied-probability engine call — book-only markets (sports, etc.). */
+export type DualEngineCallForDirective = {
+  lane: 'up' | 'down';
+  verdict: 'ENTER' | 'SCALP' | 'WATCH' | 'WAIT';
+  gate: 'ARMED' | 'PARTIAL' | 'NOT_ARMED';
+  enterOnlyIf: string;
+  go: boolean;
+  laneLock: {
+    lane: 'up' | 'down' | null;
+    status: 'LOCKED' | 'FORMING' | 'WAIT';
+    confidence: 'HIGH' | 'MED' | 'LOW';
+    reason: string;
+  };
+};
+
+/**
+ * Sports / generic binary markets — no USD spot or PTB. Uses Dual belief engine only.
+ */
+export function buildTradeDirectiveFromDual(
+  dual: DualEngineCallForDirective | null,
+  input: Pick<TradeDirectiveInput, 'currentPositionLane' | 'upLabel' | 'downLabel'>,
+): TradeDirective {
+  const { currentPositionLane, upLabel, downLabel } = input;
+  if (!dual) {
+    return {
+      ...STAND_DOWN,
+      reason: 'Waiting for dual belief chart (need both outcome mids from the book).',
+    };
+  }
+
+  const lane = dual.lane;
+  const laneName = laneLabel(lane, upLabel, downLabel);
+  const lock = dual.laneLock;
+  const evidence: string[] = [
+    `Dual ${dual.verdict} · gate ${dual.gate.replace('_', ' ')}`,
+    lock.reason || `Lane lock ${lock.status}`,
+  ];
+  if (dual.enterOnlyIf.trim()) evidence.push(dual.enterOnlyIf.trim());
+
+  const conf: TradeDirective['confidence'] =
+    dual.go && dual.verdict === 'ENTER' && lock.confidence === 'HIGH'
+      ? 'HIGH'
+      : dual.go && (dual.verdict === 'ENTER' || dual.verdict === 'SCALP')
+        ? lock.confidence === 'LOW'
+          ? 'LOW'
+          : 'MED'
+        : 'LOW';
+
+  if (!dual.go || dual.verdict === 'WAIT' || dual.gate === 'NOT_ARMED') {
+    if (currentPositionLane === lane) {
+      return {
+        action: 'HOLD',
+        lane: currentPositionLane,
+        urgency: 'patient',
+        recommendedSize: 0,
+        headline: `HOLD ${laneName}`,
+        reason: 'Dual engine not GO — hold existing position until belief re-arms.',
+        evidence,
+        confidence: conf,
+        defensive: false,
+        edgePerShareUsd: null,
+        laneMid: null,
+        laneWinProb: null,
+        laneOutcomeLabel: laneName,
+      };
+    }
+    return {
+      ...STAND_DOWN,
+      headline: 'WAIT',
+      reason: dual.enterOnlyIf.trim() || 'Dual belief not armed — wait for GO on the chart.',
+      evidence,
+      confidence: conf,
+      defensive: true,
+      edgePerShareUsd: null,
+      laneMid: null,
+      laneWinProb: null,
+      laneOutcomeLabel: null,
+    };
+  }
+
+  const size =
+    dual.verdict === 'SCALP' ? 0.35 : lock.confidence === 'HIGH' ? 0.85 : lock.confidence === 'MED' ? 0.55 : 0.35;
+  const urgency: DirectiveUrgency = dual.verdict === 'ENTER' && lock.status === 'LOCKED' ? 'now' : 'soon';
+
+  if (!currentPositionLane) {
+    return {
+      action: 'INITIATE',
+      lane,
+      urgency,
+      recommendedSize: size,
+      headline: `INITIATE ${laneName}`,
+      reason: `Dual belief GO — ${dual.verdict.toLowerCase()} on ${laneName} from order-book momentum.`,
+      evidence,
+      confidence: conf,
+      defensive: false,
+      edgePerShareUsd: null,
+      laneMid: null,
+      laneWinProb: null,
+      laneOutcomeLabel: laneName,
+    };
+  }
+
+  if (currentPositionLane === lane) {
+    if (dual.verdict === 'SCALP') {
+      return {
+        action: 'TRIM',
+        lane,
+        urgency: 'soon',
+        recommendedSize: 0.25,
+        headline: `TRIM ${laneName}`,
+        reason: 'Dual SCALP — take partial profit while belief still favors your side.',
+        evidence,
+        confidence: conf,
+        defensive: false,
+        edgePerShareUsd: null,
+        laneMid: null,
+        laneWinProb: null,
+        laneOutcomeLabel: laneName,
+      };
+    }
+    return {
+      action: 'ADD',
+      lane,
+      urgency,
+      recommendedSize: Math.min(0.5, size * 0.6),
+      headline: `ADD ${laneName}`,
+      reason: 'Dual still GO on your held outcome — add on confirmation.',
+      evidence,
+      confidence: conf,
+      defensive: false,
+      edgePerShareUsd: null,
+      laneMid: null,
+      laneWinProb: null,
+      laneOutcomeLabel: laneName,
+    };
+  }
+
+  return {
+    action: 'FLIP',
+    lane,
+    urgency,
+    recommendedSize: size * 0.75,
+    headline: `FLIP to ${laneName}`,
+    reason: `Dual belief shifted to ${laneName} while you hold ${laneLabel(currentPositionLane, upLabel, downLabel)}.`,
+    evidence,
+    confidence: conf,
+    defensive: false,
+    edgePerShareUsd: null,
+    laneMid: null,
+    laneWinProb: null,
+    laneOutcomeLabel: laneName,
+    flipHeldOutcomeLabel: laneLabel(currentPositionLane, upLabel, downLabel),
+  };
+}

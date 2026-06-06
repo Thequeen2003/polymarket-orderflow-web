@@ -19,6 +19,8 @@ import { MachineVerdictCard } from './MachineVerdictCard';
 import { tapeLaneVote, type SpotPtbMachineReadout } from './spotPtbMachineSignals';
 import { TradeDirectiveCard, type TradeExecutionSnapshot } from './TradeDirectiveCard';
 import type { TradeDirective } from './tradeDirective';
+import { buildTradeDirectiveFromDual } from './tradeDirective';
+import { inferMarketKind, marketKindLabel, marketUsesPtbSpotDesk } from './marketKind';
 import { dispatchSignalRiskLevels } from './armRiskFromSignal';
 import { resolveTradeLevelsForDirective, suggestLevelsForLane } from './tradeLevels';
 import { buildPositionDeskAlerts, computePositionExitReadout } from './positionDeskAlerts';
@@ -45,6 +47,13 @@ import { buildHeldSideDeskMetrics } from './heldSideDeskMetrics';
 import { DeskClosePanel } from './DeskClosePanel';
 import { MomentumProjectionStrip } from './MomentumProjectionStrip';
 import { shouldBuyWhichSide, type BuySideAdvisory } from './shouldBuyWhichSide';
+
+function buyAdvisoryStableKey(a: BuySideAdvisory | null): string {
+  if (!a) return 'none';
+  return [a.verdict, a.confidence, a.recommendation, a.suggestedSize ?? ''].join('|');
+}
+
+const LIVE_BUY_ADVISORY_THROTTLE_MS = 2_500;
 import { ShouldBuyCard } from './ShouldBuyCard';
 import {
   loadAutoTradeOnDoThisNow,
@@ -298,6 +307,48 @@ function synthesizeCrossCheck(
   };
 }
 
+/** Book-only desk — Dual belief engine without Spot vs PTB cross-check. */
+function synthesizeCrossCheckBookOnly(
+  dual: DualEngineCall | null,
+  upLabel: string,
+  downLabel: string,
+): {
+  pill: string;
+  tone: 'emerald' | 'amber' | 'zinc' | 'rose';
+  title: string;
+  lines: string[];
+} {
+  if (!dual) {
+    return {
+      pill: 'INCOMPLETE',
+      tone: 'zinc',
+      title: 'Waiting for dual belief chart',
+      lines: ['Need both outcome mids from the order book. Open the Book tab briefly if charts are empty.'],
+    };
+  }
+  const laneName = dual.lane === 'up' ? upLabel : downLabel;
+  if (dual.go && (dual.verdict === 'ENTER' || dual.verdict === 'SCALP')) {
+    return {
+      pill: dual.verdict === 'ENTER' ? 'GO' : 'SCALP',
+      tone: 'emerald',
+      title: `${laneName}: Dual ${dual.verdict} · gate ${dual.gate.replace('_', ' ')}`,
+      lines: [
+        dual.enterOnlyIf || 'Dual belief armed on this outcome.',
+        `Lane lock ${dual.laneLock.status} (${dual.laneLock.confidence}) — ${dual.laneLock.reason}`,
+      ],
+    };
+  }
+  return {
+    pill: 'WAIT',
+    tone: 'zinc',
+    title: `${laneName}: Dual ${dual.verdict} · not GO`,
+    lines: [
+      dual.enterOnlyIf || 'Dual engine has not armed — wait for GO on the chart.',
+      `Gate ${dual.gate.replace('_', ' ')} · lock ${dual.laneLock.status}`,
+    ],
+  };
+}
+
 /**
  * Signals tab: dual implied-probability OHLC when book mids exist; else USD spot vs PTB.
  */
@@ -375,6 +426,9 @@ export function SignalsPtbOnly(props: {
     upLabel = 'Up';
     downLabel = 'Down';
   }
+
+  const marketKind = useMemo(() => inferMarketKind(slug ?? deskSlug, market), [slug, deskSlug, market]);
+  const bookOnlyDesk = !marketUsesPtbSpotDesk(marketKind);
   const upToken = idx && books ? (books[idx.up]?.token ?? '') : '';
   const downToken = idx && books ? (books[idx.down]?.token ?? '') : '';
 
@@ -444,6 +498,28 @@ export function SignalsPtbOnly(props: {
     tradePanelLane !== masterLane;
 
   const hasDual = probUp.length >= 1 && probDown.length >= 1;
+  const [spotChartCall, setSpotChartCall] = useState<SpotEngineCall | null>(null);
+  const [dualChartCall, setDualChartCall] = useState<DualEngineCall | null>(null);
+  const lastSpotCallKeyRef = useRef('');
+  const lastDualCallKeyRef = useRef('');
+  const onSpotPrimaryCall = useMemo(
+    () => (c: SpotEngineCall) => {
+      const key = JSON.stringify(c);
+      if (key === lastSpotCallKeyRef.current) return;
+      lastSpotCallKeyRef.current = key;
+      setSpotChartCall(c);
+    },
+    [],
+  );
+  const onDualSummary = useMemo(
+    () => (s: DualEngineCall) => {
+      const key = JSON.stringify(s);
+      if (key === lastDualCallKeyRef.current) return;
+      lastDualCallKeyRef.current = key;
+      setDualChartCall(s);
+    },
+    [],
+  );
   const spotChartLaneLockedRef = useRef(false);
   const lastSpotChartInferSlugRef = useRef<string | null>(null);
   const [spotChartLane, setSpotChartLane] = useState<'up' | 'down'>(() =>
@@ -748,19 +824,6 @@ export function SignalsPtbOnly(props: {
   }, [switchForecastSpot, tradeDirectiveSpot, machineVerdictSpot?.edges, machineVerdictSpot?.crossProb, endsInMs]);
 
   const [buySideAdvisory, setBuySideAdvisory] = useState<BuySideAdvisory | null>(null);
-  const askShouldBuy = useCallback(() => {
-    const result = shouldBuyWhichSide({
-      machine: machineVerdictSpot,
-      tape: tapeNowSpot,
-      tapeLane: deskTapeLane,
-      forecast: switchForecastSpot,
-      directive: tradeDirectiveSpot,
-      stability: stabilitySpot,
-      upLabel,
-      downLabel,
-    });
-    setBuySideAdvisory(result);
-  }, [machineVerdictSpot, tapeNowSpot, deskTapeLane, switchForecastSpot, tradeDirectiveSpot, stabilitySpot, upLabel, downLabel]);
 
   const executionSnapshotSpot = useMemo((): TradeExecutionSnapshot | null => {
     if (manualPositionLane == null) return null;
@@ -1034,55 +1097,155 @@ export function SignalsPtbOnly(props: {
   }, [slug, tradeDirectiveSpot, spot, priceToBeat, probUp, probDown, upToken, downToken]);
 
   const spotChartLive = priceToBeat != null && spot.length >= 2;
-  const [chartTab, setChartTab] = useState<'spot' | 'dual' | 'now' | 'plm'>('spot');
-  const showChartTabs = priceToBeat != null && spot.length >= 1;
-  const [spotChartCall, setSpotChartCall] = useState<{
-    lane: 'up' | 'down' | null;
-    status: 'ENTER' | 'PREP' | 'WAIT';
-    confidence: 'HIGH' | 'MED' | 'LOW';
-    reason: string;
-    enterWhen: string | null;
-  } | null>(null);
-  const [dualChartCall, setDualChartCall] = useState<{
-    lane: 'up' | 'down';
-    verdict: 'ENTER' | 'SCALP' | 'WATCH' | 'WAIT';
-    gate: 'ARMED' | 'PARTIAL' | 'NOT_ARMED';
-    enterLine: string | null;
-    enterOnlyIf: string;
-    go: boolean;
-    laneLock: { lane: 'up' | 'down' | null; status: 'LOCKED' | 'FORMING' | 'WAIT'; confidence: 'HIGH' | 'MED' | 'LOW'; reason: string };
-  } | null>(null);
+  const chartTabUserPickedRef = useRef(false);
+  const [chartTab, setChartTab] = useState<'spot' | 'dual' | 'now' | 'plm'>(() =>
+    bookOnlyDesk && hasDual ? 'dual' : 'spot',
+  );
+  const showChartTabs = hasDual || (priceToBeat != null && spot.length >= 1);
 
-  // Some child charts publish summaries on every render (objects in deps change).
-  // Guard against infinite re-render loops by only accepting a summary when it actually changed.
-  const lastSpotCallKeyRef = useRef<string>('');
-  const lastDualCallKeyRef = useRef<string>('');
-  const onSpotPrimaryCall = useMemo(
-    () => (c: SpotEngineCall) => {
-      const key = JSON.stringify(c);
-      if (key === lastSpotCallKeyRef.current) return;
-      lastSpotCallKeyRef.current = key;
-      setSpotChartCall(c);
+  useEffect(() => {
+    chartTabUserPickedRef.current = false;
+  }, [slug]);
+
+  useEffect(() => {
+    if (chartTabUserPickedRef.current) return;
+    if (!bookOnlyDesk || !hasDual) return;
+    setChartTab('dual');
+  }, [slug, bookOnlyDesk, hasDual]);
+
+  useEffect(() => {
+    if (!bookOnlyDesk) return;
+    const d = buildTradeDirectiveFromDual(dualChartCall, {
+      currentPositionLane: manualPositionLane,
+      upLabel,
+      downLabel,
+    });
+    onTradeDirectiveSpot(d);
+  }, [bookOnlyDesk, dualChartCall, manualPositionLane, upLabel, downLabel, onTradeDirectiveSpot]);
+
+  const shouldBuyBookContext = useMemo(() => {
+    const lastUp = probUp.length ? probUp[probUp.length - 1]!.v : null;
+    const lastDown = probDown.length ? probDown[probDown.length - 1]!.v : null;
+    const midU = midPrice(bookAbove);
+    const midD = midPrice(bookBelow);
+    return {
+      dual: dualChartCall,
+      wallFlow: dualWallFlow,
+      probUp: lastUp != null && Number.isFinite(lastUp) ? lastUp : null,
+      probDown: lastDown != null && Number.isFinite(lastDown) ? lastDown : null,
+      midUp: midU != null && Number.isFinite(midU) ? midU : null,
+      midDown: midD != null && Number.isFinite(midD) ? midD : null,
+    };
+  }, [bookAbove, bookBelow, dualChartCall, dualWallFlow, probDown, probUp]);
+
+  const askShouldBuy = useCallback(() => {
+    const result = shouldBuyWhichSide({
+      machine: bookOnlyDesk ? null : machineVerdictSpot,
+      book: bookOnlyDesk ? shouldBuyBookContext : null,
+      tape: tapeNowSpot,
+      tapeLane: deskTapeLane,
+      forecast: switchForecastSpot,
+      directive: tradeDirectiveSpot,
+      stability: stabilitySpot,
+      upLabel,
+      downLabel,
+    });
+    setBuySideAdvisory(result);
+    if (bookOnlyDesk) {
+      if (displayAdvisoryTimerRef.current != null) {
+        window.clearTimeout(displayAdvisoryTimerRef.current);
+        displayAdvisoryTimerRef.current = null;
+      }
+      displayAdvisoryKeyRef.current = buyAdvisoryStableKey(result);
+      setDisplayBuyAdvisory(result);
+    }
+  }, [
+    bookOnlyDesk,
+    deskTapeLane,
+    downLabel,
+    machineVerdictSpot,
+    shouldBuyBookContext,
+    stabilitySpot,
+    switchForecastSpot,
+    tapeNowSpot,
+    tradeDirectiveSpot,
+    upLabel,
+  ]);
+
+  const liveBuySideAdvisory = useMemo(() => {
+    if (!bookOnlyDesk) return null;
+    return shouldBuyWhichSide({
+      machine: null,
+      book: shouldBuyBookContext,
+      tape: tapeNowSpot,
+      tapeLane: deskTapeLane,
+      forecast: switchForecastSpot,
+      directive: tradeDirectiveSpot,
+      stability: stabilitySpot,
+      upLabel,
+      downLabel,
+    });
+  }, [
+    bookOnlyDesk,
+    deskTapeLane,
+    downLabel,
+    shouldBuyBookContext,
+    stabilitySpot,
+    switchForecastSpot,
+    tapeNowSpot,
+    tradeDirectiveSpot,
+    upLabel,
+  ]);
+
+  const liveAdvisoryStableKey = useMemo(
+    () => buyAdvisoryStableKey(liveBuySideAdvisory),
+    [
+      liveBuySideAdvisory?.verdict,
+      liveBuySideAdvisory?.confidence,
+      liveBuySideAdvisory?.recommendation,
+      liveBuySideAdvisory?.suggestedSize,
+    ],
+  );
+
+  const [displayBuyAdvisory, setDisplayBuyAdvisory] = useState<BuySideAdvisory | null>(null);
+  const displayAdvisoryKeyRef = useRef('');
+  const displayAdvisoryTimerRef = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (displayAdvisoryTimerRef.current != null) window.clearTimeout(displayAdvisoryTimerRef.current);
     },
     [],
   );
-  const onDualSummary = useMemo(
-    () => (s: DualEngineCall) => {
-      const key = JSON.stringify(s);
-      if (key === lastDualCallKeyRef.current) return;
-      lastDualCallKeyRef.current = key;
-      setDualChartCall(s);
-    },
-    [],
-  );
+
+  useEffect(() => {
+    if (!bookOnlyDesk) {
+      setDisplayBuyAdvisory(buySideAdvisory);
+      return;
+    }
+    if (liveAdvisoryStableKey === displayAdvisoryKeyRef.current) return;
+    if (displayAdvisoryTimerRef.current != null) window.clearTimeout(displayAdvisoryTimerRef.current);
+    displayAdvisoryTimerRef.current = window.setTimeout(() => {
+      displayAdvisoryTimerRef.current = null;
+      displayAdvisoryKeyRef.current = liveAdvisoryStableKey;
+      setDisplayBuyAdvisory(liveBuySideAdvisory);
+    }, LIVE_BUY_ADVISORY_THROTTLE_MS);
+  }, [bookOnlyDesk, buySideAdvisory, liveAdvisoryStableKey, liveBuySideAdvisory]);
+
+  const pickChartTab = useCallback((tab: 'spot' | 'dual' | 'now' | 'plm') => {
+    chartTabUserPickedRef.current = true;
+    setChartTab(tab);
+  }, []);
+
   /** Dual implied chart vs Spot strip picked different outcome lanes — Cross-check CONFLICT. */
   const crossEngineLaneConflict = useMemo(
     () =>
+      !bookOnlyDesk &&
       hasDual &&
       spotChartCall?.lane != null &&
       dualChartCall != null &&
       spotChartCall.lane !== dualChartCall.lane,
-    [hasDual, spotChartCall, dualChartCall],
+    [bookOnlyDesk, hasDual, spotChartCall, dualChartCall],
   );
 
   const deskPhysicsInput = useMemo((): EntryPhysicsInput => {
@@ -1675,8 +1838,11 @@ export function SignalsPtbOnly(props: {
   );
 
   const crossCheckMeta = useMemo(
-    () => synthesizeCrossCheck(spotChartCall, dualChartCall, upLabel, downLabel),
-    [spotChartCall, dualChartCall, upLabel, downLabel],
+    () =>
+      bookOnlyDesk
+        ? synthesizeCrossCheckBookOnly(dualChartCall, upLabel, downLabel)
+        : synthesizeCrossCheck(spotChartCall, dualChartCall, upLabel, downLabel),
+    [bookOnlyDesk, spotChartCall, dualChartCall, upLabel, downLabel],
   );
 
   const crossCheckWarn = crossCheckMeta.pill === 'CONFLICT' || crossCheckMeta.pill === 'INCOMPLETE';
@@ -2296,12 +2462,6 @@ export function SignalsPtbOnly(props: {
         </DeskClosePanel>
       </div>
       </DeskClosePanel>
-      <ShouldBuyCard
-        advisory={buySideAdvisory}
-        onAsk={askShouldBuy}
-        upLabel={upLabel}
-        downLabel={downLabel}
-      />
       {tradeDirectiveSpot ? (
         <DeskClosePanel
           id="trade-directive-card-v1"
@@ -2452,45 +2612,51 @@ export function SignalsPtbOnly(props: {
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Chart</div>
         <div className="flex gap-1 rounded-xl border border-zinc-800/60 bg-black/20 p-1">
-          <button
-            type="button"
-            onClick={() => setChartTab('spot')}
-            className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
-              chartTab === 'spot' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
-            }`}
-          >
-            Spot vs PTB
-          </button>
+          {!bookOnlyDesk ? (
+            <button
+              type="button"
+              onClick={() => pickChartTab('spot')}
+              className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
+                chartTab === 'spot' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              Spot vs PTB
+            </button>
+          ) : null}
           {hasDual ? (
             <button
               type="button"
-              onClick={() => setChartTab('dual')}
+              onClick={() => pickChartTab('dual')}
               className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
                 chartTab === 'dual' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
               }`}
             >
-              Dual PTB
+              {bookOnlyDesk ? 'Dual belief' : 'Dual PTB'}
             </button>
           ) : null}
-          <button
-            type="button"
-            onClick={() => setChartTab('now')}
-            className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
-              chartTab === 'now' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
-            }`}
-          >
-            Now Price Signals
-          </button>
-          <button
-            type="button"
-            onClick={() => setChartTab('plm')}
-            title="Probability Lag Monitor — P_model vs P_mkt repricing"
-            className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
-              chartTab === 'plm' ? 'bg-cyan-900/60 text-cyan-50' : 'text-zinc-400 hover:text-cyan-200'
-            }`}
-          >
-            PLM
-          </button>
+          {!bookOnlyDesk ? (
+            <>
+              <button
+                type="button"
+                onClick={() => pickChartTab('now')}
+                className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
+                  chartTab === 'now' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                Now Price Signals
+              </button>
+              <button
+                type="button"
+                onClick={() => pickChartTab('plm')}
+                title="Probability Lag Monitor — P_model vs P_mkt repricing"
+                className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
+                  chartTab === 'plm' ? 'bg-cyan-900/60 text-cyan-50' : 'text-zinc-400 hover:text-cyan-200'
+                }`}
+              >
+                PLM
+              </button>
+            </>
+          ) : null}
         </div>
       </div>
 
@@ -2613,10 +2779,16 @@ export function SignalsPtbOnly(props: {
           For the <span className="text-zinc-200">dual belief</span> chart, turn on book polling on the <span className="text-zinc-200">Book</span>{' '}
           tab until both outcomes have mid history.
         </p>
-        <p className="mt-2">
-          For <span className="text-zinc-200">USD spot vs PTB</span>, load SSR price-to-beat and a{' '}
-              <span className="font-mono text-zinc-300">btc|eth|sol-updown-*</span> slug so RTDS ticks fill (see note when mids exist).
-        </p>
+        {bookOnlyDesk ? (
+          <p className="mt-2">
+            <span className="text-zinc-200">{marketKindLabel(marketKind)}</span> — signals use order-book belief and flow (no USD price-to-beat).
+          </p>
+        ) : (
+          <p className="mt-2">
+            For <span className="text-zinc-200">USD spot vs PTB</span>, load SSR price-to-beat and a{' '}
+            <span className="font-mono text-zinc-300">btc|eth|sol-updown-*</span> slug so RTDS ticks fill (see note when mids exist).
+          </p>
+        )}
       </div>
       {showChartTabs ? null : spotVsPtbSection}
       {trackingUnderCharts}
@@ -2685,7 +2857,19 @@ export function SignalsPtbOnly(props: {
           </div>
         ) : null}
       </DeskSyncBannerSlot>
+      {bookOnlyDesk && hasDual ? (
+        <div className="mb-3 rounded-xl border border-sky-800/45 bg-sky-950/20 px-3 py-2 text-[11px] leading-relaxed text-sky-100/90">
+          <span className="font-semibold text-sky-50">{marketKindLabel(marketKind)} mode</span> — Dual belief, flow zones, and Take Signal use{' '}
+          {upLabel} / {downLabel} order books (no Chainlink PTB).
+        </div>
+      ) : null}
       {hasDual ? chartTabCard : showChartTabs ? chartTabCard : null}
+      <ShouldBuyCard
+        advisory={bookOnlyDesk ? displayBuyAdvisory : buySideAdvisory}
+        onAsk={askShouldBuy}
+        upLabel={upLabel}
+        downLabel={downLabel}
+      />
       {body}
     </>
   );

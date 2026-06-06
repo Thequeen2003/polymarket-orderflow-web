@@ -48,6 +48,13 @@ export function chainlinkUsdHistory(hist: RtdsHistPoint[]): RtdsHistPoint[] {
   );
 }
 
+/** Chainlink open print often lands late on RTDS; widen grace as the window ages. */
+export function openTickGraceMsForBucket(bucketAgeMs: number): number {
+  if (bucketAgeMs < 45_000) return 15_000;
+  if (bucketAgeMs < 120_000) return 90_000;
+  return 300_000;
+}
+
 /** True when history includes a tick within grace of window open, or a before-open tick. */
 export function historyCoversBucketOpen(
   hist: RtdsHistPoint[],

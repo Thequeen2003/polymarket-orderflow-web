@@ -45,6 +45,7 @@ import {
   derivePtbFromRtdsHistory,
   derivePtbPreview,
   historyCoversBucketOpen,
+  openTickGraceMsForBucket,
   isLockedPtbSource,
   type RtdsHistPoint,
 } from './ptbFromRtds.js';
@@ -826,39 +827,55 @@ async function tryRtdsBucketPtb(bucket: { symbol: string; bucketStartMs: number 
   const bucketOpen = now >= bucket.bucketStartMs;
   const justOpened = bucketOpen && now - bucket.bucketStartMs < 45_000;
   const bucketAgeMs = Math.max(0, now - bucket.bucketStartMs);
+  const openGraceMs = openTickGraceMsForBucket(bucketAgeMs);
   const maxWaitMs = justOpened ? 18_000 : bucketAgeMs > 120_000 ? 12_000 : 8_000;
   const deadline = Date.now() + maxWaitMs;
 
   const tryDerive = (): { value: number; source: string } | null => {
     const hist = rtdsHistoryForSymbol(bucket.symbol);
     const allowPreOpenFallback = bucketOpen;
-    const v = derivePtbFromRtdsHistory(hist, bucket.bucketStartMs, { allowPreOpenFallback, chainlinkOnly: bucket.symbol.endsWith('/usd') });
+    const v = derivePtbFromRtdsHistory(hist, bucket.bucketStartMs, {
+      allowPreOpenFallback,
+      chainlinkOnly: bucket.symbol.endsWith('/usd'),
+      openTickGraceMs: openGraceMs,
+    });
     if (v == null) return null;
-    const hasOpenTick = hist.some((p) => p.t >= bucket.bucketStartMs && p.t <= bucket.bucketStartMs + 15_000);
+    const hasOpenTick = hist.some(
+      (p) => p.t >= bucket.bucketStartMs && p.t <= bucket.bucketStartMs + openGraceMs,
+    );
     const source = hasOpenTick ? 'rtds_chainlink_window_open' : 'rtds_chainlink_pre_open_tick';
     return { value: v, source };
   };
 
+  const coversOpen = (hist: RtdsHistPoint[]) => historyCoversBucketOpen(hist, bucket.bucketStartMs, openGraceMs);
+  const acceptDerived = (hist: RtdsHistPoint[], derived: { value: number; source: string } | null): boolean => {
+    if (!derived) return false;
+    if (coversOpen(hist)) return true;
+    return bucketOpen && bucketAgeMs >= 30_000;
+  };
+
   let out = tryDerive();
-  if (out && historyCoversBucketOpen(rtdsHistoryForSymbol(bucket.symbol), bucket.bucketStartMs)) {
+  const hist0 = rtdsHistoryForSymbol(bucket.symbol);
+  if (out && acceptDerived(hist0, out)) {
     return lockBucketPtb(cacheKey, out);
   }
 
   while (!out && Date.now() < deadline) {
     await waitForRtdsPrice(bucket.symbol, 8, 100);
     out = tryDerive();
-    if (out && historyCoversBucketOpen(rtdsHistoryForSymbol(bucket.symbol), bucket.bucketStartMs)) break;
+    const hist = rtdsHistoryForSymbol(bucket.symbol);
+    if (acceptDerived(hist, out)) break;
     out = null;
     await new Promise<void>((r) => setTimeout(r, 120));
   }
 
   const hist = rtdsHistoryForSymbol(bucket.symbol);
-  if (!historyCoversBucketOpen(hist, bucket.bucketStartMs)) {
+  if (!acceptDerived(hist, out)) {
     await awaitRtdsHistoryBatch(bucket.symbol, Math.min(8_000, Math.max(500, deadline - Date.now())));
     out = tryDerive();
   }
 
-  if (out && historyCoversBucketOpen(rtdsHistoryForSymbol(bucket.symbol), bucket.bucketStartMs)) {
+  if (out && acceptDerived(rtdsHistoryForSymbol(bucket.symbol), out)) {
     return lockBucketPtb(cacheKey, out);
   }
   return null;
@@ -1577,10 +1594,13 @@ app.get('/api/price-to-beat/:slug', async (req, res) => {
   }
 
   let ssrErr: unknown = null;
-  const ssrP = tryPriceToBeat(slug).catch((e) => {
-    ssrErr = e;
-    return null;
-  });
+  // Up/down shortcut slugs are not valid for Polymarket SSR PTB — skip the 8s×2 failure path.
+  const ssrP = bucket
+    ? Promise.resolve(null)
+    : tryPriceToBeat(slug).catch((e) => {
+        ssrErr = e;
+        return null;
+      });
   const rtdsP = bucket ? tryRtdsBucketPtb(bucket) : Promise.resolve(null);
 
   const [ssrOut, rtdsOut] = await Promise.all([ssrP, rtdsP]);

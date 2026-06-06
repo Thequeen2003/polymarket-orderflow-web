@@ -7,6 +7,7 @@ import {
   centsStrFromTarget01,
   isBracketTotalUsdDraft,
   resolveBracketRef,
+  sanitizeUsdBracketDraft,
   target01FromBracketInput,
 } from './bracketLevelInput';
 
@@ -89,6 +90,14 @@ describe('bracketLevelInput', () => {
     expect(
       bracketConversionFromInput({ mode: 'cents', raw: '100', kind: 'sl', ref01: 0.5, shares: 2000 }),
     ).toMatchObject({ centsLabel: '45¢', usdLabel: '$100', usdUsesTotal: true });
+  });
+
+  it('sanitizeUsdBracketDraft keeps whole dollars and limits fraction digits', () => {
+    expect(sanitizeUsdBracketDraft('50', true)).toBe('50');
+    expect(sanitizeUsdBracketDraft('50.5', true)).toBe('50.5');
+    expect(sanitizeUsdBracketDraft('50.555', true)).toBe('50.55');
+    expect(sanitizeUsdBracketDraft('$50', true)).toBe('50');
+    expect(sanitizeUsdBracketDraft('0.05', false)).toBe('0.05');
   });
 
   it('buy-bundle: total $ uses est order shares, not held shares', () => {

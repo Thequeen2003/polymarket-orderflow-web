@@ -40,8 +40,25 @@ function confBadge(conf: BuySideAdvisory['confidence']): ReactElement {
   );
 }
 
+function shortOutcomeLabel(name: string | undefined, fallback: string): string {
+  const s = (name ?? fallback).trim();
+  if (!s) return fallback;
+  if (s.length <= 12) return s.toUpperCase();
+  const first = s.split(/\s+/)[0] ?? s;
+  return first.length > 10 ? `${first.slice(0, 9)}…` : first.toUpperCase();
+}
+
+export function shouldBuyPromptLabel(upLabel?: string, downLabel?: string): string {
+  const up = (upLabel ?? 'UP').toUpperCase();
+  const down = (downLabel ?? 'DOWN').toUpperCase();
+  if (up === 'UP' && down === 'DOWN') return 'Should I buy UP or DOWN?';
+  return `Should I buy ${shortOutcomeLabel(upLabel, 'UP')} or ${shortOutcomeLabel(downLabel, 'DOWN')}?`;
+}
+
 export function ShouldBuyCard({ advisory, onAsk, upLabel, downLabel }: Props): ReactElement {
   const [expanded, setExpanded] = useState(false);
+  const scoreUp = shortOutcomeLabel(upLabel, 'UP');
+  const scoreDown = shortOutcomeLabel(downLabel, 'DOWN');
 
   if (!advisory) {
     return (
@@ -51,7 +68,7 @@ export function ShouldBuyCard({ advisory, onAsk, upLabel, downLabel }: Props): R
           onClick={onAsk}
           className="w-full rounded-xl border border-indigo-600/50 bg-indigo-950/40 px-4 py-2.5 text-sm font-semibold text-indigo-200 transition-colors hover:border-indigo-500/70 hover:bg-indigo-950/60 hover:text-indigo-100 active:scale-[0.98]"
         >
-          Should I buy UP or DOWN?
+          {shouldBuyPromptLabel(upLabel, downLabel)}
         </button>
       </div>
     );
@@ -107,14 +124,14 @@ export function ShouldBuyCard({ advisory, onAsk, upLabel, downLabel }: Props): R
       )}
 
       <div className="flex items-center gap-2 text-[9px] text-zinc-500">
-        <span>UP {scores.up.toFixed(1)}</span>
+        <span>{scoreUp} {scores.up.toFixed(1)}</span>
         <div className="relative h-1.5 flex-1 rounded-full bg-zinc-800/60 overflow-hidden">
           <div
             className="absolute inset-y-0 left-0 rounded-full bg-emerald-600/60"
             style={{ width: `${(scores.up / Math.max(scores.up + scores.down, 1)) * 100}%` }}
           />
         </div>
-        <span>DOWN {scores.down.toFixed(1)}</span>
+        <span>{scoreDown} {scores.down.toFixed(1)}</span>
       </div>
 
       <button

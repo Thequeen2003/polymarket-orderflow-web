@@ -7,6 +7,7 @@ import {
   derivePtbPreview,
   historyCoversBucketOpen,
   isLockedPtbSource,
+  openTickGraceMsForBucket,
 } from './ptbFromRtds.js';
 
 describe('derivePtbFromRtdsHistory', () => {
@@ -32,6 +33,11 @@ describe('derivePtbFromRtdsHistory', () => {
   it('rejects ticks far past window open when history is incomplete', () => {
     const hist = [{ t: open + 300_000, v: 73_900, src: 'chainlink' as const }];
     expect(derivePtbFromRtdsHistory(hist, open)).toBeNull();
+  });
+
+  it('accepts late open tick when grace window is widened', () => {
+    const hist = [{ t: open + 26_000, v: 73_900, src: 'chainlink' as const }];
+    expect(derivePtbFromRtdsHistory(hist, open, { openTickGraceMs: 90_000 })).toBe(73_900);
   });
 
   it('falls back to last tick before open when bucket is live but open tick missing', () => {
@@ -66,6 +72,14 @@ describe('chainlinkUsdHistory', () => {
       { t: 101, v: 73_750.91021515518, src: 'chainlink' },
     ]);
     expect(out.map((p) => p.v)).toEqual([73_750.91021515518]);
+  });
+});
+
+describe('openTickGraceMsForBucket', () => {
+  it('widens grace as the window ages', () => {
+    expect(openTickGraceMsForBucket(10_000)).toBe(15_000);
+    expect(openTickGraceMsForBucket(60_000)).toBe(90_000);
+    expect(openTickGraceMsForBucket(200_000)).toBe(300_000);
   });
 });
 

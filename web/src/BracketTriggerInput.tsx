@@ -11,6 +11,7 @@ import {
   bracketTriggerFromTotalUsdDraft,
   centsStrFromTarget01,
   resolveBracketRef,
+  sanitizeUsdBracketDraft,
   target01FromBracketInput,
   usdModeUsesTotal,
   type BracketInputMode,
@@ -165,20 +166,24 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
   );
 
   const applyFromDraft = useCallback(
-    (raw: string, inputMode: BracketInputMode) => {
+    (raw: string, inputMode: BracketInputMode, viaEnter: boolean) => {
       if (inputMode === 'cents') {
-        commitCentsDraft(raw, true);
+        commitCentsDraft(raw, viaEnter);
         return;
       }
       if (ref01 == null) return;
-      const target01 = target01FromBracketInput({ mode: inputMode, raw, kind, ref01, shares: orderShares });
+      const trimmed = raw.trim();
+      if (!trimmed) {
+        setDraft('');
+        onCentsChange('');
+        onAfterChange?.();
+        return;
+      }
+      const target01 = target01FromBracketInput({ mode: inputMode, raw: trimmed, kind, ref01, shares: orderShares });
       if (target01 == null) return;
       const cents = centsStrFromTarget01(target01);
-      setDraft(
-        inputMode === 'pct' || inputMode === 'usd'
-          ? bracketAuxFromCents({ mode: inputMode, centsStr: cents, kind, ref01, shares: orderShares })
-          : cents,
-      );
+      const aux = bracketAuxFromCents({ mode: inputMode, centsStr: cents, kind, ref01, shares: orderShares });
+      setDraft(aux || trimmed);
       onCentsChange(cents);
       onAfterChange?.();
     },
@@ -194,7 +199,7 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
       if (mode === 'cents') {
         commitCentsDraft(draft, viaEnter);
       } else {
-        applyFromDraft(draft, mode);
+        applyFromDraft(draft, mode, viaEnter);
       }
       setEditing(false);
     },
@@ -203,13 +208,14 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
 
   const queueApply = useCallback(
     (raw: string, inputMode: BracketInputMode) => {
+      if (inputMode === 'usd' && usdIsTotal) return;
       if (applyTimerRef.current != null) window.clearTimeout(applyTimerRef.current);
       applyTimerRef.current = window.setTimeout(() => {
         applyTimerRef.current = null;
-        applyFromDraft(raw, inputMode);
+        applyFromDraft(raw, inputMode, false);
       }, LIVE_APPLY_MS);
     },
-    [applyFromDraft],
+    [applyFromDraft, usdIsTotal],
   );
 
   const conversion = useMemo(
@@ -394,9 +400,14 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
             }}
             onChange={(e) => {
               setEditing(true);
-              const v = mode === 'cents' ? sanitizeBracketCentsDraft(e.target.value) : e.target.value;
+              const v =
+                mode === 'cents'
+                  ? sanitizeBracketCentsDraft(e.target.value)
+                  : sanitizeUsdBracketDraft(e.target.value, usdIsTotal);
               setDraft(v);
-              if (mode !== 'cents') queueApply(v, mode);
+              if (mode === 'cents' || mode === 'pct' || (mode === 'usd' && !usdIsTotal)) {
+                queueApply(v, mode);
+              }
             }}
             onBlur={() => {
               const viaEnter = enterCommitRef.current;
@@ -429,7 +440,7 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
                 (e.target as HTMLInputElement).blur();
               }
             }}
-            inputMode="decimal"
+            inputMode={mode === 'usd' && usdIsTotal ? 'decimal' : 'decimal'}
             placeholder={inputPlaceholder}
             aria-label={`${title} — ${activeMode.label}`}
             className={`min-w-0 flex-1 bg-transparent font-mono font-bold tabular-nums outline-none ${inputTone} ${
@@ -536,6 +547,16 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
       {!compact && ref01 == null && mode !== 'cents' ? (
         <p className="mt-2 text-[11px] leading-snug text-amber-200/90">
           Set a buy price and amount, or load a fill, to edit in percent or total $ — use <span className="font-semibold">Cents</span> meanwhile.
+        </p>
+      ) : null}
+      {!compact && ref01 != null && !usdIsTotal && mode === 'usd' ? (
+        <p className="mt-2 text-[11px] leading-snug text-amber-200/90">
+          Enter buy size (or hold a position) to unlock <span className="font-semibold">Total $</span> — values here are $/share (e.g. 0.05), not whole dollars.
+        </p>
+      ) : null}
+      {!compact && usdIsTotal && mode === 'usd' ? (
+        <p className="mt-2 text-[10px] leading-snug text-zinc-500">
+          Type whole dollars (e.g. <span className="font-mono text-zinc-300">50</span> = ${kind === 'sl' ? 'max loss' : 'profit'} on this order). Press Enter or tap away to apply.
         </p>
       ) : null}
     </div>

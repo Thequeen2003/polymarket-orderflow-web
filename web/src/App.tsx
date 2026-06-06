@@ -30,7 +30,7 @@ import { SignalsTradePanel } from './SignalsTradePanel';
 import { TradeSegmentedControl } from './tradeUi';
 import { loadTradeUiPreferences, saveTradeUiPreferences } from './tradeUiPreferences';
 import { pickMarketSlug } from './gammaMarketSlug';
-import { TradeSlidePanel, TRADE_SLIDE_PANEL_WIDTH_PX } from './TradeSlidePanel';
+import { TradeSlidePanel } from './TradeSlidePanel';
 const PositionsCommandPanel = lazy(() =>
   import('./PositionsCommandPanel').then((m) => ({ default: m.PositionsCommandPanel })),
 );
@@ -70,6 +70,7 @@ import {
   type UpdownSlugHint,
 } from './sixPackUpdownSlugs';
 import { updownSlugToOpen } from './updownSlugToOpen';
+import { inferMarketKind, marketUsesPtbSpotDesk } from './marketKind';
 import { BtcSpotPaperTest } from './BtcSpotPaperTest';
 import { TradingViewBtcUsdtTab } from './TradingViewBtcUsdtTab';
 import { PerpsCommandCenter } from './PerpsCommandCenter';
@@ -730,6 +731,11 @@ function App() {
     () => parseUpdownSlugWithHints(selectedSlug, updownSlugHints),
     [selectedSlug, updownSlugHints],
   );
+  const signalsMarketKind = useMemo(
+    () => inferMarketKind(selectedSlug, marketJson),
+    [selectedSlug, marketJson],
+  );
+  const signalsNeedsPtb = marketUsesPtbSpotDesk(signalsMarketKind);
   /** Multiple trade tabs in the slide panel; switching re-loads that slug (one CLOB at a time). */
   const [tradeSessionTabs, setTradeSessionTabs] = useState<TradeSessionTab[]>([]);
   const [activeTradeSessionTabId, setActiveTradeSessionTabId] = useState<string | null>(null);
@@ -1170,8 +1176,6 @@ function App() {
     !binanceSpotActive &&
     (mainTab === 'signals' || mainTab === 'book' || mainTab === 'tracking' || mainTab === 'flowzones');
 
-  /** Slide trade panel is fixed on the right — shrink main column so charts are not covered. */
-  const tradeSlideReservesSpace = tradeUiPrefs.slide && tradePanelOpen;
 
   const openTradeUi = useCallback(() => {
     if (tradeUiPrefs.slide) {
@@ -1815,12 +1819,22 @@ function App() {
     void openUpdownShortcut('btc', '5m');
   }, [apiHealth, selectedSlug, shortcutBusy]);
 
-  /** PTB poll — depends on slug only. Clear PTB only when slug changes, not on every poll setup. */
+  /** PTB poll — crypto up/down only; sports/binary markets use book-only signals. */
   useEffect(() => {
     const slug = selectedSlug.trim();
     if (!slug) {
       ptbPollSlugRef.current = '';
       queueMicrotask(() => {
+        setSsrPriceToBeat(null);
+        setSsrPtbSource(null);
+        setPtbError(null);
+      });
+      return;
+    }
+    if (!marketUsesPtbSpotDesk(inferMarketKind(slug, marketJson))) {
+      ptbPollSlugRef.current = slug;
+      queueMicrotask(() => {
+        if (selectedSlugRef.current.trim() !== slug) return;
         setSsrPriceToBeat(null);
         setSsrPtbSource(null);
         setPtbError(null);
@@ -1865,7 +1879,7 @@ function App() {
       stopped = true;
       if (intervalId != null) window.clearInterval(intervalId);
     };
-  }, [selectedSlug]);
+  }, [selectedSlug, marketJson]);
 
   useEffect(() => {
     const sym = spotSymbolForSlug(selectedSlug, updownSlugHints, marketJson);
@@ -2666,18 +2680,7 @@ function App() {
 
   return (
       <div className="min-h-full bg-zinc-950 bg-[radial-gradient(100%_60%_at_50%_-10%,rgba(99,102,241,0.08),transparent_52%),linear-gradient(180deg,#0b0b0f_0%,#09090b_45%,#060608_100%)] font-sans text-zinc-200 antialiased">
-      <div
-        className={`mx-auto px-4 py-8 transition-[padding,max-width] duration-200 ease-out sm:px-6 lg:px-8 ${
-          tradeSlideReservesSpace ? 'w-full max-w-none' : 'max-w-7xl'
-        }`}
-        style={
-          tradeSlideReservesSpace
-            ? {
-                paddingRight: `max(1rem, min(${TRADE_SLIDE_PANEL_WIDTH_PX}px, 100vw))`,
-              }
-            : undefined
-        }
-      >
+      <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
         <header className="rounded-2xl border border-zinc-800/50 bg-zinc-900/20 px-5 py-5 shadow-lg shadow-black/20 ring-1 ring-white/[0.03] backdrop-blur-sm sm:px-6">
           <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
             <div>
@@ -3200,7 +3203,9 @@ function App() {
                   <div className="mb-4 rounded-2xl border border-amber-800/35 bg-amber-950/15 px-4 py-4 text-sm leading-relaxed text-amber-100/90">
                     <p className="font-semibold text-amber-50">Pick a market to load signals</p>
                     <p className="mt-2 text-amber-100/75">
-                      Tap a <span className="font-medium text-amber-50">BTC / ETH / SOL / HYPE</span> shortcut on the left (5m is fastest), or paste a slug, then stay on this tab.
+                      Tap a <span className="font-medium text-amber-50">BTC / ETH / SOL / HYPE</span> shortcut, paste a{' '}
+                      <span className="font-medium text-amber-50">sports slug</span> (e.g.{' '}
+                      <span className="font-mono text-amber-50/95">mlb-tor-atl-2026-06-04</span>), or search — then stay on this tab.
                     </p>
                   </div>
                 ) : booksLoading && !books ? (
@@ -3229,7 +3234,7 @@ function App() {
                     </button>
                   </div>
                 ) : null}
-                {selectedSlug.trim() && ssrPriceToBeat == null && ptbError ? (
+                {selectedSlug.trim() && ssrPriceToBeat == null && ptbError && signalsNeedsPtb ? (
                   <div className="mb-4 rounded-2xl border border-amber-800/40 bg-amber-950/20 px-4 py-4 text-sm leading-relaxed text-amber-100/90">
                     <p className="font-semibold text-amber-50">Price-to-beat (PTB) not loaded yet</p>
                     <p className="mt-2 text-amber-100/75">

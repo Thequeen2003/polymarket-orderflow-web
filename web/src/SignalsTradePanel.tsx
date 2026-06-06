@@ -1,4 +1,4 @@
-import { Fragment, type ReactElement, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { Fragment, type MouseEvent, type ReactElement, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 import type { ApiErr, MyFillRow } from './lib/api';
 import {
@@ -167,6 +167,44 @@ const EMPTY_BUY_BUNDLE_BY_LANE: { up: BuyBundleLaneDraft; down: BuyBundleLaneDra
   down: { sl: '', tp: '' },
 };
 
+function emergencyStopFillToast(sl: string, tp?: string): string {
+  if (sl && tp) return `Emergency stop ${sl}¢ armed on fill · TP ${tp}¢`;
+  if (sl) return `Emergency stop armed on fill · ${sl}¢`;
+  if (tp) return `Take-profit armed on fill · ${tp}¢`;
+  return 'Brackets armed on fill';
+}
+
+/** Pre-buy emergency stop (¢) per UP/DOWN — survives refresh; arms on next buy fill for that lane. */
+const EMERGENCY_STOP_BY_LANE_KEY = 'pm:emergencyStopByLane:v1';
+
+function loadEmergencyStopByLane(): { up: string; down: string } {
+  try {
+    const raw = window.localStorage.getItem(EMERGENCY_STOP_BY_LANE_KEY);
+    if (!raw) return { up: '', down: '' };
+    const j = JSON.parse(raw) as { up?: unknown; down?: unknown };
+    return {
+      up: typeof j.up === 'string' ? j.up : '',
+      down: typeof j.down === 'string' ? j.down : '',
+    };
+  } catch {
+    return { up: '', down: '' };
+  }
+}
+
+function saveEmergencyStopByLane(draft: { up: string; down: string }): void {
+  try {
+    window.localStorage.setItem(EMERGENCY_STOP_BY_LANE_KEY, JSON.stringify(draft));
+  } catch {
+    /* quota / private mode */
+  }
+}
+
+function saveEmergencyStopForLane(lane: 'up' | 'down', slCents: string): void {
+  const prev = loadEmergencyStopByLane();
+  prev[lane] = slCents.trim();
+  saveEmergencyStopByLane(prev);
+}
+
 function stopLossStorageKey(tokenId: string): string {
   return `pm:stoploss:v1:${tokenId.trim()}`;
 }
@@ -255,6 +293,36 @@ function parseOutcomeSharesBalance(raw: string): number | null {
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 0) return null;
   return floorShares4(n);
+}
+
+function fmtPaperTradeError(code: string): string {
+  if (code === 'insufficient_cash') return 'Insufficient cash — pick a smaller size or tap Max.';
+  return code;
+}
+
+/** Set buy amount to a fraction of available cash (replaces, never adds on top). */
+function buyAmountFromCashPct(args: {
+  pct: number;
+  unit: 'dollars' | 'shares';
+  cashUsd: number;
+  price01: number | null;
+}): string {
+  const { pct, unit, cashUsd, price01 } = args;
+  if (!(cashUsd > 0) || !(pct > 0)) return '0';
+  const budget = cashUsd * Math.min(1, pct);
+  if (unit === 'dollars') {
+    const v = roundUsd2(Math.floor(budget * 100) / 100);
+    return v > 0 ? String(v) : '0';
+  }
+  if (price01 == null || !(price01 > 0)) return '0';
+  const sh = floorShares4(budget / price01);
+  return sh > 0 ? String(sh) : '0';
+}
+
+function clampBuyUsdPreset(usd: number, cashUsd: number): string {
+  if (!(cashUsd > 0)) return '0';
+  const v = roundUsd2(Math.min(usd, Math.floor(cashUsd * 100) / 100));
+  return v > 0 ? String(v) : '0';
 }
 
 function fmtCents(p01: number | null): string {
@@ -410,12 +478,13 @@ function loadArmRiskAfterBuyPrefs(): ArmRiskAfterBuyPrefs {
       armTp?: unknown;
       useSignalLevels?: unknown;
     };
+    const armSl = j.armSl === true;
     const armTp = j.armTp === true;
     const autoArmEnabled =
-      typeof j.autoArmEnabled === 'boolean' ? j.autoArmEnabled && armTp : armTp;
+      typeof j.autoArmEnabled === 'boolean' ? j.autoArmEnabled : armSl || armTp;
     return {
       autoArmEnabled,
-      armSl: false,
+      armSl,
       armTp,
       useSignalLevels: j.useSignalLevels !== false,
     };
@@ -693,6 +762,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
 
   const [busySubmit, setBusySubmit] = useState(false);
   const [busyRefresh, setBusyRefresh] = useState(false);
+  const [maxBuyBusy, setMaxBuyBusy] = useState(false);
   const [submitAbort, setSubmitAbort] = useState<AbortController | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [okMsg, setOkMsg] = useState<string | null>(null);
@@ -773,7 +843,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const prevBracketLaneRef = useRef<'up' | 'down'>(lane);
   const stopLossStopCentsRef = useRef('');
   const takeProfitTakeCentsRef = useRef('');
-  /** One-click buy: SL/TP cents staged on Buy click, applied on fill reconcile. */
+  /** One-click buy: emergency SL (and optional TP) staged on Buy click, applied on fill reconcile. */
   const buyBundleArmRef = useRef<{
     sl: string;
     tp: string;
@@ -997,7 +1067,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       if (d.armSlTp) {
         const merged: ArmRiskAfterBuyPrefs = {
           autoArmEnabled: true,
-          armSl: false,
+          armSl: true,
           armTp: true,
           useSignalLevels: true,
         };
@@ -1170,8 +1240,16 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   /** Suggested TP/SL levels (displayed as hints — never auto-filled into the inputs). */
   const [suggestedSlCents, setSuggestedSlCents] = useState('');
   const [suggestedTpCents, setSuggestedTpCents] = useState('');
-  /** Buy-on-fill SL/TP drafts — one pair per UP/DOWN lane (survives lane switches). */
-  const [buyBundleByLane, setBuyBundleByLane] = useState(EMPTY_BUY_BUNDLE_BY_LANE);
+  /** Emergency stop (+ optional TP) staged before buy — arms SL on fill; SL persists per lane. */
+  const [buyBundleByLane, setBuyBundleByLane] = useState(() => {
+    const em = loadEmergencyStopByLane();
+    return {
+      up: { sl: em.up, tp: '' },
+      down: { sl: em.down, tp: '' },
+    };
+  });
+  const buyBundleByLaneRef = useRef(buyBundleByLane);
+  buyBundleByLaneRef.current = buyBundleByLane;
   const buyBundleSlCents = buyBundleByLane[lane].sl;
   const buyBundleTpCents = buyBundleByLane[lane].tp;
   const [takeProfitSimple, setTakeProfitSimple] = useState(true);
@@ -2727,10 +2805,25 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         const merged: ArmRiskAfterBuyPrefs = {
           ...p,
           autoArmEnabled: enabled,
-          armSl: false,
+          armSl: enabled ? p.armSl || true : false,
           armTp: enabled ? p.armTp || true : false,
         };
         if (enabled) {
+          operatorSlTpLockedRef.current = false;
+          bracketArmedPinRef.current = null;
+          queueMicrotask(() => applyArmRiskNow(merged));
+        }
+        return merged;
+      });
+    },
+    [applyArmRiskNow],
+  );
+
+  const onAutoArmSlChange = useCallback(
+    (checked: boolean) => {
+      setArmRiskAfterBuy((p) => {
+        const merged = { ...p, autoArmEnabled: checked || p.autoArmEnabled, armSl: checked };
+        if (checked) {
           operatorSlTpLockedRef.current = false;
           bracketArmedPinRef.current = null;
           queueMicrotask(() => applyArmRiskNow(merged));
@@ -3027,6 +3120,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       bracketLaneDraftRef.current[lane] = { ...bracketLaneDraftRef.current[lane], sl: v };
       setStopLossStopCents(v);
       setStopLossLimitCents(v);
+      setBuyBundleByLane((prev) => ({ ...prev, [lane]: { ...prev[lane], sl: v } }));
       syncBracketPinFromOperatorEdits({ stopCents: v });
       if (riskPrefsToken) {
         saveBracketLevelsDraft(riskPrefsToken, {
@@ -3047,6 +3141,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       bracketLaneDraftRef.current[lane] = { ...bracketLaneDraftRef.current[lane], tp: v };
       setTakeProfitTakeCents(v);
       setTakeProfitLimitCents(v);
+      setBuyBundleByLane((prev) => ({ ...prev, [lane]: { ...prev[lane], tp: v } }));
       syncBracketPinFromOperatorEdits({ tpCents: v });
       if (riskPrefsToken) {
         saveBracketLevelsDraft(riskPrefsToken, {
@@ -3537,41 +3632,53 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         buyBundleArmRef.current = null;
         buyRiskArmedRowIdsRef.current.add(rowId);
         applyFilledBuyBundle({ rowTok, riskLane, shares: sh, sl: bundle.sl, tp: bundle.tp });
-        setBuyBundleByLane((prev) => ({ ...prev, [riskLane]: { sl: '', tp: '' } }));
+        setBuyBundleByLane((prev) => ({ ...prev, [riskLane]: { sl: '', tp: prev[riskLane].tp } }));
+        saveEmergencyStopForLane(riskLane, '');
         if (firstToast) {
-          const parts: string[] = [];
-          if (bundle.sl) parts.push(`SL ${bundle.sl}¢`);
-          if (bundle.tp) parts.push(`TP ${bundle.tp}¢`);
-          pushToast('info', `Brackets armed on fill · ${parts.join(' · ')}`, 5200);
+          pushToast('info', emergencyStopFillToast(bundle.sl, bundle.tp), 5200);
         }
       } else {
-      const deskAlreadyArmed =
-        (stopLossEnabled && stopLossStopCents.trim()) || (takeProfitEnabled && takeProfitTakeCents.trim());
-      if (buyRiskArmedRowIdsRef.current.has(rowId)) {
-        if (shStr) {
-          if (stopLossEnabled) setStopLossShares(shStr);
-          if (takeProfitEnabled) setTakeProfitShares(shStr);
+        const laneDraft = riskLane ? bracketLaneDraftRef.current[riskLane] : { sl: '', tp: '' };
+        const emergDraft = riskLane ? buyBundleByLaneRef.current[riskLane] : { sl: '', tp: '' };
+        const preSl = emergDraft.sl.trim() || laneDraft.sl.trim();
+        const preTp = emergDraft.tp.trim();
+        const deskAlreadyArmed =
+          (stopLossEnabled && stopLossStopCents.trim()) || (takeProfitEnabled && takeProfitTakeCents.trim());
+        if (buyRiskArmedRowIdsRef.current.has(rowId)) {
+          if (shStr) {
+            if (stopLossEnabled) setStopLossShares(shStr);
+            if (takeProfitEnabled) setTakeProfitShares(shStr);
+          }
+        } else if ((preSl || preTp) && rowTok && riskLane) {
+          buyRiskArmedRowIdsRef.current.add(rowId);
+          applyFilledBuyBundle({ rowTok, riskLane, shares: sh, sl: preSl, tp: preTp });
+          if (preSl) {
+            setBuyBundleByLane((prev) => ({ ...prev, [riskLane]: { sl: '', tp: prev[riskLane].tp } }));
+            saveEmergencyStopForLane(riskLane, '');
+          }
+          if (firstToast) {
+            pushToast('info', emergencyStopFillToast(preSl, preTp), 5200);
+          }
+        } else if (deskAlreadyArmed && rowTok && riskLane) {
+          buyRiskArmedRowIdsRef.current.add(rowId);
+          if (!bracketArmedPinRef.current) {
+            bracketArmedPinRef.current = {
+              token: rowTok,
+              lane: riskLane,
+              stopCents: stopLossStopCents.trim(),
+              tpCents: takeProfitTakeCents.trim(),
+              source: 'desk',
+              armedAtMs: Date.now(),
+            };
+          }
+          if (shStr) {
+            if (stopLossEnabled) setStopLossShares(shStr);
+            if (takeProfitEnabled) setTakeProfitShares(shStr);
+          }
+        } else {
+          buyRiskArmedRowIdsRef.current.add(rowId);
+          applyArmRiskAfterBuyFill(px, sh, riskLane);
         }
-      } else if (deskAlreadyArmed && rowTok && riskLane) {
-        buyRiskArmedRowIdsRef.current.add(rowId);
-        if (!bracketArmedPinRef.current) {
-          bracketArmedPinRef.current = {
-            token: rowTok,
-            lane: riskLane,
-            stopCents: stopLossStopCents.trim(),
-            tpCents: takeProfitTakeCents.trim(),
-            source: 'desk',
-            armedAtMs: Date.now(),
-          };
-        }
-        if (shStr) {
-          if (stopLossEnabled) setStopLossShares(shStr);
-          if (takeProfitEnabled) setTakeProfitShares(shStr);
-        }
-      } else {
-        buyRiskArmedRowIdsRef.current.add(rowId);
-        applyArmRiskAfterBuyFill(px, sh, riskLane);
-      }
       }
       if (row.token?.trim() === token?.trim()) {
         setPendingPos((p) => {
@@ -4029,43 +4136,41 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     setOkMsg(null);
   }, []);
 
+  const availableBuyUsd = useMemo(() => {
+    if (accountMode === 'paper') {
+      const c = paperAccount.cashUsdCents / 100;
+      return Number.isFinite(c) && c > 0 ? roundUsd2(Math.floor(c * 100) / 100) : 0;
+    }
+    return availUsdc != null && availUsdc > 0 ? availUsdc : null;
+  }, [accountMode, availUsdc, paperAccount.cashUsdCents]);
+
   const applyMaxBuy = useCallback(async () => {
     setErr(null);
-    setBusyRefresh(true);
+    setMaxBuyBusy(true);
     try {
-      if (accountMode === 'paper') {
-        if (unit === 'dollars') {
-          const v = Math.floor((paperAccount.cashUsdCents / 100) * 100) / 100;
-          setAmount(v > 0 ? String(v) : '0');
-        } else if (mid != null && mid > 0) {
-          const usdc = paperAccount.cashUsdCents / 100;
-          const sh = usdc / mid;
-          const v = floorShares4(sh);
-          setAmount(v > 0 ? String(v) : '0');
+      let cashUsd = availableBuyUsd ?? 0;
+      if (accountMode === 'live') {
+        await tradeUpdateBalanceAllowance({ assetType: 'collateral' });
+        const res = await tradeBalanceAllowance({ assetType: 'collateral' });
+        if (!isOk(res)) {
+          setErr('Could not read USDC balance.');
+          return;
         }
+        const usdc = parseUsdcBalance(res.data.balance);
+        setAvailUsdc(usdc);
+        cashUsd = usdc ?? 0;
+      }
+      if (cashUsd <= 0) return;
+      const price = mid != null && mid > 0 ? mid : null;
+      if (unit === 'shares' && (price == null || price <= 0)) {
+        setErr('Need a valid mid to convert USDC to shares for Max');
         return;
       }
-      await tradeUpdateBalanceAllowance({ assetType: 'collateral' });
-      const res = await tradeBalanceAllowance({ assetType: 'collateral' });
-      if (!isOk(res)) {
-        setErr('Could not read USDC balance.');
-        return;
-      }
-      const usdc = parseUsdcBalance(res.data.balance);
-      setAvailUsdc(usdc);
-      if (usdc == null) return;
-      if (unit === 'dollars') {
-        const v = roundUsd2(Math.floor(usdc * 100) / 100);
-        setAmount(v > 0 ? String(v) : '0');
-      } else if (mid != null && mid > 0) {
-        const sh = usdc / mid;
-        const v = floorShares4(sh);
-        setAmount(v > 0 ? String(v) : '0');
-      }
+      setAmount(buyAmountFromCashPct({ pct: 1, unit, cashUsd, price01: price }));
     } finally {
-      setBusyRefresh(false);
+      setMaxBuyBusy(false);
     }
-  }, [accountMode, mid, paperAccount.cashUsdCents, unit]);
+  }, [accountMode, availableBuyUsd, mid, unit]);
 
   // Load persisted stop-loss config whenever token changes (paper + live).
   useEffect(() => {
@@ -5671,6 +5776,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
 
   const applyBuyBundleSlCents = useCallback(
     (v: string) => {
+      bracketLaneDraftRef.current[lane] = { ...bracketLaneDraftRef.current[lane], sl: v };
+      saveEmergencyStopForLane(lane, v);
       setBuyBundleByLane((prev) => ({ ...prev, [lane]: { ...prev[lane], sl: v } }));
     },
     [lane],
@@ -5678,6 +5785,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
 
   const applyBuyBundleTpCents = useCallback(
     (v: string) => {
+      bracketLaneDraftRef.current[lane] = { ...bracketLaneDraftRef.current[lane], tp: v };
       setBuyBundleByLane((prev) => ({ ...prev, [lane]: { ...prev[lane], tp: v } }));
     },
     [lane],
@@ -5696,7 +5804,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     }));
   }, [lane, suggestedSlDisplay, suggestedTpDisplay]);
 
-  const buyBundleStaged = Boolean(buyBundleSlCents.trim() || buyBundleTpCents.trim());
+  const emergencyStopStaged = Boolean(buyBundleSlCents.trim());
+  const buyBundleStaged = emergencyStopStaged || Boolean(buyBundleTpCents.trim());
 
   const stageBuyBundleForSubmit = useCallback(
     (
@@ -5704,7 +5813,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       submitToken: string,
       estSizeShares: number | null,
     ): { ok: true; armed: boolean } | { ok: false; reason: string } => {
-      const sl = buyBundleSlCents.trim();
+      const laneDraft = bracketLaneDraftRef.current[submitLane];
+      const sl = buyBundleSlCents.trim() || laneDraft.sl.trim();
       const tp = buyBundleTpCents.trim();
       if (!sl && !tp) {
         buyBundleArmRef.current = null;
@@ -5756,21 +5866,22 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
 
   /** Held shares or estimated buy size — powers total-$ TP/SL (e.g. $50 profit on $1000). */
   const bracketOrderShares = useMemo(() => {
-    if (action === 'buy' && buyBundleShares != null && buyBundleShares > 0) {
-      return buyBundleShares;
+    if (positionShares != null && positionShares > 0) return positionShares;
+    if (liveSellableShares != null && liveSellableShares > 0) return liveSellableShares;
+    if (buyBundleShares != null && buyBundleShares > 0) return buyBundleShares;
+    if (action === 'buy' && amtOk && bracketPlannedEntry01 != null) {
+      const sh = unit === 'dollars' ? amtNum / bracketPlannedEntry01 : amtNum;
+      return Number.isFinite(sh) && sh > 0 ? sh : null;
     }
-    if (optimisticPositionShares != null && optimisticPositionShares > 0) {
-      return optimisticPositionShares;
-    }
-    if (action !== 'buy' || !amtOk || bracketEntry01 == null) return null;
-    return unit === 'dollars' ? amtNum / bracketEntry01 : amtNum;
+    return null;
   }, [
     action,
     amtOk,
     amtNum,
-    bracketEntry01,
+    bracketPlannedEntry01,
     buyBundleShares,
-    optimisticPositionShares,
+    liveSellableShares,
+    positionShares,
     unit,
   ]);
 
@@ -5782,6 +5893,51 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       : unit === 'dollars' && amtOk
         ? amtNum
         : null;
+  const buyExceedsCash = useMemo(() => {
+    if (action !== 'buy' || !amtOk) return false;
+    const cash = availableBuyUsd;
+    if (cash == null || !(cash > 0)) return false;
+    if (unit === 'dollars') return amtNum > cash + 0.01;
+    const px = previewPrice01 ?? mid;
+    if (px == null || !(px > 0)) return false;
+    return amtNum * px > cash + 0.01;
+  }, [action, amtOk, amtNum, availableBuyUsd, mid, previewPrice01, unit]);
+  const canSizeBuy =
+    !busySubmit &&
+    !outcomeLocked &&
+    (availableBuyUsd ?? 0) > 0 &&
+    (unit === 'dollars' || (mid != null && mid > 0));
+  const preventSizeBtnScroll = (e: MouseEvent) => e.preventDefault();
+  const applyBuyCashPct = useCallback(
+    (pct: number) => {
+      setErr(null);
+      const cash = availableBuyUsd ?? 0;
+      if (cash <= 0) {
+        setErr('No cash available.');
+        return;
+      }
+      const price = previewPrice01 ?? (mid != null && mid > 0 ? mid : null);
+      if (unit === 'shares' && (price == null || price <= 0)) {
+        setErr('Need a valid price to size in shares.');
+        return;
+      }
+      setAmount(buyAmountFromCashPct({ pct, unit, cashUsd: cash, price01: price }));
+    },
+    [availableBuyUsd, mid, previewPrice01, unit],
+  );
+  const applyBuyUsdPreset = useCallback(
+    (usd: number) => {
+      setErr(null);
+      const cash = availableBuyUsd ?? 0;
+      if (cash <= 0) {
+        setErr('No cash available.');
+        return;
+      }
+      if (unit !== 'dollars') setUnit('dollars');
+      setAmount(clampBuyUsdPreset(usd, cash));
+    },
+    [availableBuyUsd, unit],
+  );
   const payout = estShares != null ? estShares : null;
   const profit = estCost != null && payout != null ? payout - estCost : null;
 
@@ -5802,9 +5958,10 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       const c = (limit01 * 100).toFixed(1);
       const mode = accountMode === 'paper' ? 'Paper' : 'Live';
       const exec = execMode === 'touch' ? 'Quick limit buy' : 'Custom limit buy';
-      const bracketNote =
-        buyBundleStaged
-          ? ` · SL${buyBundleSlCents.trim() ? ` ${buyBundleSlCents.trim()}¢` : ''}${buyBundleTpCents.trim() ? ` · TP ${buyBundleTpCents.trim()}¢` : ''} on fill`
+      const bracketNote = emergencyStopStaged
+        ? ` · Emergency stop ${buyBundleSlCents.trim()}¢ on fill`
+        : buyBundleTpCents.trim()
+          ? ` · TP ${buyBundleTpCents.trim()}¢ on fill`
           : '';
       if (unit === 'shares' && estShares != null) {
         return `${mode} · ${exec} · ${c}¢ · ~${estShares.toFixed(2)} sh · ${label}${bracketNote}`;
@@ -5830,8 +5987,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     amtOk,
     buyGate.ok,
     buyBundleSlCents,
-    buyBundleStaged,
     buyBundleTpCents,
+    emergencyStopStaged,
     estShares,
     execMode,
     executableQuote01,
@@ -6221,12 +6378,32 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       if (bundle && fillLane && bundle.token === fillTok && bundle.lane === fillLane) {
         buyBundleArmRef.current = null;
         applyFilledBuyBundle({ rowTok: fillTok, riskLane: fillLane, shares: totalSh, sl: bundle.sl, tp: bundle.tp });
+      } else if (fillLane) {
+        const laneDraft = bracketLaneDraftRef.current[fillLane];
+        const emergDraft = buyBundleByLaneRef.current[fillLane];
+        const preSl = emergDraft.sl.trim() || laneDraft.sl.trim();
+        const preTp = emergDraft.tp.trim();
+        if (preSl || preTp) {
+          applyFilledBuyBundle({ rowTok: fillTok, riskLane: fillLane, shares: totalSh, sl: preSl, tp: preTp });
+        } else {
+          applyArmRiskAfterBuyFill(last.fillPrice01, totalSh, fillLane);
+        }
       } else {
         applyArmRiskAfterBuyFill(last.fillPrice01, totalSh, fillLane);
       }
     }
     syncRiskAutomationAfterSellFill(getPaperPosition(res.account, token).shares);
-  }, [accountMode, applyArmRiskAfterBuyFill, applyFilledBuyBundle, downToken, mid, paperAccount, syncRiskAutomationAfterSellFill, token, upToken]);
+  }, [
+    accountMode,
+    applyArmRiskAfterBuyFill,
+    applyFilledBuyBundle,
+    downToken,
+    mid,
+    paperAccount,
+    syncRiskAutomationAfterSellFill,
+    token,
+    upToken,
+  ]);
 
   const bracketsDockPanel =
     !token?.trim() || !showBracketsDock
@@ -6307,7 +6484,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                             <div className="min-w-0">
                               <div className="text-[11px] font-semibold text-zinc-200">Auto-arm SL/TP after buy</div>
                               <div className="mt-0.5 text-[10px] leading-snug text-zinc-500">
-                                Off by default — enable to set bracket levels after each buy fill.
+                                Routine TP/SL from signals — separate from the emergency stop under the buy button.
                               </div>
                             </div>
                             <button
@@ -6332,15 +6509,14 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
 
                           {armRiskAfterBuy.autoArmEnabled ? (
                             <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-zinc-800/40 pt-2.5 text-[11px]">
-                              <label className="flex cursor-not-allowed items-center gap-2 text-zinc-500" title="Auto-arm SL is disabled">
+                              <label className="flex cursor-pointer items-center gap-2 text-zinc-300">
                                 <input
                                   type="checkbox"
-                                  checked={false}
-                                  disabled
-                                  readOnly
-                                  className="h-4 w-4 accent-rose-500 opacity-40"
+                                  checked={armRiskAfterBuy.armSl}
+                                  onChange={(e) => onAutoArmSlChange(e.target.checked)}
+                                  className="h-4 w-4 accent-rose-500"
                                 />
-                                Auto-arm SL (off)
+                                Auto-arm SL
                               </label>
                               <label className="flex cursor-pointer items-center gap-2 text-zinc-300">
                                 <input
@@ -8509,7 +8685,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
 
           <div className="mt-2 flex flex-wrap items-end justify-between gap-2 text-xs text-zinc-400">
             <span className="font-semibold text-zinc-300">Amount</span>
-            <span className="font-mono text-zinc-500" title="USDC available for buys">
+            <span className="min-w-[5.5rem] text-right font-mono tabular-nums text-zinc-500" title="USDC available for buys">
               {accountMode === 'paper'
                 ? `Cash ${fmtUsdCents(paperAccount.cashUsdCents)}`
                 : balLoading
@@ -8557,58 +8733,83 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
             </div>
           </div>
 
-          {isSlide && unit === 'dollars' ? (
-            <div className="mt-2 flex flex-wrap gap-1.5">
-              {[50, 100, 200].map((n) => (
-                <button
-                  key={`tap-${n}`}
-                  type="button"
-                  onClick={() => setAmount(String(n))}
-                  className="min-h-[40px] rounded-lg border border-emerald-800/50 bg-emerald-950/25 px-3 text-[12px] font-bold text-emerald-100 hover:bg-emerald-950/40"
-                >
-                  ${n}
-                </button>
-              ))}
-            </div>
-          ) : null}
-
           <div className="mt-2 flex flex-wrap gap-2">
-            {(unit === 'dollars' ? [10, 25, 50, 100] : [10, 25, 50, 100]).map((n) => (
+            {(
+              [
+                { label: '5%', pct: 0.05 },
+                { label: '15%', pct: 0.15 },
+                { label: '25%', pct: 0.25 },
+                { label: '50%', pct: 0.5 },
+                { label: '100%', pct: 1 },
+              ] as const
+            ).map(({ label, pct }) => (
               <button
-                key={`${unit}-${n}`}
+                key={label}
                 type="button"
-                onClick={() => {
-                  setAmount((prev) => {
-                    const cur = Number(prev);
-                    const base = Number.isFinite(cur) ? cur : 0;
-                    return String(Math.max(0, base + n));
-                  });
-                }}
-                className="min-h-[40px] rounded-lg border border-zinc-800/70 bg-black/25 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-black/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/35 active:scale-[0.98]"
+                disabled={!canSizeBuy}
+                onMouseDown={preventSizeBtnScroll}
+                onClick={() => applyBuyCashPct(pct)}
+                className="min-h-[40px] rounded-lg border border-zinc-800/70 bg-black/25 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-black/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/35 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40"
               >
-                {unit === 'dollars' ? `+$${n}` : `+${n} sh`}
+                {label}
               </button>
             ))}
             <button
               type="button"
               onClick={() => void applyMaxBuy()}
-              disabled={
-                busySubmit ||
-                busyRefresh ||
-                (accountMode === 'paper' ? paperAccount.cashUsdCents <= 0 : !availUsdc) ||
-                outcomeLocked ||
-                (unit === 'shares' && (mid == null || mid <= 0))
-              }
-              aria-busy={busySubmit || busyRefresh}
+              disabled={!canSizeBuy || maxBuyBusy}
+              aria-busy={maxBuyBusy}
               title={
                 outcomeLocked
                   ? `Disabled: market looks locked at ${midIsExtremeLow ? '0¢' : midIsExtremeHigh ? '100¢' : '—'}`
-                  : maxBuyDisabledReason
+                  : maxBuyDisabledReason ?? 'Use all available cash'
               }
               className="min-h-[40px] rounded-lg border border-zinc-600/80 bg-zinc-900/60 px-4 py-2 text-xs font-semibold text-zinc-100 hover:bg-zinc-800/80 disabled:cursor-not-allowed disabled:opacity-40"
             >
               Max
             </button>
+          </div>
+
+          <div
+            className={`mt-2 flex flex-wrap gap-2 ${unit === 'dollars' ? '' : 'pointer-events-none invisible'}`}
+            aria-hidden={unit !== 'dollars'}
+          >
+            {[100, 200, 300, 400, 500, 750, 1000].map((n) => {
+              const cash = availableBuyUsd ?? 0;
+              const capped = cash > 0 && n > cash;
+              return (
+                <button
+                  key={`usd-${n}`}
+                  type="button"
+                  disabled={!canSizeBuy}
+                  onMouseDown={preventSizeBtnScroll}
+                  onClick={() => applyBuyUsdPreset(n)}
+                  title={capped ? `Clamped to available $${cash.toFixed(2)}` : undefined}
+                  className={`min-h-[40px] rounded-lg border px-3 py-2 text-xs font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/35 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40 ${
+                    isSlide
+                      ? 'border-emerald-800/50 bg-emerald-950/25 text-emerald-100 hover:bg-emerald-950/40'
+                      : 'border-zinc-800/70 bg-black/25 text-zinc-200 hover:bg-black/40'
+                  }`}
+                >
+                  ${n}
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="mt-1.5 min-h-[2rem]" aria-live="polite">
+            <p
+              className={`text-[11px] font-semibold text-amber-200/90 ${buyExceedsCash ? '' : 'invisible'}`}
+              aria-hidden={!buyExceedsCash}
+            >
+              Amount exceeds available cash (
+              {accountMode === 'paper'
+                ? fmtUsdCents(paperAccount.cashUsdCents)
+                : availUsdc != null
+                  ? `$${availUsdc.toFixed(2)}`
+                  : '—'}
+              ). Use a % button or lower the amount.
+            </p>
           </div>
 
           {executionBrief ? (
@@ -8853,7 +9054,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                       setOkMsg(null);
                     }}
                   >
-                    Set SL on fill
+                    Set emergency stop
                   </button>
                   {positionShares != null && positionShares > 0 ? (
                     <div className="mt-2 grid grid-cols-3 gap-2">
@@ -8918,24 +9119,33 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
             </div>
           ) : null}
 
-          <div className="mt-2 rounded-lg border border-zinc-800/55 bg-zinc-900/20 px-2 py-1.5">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="text-[9px] font-semibold uppercase tracking-wide text-zinc-500">SL / TP on fill</div>
-              {(suggestedSlDisplay || suggestedTpDisplay) &&
-              !buyBundleSlCents.trim() &&
-              !buyBundleTpCents.trim() ? (
+          <div className="mt-2 rounded-lg border border-rose-900/45 bg-rose-950/20 px-2.5 py-2 ring-1 ring-rose-500/10">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div className="min-w-0">
+                <div className="text-[10px] font-black uppercase tracking-[0.14em] text-rose-200/95">
+                  Emergency stop
+                </div>
+                <p className="mt-0.5 text-[10px] leading-snug text-rose-200/65">
+                  Set before you buy — if the trade goes wrong, this stop arms automatically on fill. Leave empty for no backup.
+                </p>
+              </div>
+              {suggestedSlDisplay && !buyBundleSlCents.trim() ? (
                 <button
                   type="button"
-                  className="rounded border border-zinc-700/50 bg-black/25 px-2 py-0.5 text-[9px] font-bold text-zinc-200 hover:bg-black/35"
-                  onClick={applySuggestedBuyBundleLevels}
+                  className="shrink-0 rounded border border-rose-700/45 bg-rose-950/35 px-2 py-0.5 text-[9px] font-bold text-rose-100 hover:bg-rose-900/45"
+                  onClick={() => {
+                    const v = suggestedSlDisplay;
+                    if (!v) return;
+                    applyBuyBundleSlCents(v);
+                  }}
                 >
                   Use suggested
                 </button>
               ) : null}
             </div>
-            <div className="mt-1 flex flex-col gap-1">
+            <div className="mt-2">
               <BracketTriggerInput
-                key={`buy-sl-${lane}`}
+                key={`buy-emergency-sl-${lane}`}
                 compact
                 kind="sl"
                 centsValue={buyBundleSlCents}
@@ -8952,25 +9162,32 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   applyBuyBundleSlCents(v);
                 }}
               />
-              <BracketTriggerInput
-                key={`buy-tp-${lane}`}
-                compact
-                kind="tp"
-                centsValue={buyBundleTpCents}
-                onCentsChange={applyBuyBundleTpCents}
-                avgEntry01={null}
-                plannedEntry01={buyBundleEntry01}
-                orderShares={buyBundleShares}
-                mid01={mid ?? null}
-                placeholderCents={riskTargetsFromEntry?.tpCents ?? targets?.tpCents}
-                suggestedCents={suggestedTpDisplay || undefined}
-                onApplySuggested={() => {
-                  const v = suggestedTpDisplay;
-                  if (!v) return;
-                  applyBuyBundleTpCents(v);
-                }}
-              />
             </div>
+            <details className="mt-2 rounded-md border border-zinc-800/50 bg-black/20 px-2 py-1.5">
+              <summary className="cursor-pointer text-[9px] font-semibold text-zinc-500 hover:text-zinc-300">
+                Optional take-profit on fill (not emergency)
+              </summary>
+              <div className="mt-1.5">
+                <BracketTriggerInput
+                  key={`buy-tp-${lane}`}
+                  compact
+                  kind="tp"
+                  centsValue={buyBundleTpCents}
+                  onCentsChange={applyBuyBundleTpCents}
+                  avgEntry01={null}
+                  plannedEntry01={buyBundleEntry01}
+                  orderShares={buyBundleShares}
+                  mid01={mid ?? null}
+                  placeholderCents={riskTargetsFromEntry?.tpCents ?? targets?.tpCents}
+                  suggestedCents={suggestedTpDisplay || undefined}
+                  onApplySuggested={() => {
+                    const v = suggestedTpDisplay;
+                    if (!v) return;
+                    applyBuyBundleTpCents(v);
+                  }}
+                />
+              </div>
+            </details>
           </div>
 
           {executeIntentSummary && action === 'buy' ? (
@@ -8984,7 +9201,15 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
             <button
               ref={buyButtonRef}
               type="button"
-              disabled={busySubmit || outcomeLocked || !amtOk || limit01 == null || !Number.isFinite(limit01) || !buyGate.ok}
+              disabled={
+                busySubmit ||
+                outcomeLocked ||
+                !amtOk ||
+                buyExceedsCash ||
+                limit01 == null ||
+                !Number.isFinite(limit01) ||
+                !buyGate.ok
+              }
               aria-busy={busySubmit}
               className={`w-full rounded-xl px-4 py-3 text-sm font-black text-black disabled:cursor-not-allowed disabled:opacity-40 ${
                 isSlide
@@ -9006,6 +9231,10 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                 }
                 if (!buyGate.ok) {
                   setErr(buyGate.reason ?? 'Buy blocked by gate.');
+                  return;
+                }
+                if (buyExceedsCash) {
+                  setErr('Amount exceeds available cash — use a smaller size.');
                   return;
                 }
                 const submitLane = lane;
@@ -9084,7 +9313,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                         shares,
                         price01: Math.min(submitMid, limit),
                       });
-                      if (!r.ok) setErr(r.error);
+                      if (!r.ok) setErr(fmtPaperTradeError(r.error));
                       else {
                         setPaperAccount(r.account);
                         setOkMsg(`Paper filled buy ${shares.toFixed(2)} sh of ${submitLabel}`);

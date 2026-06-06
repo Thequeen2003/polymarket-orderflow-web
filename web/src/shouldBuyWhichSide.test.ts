@@ -80,6 +80,38 @@ function baseInput(overrides: Partial<ShouldBuyInput> = {}): ShouldBuyInput {
   };
 }
 
+describe('shouldBuyWhichSide book-only', () => {
+  it('picks side from dual GO on sports desk', () => {
+    const result = shouldBuyWhichSide({
+      machine: null,
+      book: {
+        dual: {
+          lane: 'down',
+          verdict: 'ENTER',
+          gate: 'ARMED',
+          go: true,
+          enterOnlyIf: 'Dual closed above entry',
+          laneLock: { lane: 'down', status: 'LOCKED', confidence: 'HIGH', reason: 'Momentum' },
+        },
+        wallFlow: null,
+        probUp: 0.31,
+        probDown: 0.69,
+        midUp: 0.31,
+        midDown: 0.69,
+      },
+      tape: null,
+      tapeLane: null,
+      forecast: null,
+      directive: null,
+      stability: null,
+      upLabel: 'Toronto Blue Jays',
+      downLabel: 'Atlanta Braves',
+    });
+    expect(result.verdict).toBe('BUY_DOWN');
+    expect(result.recommendation).toMatch(/ATLANTA|Braves|DOWN/i);
+  });
+});
+
 describe('shouldBuyWhichSide', () => {
   it('returns NEITHER when machine is null', () => {
     const result = shouldBuyWhichSide({ ...baseInput(), machine: null });
