@@ -42,3 +42,40 @@ export async function gammaMarketBySlugOrId(slugOrId: string, opts?: { timeoutMs
   const path = numeric ? `/markets/${slugOrId}` : `/markets/slug/${encodeURIComponent(slugOrId)}`;
   return polymarketGetJson(`${GAMMA()}${path}`, { timeoutMs: opts?.timeoutMs });
 }
+
+/** Live/upcoming game events for a Polymarket sports series (MLB=3, NBA=10345, …). */
+export async function gammaEventsBySeriesId(seriesId: number, limit: number): Promise<unknown[]> {
+  const capped = Math.max(1, Math.min(80, limit));
+  const base = `${GAMMA()}/events?series_id=${seriesId}&active=true&closed=false&limit=${capped}&archived=false`;
+  const tryUrls = [
+    `${base}&order=startDate&ascending=false`,
+    `${base}&order=volume24hr&ascending=false`,
+    base,
+  ];
+  let lastErr: unknown = null;
+  for (const url of tryUrls) {
+    try {
+      const data = await polymarketGetJson(url, { timeoutMs: 10_000 });
+      if (Array.isArray(data)) return data;
+      lastErr = new Error('gamma_events_bad_shape');
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+}
+
+export type GammaSportMeta = { sport: string; series: string };
+
+/** Polymarket sports registry — maps sport code → Gamma series id. */
+export async function gammaSportsRegistry(): Promise<GammaSportMeta[]> {
+  const data = await polymarketGetJson(`${GAMMA()}/sports`, { timeoutMs: 8_000 });
+  if (!Array.isArray(data)) return [];
+  return data
+    .filter((row): row is Record<string, unknown> => row != null && typeof row === 'object')
+    .map((row) => ({
+      sport: typeof row.sport === 'string' ? row.sport.trim().toLowerCase() : '',
+      series: typeof row.series === 'string' ? row.series.trim() : String(row.series ?? ''),
+    }))
+    .filter((row) => row.sport && row.series);
+}

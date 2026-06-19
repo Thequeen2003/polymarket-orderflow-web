@@ -14,6 +14,55 @@ function slopeLastWindowProbPerSec(pts: SpotPoint[], windowMs: number): number |
   return (a.v - b.v) / dt;
 }
 
+function deltaLastWindowProb(pts: SpotPoint[], windowMs: number): number | null {
+  if (pts.length < 2) return null;
+  const end = pts[pts.length - 1]!.t;
+  const slice = pts.filter((p) => p.t >= end - windowMs && Number.isFinite(p.v));
+  if (slice.length < 2) return null;
+  return slice[slice.length - 1]!.v - slice[0]!.v;
+}
+
+function fmtDeltaCentsLabel(d01: number): string {
+  if (!Number.isFinite(d01) || Math.abs(d01) < 0.00005) return '0¢';
+  const c = d01 * 100;
+  return `${c >= 0 ? '+' : ''}${Math.abs(c) >= 10 ? c.toFixed(1) : c.toFixed(2)}¢`;
+}
+
+export type OutcomeMomentumXs = {
+  arrow: '↑' | '↓' | '→';
+  deltaLabel: string;
+  speedLabel: string | null;
+  tone: 'up' | 'down' | 'flat';
+};
+
+/** Compact 15s prob momentum for trade Outcome cards (text-xs row). */
+export function buildOutcomeMomentumXs(
+  pts: SpotPoint[] | null | undefined,
+  windowMs = 15_000,
+): OutcomeMomentumXs | null {
+  const series = pts ?? [];
+  if (series.length < 2) return null;
+
+  const delta01 = deltaLastWindowProb(series, windowMs);
+  const slopePs = slopeLastWindowProbPerSec(series, windowMs);
+  if (delta01 == null && slopePs == null) return null;
+
+  const d = delta01 ?? 0;
+  const tone: OutcomeMomentumXs['tone'] = d > 0.0005 ? 'up' : d < -0.0005 ? 'down' : 'flat';
+  const arrow: OutcomeMomentumXs['arrow'] = tone === 'up' ? '↑' : tone === 'down' ? '↓' : '→';
+  const speedLabel =
+    slopePs != null && Number.isFinite(slopePs)
+      ? `${Math.abs(slopePs * 100).toFixed(2)}¢/s`
+      : null;
+
+  return {
+    arrow,
+    deltaLabel: delta01 != null ? fmtDeltaCentsLabel(delta01) : '—',
+    speedLabel,
+    tone,
+  };
+}
+
 export type BracketMomentumUi = {
   /** Short lines for SL/TP panel (prob + book context). */
   lines: string[];

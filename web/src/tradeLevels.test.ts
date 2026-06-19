@@ -109,6 +109,33 @@ describe('suggestTradeLevels', () => {
     expect(d!.stopLossLoss).toBeCloseTo(u!.stopLossLoss, 3);
     expect(d!.lane).toBe('down');
   });
+
+  it('tightens TP band when chop regime is passed', () => {
+    const open = suggestTradeLevels({ lane: 'up', entry: 0.55, edgeUsd: 0.15, pWin: 0.62 });
+    const chop = suggestTradeLevels({
+      lane: 'up',
+      entry: 0.55,
+      edgeUsd: 0.15,
+      pWin: 0.62,
+      speedAlignment: 'CHOP',
+      machineRegime: 'chop',
+    });
+    expect(chop!.takeProfitGain).toBeLessThanOrEqual(0.02 + 1e-6);
+    expect(chop!.takeProfitGain).toBeLessThan(open!.takeProfitGain);
+    expect(chop!.timeStopSec).toBeLessThanOrEqual(15);
+  });
+
+  it('adds TP2 for acceleration regime', () => {
+    const accel = suggestTradeLevels({
+      lane: 'up',
+      entry: 0.55,
+      edgeUsd: 0.12,
+      speedMode: 'ACCELERATION_IMBALANCE',
+      pressureTiming: 'BUILDING',
+    });
+    expect(accel!.takeProfit2).not.toBeNull();
+    expect(accel!.tpRegime).toBe('ACCELERATION');
+  });
 });
 
 describe('suggestLevelsForLane', () => {

@@ -7,6 +7,7 @@ import {
   marketsList,
   marketsSearch,
   marketsUpdownShortcut,
+  marketsSportsShortcut,
   priceToBeat,
   rtdsCrypto,
   type ApiErr,
@@ -14,6 +15,7 @@ import {
   type ClobBookEntry,
   type UpdownInterval,
   type UpdownShortcutAsset,
+  type SportsLeagueId,
 } from './lib/api';
 import { BookSideGrouped } from './BookPanel';
 import { displayPrice, midPrice, pickBookLevels, topOfBook } from './bookLevels';
@@ -44,6 +46,7 @@ import {
 const PtbMultiAssetGrid = lazy(() => import('./PtbMultiAssetGrid').then((m) => ({ default: m.PtbMultiAssetGrid })));
 import type { PtbMultiAssetRow } from './PtbMultiAssetGrid';
 const TrackingTab = lazy(() => import('./TrackingTab').then((m) => ({ default: m.TrackingTab })));
+const RawProjectionsTab = lazy(() => import('./RawProjectionsTab').then((m) => ({ default: m.RawProjectionsTab })));
 import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
 import { releaseOrphanPointerCapture } from './pointerCaptureSafety';
 import type { SpotPoint } from './SpotLevelChart';
@@ -62,15 +65,19 @@ import { outcomeEntryExitHints } from './chartReadouts';
 import { buildRollingContext, rollingContextText } from './contextSummary';
 import {
   inferUpdownHintFromMarketJson,
+  isTitledUpdownSlug,
   isUpdownDeskMarket,
   nextUpdownSlug,
   parseUpdownSlug,
   parseUpdownSlugWithHints,
   titledUpdownAssetFromSlug,
+  updownSlugAtBucket,
   type UpdownSlugHint,
 } from './sixPackUpdownSlugs';
 import { updownSlugToOpen } from './updownSlugToOpen';
 import { inferMarketKind, marketUsesPtbSpotDesk } from './marketKind';
+import { buySideAdvisoryDetailEqual, type BuySideAdvisoryDetail } from './buySideAdvisoryEvent';
+import type { BuySideAdvisory } from './shouldBuyWhichSide';
 import { BtcSpotPaperTest } from './BtcSpotPaperTest';
 import { TradingViewBtcUsdtTab } from './TradingViewBtcUsdtTab';
 import { PerpsCommandCenter } from './PerpsCommandCenter';
@@ -84,6 +91,9 @@ import {
   writeUpdownShortcutCache,
   type CachedUpdownShortcut,
 } from './updownShortcutCache';
+import { readSportsShortcutCache, writeSportsShortcutCache } from './sportsShortcutCache';
+import { inferSportsLeagueFromSlug, SPORTS_LEAGUE_CHIPS } from './sportsLeagues';
+import { SportsMarketPicker } from './SportsMarketPicker';
 
 function pretty(value: unknown) {
   return JSON.stringify(value, null, 2);
@@ -546,6 +556,7 @@ type MainTab =
   | 'book'
   | 'flowzones'
   | 'signals'
+  | 'sports'
   | 'tracking'
   | 'tradehistory'
   | 'btc'
@@ -563,6 +574,8 @@ function mainTabTitle(tab: MainTab): string {
       return 'Flow Zones';
     case 'signals':
       return 'Signals';
+    case 'sports':
+      return 'Sports';
     case 'tracking':
       return 'Tracking';
     case 'tradehistory':
@@ -578,7 +591,7 @@ function mainTabTitle(tab: MainTab): string {
     case 'assistant':
       return 'Assistant';
     case 'raw':
-      return 'Raw';
+      return 'Projections (30d hourly)';
   }
 }
 
@@ -646,6 +659,8 @@ function App() {
   const [assistantAvailable, setAssistantAvailable] = useState(false);
   const [shortcutBusy, setShortcutBusy] = useState<{ asset: UpdownShortcutAsset; interval: UpdownInterval } | null>(null);
   const [lastShortcut, setLastShortcut] = useState<{ asset: UpdownShortcutAsset; interval: UpdownInterval } | null>(null);
+  const [sportsShortcutBusy, setSportsShortcutBusy] = useState<SportsLeagueId | null>(null);
+  const [activeSportsLeague, setActiveSportsLeague] = useState<SportsLeagueId | null>('mlb');
   const [mainTab, setMainTab] = useState<MainTab>('signals');
   const [mobileMarketPanelOpen, setMobileMarketPanelOpen] = useState(false);
   /** Binance BTCUSDT spot — own book/flow/signals; pauses Polymarket CLOB WS/polls while active. */
@@ -676,6 +691,8 @@ function App() {
   const [ssrPtbSource, setSsrPtbSource] = useState<string | null>(null);
   const [ptbError, setPtbError] = useState<string | null>(null);
   const [rtdsSpot, setRtdsSpot] = useState<number | null>(null);
+  /** Symbol `rtdsSpot` belongs to (eth/usd, btc/usd, …) — avoids pinning wrong asset on slug switch. */
+  const [rtdsSpotSymbol, setRtdsSpotSymbol] = useState<string | null>(null);
   const [rtdsTickAt, setRtdsTickAt] = useState<number | null>(null);
   /** Wall-clock time of last successful RTDS HTTP poll (Chainlink `ts` can lag). */
   const [rtdsReceivedAt, setRtdsReceivedAt] = useState<number | null>(null);
@@ -724,6 +741,7 @@ function App() {
   }, []);
   const [positionsPanelOpen, setPositionsPanelOpen] = useState(false);
   const [globalTradeLocked, setGlobalTradeLocked] = useState(false);
+  const [buySideAdvisoryBySlug, setBuySideAdvisoryBySlug] = useState<Record<string, BuySideAdvisoryDetail>>({});
   const [updownPickerOpen, setUpdownPickerOpen] = useState(false);
   /** Titled Polymarket hourly/daily slugs: map slug → bucket start so RTDS + PTB align like `btc-updown-1h-*`. */
   const [updownSlugHints, setUpdownSlugHints] = useState<Record<string, UpdownSlugHint>>({});
@@ -732,10 +750,11 @@ function App() {
     [selectedSlug, updownSlugHints],
   );
   const signalsMarketKind = useMemo(
-    () => inferMarketKind(selectedSlug, marketJson),
-    [selectedSlug, marketJson],
+    () => inferMarketKind(selectedSlug, marketJson, updownSlugHints),
+    [selectedSlug, marketJson, updownSlugHints],
   );
   const signalsNeedsPtb = marketUsesPtbSpotDesk(signalsMarketKind);
+  const sportsDeskActive = signalsMarketKind === 'sports_binary';
   /** Multiple trade tabs in the slide panel; switching re-loads that slug (one CLOB at a time). */
   const [tradeSessionTabs, setTradeSessionTabs] = useState<TradeSessionTab[]>([]);
   const [activeTradeSessionTabId, setActiveTradeSessionTabId] = useState<string | null>(null);
@@ -812,8 +831,8 @@ function App() {
   }, [marketJson, selectedSlug]);
 
   useEffect(() => {
-    wantSeriesRef.current = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals';
-    wantFlowRef.current = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals';
+    wantSeriesRef.current = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports';
+    wantFlowRef.current = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports';
   }, [mainTab]);
 
   const prevDepthMapsRef = useRef<Record<string, { bids: Map<string, number>; asks: Map<string, number> }>>({});
@@ -917,14 +936,16 @@ function App() {
   const signalsSpotSeries = useMemo(() => {
     const slug = selectedSlug.trim();
     if (!slug) return [] as SpotPoint[];
+    const activeSym = spotSymbolForSlug(slug, updownSlugHints, marketJson);
     let base = spotSeriesBySlug[slug] ?? [];
-    if (base.length < 2) {
-      const sym = spotSymbolForSlug(slug, updownSlugHints, marketJson);
-      const assetSeries = sym ? (spotBySymbol[sym] ?? []) : [];
+    if (base.length < 2 && activeSym) {
+      const assetSeries = spotBySymbol[activeSym] ?? [];
       if (assetSeries.length > base.length) base = assetSeries;
     }
     const anchorMs = maxFeedMs(booksFetchedAt, rtdsTickAt, rtdsReceivedAt, rtdsLastPollMs) ?? Date.now();
-    return appendLiveSpotSeries(base, rtdsSpot, anchorMs);
+    // Only pin the live RTDS tick when it belongs to this slug's underlying (eth/usd vs sol/usd vs btc/usd).
+    const liveSpot = activeSym && rtdsSpotSymbol === activeSym ? rtdsSpot : null;
+    return appendLiveSpotSeries(base, liveSpot, anchorMs);
   }, [
     selectedSlug,
     spotSeriesBySlug,
@@ -932,6 +953,7 @@ function App() {
     updownSlugHints,
     marketJson,
     rtdsSpot,
+    rtdsSpotSymbol,
     rtdsTickAt,
     rtdsReceivedAt,
     rtdsLastPollMs,
@@ -1013,6 +1035,7 @@ function App() {
       setSsrPtbSource(null);
       setPtbError(null);
       setRtdsSpot(null);
+      setRtdsSpotSymbol(null);
       setRtdsTickAt(null);
       setRtdsReceivedAt(null);
       setRtdsLastPollMs(null);
@@ -1133,6 +1156,34 @@ function App() {
     [activeTradeSessionTabId],
   );
 
+  const onBuySideAdvisoryChange = useCallback((detail: BuySideAdvisoryDetail) => {
+    const key = detail.slug?.trim();
+    if (!key) return;
+    setBuySideAdvisoryBySlug((prev) => {
+      const cur = prev[key];
+      if (cur && buySideAdvisoryDetailEqual(cur, detail)) return prev;
+      return { ...prev, [key]: detail };
+    });
+  }, []);
+
+  const tradeBuySideAdvisory = useMemo((): BuySideAdvisory | null => {
+    const key = effectiveTradeContext.slug?.trim() ?? '';
+    if (!key) return null;
+    const signalsDeskLive =
+      (mainTab === 'signals' || mainTab === 'sports') && selectedSlug.trim() === key && !binanceSpotActive;
+    if (!signalsDeskLive) return null;
+    return buySideAdvisoryBySlug[key]?.advisory ?? null;
+  }, [binanceSpotActive, buySideAdvisoryBySlug, effectiveTradeContext.slug, mainTab, selectedSlug]);
+
+  const marketEndsInMs = useMemo(() => {
+    if (!marketJson || typeof marketJson !== 'object') return null;
+    const endRaw = (marketJson as Record<string, unknown>).endDate;
+    if (typeof endRaw !== 'string') return null;
+    const t = Date.parse(endRaw);
+    if (!Number.isFinite(t)) return null;
+    return t - now;
+  }, [marketJson, now]);
+
   const tradePanelSharedProps = useMemo(
     () => ({
       marketSlug: effectiveTradeContext.slug,
@@ -1154,6 +1205,8 @@ function App() {
       bookMidDown: tradePanelBookMids.down,
       bookTouchUp: tradePanelBookTouch.up,
       bookTouchDown: tradePanelBookTouch.down,
+      buySideAdvisory: tradeBuySideAdvisory,
+      endsInMs: marketEndsInMs,
       lane: globalTradeLane,
       onLaneChange: onGlobalTradeLaneChange,
     }),
@@ -1162,6 +1215,8 @@ function App() {
       marketJson,
       signalsProbMids.down,
       signalsProbMids.up,
+      tradeBuySideAdvisory,
+      marketEndsInMs,
       tradePanelBookMids.down,
       tradePanelBookMids.up,
       tradePanelBookTouch.down,
@@ -1174,7 +1229,10 @@ function App() {
   const showEmbeddedTradeDock =
     tradeUiPrefs.embedded &&
     !binanceSpotActive &&
-    (mainTab === 'signals' || mainTab === 'book' || mainTab === 'tracking' || mainTab === 'flowzones');
+    (mainTab === 'signals' || mainTab === 'sports' || mainTab === 'book' || mainTab === 'tracking' || mainTab === 'flowzones');
+
+  /** Slide panel is fixed to the viewport — reserve its width on md+ so main UI stays visible beside it. */
+  const slideTradePanelReservesSpace = tradeUiPrefs.slide && tradePanelOpen;
 
 
   const openTradeUi = useCallback(() => {
@@ -1591,10 +1649,21 @@ function App() {
     return () => window.clearTimeout(id);
   }, [shortcutBusy]);
 
+  useEffect(() => {
+    if (!sportsShortcutBusy) return;
+    const id = window.setTimeout(() => setSportsShortcutBusy(null), 45_000);
+    return () => window.clearTimeout(id);
+  }, [sportsShortcutBusy]);
+
+  useEffect(() => {
+    const league = inferSportsLeagueFromSlug(selectedSlug);
+    if (league) setActiveSportsLeague(league);
+  }, [selectedSlug]);
+
   // REST book poll: idle markets may get no WS deltas, so `booksFetchedAt` would age out while the book is still valid.
   useEffect(() => {
     if (binanceSpotActive) return;
-    const pollTabs = new Set(['book', 'flowzones', 'signals', 'tracking']);
+    const pollTabs = new Set(['book', 'flowzones', 'signals', 'sports', 'tracking']);
     if (!pollTabs.has(mainTab)) return;
     if (mainTab === 'book' && !chartEnabled) return;
     if (!tokenIds || tokenIds.length === 0) return;
@@ -1604,12 +1673,12 @@ function App() {
     const run = () => {
       if (stopped) return;
       if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
-      const wantSeries = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals';
-      const wantFlow = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals';
+      const wantSeries = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports';
+      const wantFlow = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports';
       void loadBooks(tokenIds, { updateSeries: wantSeries, updateFlow: wantFlow });
     };
 
-    const intervalMs = mainTab === 'book' ? 5_000 : mainTab === 'signals' ? 4_000 : 6_500;
+    const intervalMs = mainTab === 'book' ? 5_000 : mainTab === 'signals' || mainTab === 'sports' ? 4_000 : 6_500;
     void run();
     const id = window.setInterval(() => void run(), intervalMs);
     return () => {
@@ -1637,8 +1706,8 @@ function App() {
     const onVis = () => {
       if (document.visibilityState !== 'visible') return;
       if (!tokenIds || tokenIds.length === 0) return;
-      const wantSeries = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals';
-      const wantFlow = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals';
+      const wantSeries = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports';
+      const wantFlow = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports';
       void loadBooks(tokenIds, { updateSeries: wantSeries, updateFlow: wantFlow });
     };
     document.addEventListener('visibilitychange', onVis);
@@ -1737,8 +1806,8 @@ function App() {
       }
       return;
     }
-    const wantSeries = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals';
-    const wantFlow = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals';
+    const wantSeries = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports';
+    const wantFlow = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports';
     queueMicrotask(() => void loadBooks(tokenIds, { updateSeries: wantSeries, updateFlow: wantFlow }));
   }, [tokenIds, loadBooks, mainTab, binanceSpotActive, selectedSlug]);
 
@@ -1831,7 +1900,10 @@ function App() {
       });
       return;
     }
-    if (!marketUsesPtbSpotDesk(inferMarketKind(slug, marketJson))) {
+    const ptbDesk =
+      isUpdownDeskMarket(slug, updownSlugHints) ||
+      marketUsesPtbSpotDesk(inferMarketKind(slug, marketJson, updownSlugHints));
+    if (!ptbDesk) {
       ptbPollSlugRef.current = slug;
       queueMicrotask(() => {
         if (selectedSlugRef.current.trim() !== slug) return;
@@ -1879,16 +1951,35 @@ function App() {
       stopped = true;
       if (intervalId != null) window.clearInterval(intervalId);
     };
-  }, [selectedSlug, marketJson]);
+  }, [selectedSlug, marketJson, updownSlugHints]);
 
   useEffect(() => {
     const sym = spotSymbolForSlug(selectedSlug, updownSlugHints, marketJson);
     if (!sym?.endsWith('/usd')) return;
     if (spotSymbolRef.current === sym) return;
     spotSymbolRef.current = sym;
+    setRtdsSpot(null);
+    setRtdsSpotSymbol(null);
+    setRtdsTickAt(null);
+    setRtdsReceivedAt(null);
     setRtdsSpotFeedSource(null);
-    setSpotBySymbol((m) => ({ ...m, [sym]: m[sym] ?? [] }));
+    setSpotBySymbol((m) => (m[sym] ? m : { ...m, [sym]: [] }));
   }, [selectedSlug, updownSlugHints, marketJson]);
+
+  /** Seed per-slug spot from the asset buffer so ETH/SOL charts work immediately after a shortcut switch. */
+  useEffect(() => {
+    const slug = selectedSlug.trim();
+    if (!slug) return;
+    const sym = spotSymbolForSlug(slug, updownSlugHints, marketJson);
+    if (!sym) return;
+    const assetSeries = spotBySymbolRef.current[sym] ?? [];
+    if (assetSeries.length < 2) return;
+    setSpotSeriesBySlug((m) => {
+      const cur = m[slug] ?? [];
+      if (cur.length >= 2) return m;
+      return { ...m, [slug]: assetSeries };
+    });
+  }, [selectedSlug, updownSlugHints, marketJson, spotBySymbol]);
 
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 5_000);
@@ -1977,7 +2068,14 @@ function App() {
           okAny = true;
           next[sym] = mergeSpotHistory(base[sym] ?? [], res.data, sym);
         }
-        setSpotBySymbol(next);
+        let spotBySymbolChanged = false;
+        for (const sym of SYMS) {
+          if (next[sym] !== base[sym]) {
+            spotBySymbolChanged = true;
+            break;
+          }
+        }
+        if (spotBySymbolChanged) setSpotBySymbol(next);
         setRtdsError(okAny ? null : firstErr);
         const sym = symFromSlug(selectedSlug);
         const pollAt = Date.now();
@@ -1997,6 +2095,7 @@ function App() {
         if (!sym) {
           queueMicrotask(() => {
             setRtdsSpot(null);
+            setRtdsSpotSymbol(null);
             setRtdsTickAt(null);
             setRtdsReceivedAt(null);
             setRtdsSpotFeedSource(null);
@@ -2018,15 +2117,28 @@ function App() {
           break;
         }
         queueMicrotask(() => {
-          setSpotSeriesBySlug((m) => ({ ...m, [selectedSlug]: series }));
+          setSpotSeriesBySlug((m) => {
+            const prev = m[selectedSlug] ?? [];
+            if (
+              prev.length === series.length &&
+              prev.length > 0 &&
+              prev[prev.length - 1]!.t === series[series.length - 1]!.t &&
+              prev[prev.length - 1]!.v === series[series.length - 1]!.v
+            ) {
+              return m;
+            }
+            return { ...m, [selectedSlug]: series };
+          });
           if (spotSrc != null) setRtdsSpotFeedSource(spotSrc);
           if (activeReceivedAt != null) setRtdsReceivedAt(activeReceivedAt);
           const liveRes = SYMS.map((s, i) => ({ s, r: results[i]! })).find((x) => x.s === sym)?.r;
-          if (liveRes && isOk(liveRes) && (liveRes.data.source === 'chainlink' || !sym.endsWith('/usd'))) {
+          if (liveRes && isOk(liveRes) && Number.isFinite(liveRes.data.value)) {
+            setRtdsSpotSymbol(sym);
             setRtdsSpot(liveRes.data.value);
             setRtdsTickAt(normalizeEpochMs(liveRes.data.ts) ?? liveRes.data.ts);
           } else if (series.length > 0) {
             const last = series[series.length - 1]!;
+            setRtdsSpotSymbol(sym);
             setRtdsSpot(last.v);
             setRtdsTickAt(normalizeEpochMs(last.t) ?? last.t);
           }
@@ -2066,7 +2178,7 @@ function App() {
 
   useEffect(() => {
     if (mainTab !== 'multiscan') return;
-    const slugs = [...new Set(ptbWatchSlugs.filter((s) => parseUpdownSlugWithHints(s, updownSlugHints) != null))];
+    const slugs = [...new Set(ptbWatchSlugs.filter((s) => isUpdownDeskMarket(s, updownSlugHints)))];
     if (slugs.length === 0) {
       queueMicrotask(() => setWatchMetaBySlug({}));
       return;
@@ -2107,21 +2219,13 @@ function App() {
     };
   }, [ptbWatchSlugs, mainTab, updownSlugHints]);
 
-  const marketEndsInMs = useMemo(() => {
-    if (!marketJson || typeof marketJson !== 'object') return null;
-    const endRaw = (marketJson as Record<string, unknown>).endDate;
-    if (typeof endRaw !== 'string') return null;
-    const t = Date.parse(endRaw);
-    if (!Number.isFinite(t)) return null;
-    return t - now;
-  }, [marketJson, now]);
-
   const multiScanRows: PtbMultiAssetRow[] = useMemo(() => {
     return ptbWatchSlugs
       .map((slug) => {
         const p = parseUpdownSlugWithHints(slug, updownSlugHints);
-        if (!p) return null;
-        const sym = `${p.asset}/usd`;
+        const asset = p?.asset ?? titledUpdownAssetFromSlug(slug);
+        if (!asset || !isUpdownDeskMarket(slug, updownSlugHints)) return null;
+        const sym = `${asset}/usd`;
         const spot = spotBySymbol[sym] ?? [];
         const meta = watchMetaBySlug[slug];
         const ptb = meta?.ptb ?? (slug === selectedSlug ? ssrPriceToBeat : null);
@@ -2130,7 +2234,7 @@ function App() {
         const lastMs = spot.length ? spot[spot.length - 1]!.t : null;
         return {
           slug,
-          label: `${p.asset.toUpperCase()}/USD`,
+          label: `${asset.toUpperCase()}/USD`,
           spot,
           priceToBeat: ptb,
           endsInMs: endsMs,
@@ -2144,20 +2248,45 @@ function App() {
     const p = updownParsed;
     if (!p) return [];
     const step = p.stepSec;
-    // Snap to exact window boundary. (ts is epoch seconds.)
     const snapped = Math.floor(p.ts / step) * step;
+    const titled = isTitledUpdownSlug(selectedSlug);
     const items: { slug: string; label: string; ts: number }[] = [];
-    // Show a useful range per interval (keeps dropdown manageable).
     const count = p.interval === '1d' ? 14 : p.interval === '4h' ? 36 : p.interval === '1h' ? 48 : p.interval === '15m' ? 12 : 24;
     for (let i = 0; i < count; i++) {
       const ts = snapped - i * step;
-      const slug = `${p.asset}-updown-${p.interval}-${ts}`;
+      const slug = updownSlugAtBucket(p.asset, p.interval, ts, titled);
       const d = new Date(ts * 1000);
-      const hh = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
-      items.push({ slug, label: hh, ts });
+      const label =
+        p.interval === '1d'
+          ? new Date((ts + step) * 1000).toLocaleDateString(undefined, {
+              timeZone: 'America/New_York',
+              month: 'short',
+              day: 'numeric',
+            })
+          : p.interval === '1h'
+            ? d.toLocaleString(undefined, {
+                timeZone: 'America/New_York',
+                month: 'short',
+                day: 'numeric',
+                hour: 'numeric',
+              })
+            : p.interval === '4h'
+              ? `${d.toLocaleTimeString(undefined, {
+                  timeZone: 'America/New_York',
+                  hour: 'numeric',
+                })}–${new Date((ts + step) * 1000).toLocaleTimeString(undefined, {
+                  timeZone: 'America/New_York',
+                  hour: 'numeric',
+                })} ET`
+              : d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+      items.push({ slug, label, ts });
     }
     return items;
-  }, [updownParsed]);
+  }, [selectedSlug, updownParsed]);
+  const stepUpdownSlug = useCallback(
+    (dir: -1 | 1) => nextUpdownSlug(selectedSlug, dir, updownSlugHints),
+    [selectedSlug, updownSlugHints],
+  );
   const [updownLiveSlugFromApi, setUpdownLiveSlugFromApi] = useState<string | null>(null);
 
   // For Up/Down markets, use the API's notion of "live" (bucket) rather than the browser clock.
@@ -2446,6 +2575,92 @@ function App() {
     }
   }
 
+  async function openSportsShortcut(league: SportsLeagueId) {
+    releaseOrphanPointerCapture();
+    const openSeq = ++shortcutOpenSeqRef.current;
+    setError(null);
+    setMarketsError(null);
+    setMarketsNotice(null);
+    setSportsShortcutBusy(league);
+    setActiveSportsLeague(league);
+    setMainTab('sports');
+
+    const openFromShortcut = (data: ReturnType<typeof readSportsShortcutCache>, notice?: string) => {
+      if (!data || openSeq !== shortcutOpenSeqRef.current) return;
+      if (notice) setMarketsNotice(notice);
+      void navigateToMarket(data.slug, { market: data.market });
+    };
+
+    const cached = readSportsShortcutCache(league);
+    const currentSlug = selectedSlugRef.current.trim().toLowerCase();
+    if (cached) {
+      const cachedSlug = cached.slug.trim().toLowerCase();
+      const needsCacheOpen = currentSlug !== cachedSlug || !marketJson;
+      if (needsCacheOpen) {
+        openFromShortcut(cached, `${league.toUpperCase()} · cached sports shortcut (refreshing…)`);
+      }
+    }
+
+    try {
+      const first = await marketsSportsShortcut(league);
+      if (openSeq !== shortcutOpenSeqRef.current) return;
+      if (!isOk(first)) {
+        if (cached) {
+          const cachedSlug = cached.slug.trim().toLowerCase();
+          if (currentSlug !== cachedSlug || !marketJson) {
+            openFromShortcut(
+              cached,
+              `Sports shortcut API slow — opened cached ${league.toUpperCase()}. ${pretty(first)}`,
+            );
+          } else {
+            setMarketsError(`Sports shortcut API slow — kept ${league.toUpperCase()}. ${pretty(first)}`);
+          }
+          setSportsShortcutBusy(null);
+          return;
+        }
+        setMarketsError(`No live ${league.toUpperCase()} market found. ${pretty(first)}`);
+        setSportsShortcutBusy(null);
+        return;
+      }
+
+      const data = first.data;
+      writeSportsShortcutCache(league, {
+        slug: data.slug,
+        league: data.league,
+        question: data.question,
+        gameStartTime: data.gameStartTime,
+        market: data.market,
+      });
+      if (data.question) {
+        setMarketsNotice(`${league.toUpperCase()} · ${data.question}`);
+      } else {
+        setMarketsNotice(`${league.toUpperCase()} · ${data.slug}`);
+      }
+      setSportsShortcutBusy(null);
+      if (openSeq === shortcutOpenSeqRef.current) {
+        void navigateToMarket(data.slug, { market: data.market });
+      }
+    } catch (e) {
+      if (openSeq !== shortcutOpenSeqRef.current) return;
+      if (cached) {
+        const cachedSlug = cached.slug.trim().toLowerCase();
+        if (currentSlug !== cachedSlug || !marketJson) {
+          openFromShortcut(
+            cached,
+            `Sports shortcut error — opened cached ${league.toUpperCase()}. ${e instanceof Error ? e.message : String(e)}`,
+          );
+        } else {
+          setMarketsError(
+            `Sports shortcut error — kept cached ${league.toUpperCase()}. ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+      } else {
+        setMarketsError(e instanceof Error ? e.message : String(e));
+      }
+      setSportsShortcutBusy(null);
+    }
+  }
+
   async function runSearch() {
     setError(null);
     setMarketsError(null);
@@ -2548,6 +2763,30 @@ function App() {
         <p className="text-[10px] leading-snug text-zinc-600">
           5m Up/Down — the <span className="font-medium text-zinc-400">btc</span> chip is only the Polymarket BTC 5-minute window (share prices), not Binance spot.
         </p>
+        <div className="mt-2 text-[10px] font-semibold uppercase tracking-[0.12em] text-emerald-200/75">Polymarket · sports</div>
+        <div className="mt-1 flex flex-wrap gap-2">
+          {SPORTS_LEAGUE_CHIPS.slice(0, 8).map((chip) => {
+            const busy = sportsShortcutBusy === chip.id;
+            return (
+              <button
+                key={`sport-${chip.id}`}
+                type="button"
+                disabled={busy}
+                onClick={() => void openSportsShortcut(chip.id)}
+                className="min-w-[3rem] rounded-xl border border-emerald-800/45 bg-emerald-950/25 px-2.5 py-2 text-center text-xs font-bold uppercase tracking-wide text-emerald-100 transition-colors hover:bg-emerald-950/45 disabled:cursor-wait disabled:opacity-50"
+              >
+                {busy ? '…' : chip.label}
+              </button>
+            );
+          })}
+          <button
+            type="button"
+            onClick={() => setMainTab('sports')}
+            className="rounded-xl border border-zinc-700/50 px-2.5 py-2 text-center text-xs font-semibold text-zinc-300 hover:bg-zinc-900/50"
+          >
+            All sports →
+          </button>
+        </div>
         <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-cyan-200/75">Separate market · spot</div>
         <div className="mt-1 rounded-xl border border-cyan-800/45 bg-cyan-950/20 p-3 ring-1 ring-cyan-500/10">
           <div className="text-[10px] font-semibold uppercase tracking-wide text-cyan-200/85">BTC / USDT (Binance)</div>
@@ -2679,7 +2918,11 @@ function App() {
   );
 
   return (
-      <div className="min-h-full bg-zinc-950 bg-[radial-gradient(100%_60%_at_50%_-10%,rgba(99,102,241,0.08),transparent_52%),linear-gradient(180deg,#0b0b0f_0%,#09090b_45%,#060608_100%)] font-sans text-zinc-200 antialiased">
+      <div
+        className={`min-h-full bg-zinc-950 bg-[radial-gradient(100%_60%_at_50%_-10%,rgba(99,102,241,0.08),transparent_52%),linear-gradient(180deg,#0b0b0f_0%,#09090b_45%,#060608_100%)] font-sans text-zinc-200 antialiased transition-[padding] duration-200 ease-out ${
+          slideTradePanelReservesSpace ? 'md:pr-[380px]' : ''
+        }`}
+      >
       <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
         <header className="rounded-2xl border border-zinc-800/50 bg-zinc-900/20 px-5 py-5 shadow-lg shadow-black/20 ring-1 ring-white/[0.03] backdrop-blur-sm sm:px-6">
           <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
@@ -2781,7 +3024,7 @@ function App() {
         <div className="mt-8 flex flex-col gap-5 xl:grid xl:grid-cols-12 xl:items-start xl:gap-6">
           <div
             className={`rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-5 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm xl:col-span-3 ${
-              mainTab === 'signals' ? 'order-2 xl:order-1' : ''
+              mainTab === 'signals' || mainTab === 'sports' ? 'order-2 xl:order-1' : ''
             }`}
           >
             {mobileLayout ? (
@@ -2814,7 +3057,7 @@ function App() {
           <div
             className={`min-w-0 max-w-full rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-4 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm sm:p-5 ${
               showEmbeddedTradeDock ? 'xl:col-span-7' : 'xl:col-span-9'
-            } ${mainTab === 'signals' ? 'order-1 xl:order-2' : ''}`}
+            } ${mainTab === 'signals' || mainTab === 'sports' ? 'order-1 xl:order-2' : ''}`}
           >
             <div className="flex flex-col gap-3 border-b border-zinc-800/40 pb-3 sm:flex-row sm:flex-wrap sm:items-center">
               <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
@@ -2860,6 +3103,7 @@ function App() {
                 <MainTabButton id="book" label="Book" active={mainTab === 'book'} onSelect={setMainTab} />
                 <MainTabButton id="flowzones" label="Flow" title="Flow Zones" active={mainTab === 'flowzones'} onSelect={setMainTab} />
                 <MainTabButton id="signals" label="Signals" active={mainTab === 'signals'} onSelect={setMainTab} />
+                <MainTabButton id="sports" label="Sports" active={mainTab === 'sports'} onSelect={setMainTab} />
                 <MainTabButton id="tracking" label="Tracking" title="Positions + open orders + cash" active={mainTab === 'tracking'} onSelect={setMainTab} />
                 <MainTabButton id="tradehistory" label="History" title="Trade history (paper + live log)" active={mainTab === 'tradehistory'} onSelect={setMainTab} />
                 <MainTabButton id="btc" label="BTC" title="BTC live spot + paper trading" active={mainTab === 'btc'} onSelect={setMainTab} />
@@ -2879,7 +3123,13 @@ function App() {
                 />
                 <MainTabButton id="multiscan" label="Multi" title="Multi-asset PTB scan" active={mainTab === 'multiscan'} onSelect={setMainTab} />
                 <MainTabButton id="assistant" label="Assistant" active={mainTab === 'assistant'} onSelect={setMainTab} />
-                <MainTabButton id="raw" label="Raw" active={mainTab === 'raw'} onSelect={setMainTab} />
+                <MainTabButton
+                  id="raw"
+                  label="Projections"
+                  title="Raw projected spot — every 1h × 30 days"
+                  active={mainTab === 'raw'}
+                  onSelect={setMainTab}
+                />
               </div>
             </div>
 
@@ -2926,10 +3176,10 @@ function App() {
                   Jump to the live window.
                 </div>
                 <div className="flex gap-2">
-                  {nextUpdownSlug(selectedSlug, -1) ? (
+                  {stepUpdownSlug(-1) ? (
                     <button
                       type="button"
-                      onClick={() => void navigateToMarket(nextUpdownSlug(selectedSlug, -1)!)}
+                      onClick={() => void navigateToMarket(stepUpdownSlug(-1)!)}
                       className="rounded-lg border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
                     >
                       Prev
@@ -2944,10 +3194,10 @@ function App() {
                       Jump to live
                     </button>
                   ) : null}
-                  {nextUpdownSlug(selectedSlug, 1) ? (
+                  {stepUpdownSlug(1) ? (
                     <button
                       type="button"
-                      onClick={() => void navigateToMarket(nextUpdownSlug(selectedSlug, 1)!)}
+                      onClick={() => void navigateToMarket(stepUpdownSlug(1)!)}
                       className="rounded-lg border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
                     >
                       +{updownParsed.stepSec}s
@@ -2962,19 +3212,19 @@ function App() {
                   <span className="font-mono">+{updownParsed?.stepSec ?? 300}s</span> market for the live book.
                 </div>
                 <div className="flex gap-2">
-                  {nextUpdownSlug(selectedSlug, -1) ? (
+                  {stepUpdownSlug(-1) ? (
                     <button
                       type="button"
-                      onClick={() => void navigateToMarket(nextUpdownSlug(selectedSlug, -1)!)}
+                      onClick={() => void navigateToMarket(stepUpdownSlug(-1)!)}
                       className="rounded-lg border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-900/50"
                     >
                       Prev
                     </button>
                   ) : null}
-                  {nextUpdownSlug(selectedSlug, 1) ? (
+                  {stepUpdownSlug(1) ? (
                     <button
                       type="button"
-                      onClick={() => void navigateToMarket(nextUpdownSlug(selectedSlug, 1)!)}
+                      onClick={() => void navigateToMarket(stepUpdownSlug(1)!)}
                       className="rounded-lg border border-amber-700/40 bg-amber-950/30 px-3 py-2 text-xs font-semibold text-amber-100 hover:bg-amber-950/50"
                     >
                       Next
@@ -2999,7 +3249,7 @@ function App() {
                             : '5-minute markers'}
                     <span className="ml-2 font-mono text-zinc-500">({updownParsed.asset.toUpperCase()} {updownParsed.interval})</span>
                   </div>
-                  {parseUpdownSlug(selectedSlug) ? (
+                  {parseUpdownSlug(selectedSlug) || isTitledUpdownSlug(selectedSlug) ? (
                     <button
                       type="button"
                       onClick={() => setUpdownPickerOpen((v) => !v)}
@@ -3022,7 +3272,7 @@ function App() {
                   ) : null}
                 </div>
 
-                {updownPickerOpen && parseUpdownSlug(selectedSlug) ? (
+                {updownPickerOpen && (parseUpdownSlug(selectedSlug) || isTitledUpdownSlug(selectedSlug)) ? (
                   <div className="mt-2 grid grid-cols-4 gap-2 sm:grid-cols-6">
                     {updownPickerItems.map((it) => (
                       <button
@@ -3283,10 +3533,89 @@ function App() {
                   tradePanelSlug={effectiveTradeContext.slug}
                   tradePanelLane={globalTradeLane}
                   tradePanelPinned={globalTradeLocked}
+                  onBuySideAdvisoryChange={onBuySideAdvisoryChange}
+                  updownSlugHints={updownSlugHints}
                 />
                 <p className="mt-3 text-center text-[11px] text-zinc-600">
                   Book tab: order flow, ladders, and above/below context. Assistant tab: chat + digest.
                 </p>
+              </div>
+            ) : null}
+
+            {!binanceSpotActive && mainTab === 'sports' ? (
+              <div className="mt-5">
+                <SportsMarketPicker
+                  activeLeague={activeSportsLeague}
+                  busyLeague={sportsShortcutBusy}
+                  selectedSlug={selectedSlug}
+                  onPickLeague={(league) => void openSportsShortcut(league)}
+                  onOpenSlug={(slug, market) => {
+                    setMainTab('sports');
+                    void navigateToMarket(slug, { market });
+                  }}
+                />
+                {sportsShortcutBusy && !selectedSlug.trim() ? (
+                  <div className="mb-4 rounded-2xl border border-emerald-800/40 bg-emerald-950/20 px-4 py-6 text-center text-sm text-emerald-100/90">
+                    Loading {sportsShortcutBusy.toUpperCase()} market…
+                  </div>
+                ) : booksLoading && selectedSlug.trim() && !books ? (
+                  <div className="mb-4 rounded-2xl border border-zinc-800/60 bg-zinc-950/40 px-4 py-6 text-center text-sm text-zinc-400">
+                    Loading order books for sports signals…
+                  </div>
+                ) : null}
+                {error && selectedSlug.trim() && !marketJson ? (
+                  <div className="mb-4 rounded-2xl border border-amber-800/40 bg-amber-950/20 px-4 py-4 text-sm leading-relaxed text-amber-100/90">
+                    <p className="font-semibold text-amber-50">Market metadata did not load</p>
+                    <p className="mt-2 text-amber-100/75">
+                      Slug <span className="font-mono text-amber-50/95">{selectedSlug}</span> could not be fetched — retry or pick another game.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => void loadMarket(selectedSlug.trim(), { force: true })}
+                      className="mt-3 rounded-xl border border-amber-600/50 bg-amber-950/40 px-4 py-2 text-xs font-semibold text-amber-50 hover:bg-amber-950/55"
+                    >
+                      Retry load
+                    </button>
+                  </div>
+                ) : null}
+                {selectedSlug.trim() && sportsDeskActive ? (
+                  <SignalsPtbOnly
+                    slug={selectedSlug}
+                    market={marketJson}
+                    books={books}
+                    outcomeLabels={outcomeLabels}
+                    priceToBeat={ssrPriceToBeat}
+                    spot={signalsSpotSeries}
+                    spotLastUpdateMs={signalsSpotFeedLastMs}
+                    probUp={signalsProbMids.up}
+                    probDown={signalsProbMids.down}
+                    probLastUpdateMs={signalsProbFeedLastMs}
+                    flowSeriesForSlug={flowSeriesBySlug[selectedSlug] ?? null}
+                    endsInMs={marketEndsInMs}
+                    booksFetchedAt={booksFetchedAt}
+                    spotStreamEligible={false}
+                    ptbSource={ssrPtbSource}
+                    spotFeedSource={rtdsSpotFeedSource}
+                    onOpenTradeHistory={() => setMainTab('tradehistory')}
+                    tradePanelSlug={effectiveTradeContext.slug}
+                    tradePanelLane={globalTradeLane}
+                    tradePanelPinned={globalTradeLocked}
+                    onBuySideAdvisoryChange={onBuySideAdvisoryChange}
+                    updownSlugHints={updownSlugHints}
+                  />
+                ) : selectedSlug.trim() ? (
+                  <div className="rounded-2xl border border-amber-800/35 bg-amber-950/15 px-4 py-5 text-sm leading-relaxed text-amber-100/90">
+                    <p className="font-semibold text-amber-50">Not a sports market</p>
+                    <p className="mt-2 text-amber-100/75">
+                      Current slug is crypto or generic — pick a live game above, or use the{' '}
+                      <span className="font-medium text-amber-50">Signals</span> tab for Up/Down markets.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="rounded-2xl border border-zinc-800/55 bg-zinc-950/35 px-4 py-6 text-center text-sm text-zinc-500">
+                    Tap a league chip or live game above to load the full sports signals desk.
+                  </div>
+                )}
               </div>
             ) : null}
 
@@ -3369,20 +3698,16 @@ function App() {
             ) : null}
 
             {mainTab === 'raw' ? (
-              <div className="mt-5 grid grid-cols-1 gap-4 lg:grid-cols-2">
-                <div>
-                  <div className="mb-2 text-xs font-medium uppercase tracking-wide text-zinc-500">Market</div>
-                  <pre className="max-h-[55vh] overflow-auto rounded-xl border border-zinc-800/50 bg-black/25 p-3 font-mono text-[11px] leading-relaxed text-zinc-300">
-                    {marketJson ? pretty(marketJson) : '—'}
-                  </pre>
-                </div>
-                <div>
-                  <div className="mb-2 text-xs font-medium uppercase tracking-wide text-zinc-500">Books</div>
-                  <pre className="max-h-[55vh] overflow-auto rounded-xl border border-zinc-800/50 bg-black/25 p-3 font-mono text-[11px] leading-relaxed text-zinc-300">
-                    {books ? pretty(books) : '—'}
-                  </pre>
-                </div>
-              </div>
+              <Suspense fallback={tabSuspenseFallback}>
+                <RawProjectionsTab
+                  slug={selectedSlug}
+                  assetLabel={updownParsed?.asset?.toUpperCase() ?? null}
+                  spot={signalsSpotSeries}
+                  priceToBeat={ssrPriceToBeat}
+                  marketJson={marketJson}
+                  books={books}
+                />
+              </Suspense>
             ) : null}
 
             {showEmbeddedTradeDock ? (
@@ -3466,9 +3791,21 @@ function App() {
               </div>
             </details>
 
-            {effectiveTradeEnabled ? (
-              <SignalsTradePanel {...tradePanelSharedProps} visualStyle="slide" />
-            ) : !effectiveTradeReady ? (
+            {effectiveTradeReady ? (
+              <>
+                {!effectiveTradeEnabled ? (
+                  <div className="mb-3 rounded-2xl border border-amber-900/25 bg-amber-950/10 p-3 text-[12px] leading-relaxed text-amber-100/85">
+                    <p className="font-medium text-amber-100">Tokens not ready</p>
+                    <p className="mt-1 text-amber-100/75">
+                      Waiting for both outcome tokens — trade controls unlock when books populate.
+                    </p>
+                  </div>
+                ) : null}
+                <div className={effectiveTradeEnabled ? '' : 'pointer-events-none opacity-50'} aria-hidden={!effectiveTradeEnabled}>
+                  <SignalsTradePanel {...tradePanelSharedProps} visualStyle="slide" />
+                </div>
+              </>
+            ) : (
               <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/40 p-4 text-[13px] leading-relaxed text-zinc-400">
                 <p className="font-medium text-zinc-300">Almost there</p>
                 <ol className="mt-2 list-decimal space-y-1 pl-4 text-zinc-500">
@@ -3476,13 +3813,6 @@ function App() {
                   <li>Wait until the order book finishes loading.</li>
                   <li>Then use Trade again — the panel unlocks automatically.</li>
                 </ol>
-              </div>
-            ) : (
-              <div className="rounded-2xl border border-amber-900/25 bg-amber-950/10 p-4 text-[13px] leading-relaxed text-amber-100/85">
-                <p className="font-medium text-amber-100">Tokens not ready</p>
-                <p className="mt-2 text-amber-100/75">
-                  This market loaded, but we still need both outcome tokens (usually a two-sided Yes/No or Up/Down market). Try another slug, or wait for books to populate.
-                </p>
               </div>
             )}
           </div>

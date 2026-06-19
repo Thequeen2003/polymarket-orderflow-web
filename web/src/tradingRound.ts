@@ -11,6 +11,18 @@ export function floorShares4(n: number): number {
   return Math.floor(n * 1e4 + 1e-12) / 1e4;
 }
 
+/** Whole shares for Max / % sizing in the trade panel (no decimals in the amount field). */
+export function floorSharesWhole(n: number): number {
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.floor(n);
+}
+
+/** Whole US dollars for Max / preset sizing in the trade panel. */
+export function floorUsdWhole(n: number): number {
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.floor(n);
+}
+
 /** Display / parse balance string as human shares (4dp). */
 export function roundShares4(n: number): number {
   if (!Number.isFinite(n)) return n;

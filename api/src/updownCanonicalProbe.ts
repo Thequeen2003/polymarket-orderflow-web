@@ -54,9 +54,11 @@ async function probeCanonicalSlug(args: {
   ts: number;
   stepSec: number;
   nowSec: number;
+  /** When true, allow the next ET bucket before its official open (Polymarket lists it early). */
+  allowPreOpen?: boolean;
 }): Promise<CanonicalUpdownHit | null> {
-  const { asset, interval, ts, stepSec, nowSec } = args;
-  if (shouldSkipFutureUpdownBucketStart(interval, ts, nowSec)) return null;
+  const { asset, interval, ts, stepSec, nowSec, allowPreOpen } = args;
+  if (!allowPreOpen && shouldSkipFutureUpdownBucketStart(interval, ts, nowSec)) return null;
   const slug = `${asset}-updown-${interval}-${ts}`;
   const m = await gammaMarketCached(slug);
   if (!m) return null;
@@ -70,6 +72,26 @@ async function probeCanonicalSlug(args: {
     return { slug, ts, market: m, tested: true };
   }
   return null;
+}
+
+const ROLL_FORWARD_REMAIN_SEC = 600;
+
+/** When the live 4h window is almost over, open the next ET bucket instead of a dead book. */
+async function maybeRollForwardEnding4h(
+  hit: CanonicalUpdownHit,
+  args: { asset: string; stepSec: number; nowSec: number },
+): Promise<CanonicalUpdownHit> {
+  const remainSec = hit.ts + args.stepSec - args.nowSec;
+  if (remainSec >= ROLL_FORWARD_REMAIN_SEC) return hit;
+  const next = await probeCanonicalSlug({
+    asset: args.asset,
+    interval: '4h',
+    ts: hit.ts + args.stepSec,
+    stepSec: args.stepSec,
+    nowSec: args.nowSec,
+    allowPreOpen: true,
+  });
+  return next ?? hit;
 }
 
 /** Resolve `asset-updown-<interval>-<ts>` with a small parallel probe set (fast 5m/15m taps). */
@@ -96,7 +118,12 @@ export async function resolveCanonicalUpdownSlug(args: {
       batch.map((ts) => probeCanonicalSlug({ asset, interval, ts, stepSec, nowSec })),
     );
     const found = hits.find((h) => h != null);
-    if (found) return found;
+    if (found) {
+      if (interval === '4h') {
+        return maybeRollForwardEnding4h(found, { asset, stepSec, nowSec });
+      }
+      return found;
+    }
   }
   return null;
 }

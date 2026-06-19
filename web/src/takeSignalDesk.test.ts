@@ -12,6 +12,7 @@ import {
 import type { DeskSingleAction } from './deskSingleAction';
 import type { OperatorVerdict } from './operatorVerdict';
 import type { TradeDirective } from './tradeDirective';
+import type { ExecutionSignal } from './executionSignal';
 import { suggestTradeLevels } from './tradeLevels';
 
 const goUp: OperatorVerdict = {
@@ -87,6 +88,83 @@ describe('buildTakeSignalPlan', () => {
       downLabel: 'Down',
     });
     expect(p.canTake).toBe(true);
+  });
+
+  it('blocks take when execution desk is not ENTER', () => {
+    const levels = suggestTradeLevels({ lane: 'up', entry: 0.62, edgeUsd: 0.08 });
+    const execution = {
+      phase: 'ALERT',
+      verdict: 'WAIT',
+      proposedLane: 'up',
+      headline: 'ALERT BTC Up — confirm continuation',
+      summaryLine: 'Edge live — hold gates 7s before enter',
+      confirmHeldMs: 2000,
+      confirmRequiredMs: 7000,
+    } as ExecutionSignal;
+    const p = buildTakeSignalPlan({
+      verdict: goUp,
+      directive: initiateUp,
+      levels,
+      crossEngineLaneConflict: false,
+      endsInMs: underFiveMin,
+      upLabel: 'Up',
+      downLabel: 'Down',
+      requireExecutionEnter: true,
+      execution,
+    });
+    expect(p.canTake).toBe(false);
+    expect(p.disabledReason).toMatch(/ALERT/i);
+  });
+
+  it('allows take when execution desk ENTER matches card lane', () => {
+    const levels = suggestTradeLevels({ lane: 'up', entry: 0.62, edgeUsd: 0.08 });
+    const execution = {
+      phase: 'ENTER',
+      verdict: 'ENTER_UP',
+      proposedLane: 'up',
+      headline: 'ENTER BTC Up',
+      summaryLine: 'Continuation confirmed',
+      confirmHeldMs: 7000,
+      confirmRequiredMs: 7000,
+    } as ExecutionSignal;
+    const p = buildTakeSignalPlan({
+      verdict: goUp,
+      directive: initiateUp,
+      levels,
+      crossEngineLaneConflict: false,
+      endsInMs: underFiveMin,
+      upLabel: 'Up',
+      downLabel: 'Down',
+      requireExecutionEnter: true,
+      execution,
+    });
+    expect(p.canTake).toBe(true);
+  });
+
+  it('blocks take on execution lane mismatch', () => {
+    const levels = suggestTradeLevels({ lane: 'up', entry: 0.62, edgeUsd: 0.08 });
+    const execution = {
+      phase: 'ENTER',
+      verdict: 'ENTER_DOWN',
+      proposedLane: 'down',
+      headline: 'ENTER BTC Down',
+      summaryLine: 'Continuation confirmed',
+      confirmHeldMs: 7000,
+      confirmRequiredMs: 7000,
+    } as ExecutionSignal;
+    const p = buildTakeSignalPlan({
+      verdict: goUp,
+      directive: initiateUp,
+      levels,
+      crossEngineLaneConflict: false,
+      endsInMs: underFiveMin,
+      upLabel: 'Up',
+      downLabel: 'Down',
+      requireExecutionEnter: true,
+      execution,
+    });
+    expect(p.canTake).toBe(false);
+    expect(p.disabledReason).toMatch(/lane mismatch|ENTER/i);
   });
 
   it('blocks cross-engine conflict only on thin LOW initiate', () => {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   bucketFloorEtUnixSec,
+  bucketFloorNoonEtUnixSec,
   buildUpdownCanonicalTryTs,
   compareUpdownCanonicalTryTs,
   shouldSkipFutureUpdownBucketStart,
@@ -22,6 +23,12 @@ describe('updownBucketEt', () => {
     const utc = Math.floor(nowSec / 3600) * 3600;
     expect(Math.abs(et - utc)).toBeLessThanOrEqual(3600);
     expect(et % 3600).toBe(0);
+  });
+
+  it('daily noon floor anchors noon→noon ET windows', () => {
+    const evening = 1_781_135_660;
+    expect(bucketFloorNoonEtUnixSec(evening)).toBe(1_781_107_200);
+    expect(updownShortcutAnchorFloors(86400, evening).et).toBe(1_781_107_200);
   });
 
   it('4h buckets are 4-hour blocks in ET same calendar day', () => {

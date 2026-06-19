@@ -4,8 +4,11 @@ import type { SpotBandGaugeSnapshot } from './spotBandDeskAction';
 import type { SpotPtbMachineReadout } from './spotPtbMachineSignals';
 import type { TapeVelocity } from './tapeVelocity';
 import { computeStableProjectedHeader } from './chartStableProjectedHeader';
+import { PredictionHorizonTimer } from './PredictionHorizonTimer';
+import { PricePredictionSignalCard } from './PricePredictionSignalCard';
+import { buildContractProbProjectionGrid } from './contractProbProjection';
+import { computePricePredictionSignal, type PricePredictionProjection } from './pricePredictionSignal';
 import { MachineVerdictCard } from './MachineVerdictCard';
-import { computeMomentumProjection, type ProjectionTick } from './momentumProjection';
 import {
   buildNowPriceBandDistances,
   buildProjectionNowWindow,
@@ -49,7 +52,20 @@ import {
 } from './deskSpeedLayers';
 import { computeDirectionScore, directionScoreShortLabel, type DirectionScoreSnapshot } from './deskDirectionScore';
 import { buildMtfConsensus } from './multiTimeframeConsensus';
-import { formatCentsFrom01 } from './deskSpeedGainPct';
+import type { ContractLeadSignal } from './contractLeadSignal';
+import { computeDirectionEngine, type DirectionEngineSignal } from './directionEngine';
+import { NowPriceBuyStrip } from './NowPriceBuyStrip';
+import type { BuySideAdvisory } from './shouldBuyWhichSide';
+import type { BookTouchForArmRisk } from './armRiskFromSignal';
+import {
+  computeExecutionSignal,
+  EXEC_MIN_EDGE_PP,
+  EXEC_MIN_MODEL_PROB,
+  type ExecutionSignal,
+} from './executionSignal';
+import { updateExecutionConfirm, type ExecutionConfirmState } from './executionConfirmTracker';
+import { computeContractEntryJump, type ContractEntryJump } from './deskSpeedGainPct';
+import { computeBilateralEdge, pickEdgeLaneHint, pickStrongerEdgeSide } from './bilateralEdge';
 import {
   computePressureBuildup,
   PRESSURE_CONFIRM_HORIZON_SEC,
@@ -422,6 +438,299 @@ function pressureVerdictTone(
   return 'down';
 }
 
+function DirectionEngineCard(props: { signal: DirectionEngineSignal }): ReactElement {
+  const { signal } = props;
+  const tone: GlanceTone =
+    signal.verdict === 'ENTER_UP' ? 'up' : signal.verdict === 'ENTER_DOWN' ? 'down' : 'flat';
+  const shell =
+    tone === 'up'
+      ? 'border-emerald-600/55 bg-emerald-950/35 ring-1 ring-emerald-500/20'
+      : tone === 'down'
+        ? 'border-rose-600/55 bg-rose-950/35 ring-1 ring-rose-500/20'
+        : 'border-zinc-700/55 bg-zinc-950/40 ring-1 ring-zinc-600/15';
+  const confCls =
+    signal.confidencePct >= 85
+      ? 'text-emerald-300'
+      : signal.confidencePct >= 70
+        ? 'text-cyan-200'
+        : signal.confidencePct >= 55
+          ? 'text-amber-200'
+          : 'text-zinc-500';
+  const conflictCls =
+    signal.conflictTone === 'high'
+      ? 'text-rose-300'
+      : signal.conflictTone === 'mid'
+        ? 'text-amber-200'
+        : 'text-emerald-300/90';
+
+  return (
+    <div className={`rounded-xl border px-3 py-3 sm:px-4 ${shell}`}>
+      <div className="text-[9px] font-black uppercase tracking-[0.14em] text-indigo-300/85">Direction engine</div>
+
+      <div className="mt-2 flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-2xl" aria-hidden>
+              {signal.emoji}
+            </span>
+            <span className="text-xl font-black tracking-tight text-zinc-50 sm:text-2xl">{signal.headline}</span>
+          </div>
+          {signal.hardRule ? (
+            <p className="mt-1 text-[10px] font-semibold text-amber-200/90">Hard rule — tier-1 stack overrides sensor noise</p>
+          ) : null}
+        </div>
+        <div className="text-right font-mono tabular-nums">
+          <div className={`text-lg font-black ${confCls}`}>Confidence: {signal.confidencePct}%</div>
+          <div className={`text-[11px] font-semibold ${conflictCls}`}>
+            {signal.conflictEmoji} Conflict: {signal.conflictPct}%
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">
+        <div className="rounded-lg border border-zinc-800/50 bg-black/25 px-2 py-1.5">
+          <div className="text-[8px] font-bold uppercase tracking-wide text-zinc-500">Edge</div>
+          <div className="font-mono text-sm font-bold text-zinc-100">{signal.edgeCents ?? '—'}</div>
+        </div>
+        <div className="rounded-lg border border-zinc-800/50 bg-black/25 px-2 py-1.5">
+          <div className="text-[8px] font-bold uppercase tracking-wide text-zinc-500">Momentum</div>
+          <div className="font-mono text-sm font-bold text-zinc-100">{signal.momentumLabel}</div>
+        </div>
+        <div className="rounded-lg border border-zinc-800/50 bg-black/25 px-2 py-1.5">
+          <div className="text-[8px] font-bold uppercase tracking-wide text-zinc-500">PTB</div>
+          <div className="font-mono text-sm font-bold text-zinc-100">{signal.ptbLabel}</div>
+        </div>
+        <div className="col-span-2 rounded-lg border border-zinc-800/50 bg-black/25 px-2 py-1.5 sm:col-span-3">
+          <div className="text-[8px] font-bold uppercase tracking-wide text-zinc-500">Repricing</div>
+          <div className="font-mono text-sm font-bold text-zinc-100">{signal.repricingLabel}</div>
+        </div>
+      </div>
+
+      <ul className="mt-3 space-y-0.5">
+        {signal.reasons.map((line) => (
+          <li key={line} className="text-[11px] leading-snug text-zinc-300">
+            {line}
+          </li>
+        ))}
+      </ul>
+
+      <details className="mt-3 rounded-lg border border-zinc-800/45 bg-black/20 px-2.5 py-2">
+        <summary className="cursor-pointer text-[9px] font-semibold text-zinc-500 hover:text-zinc-300">
+          Tier breakdown
+        </summary>
+        <div className="mt-2 space-y-2">
+          <div>
+            <div className="text-[8px] font-black uppercase tracking-wide text-cyan-400/80">Tier 1 — decides trade</div>
+            <ul className="mt-1 space-y-0.5">
+              {signal.tier1.map((s) => (
+                <li key={s.id} className="flex justify-between gap-2 text-[10px] text-zinc-400">
+                  <span>{s.label}</span>
+                  <span className="font-mono text-zinc-300">{s.lane?.toUpperCase() ?? '—'}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+          <div>
+            <div className="text-[8px] font-black uppercase tracking-wide text-violet-400/80">Tier 2 — confirmation</div>
+            <ul className="mt-1 space-y-0.5">
+              {signal.tier2.map((s) => (
+                <li key={s.id} className="flex justify-between gap-2 text-[10px] text-zinc-400">
+                  <span>{s.label}</span>
+                  <span className="font-mono text-zinc-300">{s.lane?.toUpperCase() ?? '—'}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      </details>
+    </div>
+  );
+}
+
+function EntrySideGateColumn(props: { row: ExecutionSignal['entry']['up']; minProb: number; minEdge: number }): ReactElement {
+  const { row, minProb, minEdge } = props;
+  const mark = (ok: boolean) => (ok ? '✓' : '❌');
+  const tone = row.side === 'up' ? 'text-emerald-300/90' : 'text-rose-300/90';
+  return (
+    <div className="rounded-lg border border-zinc-800/50 bg-black/20 px-2.5 py-2">
+      <div className={`text-[10px] font-black uppercase tracking-wide ${tone}`}>{row.sideLabel}</div>
+      <ul className="mt-1.5 space-y-1 font-mono text-[9px] tabular-nums text-zinc-400">
+        <li>
+          P {row.probPct != null ? `${row.probPct.toFixed(0)}%` : '—'} {mark(row.probOk)}
+          {!row.probOk ? <span className="text-zinc-600"> (need {minProb}%)</span> : null}
+        </li>
+        <li>
+          Edge {row.edgePp != null ? `${row.edgePp >= 0 ? '+' : ''}${row.edgePp.toFixed(0)}pp` : '—'} {mark(row.edgeOk)}
+          {!row.edgeOk ? <span className="text-zinc-600"> (need +{minEdge}pp)</span> : null}
+        </li>
+        <li>
+          Mom {mark(row.momentumOk)}{' '}
+          <span className="text-zinc-600">{row.momentumOk ? 'ok' : row.momentumNote.replace(/^Need /, '')}</span>
+        </li>
+      </ul>
+    </div>
+  );
+}
+
+function ExecutionSignalCard(props: { signal: ExecutionSignal }): ReactElement {
+  const { signal } = props;
+  const showExecution = signal.phase === 'ENTER';
+  const showConfirming = signal.phase === 'ALERT';
+  const biasTone: GlanceTone =
+    signal.bias.direction === 'up' ? 'up' : signal.bias.direction === 'down' ? 'down' : 'flat';
+  const execTone: GlanceTone =
+    signal.verdict === 'ENTER_UP' ? 'up' : signal.verdict === 'ENTER_DOWN' ? 'down' : 'flat';
+  const shell =
+    showExecution
+      ? execTone === 'up'
+        ? 'border-emerald-600/55 bg-emerald-950/35 ring-1 ring-emerald-500/20'
+        : 'border-rose-600/55 bg-rose-950/35 ring-1 ring-rose-500/20'
+      : showConfirming
+        ? 'border-amber-700/55 bg-amber-950/30 ring-1 ring-amber-500/15'
+        : 'border-zinc-700/55 bg-zinc-950/40 ring-1 ring-zinc-600/15';
+
+  const holdPct = Math.min(100, Math.round((signal.confirmHeldMs / signal.confirmRequiredMs) * 100));
+
+  return (
+    <div className={`rounded-xl border px-3 py-3 sm:px-4 ${shell}`}>
+      <div className="text-[9px] font-black uppercase tracking-[0.14em] text-cyan-300/85">Execution desk v2</div>
+
+      {/* Layer 1 — Bias (always) */}
+      <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-zinc-800/45 bg-black/25 px-2.5 py-2">
+        <div className="flex items-center gap-2">
+          <span className="text-[9px] font-bold uppercase tracking-wide text-zinc-500">Bias</span>
+          <span className="text-lg" aria-hidden>{signal.bias.emoji}</span>
+          <span
+            className={`text-sm font-black tracking-tight ${
+              biasTone === 'up' ? 'text-emerald-200' : biasTone === 'down' ? 'text-rose-200' : 'text-zinc-300'
+            }`}
+          >
+            {signal.bias.headline}
+          </span>
+        </div>
+        <span className="max-w-[52%] text-right text-[9px] text-zinc-500">{signal.bias.detail}</span>
+      </div>
+
+      {/* Layer 2 — Entry eligibility (both sides always) */}
+      <div className="mt-2.5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="text-[9px] font-bold uppercase tracking-wide text-zinc-500">Entry status</span>
+          <span
+            className={`text-[10px] font-black uppercase tracking-wide ${
+              signal.entry.status === 'READY'
+                ? 'text-emerald-300'
+                : signal.entry.status === 'CONFIRMING'
+                  ? 'text-amber-300'
+                  : 'text-zinc-400'
+            }`}
+          >
+            {signal.entry.statusLabel}
+          </span>
+        </div>
+        <div className="mt-2 grid grid-cols-2 gap-2">
+          <EntrySideGateColumn row={signal.entry.up} minProb={EXEC_MIN_MODEL_PROB * 100} minEdge={EXEC_MIN_EDGE_PP} />
+          <EntrySideGateColumn row={signal.entry.down} minProb={EXEC_MIN_MODEL_PROB * 100} minEdge={EXEC_MIN_EDGE_PP} />
+        </div>
+        <p className="mt-2 text-[10px] leading-snug text-zinc-500">{signal.entry.footer}</p>
+      </div>
+
+      {/* Layer 3 — Execution (only when ENTER) */}
+      {showExecution ? (
+        <div className="mt-3 rounded-lg border border-emerald-800/40 bg-emerald-950/20 px-2.5 py-2.5">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-2xl" aria-hidden>{signal.emoji}</span>
+            <span className="text-lg font-black tracking-tight text-zinc-50">{signal.headline}</span>
+          </div>
+          <p className="mt-1 text-[10px] text-zinc-400">{signal.summaryLine}</p>
+          <div className="mt-2 font-mono text-[11px] tabular-nums text-zinc-300">
+            {signal.regimePlan.tp1Cents != null ? (
+              <>TP1 +{signal.regimePlan.tp1Cents.toFixed(1)}¢{signal.dynamicTp.tp2Range ? ` · TP2 ${signal.dynamicTp.tp2Range}` : ''}</>
+            ) : (
+              <>TP {signal.dynamicTp.minCents.toFixed(1)}–{signal.dynamicTp.maxCents.toFixed(1)}¢</>
+            )}
+            <span className="text-zinc-500"> · {signal.dynamicTp.regime.replace('_', ' ')} · stop {signal.dynamicTp.timeStopSec}s</span>
+          </div>
+          {signal.regimePlan.trailing ? (
+            <p className="mt-1.5 text-[9px] text-zinc-500">
+              Trail: lock +{signal.regimePlan.trailing.lockProfitCents}¢ after +{signal.regimePlan.trailing.activateAtCents}¢
+            </p>
+          ) : null}
+          {signal.regimePlan.exitNotes.length ? (
+            <ul className="mt-1 space-y-0.5">
+              {signal.regimePlan.exitNotes.map((note) => (
+                <li key={note} className="text-[9px] text-zinc-500">· {note}</li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
+
+      {showConfirming ? (
+        <div className="mt-3 rounded-lg border border-amber-800/40 bg-amber-950/15 px-2.5 py-2">
+          <div className="flex items-center gap-2">
+            <span className="text-xl" aria-hidden>{signal.emoji}</span>
+            <span className="text-sm font-bold text-amber-100">{signal.headline}</span>
+          </div>
+          <div className="mt-2">
+            <div className="mb-1 flex justify-between text-[9px] font-semibold text-zinc-500">
+              <span>Confirmation hold</span>
+              <span>
+                {Math.round(signal.confirmHeldMs / 1000)}s / {Math.round(signal.confirmRequiredMs / 1000)}s
+              </span>
+            </div>
+            <div className="h-1.5 overflow-hidden rounded-full bg-zinc-800/70">
+              <div className="h-full rounded-full bg-amber-500/80 transition-all" style={{ width: `${holdPct}%` }} />
+            </div>
+          </div>
+          <ul className="mt-2 space-y-1">
+            {signal.gates.map((g) => (
+              <li key={g.id} className="flex justify-between gap-2 text-[9px]">
+                <span className={g.pass ? 'text-emerald-300/90' : 'text-zinc-500'}>
+                  {g.pass ? '✓' : '○'} {g.label}
+                </span>
+                <span className="max-w-[55%] text-right font-mono text-zinc-500">{g.detail}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ContractLeadCard(props: {
+  lead: ContractLeadSignal;
+  tone: 'up' | 'down' | 'warn' | 'flat';
+}): ReactElement {
+  const { lead, tone } = props;
+  const phase = lead.phase;
+  const shell =
+    phase === 'SKIP'
+      ? 'border-amber-700/55 bg-amber-950/30 ring-1 ring-amber-500/15'
+      : phase === 'ENTER'
+        ? tone === 'up'
+          ? 'border-emerald-600/50 bg-emerald-950/35 ring-1 ring-emerald-500/20'
+          : tone === 'down'
+            ? 'border-rose-600/50 bg-rose-950/35 ring-1 ring-rose-500/20'
+            : 'border-cyan-700/45 bg-cyan-950/25 ring-1 ring-cyan-500/15'
+        : 'border-violet-700/40 bg-violet-950/22 ring-1 ring-violet-500/10';
+  const labelColor =
+    phase === 'SKIP' ? 'text-amber-400/95' : phase === 'ENTER' ? 'text-cyan-300/90' : 'text-violet-300/85';
+  const titleColor =
+    phase === 'SKIP' ? 'text-amber-100' : phase === 'ENTER' ? 'text-zinc-50' : 'text-violet-100/95';
+
+  return (
+    <div className={`mt-3 rounded-xl border px-3 py-2.5 ${shell}`}>
+      <div className={`text-[9px] font-black uppercase tracking-[0.12em] ${labelColor}`}>
+        {phase === 'ENTER' ? `${lead.earlyHorizonSec}s contract lead` : phase === 'SKIP' ? 'Late — skip entry' : 'Building'}
+      </div>
+      <p className={`mt-1 text-[13px] font-bold leading-snug ${titleColor}`}>{lead.title}</p>
+      <p className="mt-1 font-mono text-[11px] tabular-nums leading-snug text-zinc-300">{lead.actionLine}</p>
+      <p className="mt-1 text-[10px] leading-snug text-zinc-500">{lead.reasonLine}</p>
+    </div>
+  );
+}
+
 function PressureBuildupCard(props: {
   pressure: PressureBuildupSnapshot;
   upLabel: string;
@@ -477,43 +786,7 @@ function PressureBuildupCard(props: {
 
       <p className="mt-2 text-[11px] leading-snug text-zinc-300">{active.interpretation}</p>
 
-      {pressure.entryJump ? (
-        <div
-          className={`mt-3 rounded-xl border px-3 py-2.5 ${
-            tone === 'up'
-              ? 'border-emerald-600/45 bg-emerald-950/30'
-              : tone === 'down'
-                ? 'border-rose-600/45 bg-rose-950/30'
-                : 'border-violet-700/40 bg-violet-950/20'
-          }`}
-        >
-          <div className="text-[9px] font-black uppercase tracking-[0.12em] text-zinc-400">
-            Live jump · contract ¢ · {pressure.confirmHorizonSec}s confirm
-          </div>
-          {pressure.timing === 'CHASING' || pressure.timing === 'EXTENDED' ? (
-            <p className="mt-1 text-[10px] font-semibold text-amber-300/95">{pressure.timingReadout.note}</p>
-          ) : null}
-          <p className="mt-1.5 text-[12px] font-semibold leading-snug text-zinc-100">{pressure.entryJump.headline}</p>
-          <p className="mt-1 text-[11px] leading-snug text-zinc-400">{pressure.entryJump.projLine}</p>
-          <div className="mt-2 flex flex-wrap gap-3 font-mono text-[11px] tabular-nums">
-            <span className="text-zinc-500">
-              {pressure.confirmHorizonSec}s ago{' '}
-              <span className="text-zinc-300">{formatCentsFrom01(pressure.entryJump.entry01)}</span>
-            </span>
-            <span className="text-zinc-500">
-              Now <span className="font-bold text-zinc-50">{formatCentsFrom01(pressure.entryJump.now01)}</span>
-            </span>
-            <span className={pressure.entryJump.gainCents >= 0 ? 'text-emerald-300' : 'text-rose-300'}>
-              Move{' '}
-              <span className="font-bold">
-                {pressure.entryJump.gainCents >= 0 ? '+' : ''}
-                {pressure.entryJump.gainCents.toFixed(1)}¢ ({pressure.entryJump.gainPct >= 0 ? '+' : ''}
-                {pressure.entryJump.gainPct.toFixed(1)}%)
-              </span>
-            </span>
-          </div>
-        </div>
-      ) : null}
+      {pressure.contractLead ? <ContractLeadCard lead={pressure.contractLead} tone={tone} /> : null}
 
       {pressure.spotJumpLine ? (
         <p className="mt-2 font-mono text-[10px] tabular-nums leading-snug text-zinc-500">{pressure.spotJumpLine}</p>
@@ -1063,7 +1336,7 @@ function PriceHeadlineRow(props: {
   spotUsd: number;
   ptbUsd: number;
   distVsPtb: number;
-  stableHeader: StableProjectedHeaderSnapshot | null;
+  spotProjections: PricePredictionProjection[] | null;
   upLabel: string;
   downLabel: string;
   probUp01: number | null;
@@ -1085,13 +1358,16 @@ function PriceHeadlineRow(props: {
         </span>
         {sep}
         <span className={p.distVsPtb >= 0 ? 'text-emerald-300' : 'text-rose-300'}>{fmtUsdSigned(p.distVsPtb)} vs PTB</span>
-        {p.stableHeader ? (
+        {p.spotProjections?.length ? (
           <>
             {sep}
-            <span className="text-indigo-200">
-              Proj 30s {fmtUsd(p.stableHeader.projectedSpotUsd)}{' '}
-              <span className="text-indigo-300/80">({fmtUsdSigned(p.stableHeader.deltaVsNowUsd)})</span>
-            </span>
+            {p.spotProjections.map((proj, i) => (
+              <span key={proj.horizonSec} className="text-indigo-200">
+                {i > 0 ? sep : null}
+                Projected {proj.label} {fmtUsd(proj.projectedUsd)}{' '}
+                <span className="text-indigo-300/80">({fmtUsdSigned(proj.deltaVsNowUsd)})</span>
+              </span>
+            ))}
           </>
         ) : null}
       </div>
@@ -1112,19 +1388,43 @@ function PriceHeadlineRow(props: {
         {p.modelPUp != null ? (
           <>
             {sep}
-            <span className="text-zinc-400">
-              Model P(Up) <span className="text-zinc-200">{fmtProbPct01(p.modelPUp)}</span>
+            <span className="text-zinc-400" title="Desk settlement model from spot vs PTB, momentum, and flow">
+              Model P({p.upLabel}) <span className="text-zinc-200">{fmtProbPct01(p.modelPUp)}</span>
             </span>
           </>
         ) : null}
-        {p.edgePp != null ? (
-          <>
-            {sep}
-            <span className={p.edgePp > 0.3 ? 'text-emerald-300' : p.edgePp < -0.3 ? 'text-rose-300' : 'text-zinc-400'}>
-              Edge {fmtPp(p.edgePp)}
-            </span>
-          </>
-        ) : null}
+        {p.edgePp != null ? (() => {
+          const edge = buildUpEdgeHeadline({
+            edgePp: p.edgePp,
+            modelPUp: p.modelPUp,
+            pMktUp: p.probUp01,
+            upLabel: p.upLabel,
+          });
+          const toneCls =
+            edge.tone === 'up'
+              ? 'text-emerald-300'
+              : edge.tone === 'down'
+                ? 'text-rose-300'
+                : 'text-zinc-400';
+          return (
+            <>
+              {sep}
+              <span className={toneCls} title={edge.title}>
+                <span className="text-zinc-500">{p.upLabel} edge</span>{' '}
+                <span className="font-semibold">{fmtPp(p.edgePp)}</span>
+                {edge.math ? <span className="font-normal text-zinc-600"> ({edge.math})</span> : null}
+                <span className="font-normal text-zinc-500"> · {edge.qualifier}</span>
+              </span>
+            </>
+          );
+        })() : null}
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-1.5 border-t border-indigo-800/30 pt-2">
+        <span className="text-[8px] font-black uppercase tracking-[0.12em] text-indigo-400/80">Timers</span>
+        <PredictionHorizonTimer horizonSec={0} compact />
+        {p.spotProjections?.map((proj) => (
+          <PredictionHorizonTimer key={proj.horizonSec} horizonSec={proj.horizonSec} compact />
+        ))}
       </div>
     </div>
   );
@@ -1139,6 +1439,8 @@ function CompactSnapshotStrip(props: {
   tradeCall: string;
   tradeTone: GlanceTone;
   edgePp: number | null;
+  edgeUpLabel: string;
+  edgeTitle: string | null;
   speedHint: string | null;
   machineHint: string | null;
   upMid: string | null;
@@ -1146,8 +1448,9 @@ function CompactSnapshotStrip(props: {
 }): ReactElement {
   const p = props;
   const edgeStr = p.edgePp != null ? fmtPp(p.edgePp) : '—';
-  const pill = (text: string, tone?: GlanceTone) => (
+  const pill = (text: string, tone?: GlanceTone, title?: string) => (
     <span
+      title={title}
       className={`inline-flex shrink-0 items-center rounded-md border px-2 py-1 font-mono text-[10px] font-bold tabular-nums ${
         tone === 'up'
           ? 'border-emerald-700/45 bg-emerald-950/30 text-emerald-200'
@@ -1169,7 +1472,11 @@ function CompactSnapshotStrip(props: {
         {pill(fmtUsd(p.spotUsd))}
         {pill(`${fmtUsdSigned(p.distVsPtb)} PTB`)}
         {pill(p.tradeCall, p.tradeTone)}
-        {pill(`Edge ${edgeStr}`, p.edgePp != null && p.edgePp > 0.3 ? 'up' : p.edgePp != null && p.edgePp < -0.3 ? 'down' : 'flat')}
+        {pill(
+          `${p.edgeUpLabel} edge ${edgeStr}`,
+          p.edgePp != null && p.edgePp > 0.3 ? 'up' : p.edgePp != null && p.edgePp < -0.3 ? 'down' : 'flat',
+          p.edgeTitle ?? undefined,
+        )}
         {p.speedHint ? pill(p.speedHint, p.speedHint.includes('DOWN') ? 'down' : p.speedHint.includes('UP') ? 'up' : 'warn') : null}
         {p.machineHint ? pill(p.machineHint, 'flat') : null}
       </div>
@@ -1183,8 +1490,504 @@ function CompactSnapshotStrip(props: {
   );
 }
 
+function fmtEndsInShort(ms: number | null | undefined): string | null {
+  if (ms == null || !Number.isFinite(ms)) return null;
+  if (ms < 0) return 'ENDED';
+  const sec = Math.floor(ms / 1000);
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  if (m >= 60) {
+    const h = Math.floor(m / 60);
+    const rm = m % 60;
+    return `${h}h${rm}m`;
+  }
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function quickCtxPill(tone: GlanceTone, large = false): string {
+  const base = large ? 'rounded-xl border px-3 py-2 sm:px-4 sm:py-2.5' : 'rounded-lg border px-2.5 py-1.5';
+  switch (tone) {
+    case 'up':
+      return `${base} border-emerald-600/50 bg-emerald-950/40 text-emerald-100`;
+    case 'down':
+      return `${base} border-rose-600/50 bg-rose-950/40 text-rose-100`;
+    case 'warn':
+      return `${base} border-amber-600/45 bg-amber-950/35 text-amber-100`;
+    default:
+      return `${base} border-zinc-600/50 bg-zinc-900/50 text-zinc-200`;
+  }
+}
+
+/** Compact context strip — spot, contracts, breaks at desk-normal type. */
+function NowPriceQuickContextStrip(props: {
+  band: NowPriceBandDistances;
+  glance: ReturnType<typeof buildSpotBandGlance>;
+  geoTone: GlanceTone;
+  upLabel: string;
+  downLabel: string;
+  probUp01: number | null;
+  probDown01: number | null;
+  probUpDelta01: number | null;
+  probDownDelta01: number | null;
+  modelPUp: number | null;
+  edgeUpPp: number | null;
+  edgeDownPp: number | null;
+  activeLane: 'up' | 'down' | null;
+  speedHint: string | null;
+  machineHint: string | null;
+  endsInMs: number | null | undefined;
+  slopeUsdPerMin: number | null;
+}): ReactElement {
+  const p = props;
+  const geoLabel = p.band.geo.replace('_', ' ');
+  const endsLabel = fmtEndsInShort(p.endsInMs);
+  const activeEdge =
+    p.activeLane === 'down' ? p.edgeDownPp : p.activeLane === 'up' ? p.edgeUpPp : p.edgeUpPp;
+  const slopeLabel =
+    p.slopeUsdPerMin != null && Number.isFinite(p.slopeUsdPerMin)
+      ? `${p.slopeUsdPerMin >= 0 ? '+' : ''}${p.slopeUsdPerMin.toFixed(1)}/min`
+      : null;
+
+  return (
+    <div className="rounded-xl border border-zinc-700/50 bg-zinc-950/50 px-2.5 py-2.5 sm:px-3 sm:py-3">
+      <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
+        <span className={`${quickCtxPill(p.geoTone)} text-[10px] font-black uppercase tracking-wide`}>
+          {geoLabel}
+        </span>
+        <span className="font-mono text-[13px] font-bold tabular-nums text-zinc-50">{fmtUsd(p.band.now)}</span>
+        <span
+          className={`font-mono text-[11px] font-bold tabular-nums ${
+            p.band.distNowFromPtb >= 0 ? 'text-emerald-300' : 'text-rose-300'
+          }`}
+        >
+          {fmtUsdSigned(p.band.distNowFromPtb)} vs PTB
+        </span>
+        <span className="font-mono text-[10px] text-zinc-500">PTB {fmtUsd(p.band.ptb)}</span>
+        {endsLabel ? (
+          <span className={`${quickCtxPill('warn')} font-mono text-[10px] font-bold tabular-nums`}>⏱ {endsLabel}</span>
+        ) : null}
+        {slopeLabel ? (
+          <span className={`${quickCtxPill('flat')} font-mono text-[10px] font-bold tabular-nums`}>slope {slopeLabel}</span>
+        ) : null}
+      </div>
+
+      <div className="mt-2 flex flex-wrap items-center gap-1.5">
+        {p.probUp01 != null ? (
+          <span className={`${quickCtxPill('up')} font-mono text-[10px] font-bold tabular-nums`}>
+            {p.upLabel} {fmtCents(p.probUp01)}
+            {p.probUpDelta01 != null ? <span className="opacity-85"> {fmtDeltaCents(p.probUpDelta01)}</span> : null}
+          </span>
+        ) : null}
+        {p.probDown01 != null ? (
+          <span className={`${quickCtxPill('down')} font-mono text-[10px] font-bold tabular-nums`}>
+            {p.downLabel} {fmtCents(p.probDown01)}
+            {p.probDownDelta01 != null ? <span className="opacity-85"> {fmtDeltaCents(p.probDownDelta01)}</span> : null}
+          </span>
+        ) : null}
+        {activeEdge != null ? (
+          <span
+            className={`${quickCtxPill(
+              activeEdge > 0.3 ? 'up' : activeEdge < -0.3 ? 'down' : 'flat',
+            )} font-mono text-[10px] font-bold tabular-nums`}
+          >
+            Edge {fmtPp(activeEdge)}
+          </span>
+        ) : null}
+        {p.modelPUp != null ? (
+          <span className={`${quickCtxPill('flat')} font-mono text-[10px] font-bold tabular-nums`}>
+            Model {p.upLabel} {fmtProbPct01(p.modelPUp)}
+          </span>
+        ) : null}
+        {p.speedHint ? (
+          <span className={`${quickCtxPill('warn')} text-[9px] font-bold uppercase tracking-wide`}>{p.speedHint}</span>
+        ) : null}
+        {p.machineHint ? (
+          <span className={`${quickCtxPill('flat')} font-mono text-[10px] font-bold`}>{p.machineHint}</span>
+        ) : null}
+      </div>
+
+      <div className="mt-2 flex flex-wrap gap-x-3 gap-y-0.5 border-t border-zinc-800/50 pt-2 text-[11px] font-semibold leading-snug">
+        <span className={p.glance.upBreak.cleared ? 'text-emerald-300' : 'text-amber-200'}>
+          {p.glance.upBreak.cleared ? '✓' : '○'} UP: {p.glance.upBreak.primary}
+        </span>
+        <span className={p.glance.downBreak.cleared ? 'text-rose-300' : 'text-amber-200'}>
+          {p.glance.downBreak.cleared ? '✓' : '○'} DOWN: {p.glance.downBreak.primary}
+        </span>
+      </div>
+      <p className="mt-1 text-[10px] leading-snug text-zinc-500">{p.glance.subline}</p>
+    </div>
+  );
+}
+
+type NowPriceHeroView = {
+  tone: GlanceTone;
+  emoji: string;
+  primary: string;
+  laneLabel: string | null;
+  subline: string;
+  detail: string | null;
+  confidencePct: number | null;
+  confirmPct: number | null;
+  phaseLabel: string | null;
+  edgePp: number | null;
+  edgeCentsLabel: string | null;
+  jumpGainCents: number | null;
+  projJumpCents1m: number | null;
+  jumpHeadline: string | null;
+  projLine: string | null;
+};
+
+type HeroMetricsCtx = {
+  directionEngine: DirectionEngineSignal | null;
+  bilateral: ReturnType<typeof computeBilateralEdge> | null;
+  jumps: { up: ContractEntryJump | null; down: ContractEntryJump | null };
+  contractLag: ReturnType<typeof computeContractLagReadout> | null;
+};
+
+function resolveHeroLaneMetrics(
+  lane: 'up' | 'down',
+  ctx: HeroMetricsCtx,
+): Pick<
+  NowPriceHeroView,
+  'edgePp' | 'edgeCentsLabel' | 'jumpGainCents' | 'projJumpCents1m' | 'jumpHeadline' | 'projLine'
+> {
+  const edgePp = lane === 'up' ? ctx.bilateral?.edgeUpPp ?? null : ctx.bilateral?.edgeDownPp ?? null;
+  let edgeCentsLabel: string | null = null;
+  if (ctx.directionEngine?.proposedLane === lane && ctx.directionEngine.edgeCents) {
+    edgeCentsLabel = ctx.directionEngine.edgeCents;
+  } else if (ctx.contractLag) {
+    const lag = lane === 'up' ? ctx.contractLag.lagUpCents : ctx.contractLag.lagDownCents;
+    if (lag > 0.5) edgeCentsLabel = `+${lag.toFixed(1)}¢ lag`;
+  }
+  const jump = lane === 'up' ? ctx.jumps.up : ctx.jumps.down;
+  return {
+    edgePp,
+    edgeCentsLabel,
+    jumpGainCents: jump?.gainCents ?? null,
+    projJumpCents1m: jump?.projJumpCentsFromNow1m ?? null,
+    jumpHeadline: jump?.headline ?? null,
+    projLine: jump?.projLine ?? null,
+  };
+}
+
+const EMPTY_HERO_METRICS: Pick<
+  NowPriceHeroView,
+  'edgePp' | 'edgeCentsLabel' | 'jumpGainCents' | 'projJumpCents1m' | 'jumpHeadline' | 'projLine'
+> = {
+  edgePp: null,
+  edgeCentsLabel: null,
+  jumpGainCents: null,
+  projJumpCents1m: null,
+  jumpHeadline: null,
+  projLine: null,
+};
+
+function withHeroMetrics(
+  view: Omit<NowPriceHeroView, keyof typeof EMPTY_HERO_METRICS>,
+  lane: 'up' | 'down' | null,
+  ctx: HeroMetricsCtx,
+): NowPriceHeroView {
+  if (!lane) return { ...view, ...EMPTY_HERO_METRICS };
+  return { ...view, ...resolveHeroLaneMetrics(lane, ctx) };
+}
+
+function buildNowPriceHeroView(args: {
+  executionSignal: ExecutionSignal | null;
+  directionEngine: DirectionEngineSignal | null;
+  tradeCall: string;
+  upLabel: string;
+  downLabel: string;
+  metricsCtx: HeroMetricsCtx;
+}): NowPriceHeroView {
+  const { executionSignal, directionEngine, tradeCall, upLabel, downLabel, metricsCtx } = args;
+
+  if (executionSignal?.phase === 'ENTER') {
+    const lane = executionSignal.verdict === 'ENTER_UP' ? upLabel : downLabel;
+    const laneKey: 'up' | 'down' = executionSignal.verdict === 'ENTER_UP' ? 'up' : 'down';
+    const tone: GlanceTone = laneKey === 'up' ? 'up' : 'down';
+    return withHeroMetrics(
+      {
+        tone,
+        emoji: executionSignal.emoji,
+        primary: 'ENTER',
+        laneLabel: lane,
+        subline: executionSignal.headline,
+        detail: executionSignal.summaryLine,
+        confidencePct: directionEngine?.confidencePct ?? null,
+        confirmPct: 100,
+        phaseLabel: 'GO',
+      },
+      laneKey,
+      metricsCtx,
+    );
+  }
+
+  if (executionSignal?.phase === 'ALERT') {
+    const laneKey: 'up' | 'down' | null =
+      executionSignal.bias.direction === 'up'
+        ? 'up'
+        : executionSignal.bias.direction === 'down'
+          ? 'down'
+          : null;
+    const lane = laneKey === 'up' ? upLabel : laneKey === 'down' ? downLabel : null;
+    const confirmPct = Math.min(
+      100,
+      Math.round((executionSignal.confirmHeldMs / Math.max(1, executionSignal.confirmRequiredMs)) * 100),
+    );
+    return withHeroMetrics(
+      {
+        tone: laneKey === 'up' ? 'up' : laneKey === 'down' ? 'down' : 'warn',
+        emoji: executionSignal.emoji,
+        primary: 'ALERT',
+        laneLabel: lane,
+        subline: executionSignal.headline,
+        detail: executionSignal.summaryLine,
+        confidencePct: directionEngine?.confidencePct ?? null,
+        confirmPct,
+        phaseLabel: 'CONFIRM',
+      },
+      laneKey,
+      metricsCtx,
+    );
+  }
+
+  if (directionEngine?.verdict === 'ENTER_UP' || directionEngine?.verdict === 'ENTER_DOWN') {
+    const laneKey: 'up' | 'down' = directionEngine.verdict === 'ENTER_UP' ? 'up' : 'down';
+    const tone: GlanceTone = laneKey === 'up' ? 'up' : 'down';
+    const lane = laneKey === 'up' ? upLabel : downLabel;
+    return withHeroMetrics(
+      {
+        tone,
+        emoji: directionEngine.emoji,
+        primary: directionEngine.hardRule ? 'HARD ENTER' : 'LEAN ENTER',
+        laneLabel: lane,
+        subline: directionEngine.headline,
+        detail: directionEngine.reasons[0] ?? null,
+        confidencePct: directionEngine.confidencePct,
+        confirmPct: null,
+        phaseLabel: directionEngine.hardRule ? 'HARD RULE' : 'DIRECTION',
+      },
+      laneKey,
+      metricsCtx,
+    );
+  }
+
+  if (tradeCall.startsWith('LONG ')) {
+    const laneKey: 'up' | 'down' = tradeCall.includes(upLabel) ? 'up' : 'down';
+    const tone: GlanceTone = laneKey === 'up' ? 'up' : 'down';
+    return withHeroMetrics(
+      {
+        tone,
+        emoji: laneKey === 'up' ? '🟢' : '🔴',
+        primary: 'LONG',
+        laneLabel: tradeCall.replace(/^LONG /, ''),
+        subline: directionEngine?.headline ?? tradeCall,
+        detail: directionEngine?.reasons[0] ?? null,
+        confidencePct: directionEngine?.confidencePct ?? null,
+        confirmPct: null,
+        phaseLabel: 'EDGE',
+      },
+      laneKey,
+      metricsCtx,
+    );
+  }
+
+  const isNoTrade =
+    tradeCall === 'NO TRADE' ||
+    executionSignal?.phase === 'NO_TRADE' ||
+    directionEngine?.verdict === 'NO_TRADE';
+
+  return withHeroMetrics(
+    {
+      tone: isNoTrade ? 'flat' : 'warn',
+      emoji: isNoTrade ? '⚪' : '🔵',
+      primary: isNoTrade ? 'NO TRADE' : 'WAIT',
+      laneLabel: null,
+      subline: directionEngine?.headline ?? tradeCall,
+      detail: directionEngine?.reasons[0] ?? null,
+      confidencePct: directionEngine?.confidencePct ?? null,
+      confirmPct: null,
+      phaseLabel: null,
+    },
+    directionEngine?.proposedLane ?? null,
+    metricsCtx,
+  );
+}
+
+function nowPriceHeroShell(tone: GlanceTone, _phaseLabel: string | null): string {
+  switch (tone) {
+    case 'up':
+      return 'border-emerald-600/55 bg-emerald-950/35 ring-1 ring-emerald-500/20';
+    case 'down':
+      return 'border-rose-600/55 bg-rose-950/35 ring-1 ring-rose-500/20';
+    case 'warn':
+      return 'border-amber-600/45 bg-amber-950/30 ring-1 ring-amber-500/15';
+    default:
+      return 'border-zinc-700/55 bg-zinc-950/40 ring-1 ring-zinc-600/15';
+  }
+}
+
+function nowPriceHeroLaneTone(tone: GlanceTone): string {
+  switch (tone) {
+    case 'up':
+      return 'text-emerald-200';
+    case 'down':
+      return 'text-rose-200';
+    case 'warn':
+      return 'text-amber-100';
+    default:
+      return 'text-zinc-100';
+  }
+}
+
+function NowPriceHeroSignalBanner(props: { view: NowPriceHeroView }): ReactElement {
+  const { view } = props;
+  const laneCls = nowPriceHeroLaneTone(view.tone);
+  const confCls =
+    view.confidencePct != null && view.confidencePct >= 85
+      ? 'text-emerald-300'
+      : view.confidencePct != null && view.confidencePct >= 70
+        ? 'text-cyan-200'
+        : view.confidencePct != null && view.confidencePct >= 55
+          ? 'text-amber-200'
+          : 'text-zinc-400';
+
+  return (
+    <div className={`rounded-xl border px-3 py-3 sm:px-4 ${nowPriceHeroShell(view.tone, view.phaseLabel)}`}>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="flex min-w-0 flex-1 items-start gap-2 sm:gap-3">
+          <span className="select-none text-2xl leading-none sm:text-3xl" aria-hidden>
+            {view.emoji}
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0">
+              <span className={`text-xl font-black uppercase tracking-tight sm:text-2xl ${laneCls}`}>
+                {view.primary}
+              </span>
+              {view.laneLabel ? (
+                <span className={`text-lg font-black tracking-tight sm:text-xl ${laneCls}`}>{view.laneLabel}</span>
+              ) : null}
+            </div>
+            <p className="mt-1 text-[13px] font-bold leading-snug text-zinc-100 sm:text-sm">{view.subline}</p>
+            {view.detail ? (
+              <p className="mt-1 max-w-3xl text-[11px] leading-snug text-zinc-400">{view.detail}</p>
+            ) : null}
+            {view.edgePp != null || view.jumpGainCents != null || view.projJumpCents1m != null ? (
+              <div className="mt-2.5 flex flex-wrap gap-2">
+                {view.edgePp != null ? (
+                  <div className="rounded-lg border border-black/35 bg-black/35 px-2.5 py-2 sm:min-w-[5.5rem]">
+                    <div className="text-[8px] font-bold uppercase tracking-[0.12em] text-zinc-500">Edge</div>
+                    <div
+                      className={`mt-0.5 font-mono text-lg font-black tabular-nums sm:text-xl ${
+                        view.tone === 'up' ? 'text-emerald-300' : view.tone === 'down' ? 'text-rose-300' : 'text-zinc-200'
+                      }`}
+                    >
+                      {fmtPp(view.edgePp)}
+                    </div>
+                    {view.edgeCentsLabel ? (
+                      <div className="mt-0.5 font-mono text-[10px] font-semibold text-zinc-400">{view.edgeCentsLabel}</div>
+                    ) : null}
+                  </div>
+                ) : null}
+                {view.jumpGainCents != null && Math.abs(view.jumpGainCents) >= 0.05 ? (
+                  <div className="rounded-lg border border-black/35 bg-black/35 px-2.5 py-2 sm:min-w-[5.5rem]">
+                    <div className="text-[8px] font-bold uppercase tracking-[0.12em] text-zinc-500">30s jump</div>
+                    <div
+                      className={`mt-0.5 font-mono text-lg font-black tabular-nums sm:text-xl ${
+                        view.jumpGainCents >= 0 ? 'text-cyan-200' : 'text-rose-300/90'
+                      }`}
+                    >
+                      {view.jumpGainCents >= 0 ? '+' : ''}
+                      {view.jumpGainCents.toFixed(1)}¢
+                    </div>
+                    {view.jumpHeadline ? (
+                      <div className="mt-1 max-w-xs text-[9px] leading-snug text-zinc-500">{view.jumpHeadline}</div>
+                    ) : null}
+                  </div>
+                ) : null}
+                {view.projJumpCents1m != null && Math.abs(view.projJumpCents1m) >= 0.05 ? (
+                  <div className="rounded-lg border border-black/35 bg-black/35 px-2.5 py-2 sm:min-w-[5.5rem]">
+                    <div className="text-[8px] font-bold uppercase tracking-[0.12em] text-zinc-500">Proj 1m</div>
+                    <div
+                      className={`mt-0.5 font-mono text-lg font-black tabular-nums sm:text-xl ${
+                        view.projJumpCents1m >= 0 ? 'text-violet-200' : 'text-amber-200/90'
+                      }`}
+                    >
+                      ~{view.projJumpCents1m >= 0 ? '+' : ''}
+                      {view.projJumpCents1m.toFixed(1)}¢
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+            {view.projLine ? (
+              <p className="mt-1.5 max-w-3xl font-mono text-[10px] leading-snug text-zinc-500">{view.projLine}</p>
+            ) : null}
+            {view.confirmPct != null && view.confirmPct < 100 ? (
+              <div className="mt-2.5 max-w-md">
+                <div className="flex items-center justify-between text-[9px] font-bold uppercase tracking-wide text-amber-200/90">
+                  <span>Continuation confirm</span>
+                  <span className="font-mono tabular-nums">{view.confirmPct}%</span>
+                </div>
+                <div className="mt-1 h-2 overflow-hidden rounded-full bg-black/40">
+                  <div
+                    className="h-full rounded-full bg-gradient-to-r from-amber-500/80 to-amber-300/90 transition-[width] duration-300"
+                    style={{ width: `${view.confirmPct}%` }}
+                  />
+                </div>
+              </div>
+            ) : null}
+          </div>
+        </div>
+        <div className="shrink-0 text-right">
+          {view.phaseLabel ? (
+            <div className="text-[9px] font-black uppercase tracking-[0.16em] text-zinc-500">{view.phaseLabel}</div>
+          ) : null}
+          {view.confidencePct != null ? (
+            <>
+              <div className={`mt-0.5 font-mono text-2xl font-black tabular-nums sm:text-3xl ${confCls}`}>
+                {view.confidencePct}%
+              </div>
+              <div className="text-[9px] font-bold uppercase tracking-wide text-zinc-500">Confidence</div>
+            </>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function fmtPp(pp: number): string {
   return `${pp >= 0 ? '+' : ''}${pp.toFixed(1)}pp`;
+}
+
+/** Desk model P(Up) minus Up mid, in percentage points. */
+function upEdgePp(modelPUp: number | null, pMktUp: number | null): number | null {
+  if (modelPUp == null || pMktUp == null || !Number.isFinite(modelPUp) || !Number.isFinite(pMktUp)) {
+    return null;
+  }
+  return (modelPUp - pMktUp) * 100;
+}
+
+function buildUpEdgeHeadline(params: {
+  edgePp: number;
+  modelPUp: number | null;
+  pMktUp: number | null;
+  upLabel: string;
+}): { qualifier: string; math: string | null; title: string; tone: GlanceTone } {
+  const { edgePp, modelPUp, pMktUp, upLabel } = params;
+  const qualifier =
+    edgePp > 0.3 ? `${upLabel} cheap` : edgePp < -0.3 ? `${upLabel} rich` : 'near fair';
+  const math =
+    modelPUp != null && pMktUp != null ? `${fmtProbPct01(modelPUp)} − ${fmtProbPct01(pMktUp)}` : null;
+  const title = [
+    `${upLabel} edge = desk model P(${upLabel}) minus ${upLabel} mid on the book.`,
+    'Positive → model thinks the contract is underpriced (cheap).',
+    'Negative → model thinks the contract is overpriced (rich).',
+    math ? `${math} = ${fmtPp(edgePp)} (${qualifier}).` : fmtPp(edgePp),
+  ].join(' ');
+  const tone: GlanceTone = edgePp > 0.3 ? 'up' : edgePp < -0.3 ? 'down' : 'flat';
+  return { qualifier, math, title, tone };
 }
 
 function contractLagPhaseCls(phase: ContractLagPhase): string {
@@ -1351,7 +2154,18 @@ function ContractLagBox(props: {
           Spot {fmtUsdSigned(distVsPtb)} vs PTB
           {lag.geo ? ` · ${lag.geo.replace('_', ' ')}` : ''}
         </span>
-        <span>Edge {fmtPp(lag.edgePp)}</span>
+        <span
+          title={
+            buildUpEdgeHeadline({
+              edgePp: lag.edgePp,
+              modelPUp: lag.modelUp,
+              pMktUp: lag.marketUp,
+              upLabel,
+            }).title
+          }
+        >
+          {upLabel} edge {fmtPp(lag.edgePp)}
+        </span>
         <span className={lag.geoAligned ? 'text-emerald-400/90' : 'text-amber-400/90'}>
           {lag.geoAligned ? 'Geo ✓' : 'Geo ✗'}
         </span>
@@ -1629,6 +2443,9 @@ export function NowPriceSignalsPanel(props: {
   physicsLine?: string | null;
   probLastUpdateMs?: number | null;
   booksFetchedAt?: number | null;
+  buySideAdvisory?: BuySideAdvisory | null;
+  bookTouchUp?: BookTouchForArmRisk | null;
+  bookTouchDown?: BookTouchForArmRisk | null;
 }): ReactElement {
   const {
     slug = 'unknown',
@@ -1647,6 +2464,9 @@ export function NowPriceSignalsPanel(props: {
     physicsLine,
     probLastUpdateMs,
     booksFetchedAt = null,
+    buySideAdvisory = null,
+    bookTouchUp = null,
+    bookTouchDown = null,
   } = props;
 
   const spotLast = spot.length ? spot[spot.length - 1]!.v : null;
@@ -1699,49 +2519,51 @@ export function NowPriceSignalsPanel(props: {
     });
   }, [spotLast, slopeUsdPerSec, priceToBeat, lastProbUp, lastProbDown, upLabel, downLabel]);
 
-  const probProj = useMemo(() => {
-    const net = tape?.netPressure ?? null;
-    const horizons = [
-      { label: '30s', sec: 30 },
-      { label: '1m', sec: 60 },
-    ];
-    const up = computeMomentumProjection({
-      pts: probUp as ProjectionTick[],
-      tapeNetPressure: net,
-      horizons,
+  const pricePrediction = useMemo(() => {
+    if (spotLast == null || priceToBeat == null) return null;
+    return computePricePredictionSignal({
+      spotUsd: spotLast,
+      slopeUsdPerSec,
+      ptbUsd: priceToBeat,
+      bandUsd,
+      horizonSec: 30,
+      upLabel,
+      downLabel,
     });
-    const down = computeMomentumProjection({
-      pts: probDown as ProjectionTick[],
-      tapeNetPressure: net != null ? -net : null,
-      horizons,
-    });
-    return {
-      up30: up?.points.find((p) => p.label === '30s') ?? null,
-      down30: down?.points.find((p) => p.label === '30s') ?? null,
-      up1m: up?.points.find((p) => p.label === '1m') ?? null,
-      down1m: down?.points.find((p) => p.label === '1m') ?? null,
-    };
-  }, [probUp, probDown, tape?.netPressure]);
+  }, [bandUsd, downLabel, priceToBeat, slopeUsdPerSec, spotLast, upLabel]);
 
-  const normLive = useMemo(
-    () => normalizeBinaryFlexible(lastProbUp, lastProbDown),
-    [lastProbUp, lastProbDown],
-  );
-
-  const probTicksUp = useMemo(
+  const probTicksUpEarly = useMemo(
     () =>
       probUp
         .filter((p) => p.v != null && Number.isFinite(p.v))
         .map((p) => ({ t: p.t, v: p.v! })),
     [probUp],
   );
-  const probTicksDown = useMemo(
+  const probTicksDownEarly = useMemo(
     () =>
       probDown
         .filter((p) => p.v != null && Number.isFinite(p.v))
         .map((p) => ({ t: p.t, v: p.v! })),
     [probDown],
   );
+
+  const contractProbGrid = useMemo(() => {
+    return buildContractProbProjectionGrid({
+      probUpPts: probTicksUpEarly,
+      probDownPts: probTicksDownEarly,
+      nowUp01: lastProbUp,
+      nowDown01: lastProbDown,
+      tapeNetPressure: tape?.netPressure ?? null,
+    });
+  }, [probTicksUpEarly, probTicksDownEarly, lastProbUp, lastProbDown, tape?.netPressure]);
+
+  const normLive = useMemo(
+    () => normalizeBinaryFlexible(lastProbUp, lastProbDown),
+    [lastProbUp, lastProbDown],
+  );
+
+  const probTicksUp = probTicksUpEarly;
+  const probTicksDown = probTicksDownEarly;
 
   const recentDeltaUp01 = useMemo(() => recentProbDelta01(probTicksUp, 30_000), [probTicksUp]);
   const recentDeltaDown01 = useMemo(() => recentProbDelta01(probTicksDown, 30_000), [probTicksDown]);
@@ -1752,12 +2574,6 @@ export function NowPriceSignalsPanel(props: {
   );
 
   const normNow = normLive;
-  const norm30 = useMemo(() => {
-    const u = probProj.up30?.price01 ?? lastProbUp ?? null;
-    const d = probProj.down30?.price01 ?? lastProbDown ?? null;
-    return normalizeBinaryFlexible(u, d);
-  }, [probProj.up30?.price01, probProj.down30?.price01, lastProbUp, lastProbDown]);
-
   const binaryBias = useMemo(() => {
     if (spotLast == null || priceToBeat == null) return null;
     return estimateBinaryOutcomeBias({
@@ -1832,6 +2648,30 @@ export function NowPriceSignalsPanel(props: {
     });
   }, [spotLast, priceToBeat, spot, probUp, probDown, pMktUp, pMktDown, upLabel, downLabel]);
 
+  const contractEarlyJumps = useMemo(
+    () => ({
+      up:
+        deskSpeedEarly && pMktUp != null
+          ? computeContractEntryJump({
+              prob: deskSpeedEarly.lanes.up.prob,
+              now01: pMktUp,
+              horizonSec: PRESSURE_EARLY_HORIZON_SEC,
+              outcomeLabel: upLabel,
+            })
+          : null,
+      down:
+        deskSpeedEarly && pMktDown != null
+          ? computeContractEntryJump({
+              prob: deskSpeedEarly.lanes.down.prob,
+              now01: pMktDown,
+              horizonSec: PRESSURE_EARLY_HORIZON_SEC,
+              outcomeLabel: downLabel,
+            })
+          : null,
+    }),
+    [deskSpeedEarly, pMktUp, pMktDown, upLabel, downLabel],
+  );
+
   const deskSpeed = deskSpeedConfirm;
 
   const fvgSignal = useMemo(() => {
@@ -1886,6 +2726,16 @@ export function NowPriceSignalsPanel(props: {
     };
   }, [binaryBias, fairValueGap?.pExpected, pMktUp, upLabel, downLabel]);
 
+  const bilateralEdgeSnap = useMemo(
+    () =>
+      computeBilateralEdge({
+        modelPUp: binaryBias?.probUp ?? fairValueSimple?.fairUp ?? null,
+        pMktUp,
+        pMktDown,
+      }),
+    [binaryBias?.probUp, fairValueSimple?.fairUp, pMktUp, pMktDown],
+  );
+
   const mtfConsensus = useMemo(() => {
     if (bandUsd == null || spot.length < 4) return null;
     return buildMtfConsensus(spot, bandUsd);
@@ -1918,6 +2768,133 @@ export function NowPriceSignalsPanel(props: {
     [deskSpeed, upLabel, downLabel, spotLast, pMktUp, pMktDown],
   );
 
+  const directionEngine = useMemo(() => {
+    if (bandDistances == null) return null;
+    const edgePp =
+      binaryBias != null && pMktUp != null
+        ? (binaryBias.probUp - pMktUp) * 100
+        : fairValueGap?.rawGapPp ?? null;
+    return computeDirectionEngine({
+      geo: bandDistances.geo,
+      modelPUp: binaryBias?.probUp ?? fairValueSimple?.fairUp ?? null,
+      pMktUp,
+      pMktDown,
+      deskSpeed,
+      machine: machineReadout ?? null,
+      mtf: mtfConsensus,
+      edgePp,
+      contractLag: contractLag ?? undefined,
+      repricingIntoEdge: edgeScalp?.repricingIntoEdge ?? contractLag?.repricingIntoEdge ?? null,
+      upLabel,
+      downLabel,
+    });
+  }, [
+    bandDistances,
+    binaryBias,
+    pMktUp,
+    pMktDown,
+    fairValueGap?.rawGapPp,
+    fairValueSimple?.fairUp,
+    deskSpeed,
+    machineReadout,
+    mtfConsensus,
+    contractLag,
+    edgeScalp?.repricingIntoEdge,
+    upLabel,
+    downLabel,
+  ]);
+
+  const executionInputBase = useMemo(() => {
+    if (bandDistances == null) return null;
+    const modelPUp = binaryBias?.probUp ?? fairValueSimple?.fairUp ?? null;
+    const bilateral = computeBilateralEdge({
+      modelPUp,
+      pMktUp,
+      pMktDown,
+    });
+    const earlyJumpUp = deskSpeedEarly
+      ? computeContractEntryJump({
+          prob: deskSpeedEarly.lanes.up.prob,
+          now01: pMktUp,
+          horizonSec: PRESSURE_EARLY_HORIZON_SEC,
+          outcomeLabel: upLabel,
+        })
+      : null;
+    const earlyJumpDown = deskSpeedEarly
+      ? computeContractEntryJump({
+          prob: deskSpeedEarly.lanes.down.prob,
+          now01: pMktDown,
+          horizonSec: PRESSURE_EARLY_HORIZON_SEC,
+          outcomeLabel: downLabel,
+        })
+      : null;
+    const laneHint = pickEdgeLaneHint(bilateral.edgeUpPp, bilateral.edgeDownPp, 20);
+    const strongerSide = pickStrongerEdgeSide(bilateral.edgeUpPp, bilateral.edgeDownPp);
+    const earlyGain =
+      laneHint === 'down' || (laneHint == null && strongerSide === 'down')
+        ? earlyJumpDown?.gainCents ?? null
+        : earlyJumpUp?.gainCents ?? null;
+
+    return {
+      geo: bandDistances.geo,
+      modelPUp,
+      pMktUp,
+      pMktDown,
+      edgePp: bilateral.edgeUpPp,
+      deskSpeedEarly,
+      deskSpeedConfirm: deskSpeedConfirm,
+      machine: machineReadout ?? null,
+      mtf: mtfConsensus,
+      probUpDelta01: recentDeltaUp01,
+      probDownDelta01: recentDeltaDown01,
+      spotPts: spot.map((p) => ({ t: p.t, v: p.v })),
+      nowSpotUsd: spotLast,
+      earlyProbGainCents: earlyGain,
+      pressureTiming: pressureBuildup?.timing ?? null,
+      upLabel,
+      downLabel,
+    };
+  }, [
+    bandDistances,
+    binaryBias,
+    pMktUp,
+    pMktDown,
+    fairValueGap?.rawGapPp,
+    fairValueSimple?.fairUp,
+    deskSpeedEarly,
+    deskSpeedConfirm,
+    machineReadout,
+    mtfConsensus,
+    recentDeltaUp01,
+    recentDeltaDown01,
+    spot,
+    spotLast,
+    pressureBuildup?.timing,
+    upLabel,
+    downLabel,
+  ]);
+
+  const [execConfirm, setExecConfirm] = useState<ExecutionConfirmState | null>(null);
+  useEffect(() => {
+    if (!executionInputBase) return;
+    setExecConfirm((prev) => updateExecutionConfirm(prev, executionInputBase, Date.now()));
+  }, [executionInputBase]);
+  useEffect(() => {
+    if (!executionInputBase) return;
+    const id = window.setInterval(() => {
+      setExecConfirm((prev) => updateExecutionConfirm(prev, executionInputBase, Date.now()));
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [executionInputBase]);
+
+  const executionSignal = useMemo(() => {
+    if (!executionInputBase) return null;
+    return computeExecutionSignal({
+      ...executionInputBase,
+      confirmHeldMs: execConfirm?.confirmHeldMs ?? 0,
+    });
+  }, [executionInputBase, execConfirm?.confirmHeldMs]);
+
   const speedHint = pressureBuildup
     ? pressureBuildupShortLabel(pressureBuildup)
     : directionScore
@@ -1945,31 +2922,47 @@ export function NowPriceSignalsPanel(props: {
       ? `LEAN ${machineReadout.focusLane === 'up' ? upLabel : downLabel}`
       : 'WAIT';
 
-  const tradeCallTone: GlanceTone =
-    edgeScalp?.scalpSignal === 'LONG_UP' || machineReadout?.focusLane === 'up'
-      ? 'up'
-      : edgeScalp?.scalpSignal === 'LONG_DOWN' || machineReadout?.focusLane === 'down'
-        ? 'down'
-        : 'flat';
+  const heroSignal = buildNowPriceHeroView({
+    executionSignal,
+    directionEngine,
+    tradeCall,
+    upLabel,
+    downLabel,
+    metricsCtx: {
+      directionEngine,
+      bilateral: bilateralEdgeSnap,
+      jumps: contractEarlyJumps,
+      contractLag,
+    },
+  });
 
-  const upMidSnap =
-    pMktUp != null
-      ? `${upLabel} ${fmtCents(pMktUp)}${recentDeltaUp01 != null ? ` (${fmtDeltaCents(recentDeltaUp01)})` : ''}`
+  const heroActiveLane: 'up' | 'down' | null =
+    executionSignal?.verdict === 'ENTER_UP' || directionEngine?.verdict === 'ENTER_UP'
+      ? 'up'
+      : executionSignal?.verdict === 'ENTER_DOWN' || directionEngine?.verdict === 'ENTER_DOWN'
+        ? 'down'
+        : directionEngine?.proposedLane ??
+          (tradeCall.includes(upLabel) ? 'up' : tradeCall.includes(downLabel) ? 'down' : null);
+
+  const machineHint =
+    machineReadout != null
+      ? `${machineReadout.agreementScore}% ${machineReadout.focusLane?.toUpperCase() ?? 'SPLIT'}`
       : null;
-  const downMidSnap =
-    pMktDown != null
-      ? `${downLabel} ${fmtCents(pMktDown)}${recentDeltaDown01 != null ? ` (${fmtDeltaCents(recentDeltaDown01)})` : ''}`
-      : null;
+
+  const headlineEdgePp =
+    upEdgePp(binaryBias?.probUp ?? null, pMktUp) ??
+    (edgeScalp?.edge != null ? edgeScalp.edge * 100 : null) ??
+    fairValueGap?.rawGapPp ??
+    null;
 
   return (
-    <div className="flex min-w-0 flex-col gap-2.5 rounded-2xl border border-zinc-800/60 bg-[#0b1018] p-3 sm:p-4">
-      <div className="text-[10px] font-black uppercase tracking-[0.16em] text-indigo-300/85">Now price signals</div>
+    <div className="flex min-w-0 flex-col gap-3 rounded-2xl border border-zinc-800/60 bg-[#0b1018] p-3 sm:p-4">
+      <NowPriceHeroSignalBanner view={heroSignal} />
 
-      <PriceHeadlineRow
-        spotUsd={bandDistances.now}
-        ptbUsd={bandDistances.ptb}
-        distVsPtb={bandDistances.distNowFromPtb}
-        stableHeader={stableHeader}
+      <NowPriceQuickContextStrip
+        band={bandDistances}
+        glance={glance}
+        geoTone={geoTone}
         upLabel={upLabel}
         downLabel={downLabel}
         probUp01={pMktUp}
@@ -1977,8 +2970,82 @@ export function NowPriceSignalsPanel(props: {
         probUpDelta01={recentDeltaUp01}
         probDownDelta01={recentDeltaDown01}
         modelPUp={binaryBias?.probUp ?? null}
-        edgePp={binaryBias != null && pMktUp != null ? (binaryBias.probUp - pMktUp) * 100 : fairValueGap?.rawGapPp ?? null}
+        edgeUpPp={bilateralEdgeSnap.edgeUpPp}
+        edgeDownPp={bilateralEdgeSnap.edgeDownPp}
+        activeLane={heroActiveLane}
+        speedHint={speedHint}
+        machineHint={machineHint}
+        endsInMs={endsInMs}
+        slopeUsdPerMin={slopeUsdPerMin}
       />
+
+      <NowPriceBuyStrip
+        slug={slug}
+        upLabel={upLabel}
+        downLabel={downLabel}
+        buySideAdvisory={buySideAdvisory}
+        probUp={probUp}
+        probDown={probDown}
+        midUp01={pMktUp}
+        midDown01={pMktDown}
+        bookTouchUp={bookTouchUp}
+        bookTouchDown={bookTouchDown}
+        endsInMs={endsInMs}
+        leanLane={heroActiveLane}
+      />
+
+      <details className="rounded-xl border border-zinc-800/50 bg-zinc-950/30 px-3 py-2">
+        <summary className="cursor-pointer text-sm font-semibold text-zinc-500 hover:text-zinc-300 sm:text-base">
+          Spot tape · projections · timers
+        </summary>
+        <div className="mt-2">
+          <PriceHeadlineRow
+            spotUsd={bandDistances.now}
+            ptbUsd={bandDistances.ptb}
+            distVsPtb={bandDistances.distNowFromPtb}
+            spotProjections={pricePrediction?.projections ?? null}
+            upLabel={upLabel}
+            downLabel={downLabel}
+            probUp01={pMktUp}
+            probDown01={pMktDown}
+            probUpDelta01={recentDeltaUp01}
+            probDownDelta01={recentDeltaDown01}
+            modelPUp={binaryBias?.probUp ?? null}
+            edgePp={headlineEdgePp}
+          />
+        </div>
+      </details>
+
+      {pricePrediction ? (
+        <PricePredictionSignalCard
+          signal={pricePrediction}
+          contractProb={contractProbGrid}
+          upLabel={upLabel}
+          downLabel={downLabel}
+        />
+      ) : null}
+
+      {directionEngine ? (
+        <details className="rounded-xl border border-zinc-800/50 bg-zinc-950/30 px-3 py-2" open>
+          <summary className="cursor-pointer text-sm font-semibold text-zinc-500 hover:text-zinc-300 sm:text-base">
+            Direction engine breakdown
+          </summary>
+          <div className="mt-2">
+            <DirectionEngineCard signal={directionEngine} />
+          </div>
+        </details>
+      ) : null}
+
+      {executionSignal ? (
+        <details className="rounded-xl border border-zinc-800/50 bg-zinc-950/30 px-3 py-2" open>
+          <summary className="cursor-pointer text-sm font-semibold text-zinc-500 hover:text-zinc-300 sm:text-base">
+            Execution gates
+          </summary>
+          <div className="mt-2">
+            <ExecutionSignalCard signal={executionSignal} />
+          </div>
+        </details>
+      ) : null}
 
       {contractLag ? (
         <ContractLagBox
@@ -2004,30 +3071,17 @@ export function NowPriceSignalsPanel(props: {
         />
       ) : null}
 
-      {pressureBuildup ? (
-        <PressureBuildupCard pressure={pressureBuildup} upLabel={upLabel} downLabel={downLabel} />
-      ) : null}
-
-      {directionScore ? <DirectionScoreCard score={directionScore} upLabel={upLabel} downLabel={downLabel} /> : null}
-
-      <CompactSnapshotStrip
-        geo={bandDistances.geo.replace('_', ' ')}
-        geoTone={geoTone}
-        spotUsd={bandDistances.now}
-        ptbUsd={bandDistances.ptb}
-        distVsPtb={bandDistances.distNowFromPtb}
-        tradeCall={tradeCall}
-        tradeTone={tradeCallTone}
-        edgePp={edgeScalp?.edge ?? fairValueGap?.rawGapPp ?? null}
-        speedHint={speedHint}
-        machineHint={
-          machineReadout
-            ? `${machineReadout.agreementScore}% ${machineReadout.focusLane?.toUpperCase() ?? 'SPLIT'}`
-            : null
-        }
-        upMid={upMidSnap}
-        downMid={downMidSnap}
-      />
+      <details className="rounded-xl border border-zinc-800/50 bg-zinc-950/30 px-3 py-2">
+        <summary className="cursor-pointer text-[10px] font-semibold text-zinc-500 hover:text-zinc-300">
+          More signals (pressure, direction score, machine)
+        </summary>
+        <div className="mt-2 space-y-2.5">
+          {pressureBuildup ? (
+            <PressureBuildupCard pressure={pressureBuildup} upLabel={upLabel} downLabel={downLabel} />
+          ) : null}
+          {directionScore ? <DirectionScoreCard score={directionScore} upLabel={upLabel} downLabel={downLabel} /> : null}
+        </div>
+      </details>
 
       {physicsLine ? (
         <p className="rounded-lg border border-violet-800/30 bg-violet-950/15 px-2.5 py-2 text-[11px] leading-snug text-violet-100/90">
@@ -2036,7 +3090,14 @@ export function NowPriceSignalsPanel(props: {
       ) : null}
 
       {machineReadout ? (
-        <MachineVerdictCard readout={machineReadout} physicsLine={null} compact minimal />
+        <details className="rounded-xl border border-zinc-800/50 bg-zinc-950/30 px-3 py-2">
+          <summary className="cursor-pointer text-[10px] font-semibold text-zinc-500 hover:text-zinc-300">
+            Machine sensor breakdown
+          </summary>
+          <div className="mt-2">
+            <MachineVerdictCard readout={machineReadout} physicsLine={null} compact minimal />
+          </div>
+        </details>
       ) : null}
 
       <div className="flex flex-wrap items-center justify-end gap-2">

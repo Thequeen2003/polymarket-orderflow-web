@@ -2,6 +2,8 @@ import { type ReactElement } from 'react';
 import type { SignalTakenPlaybook } from './signalTakenPlaybook';
 import type { PositionDeskAlert } from './positionDeskAlerts';
 import type { HeldSideDeskMetrics } from './heldSideDeskMetrics';
+import type { PositionTpOutlook } from './positionTpOutlook';
+import { PositionTpOutlookCard } from './PositionTpOutlookCard';
 
 export function SignalTakenAckPanel(props: {
   upLabel: string;
@@ -19,6 +21,8 @@ export function SignalTakenAckPanel(props: {
   positionAlerts?: PositionDeskAlert[] | null;
   /** Live glance numbers for the outcome you marked (implied mid, bell, cross, tape, …). */
   heldMetrics?: HeldSideDeskMetrics | null;
+  /** TP hit odds + hold / bank / greedy read when positioned with a bracket. */
+  tpOutlook?: PositionTpOutlook | null;
 }): ReactElement {
   const {
     upLabel,
@@ -31,6 +35,7 @@ export function SignalTakenAckPanel(props: {
     playbook,
     positionAlerts = null,
     heldMetrics = null,
+    tpOutlook = null,
   } = props;
 
   const toneRing =
@@ -174,6 +179,12 @@ export function SignalTakenAckPanel(props: {
           </button>
         ) : null}
       </div>
+
+      {manualLane != null && tpOutlook ? (
+        <div className="mt-3">
+          <PositionTpOutlookCard outlook={tpOutlook} />
+        </div>
+      ) : null}
 
       {manualLane != null && positionAlerts && positionAlerts.length > 0 ? (
         <div className="mt-3 space-y-2">

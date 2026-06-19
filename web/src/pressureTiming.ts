@@ -12,12 +12,14 @@ export const PRESSURE_CONFIRM_HORIZON_SEC = 30;
 
 /** Max prob ¢ move on early window to count as “building”, not “already jumped”. */
 export const PRESSURE_EARLY_MAX_PROB_PP = 7;
-/** Confirm window: move beyond this = extended. */
-export const PRESSURE_EXTENDED_PROB_PP = 14;
-export const PRESSURE_EXTENDED_GAIN_PCT = 18;
+/** Confirm window: move beyond this = extended (too late for fresh entry on 30s alone). */
+export const PRESSURE_EXTENDED_PROB_PP = 4;
+export const PRESSURE_EXTENDED_GAIN_PCT = 5;
+export const PRESSURE_EXTENDED_GAIN_CENTS = 3.5;
 /** Confirm window: move beyond this = chasing — do not treat as fresh setup. */
-export const PRESSURE_CHASING_PROB_PP = 22;
-export const PRESSURE_CHASING_GAIN_PCT = 30;
+export const PRESSURE_CHASING_PROB_PP = 8;
+export const PRESSURE_CHASING_GAIN_PCT = 10;
+export const PRESSURE_CHASING_GAIN_CENTS = 5;
 
 export type PressureTiming = 'EARLY' | 'BUILDING' | 'EXTENDED' | 'CHASING';
 
@@ -57,35 +59,46 @@ export function classifyPressureTiming(params: {
 
   const confirmProbPp = activeConfirmProbPp(confirm, bias);
   const confirmGainPct = entryJump ? Math.abs(entryJump.gainPct) : null;
+  const confirmGainCents = entryJump ? Math.abs(entryJump.gainCents) : null;
 
   const chasing =
     confirmProbPp >= PRESSURE_CHASING_PROB_PP ||
-    (confirmGainPct != null && confirmGainPct >= PRESSURE_CHASING_GAIN_PCT);
+    (confirmGainPct != null && confirmGainPct >= PRESSURE_CHASING_GAIN_PCT) ||
+    (confirmGainCents != null && confirmGainCents >= PRESSURE_CHASING_GAIN_CENTS);
   const extended =
     !chasing &&
     (confirmProbPp >= PRESSURE_EXTENDED_PROB_PP ||
-      (confirmGainPct != null && confirmGainPct >= PRESSURE_EXTENDED_GAIN_PCT));
+      (confirmGainPct != null && confirmGainPct >= PRESSURE_EXTENDED_GAIN_PCT) ||
+      (confirmGainCents != null && confirmGainCents >= PRESSURE_EXTENDED_GAIN_CENTS));
   const building =
     !chasing &&
     !extended &&
-    (confirmProbPp >= 5 || (confirmGainPct != null && confirmGainPct >= 8));
+    (confirmProbPp >= 3 || (confirmGainPct != null && confirmGainPct >= 4));
 
   if (chasing) {
+    const centsNote =
+      confirmGainCents != null && confirmGainCents >= PRESSURE_CHASING_GAIN_CENTS
+        ? `+${confirmGainCents.toFixed(1)}¢`
+        : `+${confirmProbPp.toFixed(0)}pp`;
     return {
       timing: 'CHASING',
       confirmProbPp,
       confirmGainPct,
-      note: `Move already +${confirmProbPp.toFixed(0)}pp${confirmGainPct != null ? ` (+${confirmGainPct.toFixed(0)}%)` : ''} on ${confirm.horizonSec}s — confirming late, not early entry.`,
+      note: `Too late — ${centsNote} already in on ${confirm.horizonSec}s confirm. Skip chasing; wait pullback or next 10s lead.`,
       maxVerdict: 'WATCH',
     };
   }
   if (extended) {
+    const centsNote =
+      confirmGainCents != null && confirmGainCents >= 3
+        ? `+${confirmGainCents.toFixed(1)}¢`
+        : `+${confirmProbPp.toFixed(0)}pp`;
     return {
       timing: 'EXTENDED',
       confirmProbPp,
       confirmGainPct,
-      note: `Repricing mostly done (+${confirmProbPp.toFixed(0)}pp / ${confirm.horizonSec}s) — add only on pullback.`,
-      maxVerdict: 'EARLY_ENTRY',
+      note: `Late for fresh entry — ${centsNote} on ${confirm.horizonSec}s confirm. Act on 10s lead next window, not this extension.`,
+      maxVerdict: 'WATCH',
     };
   }
   if (building) {

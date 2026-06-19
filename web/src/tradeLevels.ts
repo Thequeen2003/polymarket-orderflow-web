@@ -22,8 +22,17 @@
  * Pure module — no React, easy to unit-test.
  */
 
-import type { LaneEdges } from './tradeEdgeCalculator';
+import type { SpeedAlignment, SpeedMode } from './deskSpeedLayers';
 import type { TradeDirective } from './tradeDirective';
+import type { LaneEdges } from './tradeEdgeCalculator';
+import {
+  clampTpLegToRegime,
+  resolveRegimeTpPlan,
+  type RegimeTpPlan,
+  type TpMarketRegime,
+} from './regimeTpEngine';
+import type { NowPriceBandDistances } from './nowPriceSignals';
+import type { PressureTiming } from './pressureTiming';
 
 export type TradeLevels = {
   lane: 'up' | 'down';
@@ -47,6 +56,15 @@ export type TradeLevels = {
   collapsed: boolean;
   /** True when the symmetric band was tightened for the last ~60s (still actionable). */
   toBellBand?: boolean;
+  /** Secondary target for ACCELERATION split-exit. */
+  takeProfit2?: number;
+  takeProfit2Gain?: number;
+  /** Regime that sized this bracket. */
+  tpRegime?: TpMarketRegime;
+  /** Exit if TP not hit within this many seconds. */
+  timeStopSec?: number;
+  /** Full regime TP plan for live management. */
+  regimePlan?: RegimeTpPlan;
 };
 
 /** Seconds left at which TP/SL pin to mid (no new limit risk on the ladder). */
@@ -93,9 +111,30 @@ export function suggestTradeLevels(input: {
   endsInMs?: number | null;
   bestAsk?: number | null;
   bestBid?: number | null;
+  /** Model win probability — drives asymmetric TP when +EV. */
   pWin?: number | null;
+  /** Volatility regime from desk speed — tightens TP in chop, widens in trend grind. */
+  speedAlignment?: SpeedAlignment | null;
+  /** Machine regime (`chop` / `trend`) — combined with speedAlignment for TP band. */
+  machineRegime?: 'chop' | 'grind' | 'trend' | null;
+  speedMode?: SpeedMode | null;
+  geo?: NowPriceBandDistances['geo'] | null;
+  pressureTiming?: PressureTiming | null;
 }): TradeLevels | null {
-  const { lane, edgeUsd, crossProb, endsInMs, bestAsk, bestBid, pWin } = input;
+  const {
+    lane,
+    edgeUsd,
+    crossProb,
+    endsInMs,
+    bestAsk,
+    bestBid,
+    pWin,
+    speedAlignment,
+    machineRegime,
+    speedMode,
+    geo,
+    pressureTiming,
+  } = input;
 
   // Use the best ask as actual entry price (what you'd pay) when available, else fall back to mid.
   let entry = input.entry;
@@ -150,6 +189,29 @@ export function suggestTradeLevels(input: {
   tpLeg = Math.min(tpLeg, roomUp);
   slLeg = Math.min(slLeg, roomDn);
 
+  const regimePlan =
+    speedAlignment != null ||
+    machineRegime != null ||
+    geo != null ||
+    speedMode != null ||
+    pressureTiming != null
+      ? resolveRegimeTpPlan({
+          geo: geo ?? null,
+          lane,
+          machineRegime: machineRegime ?? null,
+          speedAlignment: speedAlignment ?? null,
+          speedMode: speedMode ?? null,
+          pressureTiming: pressureTiming ?? null,
+        })
+      : null;
+
+  if (regimePlan) {
+    tpLeg = clampTpLegToRegime(tpLeg, regimePlan);
+    if (regimePlan.regime === 'CHOP' || regimePlan.regime === 'NEUTRAL') {
+      slLeg = Math.min(slLeg, regimePlan.tpMaxCents / 100);
+    }
+  }
+
   let toBellBand = false;
   if (
     horizonSec >= SETTLEMENT_PIN_BELOW_SEC &&
@@ -167,6 +229,13 @@ export function suggestTradeLevels(input: {
   const takeProfit = clamp01(entry + tpLeg);
   const stopLoss = clamp01(entry - slLeg);
 
+  let takeProfit2: number | undefined;
+  let takeProfit2Gain: number | undefined;
+  if (regimePlan?.tp2MinCents != null) {
+    takeProfit2 = clamp01(entry + regimePlan.tp2MinCents / 100);
+    takeProfit2Gain = takeProfit2 - entry;
+  }
+
   const takeProfitGain = takeProfit - entry;
   const stopLossLoss = entry - stopLoss;
   const rrRatio = stopLossLoss > 1e-6 ? takeProfitGain / stopLossLoss : 0;
@@ -177,11 +246,13 @@ export function suggestTradeLevels(input: {
       ? ` · ~${Math.max(1, Math.round(horizonSec))}s to bell (tight band)`
       : '';
   const entryNote = bestAsk != null && Number.isFinite(bestAsk) ? ' (ask)' : '';
+  const regimeHint = regimePlan ? ` · ${regimePlan.regime.replace('_', ' ')} TP` : '';
   const summary =
     `${laneWord} token @ ${entry.toFixed(2)}${entryNote} → ` +
-    `TP ${takeProfit.toFixed(2)} (+${takeProfitGain.toFixed(2)}/sh) · ` +
-    `SL ${stopLoss.toFixed(2)} (−${stopLossLoss.toFixed(2)}/sh) · ` +
-    `R:R ${rrRatio.toFixed(2)}${bellHint}`;
+    `TP ${takeProfit.toFixed(2)} (+${takeProfitGain.toFixed(2)}/sh)` +
+    (takeProfit2 != null ? ` · TP2 ${takeProfit2.toFixed(2)} (+${takeProfit2Gain!.toFixed(2)}/sh)` : '') +
+    ` · SL ${stopLoss.toFixed(2)} (−${stopLossLoss.toFixed(2)}/sh) · ` +
+    `R:R ${rrRatio.toFixed(2)}${bellHint}${regimeHint}`;
 
   return {
     lane,
@@ -195,6 +266,11 @@ export function suggestTradeLevels(input: {
     summary,
     collapsed: false,
     toBellBand: toBellBand || undefined,
+    takeProfit2,
+    takeProfit2Gain,
+    tpRegime: regimePlan?.regime,
+    timeStopSec: regimePlan ? Math.round(regimePlan.timeStopMs / 1000) : undefined,
+    regimePlan: regimePlan ?? undefined,
   };
 }
 

@@ -6,8 +6,10 @@ import {
 } from './bracketCentsInput';
 import {
   bracketAuxFromCents,
+  bracketCentsFromAltModeDraft,
   bracketConversionFromInput,
   bracketRefLabel,
+  bracketSizingKey,
   bracketTriggerFromTotalUsdDraft,
   centsStrFromTarget01,
   resolveBracketRef,
@@ -17,6 +19,8 @@ import {
   type BracketInputMode,
   type BracketLegKind,
 } from './lib/bracketLevelInput';
+
+export type BracketTriggerDraftState = { draft: string; mode: BracketInputMode };
 
 export type BracketTriggerInputProps = {
   kind: BracketLegKind;
@@ -28,6 +32,8 @@ export type BracketTriggerInputProps = {
   mid01: number | null;
   /** Shares on the order or position — enables total-$ TP/SL (e.g. $50 on a $1000 buy). */
   orderShares?: number | null;
+  /** When sizing in $ on the buy form, show this notional instead of shares × ref. */
+  orderNotionalUsd?: number | null;
   placeholderCents?: string;
   onAfterChange?: () => void;
   /** Tighter layout for buy-panel stacking — compact gain/loss readout instead of full equivalent table. */
@@ -35,9 +41,9 @@ export type BracketTriggerInputProps = {
   /** Signal/spread suggested trigger (¢) — shown with projected gain/loss when input empty. */
   suggestedCents?: string;
   onApplySuggested?: () => void;
+  /** Live draft while editing — parent can flush to committed state on Buy. */
+  onDraftSync?: (state: BracketTriggerDraftState) => void;
 };
-
-const LIVE_APPLY_MS = 180;
 
 const MODE_OPTIONS_BASE: { value: BracketInputMode; label: string; short: string; hintPerShare: string; hintTotal: string }[] = [
   { value: 'cents', label: 'Cents', short: '¢', hintPerShare: 'Trigger price in probability cents', hintTotal: 'Trigger price in probability cents' },
@@ -54,24 +60,32 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
     plannedEntry01,
     mid01,
     orderShares,
+    orderNotionalUsd,
     placeholderCents,
     onAfterChange,
     compact = false,
     suggestedCents,
     onApplySuggested,
+    onDraftSync,
   } = props;
 
   const [mode, setMode] = useState<BracketInputMode>('cents');
   const [draft, setDraft] = useState(centsValue);
   const [editing, setEditing] = useState(false);
   const id = useId();
-  const applyTimerRef = useRef<number | null>(null);
   const enterCommitRef = useRef(false);
+  const skipBlurCommitRef = useRef(false);
+  const prevSizingKeyRef = useRef('');
+  const sizingEffectReadyRef = useRef(false);
+  /** Ref mirror — onChange must not read stale `mode` from a pre-switch render closure. */
+  const modeRef = useRef<BracketInputMode>('cents');
+  modeRef.current = mode;
 
   const { ref01, source: refSource } = useMemo(
     () => resolveBracketRef({ avgEntry01, plannedEntry01, mid01 }),
     [avgEntry01, mid01, plannedEntry01],
   );
+  const sizingKey = bracketSizingKey(ref01, orderShares);
   const refSuffix = bracketRefLabel(refSource);
   const usdIsTotal = usdModeUsesTotal(orderShares);
 
@@ -86,9 +100,11 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
   );
 
   const orderNotional =
-    usdIsTotal && orderShares != null && ref01 != null && orderShares > 0 && ref01 > 0
-      ? orderShares * ref01
-      : null;
+    orderNotionalUsd != null && orderNotionalUsd > 0
+      ? orderNotionalUsd
+      : usdIsTotal && orderShares != null && ref01 != null && orderShares > 0 && ref01 > 0
+        ? orderShares * ref01
+        : null;
 
   /** Sync from parent when not focused — ref/mid ticks must not wipe in-progress edits. */
   useEffect(() => {
@@ -112,12 +128,52 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
     );
   }, [centsValue, editing, kind, mode, orderShares, ref01]);
 
-  useEffect(
-    () => () => {
-      if (applyTimerRef.current != null) window.clearTimeout(applyTimerRef.current);
+  /** When buy size or entry ref changes, re-commit % / Total $ intent to a new trigger ¢. */
+  useEffect(() => {
+    if (!sizingEffectReadyRef.current) {
+      sizingEffectReadyRef.current = true;
+      prevSizingKeyRef.current = sizingKey;
+      return;
+    }
+    const prev = prevSizingKeyRef.current;
+    prevSizingKeyRef.current = sizingKey;
+    if (editing || mode === 'cents' || ref01 == null) return;
+    if (prev === sizingKey) return;
+    const raw = draft.trim();
+    if (!raw) return;
+    const nextCents = bracketCentsFromAltModeDraft({
+      mode,
+      draft: raw,
+      kind,
+      ref01,
+      shares: orderShares,
+    });
+    if (nextCents == null) return;
+    const aux = bracketAuxFromCents({ mode, centsStr: nextCents, kind, ref01, shares: orderShares });
+    if (aux) setDraft(aux);
+    if (nextCents !== centsValue) onCentsChange(nextCents);
+  }, [
+    centsValue,
+    draft,
+    editing,
+    kind,
+    mode,
+    onCentsChange,
+    orderShares,
+    ref01,
+    sizingKey,
+  ]);
+
+  const syncDraftToParent = useCallback(
+    (nextDraft: string, nextMode: BracketInputMode = modeRef.current) => {
+      onDraftSync?.({ draft: nextDraft, mode: nextMode });
     },
-    [],
+    [onDraftSync],
   );
+
+  const clearDraftToParent = useCallback(() => {
+    onDraftSync?.({ draft: '', mode: 'cents' });
+  }, [onDraftSync]);
 
   const commitCentsDraft = useCallback(
     (raw: string, viaEnter: boolean) => {
@@ -125,6 +181,7 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
       if (!trimmed) {
         setDraft('');
         onCentsChange('');
+        clearDraftToParent();
         onAfterChange?.();
         return;
       }
@@ -139,6 +196,7 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
           setMode('usd');
           setDraft(usdCommit.usdRaw);
           onCentsChange(usdCommit.centsStr);
+          clearDraftToParent();
           onAfterChange?.();
           return;
         }
@@ -160,9 +218,10 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
       }
       setDraft(formatted);
       onCentsChange(formatted);
+      clearDraftToParent();
       onAfterChange?.();
     },
-    [centsValue, kind, onAfterChange, onCentsChange, orderShares, ref01],
+    [centsValue, clearDraftToParent, kind, onAfterChange, onCentsChange, orderShares, ref01],
   );
 
   const applyFromDraft = useCallback(
@@ -176,6 +235,7 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
       if (!trimmed) {
         setDraft('');
         onCentsChange('');
+        clearDraftToParent();
         onAfterChange?.();
         return;
       }
@@ -185,17 +245,14 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
       const aux = bracketAuxFromCents({ mode: inputMode, centsStr: cents, kind, ref01, shares: orderShares });
       setDraft(aux || trimmed);
       onCentsChange(cents);
+      clearDraftToParent();
       onAfterChange?.();
     },
-    [commitCentsDraft, kind, onAfterChange, onCentsChange, orderShares, ref01],
+    [clearDraftToParent, commitCentsDraft, kind, onAfterChange, onCentsChange, orderShares, ref01],
   );
 
   const finishEditing = useCallback(
     (viaEnter: boolean) => {
-      if (applyTimerRef.current != null) {
-        window.clearTimeout(applyTimerRef.current);
-        applyTimerRef.current = null;
-      }
       if (mode === 'cents') {
         commitCentsDraft(draft, viaEnter);
       } else {
@@ -206,22 +263,17 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
     [applyFromDraft, commitCentsDraft, draft, mode],
   );
 
-  const queueApply = useCallback(
-    (raw: string, inputMode: BracketInputMode) => {
-      if (inputMode === 'usd' && usdIsTotal) return;
-      if (applyTimerRef.current != null) window.clearTimeout(applyTimerRef.current);
-      applyTimerRef.current = window.setTimeout(() => {
-        applyTimerRef.current = null;
-        applyFromDraft(raw, inputMode, false);
-      }, LIVE_APPLY_MS);
-    },
-    [applyFromDraft, usdIsTotal],
-  );
+  const conversionInputRaw = mode === 'cents' && !editing ? centsValue : draft;
 
   const conversion = useMemo(
-    () => bracketConversionFromInput({ mode, raw: draft, kind, ref01, shares: orderShares }),
-    [draft, kind, mode, orderShares, ref01],
+    () => bracketConversionFromInput({ mode, raw: conversionInputRaw, kind, ref01, shares: orderShares }),
+    [conversionInputRaw, kind, mode, orderShares, ref01],
   );
+
+  const triggerMisaligned =
+    conversion.target01 != null &&
+    ref01 != null &&
+    (kind === 'sl' ? conversion.target01 >= ref01 - 1e-6 : conversion.target01 <= ref01 + 1e-6);
 
   const suggestedPreview = useMemo(() => {
     const sug = suggestedCents?.trim();
@@ -230,7 +282,10 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
   }, [centsValue, kind, orderShares, ref01, suggestedCents]);
 
   const showCompactConversions =
-    compact && ref01 != null && conversion.target01 != null && (centsValue.trim() || draft.trim());
+    compact &&
+    ref01 != null &&
+    conversion.target01 != null &&
+    (centsValue.trim() || draft.trim() || conversionInputRaw.trim());
   const gainLossLabel = kind === 'sl' ? 'Loss' : 'Gain';
 
   const compactConversionRows = useMemo(() => {
@@ -301,16 +356,16 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
   const switchMode = (next: BracketInputMode) => {
     if (next !== 'cents' && ref01 == null) return;
     if (editing) finishEditing(true);
-    if (applyTimerRef.current != null) {
-      window.clearTimeout(applyTimerRef.current);
-      applyTimerRef.current = null;
-    }
+    let nextDraft = centsValue;
     if (next === 'cents') {
       setDraft(centsValue);
     } else if (ref01 != null) {
-      setDraft(bracketAuxFromCents({ mode: next, centsStr: centsValue, kind, ref01, shares: orderShares }));
+      nextDraft = bracketAuxFromCents({ mode: next, centsStr: centsValue, kind, ref01, shares: orderShares });
+      setDraft(nextDraft);
     }
+    modeRef.current = next;
     setMode(next);
+    syncDraftToParent(nextDraft, next);
   };
 
   return (
@@ -405,11 +460,13 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
                   ? sanitizeBracketCentsDraft(e.target.value)
                   : sanitizeUsdBracketDraft(e.target.value, usdIsTotal);
               setDraft(v);
-              if (mode === 'cents' || mode === 'pct' || (mode === 'usd' && !usdIsTotal)) {
-                queueApply(v, mode);
-              }
+              syncDraftToParent(v, modeRef.current);
             }}
             onBlur={() => {
+              if (skipBlurCommitRef.current) {
+                skipBlurCommitRef.current = false;
+                return;
+              }
               const viaEnter = enterCommitRef.current;
               enterCommitRef.current = false;
               finishEditing(viaEnter);
@@ -421,14 +478,11 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
               }
               if (e.key === 'Enter') {
                 e.preventDefault();
-                enterCommitRef.current = true;
+                skipBlurCommitRef.current = true;
+                finishEditing(true);
                 (e.target as HTMLInputElement).blur();
               } else if (e.key === 'Escape') {
                 e.preventDefault();
-                if (applyTimerRef.current != null) {
-                  window.clearTimeout(applyTimerRef.current);
-                  applyTimerRef.current = null;
-                }
                 setDraft(
                   mode === 'cents'
                     ? centsValue
@@ -450,66 +504,84 @@ export function BracketTriggerInput(props: BracketTriggerInputProps): ReactEleme
         </div>
       </label>
 
-      {compact && suggestedPreview && suggestedCents?.trim() && !centsValue.trim() ? (
-        <div
-          className={`mt-1 flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 rounded border px-1.5 py-1 ${
-            kind === 'sl' ? 'border-rose-800/25 bg-rose-950/10' : 'border-emerald-800/25 bg-emerald-950/10'
-          }`}
-        >
-          <span className={`text-[9px] leading-snug ${kind === 'sl' ? 'text-rose-300/85' : 'text-emerald-300/85'}`}>
-            Suggested{' '}
-            <span className={`font-mono font-bold ${inputTone}`}>{suggestedCents.trim()}¢</span>
-            {suggestedPreview.pctLabel !== '—' || suggestedPreview.usdLabel !== '—' ? (
-              <>
-                <span className="text-zinc-600"> · </span>
-                <span className="text-zinc-500">{gainLossLabel}</span>{' '}
-                <span className={`font-mono font-bold ${inputTone}`}>{suggestedPreview.pctLabel}</span>
-                {suggestedPreview.usdLabel !== '—' ? (
+      {compact && suggestedCents?.trim() ? (
+        <div className="mt-1 min-h-[1.75rem]">
+          {suggestedPreview && !centsValue.trim() ? (
+            <div
+              className={`flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 rounded border px-1.5 py-1 ${
+                kind === 'sl' ? 'border-rose-800/25 bg-rose-950/10' : 'border-emerald-800/25 bg-emerald-950/10'
+              }`}
+            >
+              <span className={`text-[9px] leading-snug ${kind === 'sl' ? 'text-rose-300/85' : 'text-emerald-300/85'}`}>
+                Suggested{' '}
+                <span className={`font-mono font-bold ${inputTone}`}>{suggestedCents.trim()}¢</span>
+                {suggestedPreview.pctLabel !== '—' || suggestedPreview.usdLabel !== '—' ? (
                   <>
                     <span className="text-zinc-600"> · </span>
-                    <span className={`font-mono font-bold ${inputTone}`}>{suggestedPreview.usdLabel}</span>
+                    <span className="text-zinc-500">{gainLossLabel}</span>{' '}
+                    <span className={`font-mono font-bold ${inputTone}`}>{suggestedPreview.pctLabel}</span>
+                    {suggestedPreview.usdLabel !== '—' ? (
+                      <>
+                        <span className="text-zinc-600"> · </span>
+                        <span className={`font-mono font-bold ${inputTone}`}>{suggestedPreview.usdLabel}</span>
+                      </>
+                    ) : null}
                   </>
                 ) : null}
-              </>
-            ) : null}
-          </span>
-          {onApplySuggested ? (
-            <button
-              type="button"
-              className={`shrink-0 rounded border px-1.5 py-0.5 text-[9px] font-bold ${
-                kind === 'sl'
-                  ? 'border-rose-700/40 bg-rose-950/30 text-rose-100 hover:bg-rose-900/40'
-                  : 'border-emerald-700/40 bg-emerald-950/30 text-emerald-100 hover:bg-emerald-900/40'
-              }`}
-              onClick={onApplySuggested}
-            >
-              Use
-            </button>
+              </span>
+              {onApplySuggested ? (
+                <button
+                  type="button"
+                  className={`shrink-0 rounded border px-1.5 py-0.5 text-[9px] font-bold ${
+                    kind === 'sl'
+                      ? 'border-rose-700/40 bg-rose-950/30 text-rose-100 hover:bg-rose-900/40'
+                      : 'border-emerald-700/40 bg-emerald-950/30 text-emerald-100 hover:bg-emerald-900/40'
+                  }`}
+                  onClick={onApplySuggested}
+                >
+                  Use
+                </button>
+              ) : null}
+            </div>
           ) : null}
         </div>
       ) : null}
 
-      {showCompactConversions && compactConversionRows.length > 0 ? (
-        <div className="mt-1 flex gap-1">
-          {compactConversionRows.map((row) => (
-            <div
-              key={row.key}
-              className={`min-w-0 flex-1 rounded border px-1 py-0.5 text-center ${
-                row.active
-                  ? `${activeBg} ring-1 ring-inset ${activeRing}`
-                  : 'border-zinc-800/50 bg-black/25'
-              }`}
-            >
-              <div className="truncate text-[8px] font-semibold uppercase tracking-wide text-zinc-500">{row.short}</div>
-              <div
-                className={`truncate font-mono text-[10px] font-bold tabular-nums ${
-                  row.active ? inputTone : 'text-zinc-300'
-                }`}
-              >
-                {row.value}
-              </div>
+      {compact && triggerMisaligned ? (
+        <p className="mt-1 text-[9px] leading-snug text-amber-200/90">
+          {kind === 'sl'
+            ? 'Stop is at or above entry — use a lower ¢ trigger for a long backup stop.'
+            : 'Take-profit is at or below entry — use a higher ¢ trigger.'}
+        </p>
+      ) : null}
+
+      {compact && ref01 != null ? (
+        <div className="mt-1 min-h-[2.375rem]">
+          {showCompactConversions && compactConversionRows.length > 0 ? (
+            <div className="flex gap-1">
+              {compactConversionRows.map((row) => (
+                <div
+                  key={row.key}
+                  className={`min-w-0 flex-1 rounded border px-1 py-0.5 text-center ${
+                    row.active
+                      ? `${activeBg} ring-1 ring-inset ${activeRing}`
+                      : 'border-zinc-800/50 bg-black/25'
+                  }`}
+                >
+                  <div className="truncate text-[8px] font-semibold uppercase tracking-wide text-zinc-500">
+                    {row.short}
+                  </div>
+                  <div
+                    className={`truncate font-mono text-[10px] font-bold tabular-nums ${
+                      row.active ? inputTone : 'text-zinc-300'
+                    }`}
+                  >
+                    {row.value}
+                  </div>
+                </div>
+              ))}
             </div>
-          ))}
+          ) : null}
         </div>
       ) : null}
 

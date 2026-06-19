@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   bracketAuxFromCents,
+  bracketCentsFromAltModeDraft,
   bracketConversionFromInput,
   bracketRef01,
+  bracketSizingKey,
   bracketTriggerFromTotalUsdDraft,
   centsStrFromTarget01,
   isBracketTotalUsdDraft,
@@ -115,5 +117,40 @@ describe('bracketLevelInput', () => {
     expect(
       bracketConversionFromInput({ mode: 'usd', raw: '50', kind: 'tp', ref01: buyLimit, shares: estShares }),
     ).toMatchObject({ centsLabel: '52.5¢', usdLabel: '$50' });
+  });
+
+  it('sizes $97 notional at 65¢ entry as ~149 sh for SL loss math', () => {
+    const ref01 = 0.65;
+    const shares = 97 / ref01;
+    expect(
+      bracketConversionFromInput({ mode: 'cents', raw: '42', kind: 'sl', ref01, shares }),
+    ).toMatchObject({
+      centsLabel: '42¢',
+      pctLabel: '35.4%',
+      usdLabel: '$34.3',
+      usdUsesTotal: true,
+    });
+  });
+
+  it('re-derives trigger ¢ when total-$ intent is fixed but shares change', () => {
+    const ref01 = 0.65;
+    const small = 97 / ref01;
+    const large = 194 / ref01;
+    expect(
+      bracketCentsFromAltModeDraft({ mode: 'usd', draft: '34', kind: 'sl', ref01, shares: small }),
+    ).toBe('42.2');
+    expect(
+      bracketCentsFromAltModeDraft({ mode: 'usd', draft: '34', kind: 'sl', ref01, shares: large }),
+    ).toBe('53.6');
+    expect(bracketSizingKey(ref01, small)).not.toBe(bracketSizingKey(ref01, large));
+  });
+
+  it('re-derives trigger ¢ when % intent is fixed but entry ref moves', () => {
+    expect(
+      bracketCentsFromAltModeDraft({ mode: 'pct', draft: '10', kind: 'sl', ref01: 0.65, shares: 150 }),
+    ).toBe('58.5');
+    expect(
+      bracketCentsFromAltModeDraft({ mode: 'pct', draft: '10', kind: 'sl', ref01: 0.7, shares: 150 }),
+    ).toBe('63');
   });
 });

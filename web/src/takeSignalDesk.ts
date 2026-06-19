@@ -11,6 +11,12 @@ import { orderFlowConflictsLane, type SpotPtbMachineReadout } from './spotPtbMac
 import type { TradeDirective } from './tradeDirective';
 import type { TradeLevels } from './tradeLevels';
 import { parseUpdownSlug } from './sixPackUpdownSlugs';
+import type { ExecutionSignal } from './executionSignal';
+import {
+  executionEnterLane,
+  executionTakeBlockReason,
+  executionTakeButtonSuffix,
+} from './executionSignalDesk';
 
 export const BPX_TRADE_PANEL_OPEN_EVENT = 'bpx-trade-panel-open';
 export const BPX_TRADE_SUBMIT_BUY_EVENT = 'bpx-trade-submit-buy';
@@ -148,9 +154,24 @@ export function buildTakeSignalPlan(args: {
   slug?: string | null;
   upLabel: string;
   downLabel: string;
+  /** When true, take only fires when execution desk phase is ENTER on the same lane. */
+  requireExecutionEnter?: boolean;
+  execution?: ExecutionSignal | null;
 }): TakeSignalPlan {
-  const { verdict, directive, levels, crossEngineLaneConflict, deskAction, machine, endsInMs, slug, upLabel, downLabel } =
-    args;
+  const {
+    verdict,
+    directive,
+    levels,
+    crossEngineLaneConflict,
+    deskAction,
+    machine,
+    endsInMs,
+    slug,
+    upLabel,
+    downLabel,
+    requireExecutionEnter,
+    execution,
+  } = args;
   const deskLane = parseDeskEnterLane(deskAction?.primary ?? null);
   const deskShowsEnter =
     deskLane != null && (deskAction?.tone === 'green' || deskAction?.tone === 'emerald');
@@ -246,6 +267,22 @@ export function buildTakeSignalPlan(args: {
   const timerBlock = roundTimerExecuteBlockReason(endsInMs, slug);
   if (timerBlock) {
     return fail(timerBlock, 'Take signal — wait for bell');
+  }
+
+  if (requireExecutionEnter) {
+    const execBlock = executionTakeBlockReason(execution);
+    if (execBlock) {
+      return fail(execBlock, `Take signal${executionTakeButtonSuffix(execution?.phase)}`);
+    }
+    const execLane = executionEnterLane(execution);
+    if (execLane && execLane !== lane) {
+      const execLabel = execLane === 'up' ? upLabel : downLabel;
+      const cardLabel = lane === 'up' ? upLabel : downLabel;
+      return fail(
+        `Execution desk ENTER ${execLabel} — trade card is ${cardLabel}. Wait for lanes to match.`,
+        'Take signal — lane mismatch',
+      );
+    }
   }
 
   const takeProfit01 =

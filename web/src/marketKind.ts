@@ -1,4 +1,9 @@
-import { parseUpdownSlug } from './sixPackUpdownSlugs';
+import {
+  inferUpdownHintFromMarketJson,
+  isUpdownDeskMarket,
+  parseUpdownSlug,
+  type UpdownSlugHint,
+} from './sixPackUpdownSlugs';
 
 export type MarketKind = 'crypto_updown' | 'sports_binary' | 'generic_binary';
 
@@ -11,11 +16,16 @@ function marketRecord(market: unknown | null): Record<string, unknown> | null {
 }
 
 /** Classify slug for Signals desk routing (PTB+spot vs book-only). */
-export function inferMarketKind(slug: string | null | undefined, market?: unknown | null): MarketKind {
+export function inferMarketKind(
+  slug: string | null | undefined,
+  market?: unknown | null,
+  hints?: Readonly<Record<string, UpdownSlugHint>> | null,
+): MarketKind {
   const s = slug?.trim().toLowerCase() ?? '';
-  if (s && parseUpdownSlug(s)) return 'crypto_updown';
-  if (SPORTS_SLUG_PREFIX.test(s)) return 'sports_binary';
+  if (s && (parseUpdownSlug(s) || isUpdownDeskMarket(s, hints))) return 'crypto_updown';
   const o = marketRecord(market);
+  if (s && o && inferUpdownHintFromMarketJson(s, o)) return 'crypto_updown';
+  if (SPORTS_SLUG_PREFIX.test(s)) return 'sports_binary';
   if (o) {
     if (typeof o.sport === 'string' && o.sport.trim()) return 'sports_binary';
     if (typeof o.gameStartTime === 'string' && o.gameStartTime.trim()) return 'sports_binary';

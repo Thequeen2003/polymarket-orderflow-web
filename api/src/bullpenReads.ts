@@ -98,6 +98,15 @@ function toEntryPrice01(raw: unknown): number | null {
 
 /** Cost-basis entry only — never use mark/cur price fields mislabeled as avg_price. */
 export function positionAvgEntry01(row: Record<string, unknown>): number | null {
+  const shares =
+    parseNum(row.shares ?? row.size ?? row.position ?? row.quantity) ?? 0;
+  const invested =
+    parseNum(row.invested_usd ?? row.investedUsd ?? row.cost_usd ?? row.costUsd) ?? null;
+  if (invested != null && invested > 0 && shares > 0) {
+    const fromCost = invested / shares;
+    if (fromCost > 0 && fromCost < 1.0001) return fromCost;
+  }
+
   const costKeys = [
     'avg_entry',
     'avgEntry',
@@ -121,7 +130,8 @@ export function positionAvgEntry01(row: Record<string, unknown>): number | null 
       row.currentPrice,
   );
   const avgP = toEntryPrice01(row.avg_price ?? row.avgPrice);
-  if (avgP != null && mark != null && Math.abs(avgP - mark) < 0.008) return null;
+  // Reject avg_price only when it equals the live mark (mislabeled quote), not when entry ≈ mark after a fresh fill.
+  if (avgP != null && mark != null && Math.abs(avgP - mark) < 0.001) return null;
   return avgP;
 }
 

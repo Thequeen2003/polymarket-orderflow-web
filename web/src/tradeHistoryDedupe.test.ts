@@ -76,6 +76,47 @@ describe('tradeHistoryDedupe', () => {
     expect(merged[0]!.orderId).toBe('oid-1');
   });
 
+  it('shows auto TP rows in recent fills once tape confirms them', () => {
+    const local = [
+      row({
+        id: 'tp-1',
+        orderId: 'oid-tp',
+        side: 'sell',
+        status: 'sent',
+        shares: 0,
+        fillAvgPrice01: null,
+        requestedShares: 5,
+        remainingShares: 5,
+        auditNote: 'take_profit_limit_first take=60.0¢',
+      }),
+    ];
+    const fills: MyFillRow[] = [
+      {
+        token_id: 'tok-a',
+        order_id: 'oid-tp',
+        side: 'sell',
+        price_01: 0.61,
+        shares: 5,
+        match_time_ms: 2000,
+        role: 'taker',
+      },
+    ];
+
+    const merged = mergeRecentFillsForDisplay({
+      localFilled: local,
+      myFills: fills,
+      tokenId: 'tok-a',
+      mode: 'live',
+    });
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]!.id).toBe('tp-1');
+    expect(merged[0]!.status).toBe('filled');
+    expect(merged[0]!.side).toBe('sell');
+    expect(merged[0]!.fillAvgPrice01).toBeCloseTo(0.61, 6);
+    expect(merged[0]!.auditNote).toContain('take_profit');
+  });
+
   it('pruneDuplicateLiveFillsInHistory removes extra storage rows', () => {
     saveTradeHistory([
       row({ id: 'a', orderId: 'oid-x' }),

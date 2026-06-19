@@ -1,4 +1,6 @@
 import type { UpdownInterval, UpdownShortcutAsset } from './lib/api';
+import { bucketFloorEtUnixSec } from './updownBucketEt';
+import { buildTitledDailySlug, buildTitledHourlySlug } from './updownTitledSlugs';
 
 const STORAGE_KEY = 'pm:updown-shortcut-cache:v1';
 const FRESH_MS = 15 * 60_000;
@@ -81,20 +83,19 @@ export function isUpdownShortcutCacheFresh(asset: UpdownShortcutAsset, interval:
   return row != null && Date.now() - row.at <= FRESH_MS;
 }
 
-/** Client-only slug when the shortcut API is down — canonical UTC bucket. */
+/** Client-only slug when the shortcut API is down — ET bucket for 4h, titled slug for 1h/1d, UTC for 5m/15m. */
 export function fallbackUpdownSlug(asset: UpdownShortcutAsset, interval: UpdownInterval): string {
+  if (interval === '1h') return buildTitledHourlySlug(asset);
+  if (interval === '1d') return buildTitledDailySlug(asset);
   const stepSec =
     interval === '15m'
       ? 900
-      : interval === '1h'
-        ? 3600
-        : interval === '4h'
-          ? 4 * 3600
-          : interval === '1d'
-            ? 86400
-            : 300;
+      : interval === '4h'
+        ? 4 * 3600
+        : 300;
   const nowSec = Math.floor(Date.now() / 1000);
-  const ts = Math.floor(nowSec / stepSec) * stepSec;
+  const ts =
+    interval === '4h' ? bucketFloorEtUnixSec(stepSec, nowSec) : Math.floor(nowSec / stepSec) * stepSec;
   return `${asset}-updown-${interval}-${ts}`;
 }
 

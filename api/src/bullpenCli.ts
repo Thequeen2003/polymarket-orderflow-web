@@ -382,6 +382,23 @@ export function isBullpenFokKill(message: string): boolean {
   return c.includes('fully filled') || c.includes('fok orders') || c.includes('fill or kill');
 }
 
+export function isBullpenLiquidityKill(message: string): boolean {
+  const c = message.toLowerCase();
+  return (
+    isBullpenFokKill(message) ||
+    c.includes('no orders found') ||
+    c.includes('no match') ||
+    c.includes("couldn't be fully filled") ||
+    c.includes('could not be fully filled') ||
+    (c.includes('fak') && c.includes('kill'))
+  );
+}
+
+export function isBullpenBalanceInsufficient(message: string): boolean {
+  const c = message.toLowerCase();
+  return c.includes('balance_insufficient') || (c.includes('insufficient') && c.includes('balance'));
+}
+
 export function bullpenTradeFailureHint(message: string): string {
   const c = message.toLowerCase();
   if (isBullpenFokKill(message)) {
@@ -476,8 +493,41 @@ function floorSizeShares4(n: number): number {
   return Math.floor(n * 10_000 + 1e-12) / 10_000;
 }
 
+async function bullpenFakLimitOrder(args: {
+  side: 'buy' | 'sell';
+  env: string;
+  marketSlug: string;
+  outcomeArg: string;
+  price: number;
+  shares: number;
+  timeoutMs: number;
+}): Promise<{ r: CliResult; trade: ReturnType<typeof interpretBullpenTradeCli> }> {
+  const limitCmd = args.side === 'buy' ? 'limit-buy' : 'limit-sell';
+  const r = await runBullpen(
+    [
+      'polymarket',
+      limitCmd,
+      '--env',
+      args.env,
+      '--output',
+      'json',
+      '--yes',
+      '--expiration',
+      'fak',
+      '--price',
+      formatBullpenPriceArg(args.price),
+      '--shares',
+      String(args.shares),
+      args.marketSlug,
+      args.outcomeArg,
+    ],
+    { timeoutMs: args.timeoutMs },
+  );
+  return { r, trade: interpretBullpenTradeCli(r.stdout, r.stderr, r.code) };
+}
+
 /**
- * Bullpen `buy`/`sell` use FOK-style market paths; on FOK kill, retry as FAK limit at the touch.
+ * Bullpen `buy`/`sell` use FOK-style market paths; on kill, retry FAK limits through the book.
  */
 export async function bullpenExecuteMarketOrder(params: {
   marketSlug: string;
@@ -488,16 +538,41 @@ export async function bullpenExecuteMarketOrder(params: {
   timeoutMs?: number;
 }): Promise<{ r: CliResult; trade: ReturnType<typeof interpretBullpenTradeCli>; fakFallback?: boolean }> {
   const env = bullpenEnvName();
-  const { marketSlug, outcomeArg, side, amount, tokenId, timeoutMs = 45_000 } = params;
-  const marketArgs =
-    side === 'buy'
-      ? ['polymarket', 'buy', '--env', env, '--output', 'json', '--yes', marketSlug, outcomeArg, String(amount)]
-      : ['polymarket', 'sell', '--env', env, '--output', 'json', '--yes', marketSlug, outcomeArg, String(amount)];
+  const { marketSlug, outcomeArg, side, tokenId, timeoutMs = 45_000 } = params;
+  let amount = params.amount;
+  if (side === 'buy') {
+    amount = Math.max(1, Math.floor(amount * 100 * 0.995) / 100);
+  }
 
-  let r = await runBullpen(marketArgs, { timeoutMs });
+  const runMarket = (amt: number) => {
+    const marketArgs =
+      side === 'buy'
+        ? ['polymarket', 'buy', '--env', env, '--output', 'json', '--yes', marketSlug, outcomeArg, String(amt)]
+        : ['polymarket', 'sell', '--env', env, '--output', 'json', '--yes', marketSlug, outcomeArg, String(amt)];
+    return runBullpen(marketArgs, { timeoutMs });
+  };
+
+  let r = await runMarket(amount);
   let trade = interpretBullpenTradeCli(r.stdout, r.stderr, r.code);
-  if (trade.ok || !tokenId?.trim()) return { r, trade };
-  if (!isBullpenFokKill(trade.ok ? '' : trade.message)) return { r, trade };
+  if (trade.ok) return { r, trade };
+
+  const failMsg = trade.ok ? '' : trade.message;
+  if (
+    side === 'buy' &&
+    isBullpenBalanceInsufficient(failMsg) &&
+    amount > 1.01
+  ) {
+    const reduced = Math.max(1, Math.floor(amount * 100 * 0.99) / 100);
+    if (reduced < amount) {
+      r = await runMarket(reduced);
+      trade = interpretBullpenTradeCli(r.stdout, r.stderr, r.code);
+      if (trade.ok) return { r, trade };
+    }
+  }
+
+  if (!tokenId?.trim()) return { r, trade };
+  const retryMsg = trade.ok ? '' : trade.message;
+  if (!isBullpenLiquidityKill(retryMsg) && !isBullpenBalanceInsufficient(retryMsg)) return { r, trade };
 
   try {
     const book = await clobBookHttp(tokenId.trim());
@@ -505,34 +580,28 @@ export async function bullpenExecuteMarketOrder(params: {
     const touch = side === 'buy' ? bestAsk : bestBid;
     if (touch == null) return { r, trade };
 
-    const price = side === 'buy' ? slipExplicitBuyPrice(touch) : slipExplicitSellPrice(touch);
-    const shares = side === 'buy' ? floorSizeShares4(amount / price) : floorSizeShares4(amount);
-    if (shares < 1e-4) return { r, trade };
+    const slipTiers =
+      side === 'buy'
+        ? [slipExplicitBuyPrice(touch), Math.min(0.99, roundPriceToTick(slipExplicitBuyPrice(touch) + 0.05))]
+        : [slipExplicitSellPrice(touch), Math.max(0.01, roundPriceToTick(slipExplicitSellPrice(touch) - 0.05))];
 
-    const limitCmd =
-      side === 'buy' ? 'limit-buy' : 'limit-sell';
-    const fakArgs = [
-      'polymarket',
-      limitCmd,
-      '--env',
-      env,
-      '--output',
-      'json',
-      '--yes',
-      '--expiration',
-      'fak',
-      '--price',
-      formatBullpenPriceArg(price),
-      '--shares',
-      String(shares),
-      marketSlug,
-      outcomeArg,
-    ];
-    const r2 = await runBullpen(fakArgs, { timeoutMs });
-    const trade2 = interpretBullpenTradeCli(r2.stdout, r2.stderr, r2.code);
-    if (trade2.ok) return { r: r2, trade: trade2, fakFallback: true };
+    for (const price of slipTiers) {
+      const shares =
+        side === 'buy' ? floorSizeShares4(amount / price) : floorSizeShares4(amount);
+      if (shares < 1e-4) continue;
+      const attempt = await bullpenFakLimitOrder({
+        side,
+        env,
+        marketSlug,
+        outcomeArg,
+        price,
+        shares,
+        timeoutMs,
+      });
+      if (attempt.trade.ok) return { r: attempt.r, trade: attempt.trade, fakFallback: true };
+    }
   } catch {
-    /* keep original FOK rejection */
+    /* keep original rejection */
   }
   return { r, trade };
 }

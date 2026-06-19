@@ -114,17 +114,10 @@ function cap(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
 }
 
-function shouldBuyWhichSideFromBook(input: ShouldBuyInput): BuySideAdvisory {
-  const { book, tape, tapeLane, directive, stability, upLabel, downLabel } = input;
-  if (!book) {
-    return {
-      ...NEITHER_ADVISORY,
-      recommendation: 'Waiting for order-book data — open the Book tab briefly.',
-    };
-  }
+type LaneScores = { up: number; down: number };
 
-  const { dual, wallFlow, probUp, probDown, midUp, midDown } = book;
-  const scores = { up: 0, down: 0 };
+function accumulateBookStructureVotes(scores: LaneScores, book: ShouldBuyBookContext): void {
+  const { dual, wallFlow, probUp, probDown } = book;
   const addVote = (lane: 'up' | 'down' | null, weight: number) => {
     if (lane === 'up') scores.up += weight;
     else if (lane === 'down') scores.down += weight;
@@ -150,6 +143,20 @@ function shouldBuyWhichSideFromBook(input: ShouldBuyInput): BuySideAdvisory {
       addVote(spread > 0 ? 'up' : 'down', 0.8 + Math.min(2, Math.abs(spread) * 12));
     }
   }
+}
+
+function accumulateBookVotes(
+  scores: LaneScores,
+  book: ShouldBuyBookContext,
+  tape: TapeVelocity | null,
+  tapeLane: 'up' | 'down' | null,
+  directive: TradeDirective | null,
+): void {
+  accumulateBookStructureVotes(scores, book);
+  const addVote = (lane: 'up' | 'down' | null, weight: number) => {
+    if (lane === 'up') scores.up += weight;
+    else if (lane === 'down') scores.down += weight;
+  };
 
   if (tape && tape.reliable && tapeLane) {
     const tl = tapeLaneVote(tapeLane, tape.dominance);
@@ -162,8 +169,64 @@ function shouldBuyWhichSideFromBook(input: ShouldBuyInput): BuySideAdvisory {
   }
 
   if (directive && (directive.action === 'INITIATE' || directive.action === 'ADD') && directive.lane) {
-    addVote(directive.lane, 1.2);
+    const w =
+      directive.action === 'INITIATE' && directive.confidence === 'HIGH'
+        ? 2.4
+        : directive.action === 'INITIATE'
+          ? 1.8
+          : 1.2;
+    addVote(directive.lane, w);
   }
+}
+
+/** Prefer a directional call over a stale NEITHER when both sources are available. */
+export function pickStrongerBuyAdvisory(
+  desk: BuySideAdvisory | null | undefined,
+  fallback: BuySideAdvisory,
+): BuySideAdvisory {
+  if (!desk) return fallback;
+  if (desk.verdict !== 'NEITHER' && fallback.verdict === 'NEITHER') return desk;
+  if (desk.verdict === 'NEITHER' && fallback.verdict !== 'NEITHER') return fallback;
+  if (desk.verdict === 'NEITHER' && fallback.verdict === 'NEITHER') {
+    const deskMargin = Math.abs(desk.scores.up - desk.scores.down);
+    const fbMargin = Math.abs(fallback.scores.up - fallback.scores.down);
+    return fbMargin > deskMargin ? fallback : desk;
+  }
+  const rank = { HIGH: 3, MED: 2, LOW: 1 };
+  if (rank[fallback.confidence] > rank[desk.confidence]) return fallback;
+  return desk;
+}
+
+function resolveMachineWinner(args: {
+  scores: LaneScores;
+  machine: SpotPtbMachineReadout;
+  directive: TradeDirective | null;
+}): 'up' | 'down' | null {
+  const { scores, machine, directive } = args;
+  const margin = scores.up - scores.down;
+  const absMargin = Math.abs(margin);
+  if (absMargin >= MIN_SCORE_MARGIN) {
+    return margin > 0 ? 'up' : 'down';
+  }
+  if (machine.agreementScore < MIN_AGREEMENT) return null;
+  if (directive?.action === 'INITIATE' && directive.lane) return directive.lane;
+  if (machine.focusLane) return machine.focusLane;
+  if (machine.flowWinningLane) return machine.flowWinningLane;
+  return null;
+}
+
+function shouldBuyWhichSideFromBook(input: ShouldBuyInput): BuySideAdvisory {
+  const { book, tape, tapeLane, directive, stability, upLabel, downLabel } = input;
+  if (!book) {
+    return {
+      ...NEITHER_ADVISORY,
+      recommendation: 'Waiting for order-book data — open the Book tab briefly.',
+    };
+  }
+
+  const { dual, wallFlow, probUp, probDown, midUp, midDown } = book;
+  const scores = { up: 0, down: 0 };
+  accumulateBookVotes(scores, book, tape, tapeLane, directive);
 
   const margin = scores.up - scores.down;
   const absMargin = Math.abs(margin);
@@ -321,18 +384,25 @@ export function shouldBuyWhichSide(input: ShouldBuyInput): BuySideAdvisory {
     }
   }
 
-  // 5. Directive alignment bonus — if buildTradeDirective already says INITIATE on a side.
+  // 5. Directive alignment — trade card INITIATE/ADD should move the needle.
   if (directive && (directive.action === 'INITIATE' || directive.action === 'ADD') && directive.lane) {
-    addVote(directive.lane, 1.0);
+    const w =
+      directive.action === 'INITIATE' && directive.confidence === 'HIGH'
+        ? 2.5
+        : directive.action === 'INITIATE'
+          ? 1.8
+          : 1.0;
+    addVote(directive.lane, w);
   }
 
-  // Determine winner.
+  // 6. Book / dual belief — merge structure only (tape + directive already scored above).
+  if (book) {
+    accumulateBookStructureVotes(scores, book);
+  }
+
+  const winner = resolveMachineWinner({ scores, machine, directive });
   const margin = scores.up - scores.down;
   const absMargin = Math.abs(margin);
-  const winner: 'up' | 'down' | null =
-    absMargin >= MIN_SCORE_MARGIN
-      ? margin > 0 ? 'up' : 'down'
-      : null;
 
   // Check minimum agreement threshold.
   if (!winner || machine.agreementScore < MIN_AGREEMENT) {

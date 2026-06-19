@@ -1,4 +1,5 @@
-import { useEffect, type ReactElement, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type ReactElement, type ReactNode } from 'react';
+import { TradeFloatChromeProvider } from './TradeFloatChromeContext';
 
 /** @deprecated Slide width constant kept for callers that adjust layout padding. */
 export const TRADE_SLIDE_PANEL_WIDTH_PX = 380;
@@ -16,6 +17,8 @@ export type TradeSlidePanelProps = {
  */
 export function TradeSlidePanel(props: TradeSlidePanelProps): ReactElement {
   const { open, onClose, title = 'Trade', children } = props;
+  const [subHeader, setSubHeader] = useState<ReactNode>(null);
+  const floatChrome = useMemo(() => ({ setSubHeader }), []);
 
   useEffect(() => {
     if (!open) return;
@@ -58,7 +61,14 @@ export function TradeSlidePanel(props: TradeSlidePanelProps): ReactElement {
             Close
           </button>
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-y-contain px-3 py-3 [overflow-anchor:none]">{children}</div>
+        <TradeFloatChromeProvider value={floatChrome}>
+          {subHeader ? (
+            <div className="shrink-0 border-b border-zinc-800/70 bg-zinc-950/95 px-3 py-2.5 backdrop-blur-sm">{subHeader}</div>
+          ) : null}
+          <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-y-contain px-3 py-3 [overflow-anchor:none]">
+            {children}
+          </div>
+        </TradeFloatChromeProvider>
       </div>
     </>
   );

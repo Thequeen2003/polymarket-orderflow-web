@@ -25,6 +25,7 @@ import {
   type PressureTimingReadout,
 } from './pressureTiming';
 import type { MtfConsensus } from './multiTimeframeConsensus';
+import { computeContractLeadSignal, type ContractLeadSignal } from './contractLeadSignal';
 
 export {
   PRESSURE_EARLY_HORIZON_SEC,
@@ -78,7 +79,11 @@ export type PressureBuildupSnapshot = {
   tagline: string;
   gainSummary: string | null;
   entryJump: ContractEntryJump | null;
+  /** Same contract jump on the early (10s) window — act here when confirm is late. */
+  earlyEntryJump: ContractEntryJump | null;
   spotJumpLine: string | null;
+  /** Actionable entry lead — spot-led or pressure-aligned; null when chop/noise. */
+  contractLead: ContractLeadSignal | null;
   active: PressureSide;
   confirmActive: PressureSide;
   mtfSummary: string | null;
@@ -357,6 +362,23 @@ export function computePressureBuildup(
           })
         : null;
 
+  const earlyEntryJump =
+    bias === 'BUY'
+      ? computeContractEntryJump({
+          prob: earlySpeed.lanes.up.prob,
+          now01: ctx.pMktUp,
+          horizonSec: earlySpeed.horizonSec,
+          outcomeLabel: upLabel,
+        })
+      : bias === 'SELL'
+        ? computeContractEntryJump({
+            prob: earlySpeed.lanes.down.prob,
+            now01: ctx.pMktDown,
+            horizonSec: earlySpeed.horizonSec,
+            outcomeLabel: downLabel,
+          })
+        : null;
+
   const timingReadout = classifyPressureTiming({ confirm: confirmSpeed, bias, entryJump });
 
   let rawVerdict =
@@ -372,9 +394,9 @@ export function computePressureBuildup(
 
   const tagline =
     timingReadout.timing === 'CHASING'
-      ? '30s confirm is late — move already repriced. Wait for pullback or next window.'
+      ? 'Too late for fresh entry on 30s confirm — wait for pullback or the next 10s lead.'
       : timingReadout.timing === 'EXTENDED'
-        ? 'Act on 10s lead; 30s confirm is catching up — size down or wait.'
+        ? '30s confirm is catching up — most of the move is already in. Use 10s lead next time.'
         : verdict === 'NO_TRADE' || verdict === 'WATCH'
           ? 'Watch 10s pressure — do not wait for full 30s confirm.'
           : '10s pressure lead — act before 30s confirm finishes.';
@@ -399,7 +421,7 @@ export function computePressureBuildup(
       ? spotEntryJumpLine(confirmSpeed.spot, nowSpot, confirmSpeed.horizonSec)
       : null;
 
-  return {
+  const draft: PressureBuildupSnapshot = {
     earlyHorizonSec: earlySpeed.horizonSec,
     confirmHorizonSec: confirmSpeed.horizonSec,
     horizonSec: earlySpeed.horizonSec,
@@ -418,11 +440,15 @@ export function computePressureBuildup(
     tagline,
     gainSummary,
     entryJump,
+    earlyEntryJump,
     spotJumpLine,
+    contractLead: null,
     active,
     confirmActive,
     mtfSummary: mtf?.summary ?? null,
   };
+
+  return { ...draft, contractLead: computeContractLeadSignal(draft) };
 }
 
 export function pressureBuildupShortLabel(snap: PressureBuildupSnapshot): string {

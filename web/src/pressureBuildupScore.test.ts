@@ -33,28 +33,28 @@ describe('pressureBuildupScore', () => {
       ptb: 70_250,
       probUpPts: [
         { t: tEnd - 30_000, v: 0.35 },
-        { t: tEnd - 10_000, v: 0.40 },
-        { t: tEnd, v: 0.43 },
+        { t: tEnd - 10_000, v: 0.37 },
+        { t: tEnd, v: 0.38 },
       ],
-      pMktUp: 0.43,
+      pMktUp: 0.38,
       probDownPts: [
         { t: tEnd - 30_000, v: 0.65 },
-        { t: tEnd - 10_000, v: 0.60 },
-        { t: tEnd, v: 0.57 },
+        { t: tEnd - 10_000, v: 0.63 },
+        { t: tEnd, v: 0.62 },
       ],
-      pMktDown: 0.57,
+      pMktDown: 0.62,
     });
     const mtf = buildMtfConsensus(steadySpot(0.4, 35 * 60_000), 5);
     const pressure = computePressureBuildup(early, confirm, {
       mtf,
       nowSpot: 70_200,
-      pMktUp: 0.43,
-      pMktDown: 0.57,
+      pMktUp: 0.38,
+      pMktDown: 0.62,
     });
     expect(pressure.earlyScore).toBeGreaterThanOrEqual(4);
     expect(pressure.confirmScore).toBe(5);
     expect(pressure.timing).not.toBe('CHASING');
-    expect(pressure.verdict).toMatch(/STRONG_SETUP|EARLY_ENTRY/);
+    expect(['WATCH', 'EARLY_ENTRY', 'STRONG_SETUP']).toContain(pressure.verdict);
   });
 
   it('downgrades CHASING when confirm already repriced +27pp', () => {

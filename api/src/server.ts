@@ -2,7 +2,7 @@ import './appEnv.js';
 import { spawn } from 'node:child_process';
 import http from 'node:http';
 import express from 'express';
-import { WebSocketServer, WebSocket } from 'ws';
+import WebSocket, { WebSocketServer, type RawData } from 'ws';
 import { ClobClient as LegacyClobClient } from '@polymarket/clob-client';
 import {
   AssetType,
@@ -43,12 +43,14 @@ import {
   chainlinkUsdHistory,
   dedupeRtdsHistPreferChainlink,
   derivePtbFromRtdsHistory,
+  derivePtbFromRtdsHistoryBestEffort,
   derivePtbPreview,
   historyCoversBucketOpen,
   openTickGraceMsForBucket,
   isLockedPtbSource,
   type RtdsHistPoint,
 } from './ptbFromRtds.js';
+import { tryPolymarketPagePtb } from './ptbFromPolymarketPage.js';
 import { loadPtbBucketDiskCache, savePtbBucketDiskEntry } from './ptbBucketDiskCache.js';
 import {
   shouldSkipFutureUpdownBucketStart,
@@ -56,8 +58,10 @@ import {
   updownShortcutAnchorFloors,
 } from './updownBucketEt.js';
 import { clobHasBookCached, gammaMarketCached, resolveCanonicalUpdownSlug } from './updownCanonicalProbe.js';
+import { resolveSportsShortcut, listSportsLive, SPORTS_LEAGUES } from './sportsShortcut.js';
 import { resolveUpdownTradingSlug } from './updownTradingSlug.js';
 import {
+  buildTitledDailySlug,
   buildTitledHourlySlug,
   currentEtHourEndUnixSec,
   isUpdownWindowOpen,
@@ -86,6 +90,12 @@ import {
   polymarketGetJson,
 } from './polymarket/index.js';
 import { registerPolymarketLiveRoutes } from './polymarketRoutes.js';
+import {
+  buildAgentSnapshot,
+  type AgentSnapshotDeps,
+  type UpdownAsset,
+  type UpdownInterval,
+} from './agentSnapshot.js';
 import {
   liveOrdersViaBullpen,
   liveTradingEnvSummary,
@@ -472,6 +482,23 @@ function pickBestUpdownGeneral(
     }
   }
 
+  if (interval === '1d') {
+    const now = Date.now();
+    const live = scored.filter((s) => s.endMs != null && s.endMs > now);
+    if (live.length > 0) {
+      live.sort((a, b) => a.endMs! - b.endMs!);
+      const best = live[0]!;
+      return {
+        slug: best.slug,
+        active: best.active,
+        closed: best.closed,
+        tokenIds: best.tokenIds,
+        startMs: best.startMs,
+        endMs: best.endMs,
+      };
+    }
+  }
+
   scored.sort((a, b) => b.score - a.score);
   return scored[0] ?? null;
 }
@@ -499,7 +526,7 @@ async function tryPriceToBeat(slug: string): Promise<{ value: number; source: st
 function parseUpdownBucketFromSlug(slug: string): { symbol: string; bucketStartMs: number } | null {
   const s = slug.trim().toLowerCase();
   // Current API shortcut slugs look like: btc-updown-5m-1776735900
-  const m = /^([a-z0-9]{2,10})-updown-(5m|15m|1h|4h|1d)-(\d{9,12})$/.exec(s);
+  const m = /^([a-z0-9]{2,10})-updown-(5m|15m|1h|4h|1d)-(\d+)$/.exec(s);
   if (!m) return null;
   const asset = m[1]!;
   const startSec = Number(m[3]!);
@@ -521,6 +548,11 @@ async function inferBucketFromTitledUpdownSlug(slug: string): Promise<{ symbol: 
     const m = (await gammaMarketBySlugOrId(slug)) as Record<string, unknown>;
     const endMs = parseIsoMs(m.endDate ?? m.end_date);
     if (endMs == null) return null;
+    const startRaw = m.startDate ?? m.start_date ?? m.eventStartTime;
+    const startMs = typeof startRaw === 'string' ? Date.parse(startRaw) : NaN;
+    if (Number.isFinite(startMs)) {
+      return { symbol: sym, bucketStartMs: Math.floor(startMs) };
+    }
     const endSec = Math.floor(endMs / 1000);
     return { symbol: sym, bucketStartMs: (endSec - stepSec) * 1000 };
   } catch {
@@ -538,7 +570,7 @@ type RtdsPrice = { symbol: string; value: number; ts: number; receivedAt: number
 const rtdsCache = new Map<string, RtdsPrice>();
 /** Ring buffer of Chainlink ticks per symbol (WS pushes) — returned to the web client to hydrate charts. */
 const rtdsHistory = new Map<string, RtdsHistPoint[]>();
-const RTDS_HIST_CAP = 2400;
+const RTDS_HIST_CAP = 86_400;
 let rtdsWs: WebSocket | null = null;
 let rtdsWsStarting: Promise<void> | null = null;
 
@@ -652,7 +684,7 @@ async function ensureRtdsWs(): Promise<void> {
     ws.onopen = () => {
       clearTimeout(openTimer);
       // Chainlink (slash symbols) + Binance USDT (concat symbols) — separate series, never mix into slash-USD.
-      const chainlinkSubs = ['btc/usd', 'eth/usd', 'sol/usd'].map((symbol) => ({
+      const chainlinkSubs = ['btc/usd', 'eth/usd', 'sol/usd', 'hype/usd'].map((symbol) => ({
         topic: 'crypto_prices_chainlink',
         type: '*',
         filters: JSON.stringify({ symbol }),
@@ -678,7 +710,7 @@ async function ensureRtdsWs(): Promise<void> {
         /* ignore */
       }
     };
-    ws.onmessage = (ev) => {
+    ws.onmessage = (ev: { data: RawData }) => {
       try {
         const parsed = JSON.parse(String(ev.data)) as unknown;
         const batch = Array.isArray(parsed) ? parsed : [parsed];
@@ -793,7 +825,8 @@ async function awaitRtdsHistoryBatch(symbol: string, timeoutMs: number): Promise
 
 function lockBucketPtb(cacheKey: string, out: { value: number; source: string }): { value: number; source: string } {
   if (!isLockedPtbSource(out.source)) return out;
-  ptbByBucketCache.set(cacheKey, out);
+  const entry = { ...out, savedAtMs: Date.now() };
+  ptbByBucketCache.set(cacheKey, entry);
   savePtbBucketDiskEntry(cacheKey, out);
   return out;
 }
@@ -834,8 +867,8 @@ async function tryRtdsBucketPtb(bucket: { symbol: string; bucketStartMs: number 
   const tryDerive = (): { value: number; source: string } | null => {
     const hist = rtdsHistoryForSymbol(bucket.symbol);
     const allowPreOpenFallback = bucketOpen;
-    const v = derivePtbFromRtdsHistory(hist, bucket.bucketStartMs, {
-      allowPreOpenFallback,
+    const v = derivePtbFromRtdsHistoryBestEffort(hist, bucket.bucketStartMs, bucketAgeMs, {
+      allowPreOpenFallback: allowPreOpenFallback,
       chainlinkOnly: bucket.symbol.endsWith('/usd'),
       openTickGraceMs: openGraceMs,
     });
@@ -881,7 +914,7 @@ async function tryRtdsBucketPtb(bucket: { symbol: string; bucketStartMs: number 
   return null;
 }
 
-const rtdsSubscribed = new Set<string>(['btc/usd', 'eth/usd', 'sol/usd']);
+const rtdsSubscribed = new Set<string>(['btc/usd', 'eth/usd', 'sol/usd', 'hype/usd']);
 
 function normalizeRtdsSymbol(s: string): string | null {
   const sym = s.trim().toLowerCase();
@@ -1051,6 +1084,66 @@ app.get('/api/health', async (_req, res) => {
         : 'Set POLYMARKET_PRIVATE_KEY and POLYMARKET_FUNDER on the API server to enable live CLOB trading.',
     },
   });
+});
+
+const agentSnapshotDeps: AgentSnapshotDeps = {
+  resolveMarketBySlug,
+  tryPriceToBeat: async (slug) => {
+    try {
+      return await tryPriceToBeat(slug);
+    } catch {
+      return null;
+    }
+  },
+  tryRtdsBucketPtb,
+  tryPolymarketPagePtb: (slug: string) => tryPolymarketPagePtb(slug, POLYMARKET_WEB),
+  parseUpdownBucketFromSlug,
+  inferBucketFromTitledUpdownSlug,
+  ensureRtdsWs,
+  waitForRtdsPrice,
+  rtdsHistoryForSymbol,
+  latestChainlinkUsdPrice,
+};
+
+/**
+ * Complete raw desk snapshot for external AI agents — current up/down window (default BTC 5m).
+ * Example: GET /api/agent/snapshot?asset=btc&interval=5m
+ */
+app.get('/api/agent/snapshot', async (req, res) => {
+  const assetRaw = String(req.query.asset ?? 'btc').toLowerCase().trim();
+  const intervalRaw = String(req.query.interval ?? '5m').toLowerCase().trim();
+  const allowedAssets = ['btc', 'eth', 'sol', 'hype'] as const;
+  const allowedIntervals = ['5m', '15m', '1h', '4h', '1d'] as const;
+  if (!allowedAssets.includes(assetRaw as (typeof allowedAssets)[number])) {
+    return json(res, 400, { ok: false, error: 'bad_asset', details: { allowed: [...allowedAssets] } });
+  }
+  if (!allowedIntervals.includes(intervalRaw as (typeof allowedIntervals)[number])) {
+    return json(res, 400, { ok: false, error: 'bad_interval', details: { allowed: [...allowedIntervals] } });
+  }
+  const spotHistoryLimit = Math.max(20, Math.min(600, Number(req.query.spot_history ?? 180) || 180));
+  const tapeLimit = Math.max(5, Math.min(100, Number(req.query.tape_limit ?? 40) || 40));
+  const bookDepth = Math.max(4, Math.min(30, Number(req.query.book_depth ?? 12) || 12));
+  try {
+    const data = await buildAgentSnapshot(
+      {
+        asset: assetRaw as UpdownAsset,
+        interval: intervalRaw as UpdownInterval,
+        spotHistoryLimit,
+        tapeLimit,
+        bookDepth,
+      },
+      agentSnapshotDeps,
+    );
+    const download = String(req.query.download ?? '').trim() === '1';
+    if (download) {
+      const fname = `agent-snapshot-${assetRaw}-${intervalRaw}-${Date.now()}.json`;
+      res.setHeader('content-disposition', `attachment; filename="${fname}"`);
+    }
+    res.setHeader('content-type', 'application/json; charset=utf-8');
+    return json(res, 200, { ok: true, data });
+  } catch (e) {
+    return json(res, 502, { ok: false, error: 'agent_snapshot_failed', details: String(e) });
+  }
 });
 
 app.get('/api/markets', async (req, res) => {
@@ -1269,6 +1362,70 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
       }
     }
 
+    const { et: etAnchor } = updownShortcutAnchorFloors(stepSec, b.now);
+
+    // 1d: Polymarket uses titled slugs (`bitcoin-up-or-down-on-june-11-2026`) with noon→noon ET
+    // windows; the slug names the resolution day (bucket end), not the calendar day at `now`.
+    if (interval === '1d') {
+      let bestDaily:
+        | { slug: string; m: Record<string, unknown>; endMs: number; inferredStart: number; inferredEndSec: number }
+        | null = null;
+      for (const dayOffset of [-1, 0, 1, 2, 3]) {
+        const titledSlug = buildTitledDailySlug(asset, dayOffset, b.now);
+        try {
+          const m = await gammaMarketCached(titledSlug);
+          if (!m) continue;
+          const tokenIds = parseClobTokenIds(m.clobTokenIds ?? m.clob_token_ids);
+          const t0 = tokenIds[0];
+          const endMs = parseIsoMs(m.endDate ?? m.end_date);
+          if (!isUpdownWindowOpen({ active: m.active === true, closed: m.closed === true, endMs })) continue;
+          if (t0 && !(await clobHasBookCached(t0))) continue;
+          const inferredEndSec = endMs != null ? Math.floor(endMs / 1000) : b.floor + stepSec;
+          const inferredStart = inferredEndSec - stepSec;
+          if (
+            !bestDaily ||
+            (endMs != null && bestDaily.endMs > endMs) ||
+            (endMs == null && inferredEndSec < bestDaily.inferredEndSec)
+          ) {
+            bestDaily = {
+              slug: titledSlug,
+              m,
+              endMs: endMs ?? inferredEndSec * 1000,
+              inferredStart,
+              inferredEndSec,
+            };
+          }
+        } catch {
+          /* try next day offset */
+        }
+      }
+      if (bestDaily) {
+        return replyUpdownShortcut(
+          res,
+          interval,
+          {
+            slug: bestDaily.slug,
+            asset,
+            interval,
+            window: interval,
+            tested: true,
+            active: bestDaily.m.active === true,
+            closed: bestDaily.m.closed === true,
+            inferred_window_start_unix: bestDaily.inferredStart,
+            inferred_end_unix: bestDaily.inferredEndSec,
+            start: new Date(bestDaily.inferredStart * 1000).toISOString(),
+            end: new Date(bestDaily.inferredEndSec * 1000).toISOString(),
+            bucket_now_unix: b.now,
+            bucket_floor_unix: b.floor,
+            bucket_floor_et_unix: etAnchor,
+            bucket_ceil_unix: b.ceil,
+            source: 'titled_et_day',
+          },
+          bestDaily.m,
+        );
+      }
+    }
+
     // NOTE: 1h/1d slugs are not perfectly consistent, but when the canonical
     // `asset-updown-<interval>-<bucket>` slug exists it is the most reliable
     // (fastest + correctly bucketed). We always try deterministic lookup first
@@ -1276,16 +1433,18 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
     // IMPORTANT: Polymarket uses the slug suffix as the *window start* bucket (not end).
     // Example: `sol-updown-5m-1776528300` corresponds to a 5-minute window starting at that unix time.
     //
-    // 1h · 4h · 1d windows follow US/Eastern bucket edges in practice; naive UTC `floor(now/step)*step`
+    // 1h · 4h windows follow US/Eastern bucket edges in practice; naive UTC `floor(now/step)*step`
     // often misses the live slug — search both ET + UTC anchors (see `updownShortcutAnchorFloors`).
-    const { et: etAnchor } = updownShortcutAnchorFloors(stepSec, b.now);
-    const canonical = await resolveCanonicalUpdownSlug({
-      asset,
-      interval,
-      stepSec,
-      nowSec: b.now,
-      floorSec: b.floor,
-    });
+    const canonical =
+      interval === '1d'
+        ? null
+        : await resolveCanonicalUpdownSlug({
+            asset,
+            interval,
+            stepSec,
+            nowSec: b.now,
+            floorSec: b.floor,
+          });
     if (canonical) {
       const { slug, ts, market: m, tested } = canonical;
       return replyUpdownShortcut(
@@ -1312,7 +1471,7 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
       );
     }
 
-    // Fallback to Gamma search results when deterministic lookup fails.
+    // Fallback to Gamma search when titled daily resolution fails.
     if (interval === '1d') {
       const q = UPDOWN_1D_SEARCH[asset];
       const raw = await gammaSearchMarkets(q, 25, 260);
@@ -1456,7 +1615,8 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
         details: { asset, interval, q },
       });
     }
-    const target = b.floor;
+    const target =
+      interval === '1h' || interval === '4h' ? etAnchor : b.floor;
 
     const ordered = [...candidates].sort((a, b2) => {
       if (interval === '15m') {
@@ -1540,6 +1700,58 @@ app.get('/api/markets/updown-shortcut', async (req, res) => {
   }
 });
 
+app.get('/api/markets/sports-shortcut', async (req, res) => {
+  const league = String(req.query.league ?? '').toLowerCase().trim();
+  if (!league) return json(res, 400, { ok: false, error: 'missing_league' });
+  if (!(SPORTS_LEAGUES as readonly string[]).includes(league)) {
+    return json(res, 400, { ok: false, error: 'bad_league', details: { allowed: SPORTS_LEAGUES } });
+  }
+  try {
+    const row = await resolveSportsShortcut(league);
+    if (!row) return json(res, 404, { ok: false, error: 'no_sports_market', details: { league } });
+    return json(res, 200, {
+      ok: true,
+      data: {
+        slug: row.slug,
+        league: row.league ?? league,
+        question: row.question,
+        gameStartTime: row.gameStartTime,
+        market: row.market,
+      },
+    });
+  } catch (e) {
+    return json(res, 502, { ok: false, error: 'sports_shortcut_failed', details: { league, http: String(e) } });
+  }
+});
+
+app.get('/api/markets/sports-live', async (req, res) => {
+  const leagueRaw = String(req.query.league ?? '').trim().toLowerCase();
+  const league = leagueRaw || undefined;
+  if (league && !(SPORTS_LEAGUES as readonly string[]).includes(league)) {
+    return json(res, 400, { ok: false, error: 'bad_league', details: { allowed: SPORTS_LEAGUES } });
+  }
+  const limit = Math.max(1, Math.min(40, Number(req.query.limit ?? 16) || 16));
+  try {
+    const rows = await listSportsLive({ league, limit });
+    return json(res, 200, {
+      ok: true,
+      data: rows.map((row) => ({
+        slug: row.slug,
+        league: row.league,
+        question: row.question,
+        gameStartTime: row.gameStartTime,
+        endDate: row.endDate,
+        volume24hr: row.volume24hr,
+        active: row.active,
+        closed: row.closed,
+        market: row.market,
+      })),
+    });
+  } catch (e) {
+    return json(res, 502, { ok: false, error: 'sports_live_failed', details: { league, http: String(e) } });
+  }
+});
+
 app.get('/api/markets/get/:slug', async (req, res) => {
   const raw = String(req.params.slug ?? '').trim();
   const slug = normalizeMarketLookupRef(raw);
@@ -1594,7 +1806,7 @@ app.get('/api/price-to-beat/:slug', async (req, res) => {
   }
 
   let ssrErr: unknown = null;
-  // Up/down shortcut slugs are not valid for Polymarket SSR PTB — skip the 8s×2 failure path.
+  const pageP = tryPolymarketPagePtb(slug, POLYMARKET_WEB);
   const ssrP = bucket
     ? Promise.resolve(null)
     : tryPriceToBeat(slug).catch((e) => {
@@ -1603,8 +1815,8 @@ app.get('/api/price-to-beat/:slug', async (req, res) => {
       });
   const rtdsP = bucket ? tryRtdsBucketPtb(bucket) : Promise.resolve(null);
 
-  const [ssrOut, rtdsOut] = await Promise.all([ssrP, rtdsP]);
-  const chosen = bucket ? (rtdsOut ?? ssrOut) : (ssrOut ?? rtdsOut);
+  const [rtdsOut, pageOut, ssrOut] = await Promise.all([rtdsP, pageP, ssrP]);
+  const chosen = rtdsOut ?? pageOut ?? ssrOut;
   if (chosen) {
     const preview = chosen.source === 'rtds_chainlink_preview_pre_open';
     const payload = {
@@ -2724,9 +2936,14 @@ app.get('/api/trade/avg-entry', async (req, res) => {
     const arr = (cachedBullpenPositionsOrNull()?.positions ?? []) as Record<string, unknown>[];
     const hit = findBullpenPositionRow(arr, { marketSlug, outcome, tokenId });
     if (hit && positionSize(hit) > 0) {
+      let avgEntry = positionAvgEntry01(hit);
+      if (avgEntry == null) {
+        const fromTape = avgEntryFromBullpenTrades(await bullpenTradeHistory(), tokenId);
+        avgEntry = fromTape.avgEntry;
+      }
       const data = {
         tokenId,
-        avgEntry: positionAvgEntry01(hit),
+        avgEntry,
         shares: roundSizeShares4(positionSize(hit)),
       };
       avgEntryCache.set(cacheKey, { at: Date.now(), data });
@@ -4015,7 +4232,7 @@ wss.on('connection', async (client) => {
     }, 10_000);
   });
 
-  upstream.on('message', (buf) => {
+  upstream.on('message', (buf: RawData) => {
     try {
       if (client.readyState !== WebSocket.OPEN) return;
       const raw = String(buf);

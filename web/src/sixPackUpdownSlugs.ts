@@ -1,4 +1,5 @@
 import type { UpdownInterval, UpdownShortcutAsset } from './lib/api';
+import { buildTitledDailySlugFromBucketSec, buildTitledHourlySlugFromBucketSec } from './updownTitledSlugs';
 
 export type ParsedUpdownSlug = {
   asset: string;
@@ -45,6 +46,21 @@ export function isUpdownDeskMarket(
  * (`bitcoin-up-or-down-…-5pm-et`, `bitcoin-up-or-down-on-april-28-2026`, …) using `endDate`.
  */
 export function inferUpdownHintFromMarketJson(slug: string, market: Record<string, unknown>): UpdownSlugHint | null {
+  const canonical = parseUpdownSlug(slug);
+  if (canonical) {
+    let bucketStartSec = canonical.ts;
+    const eventStartRaw = market.eventStartTime;
+    if (typeof eventStartRaw === 'string') {
+      const eventStartMs = Date.parse(eventStartRaw);
+      if (Number.isFinite(eventStartMs)) bucketStartSec = Math.floor(eventStartMs / 1000);
+    }
+    return {
+      asset: canonical.asset as UpdownShortcutAsset,
+      interval: canonical.interval,
+      bucketStartSec,
+    };
+  }
+
   const stepSec = titledHourlyOrDailyStepSec(slug);
   const asset = titledUpdownAssetFromSlug(slug);
   if (!stepSec || !asset) return null;
@@ -52,8 +68,21 @@ export function inferUpdownHintFromMarketJson(slug: string, market: Record<strin
   if (typeof endRaw !== 'string') return null;
   const endMs = Date.parse(endRaw);
   if (!Number.isFinite(endMs)) return null;
-  const bucketStartSec = Math.floor(endMs / 1000) - stepSec;
-  const interval: UpdownInterval = stepSec === 86400 ? '1d' : '1h';
+  const startRaw = market.startDate ?? market.start_date ?? market.eventStartTime;
+  const startMs = typeof startRaw === 'string' ? Date.parse(startRaw) : NaN;
+  const durSec =
+    Number.isFinite(startMs) && endMs > startMs ? Math.round((endMs - startMs) / 1000) : stepSec;
+  const interval: UpdownInterval =
+    durSec >= 20 * 3600 ? '1d' : durSec >= 3 * 3600 ? '4h' : stepSec === 86400 ? '1d' : '1h';
+  const stepForInterval = interval === '1d' ? 86400 : interval === '4h' ? 14400 : 3600;
+  let bucketStartSec = Math.floor(endMs / 1000) - stepForInterval;
+  const eventStartRaw = market.eventStartTime;
+  if (typeof eventStartRaw === 'string') {
+    const eventStartMs = Date.parse(eventStartRaw);
+    if (Number.isFinite(eventStartMs)) bucketStartSec = Math.floor(eventStartMs / 1000);
+  } else if (Number.isFinite(startMs)) {
+    bucketStartSec = Math.floor(startMs / 1000);
+  }
   return { asset, interval, bucketStartSec };
 }
 
@@ -81,10 +110,37 @@ export function parseUpdownSlug(slug: string): ParsedUpdownSlug | null {
   return { asset, ts, interval, stepSec };
 }
 
-export function nextUpdownSlug(slug: string, dir: -1 | 1): string | null {
-  const p = parseUpdownSlug(slug);
+/** True when Polymarket uses titled slugs (`bitcoin-up-or-down-…-5pm-et`) instead of `btc-updown-1h-<ts>`. */
+export function isTitledUpdownSlug(slug: string): boolean {
+  const s = slug.trim().toLowerCase();
+  return titledHourlyOrDailyStepSec(s) != null && parseUpdownSlug(s) == null;
+}
+
+export function updownSlugAtBucket(
+  asset: string,
+  interval: UpdownInterval,
+  bucketStartSec: number,
+  titled = false,
+): string {
+  if (titled && interval === '1h') {
+    return buildTitledHourlySlugFromBucketSec(asset as UpdownShortcutAsset, bucketStartSec);
+  }
+  if (titled && interval === '1d') {
+    return buildTitledDailySlugFromBucketSec(asset as UpdownShortcutAsset, bucketStartSec);
+  }
+  return `${asset}-updown-${interval}-${bucketStartSec}`;
+}
+
+export function nextUpdownSlug(
+  slug: string,
+  dir: -1 | 1,
+  hints?: Readonly<Record<string, UpdownSlugHint>> | null,
+): string | null {
+  const p = parseUpdownSlugWithHints(slug, hints);
   if (!p) return null;
-  return `${p.asset}-updown-${p.interval}-${p.ts + dir * p.stepSec}`;
+  const nextTs = p.ts + dir * p.stepSec;
+  const titled = isTitledUpdownSlug(slug);
+  return updownSlugAtBucket(p.asset, p.interval, nextTs, titled);
 }
 
 /**

@@ -124,10 +124,11 @@ export function mergeRecentFillsForDisplay(args: {
   limit?: number;
 }): TradeHistoryRow[] {
   const limit = args.limit ?? 12;
-  const upgraded =
+  const localCandidates =
     args.mode === 'live' && args.myFills.length
       ? upgradeBracketRowsFromTape(args.localFilled, args.myFills, args.tokenId)
       : args.localFilled;
+  const upgraded = localCandidates.filter((r) => isFilledLike(r) && (args.mode !== 'live' || rowShowsExchangeFill(r)));
   const local = dedupeFilledRowsByOrderId(upgraded);
 
   if (args.mode !== 'live' || !args.myFills.length) {

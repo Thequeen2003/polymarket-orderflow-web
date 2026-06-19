@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { shouldBuyWhichSide, type ShouldBuyInput } from './shouldBuyWhichSide';
+import { pickStrongerBuyAdvisory, shouldBuyWhichSide, type ShouldBuyInput } from './shouldBuyWhichSide';
 import type { SpotPtbMachineReadout } from './spotPtbMachineSignals';
 import type { TapeVelocity } from './tapeVelocity';
 
@@ -80,6 +80,14 @@ function baseInput(overrides: Partial<ShouldBuyInput> = {}): ShouldBuyInput {
   };
 }
 
+describe('pickStrongerBuyAdvisory', () => {
+  it('prefers directional fallback over desk NEITHER', () => {
+    const desk = shouldBuyWhichSide({ ...baseInput(), machine: null });
+    const fallback = shouldBuyWhichSide(baseInput());
+    expect(pickStrongerBuyAdvisory(desk, fallback).verdict).toBe('BUY_UP');
+  });
+});
+
 describe('shouldBuyWhichSide book-only', () => {
   it('picks side from dual GO on sports desk', () => {
     const result = shouldBuyWhichSide({
@@ -152,16 +160,62 @@ describe('shouldBuyWhichSide', () => {
     expect(result.verdict).toBe('NEITHER');
   });
 
-  it('returns NEITHER when scores are too close', () => {
+  it('returns NEITHER when scores are too close and no focus lane', () => {
     const machine = baseMachine({
       agreementScore: 60,
       laneVotes: { up: 4.0, down: 3.9 },
+      focusLane: null,
+      flowWinningLane: null,
       edges: null,
     });
-    const result = shouldBuyWhichSide(baseInput({ machine, tape: null }));
+    const result = shouldBuyWhichSide(baseInput({ machine, tape: null, directive: null }));
     expect(result.verdict).toBe('NEITHER');
     expect(result.scores.up).toBeGreaterThan(0);
     expect(result.scores.down).toBeGreaterThan(0);
+  });
+
+  it('uses focus lane when score margin is thin but agreement is sufficient', () => {
+    const machine = baseMachine({
+      agreementScore: 47,
+      laneVotes: { up: 3.1, down: 2.5 },
+      focusLane: 'up',
+      flowWinningLane: 'up',
+      edges: null,
+    });
+    const result = shouldBuyWhichSide(baseInput({ machine, tape: null }));
+    expect(result.verdict).toBe('BUY_UP');
+  });
+
+  it('merges dual GO book votes into PTB machine readout', () => {
+    const machine = baseMachine({
+      agreementScore: 47,
+      laneVotes: { up: 2.0, down: 2.1 },
+      focusLane: 'down',
+      flowWinningLane: 'down',
+      edges: null,
+    });
+    const result = shouldBuyWhichSide(
+      baseInput({
+        machine,
+        tape: null,
+        book: {
+          dual: {
+            lane: 'down',
+            verdict: 'ENTER',
+            gate: 'ARMED',
+            go: true,
+            enterOnlyIf: 'Dual closed above entry',
+            laneLock: { lane: 'down', status: 'LOCKED', confidence: 'HIGH', reason: 'Momentum' },
+          },
+          wallFlow: null,
+          probUp: 0.42,
+          probDown: 0.58,
+          midUp: 0.42,
+          midDown: 0.58,
+        },
+      }),
+    );
+    expect(result.verdict).toBe('BUY_DOWN');
   });
 
   it('reduces size in choppy regime', () => {

@@ -82,7 +82,7 @@ const FLAT_SPOT_USD_PER_SEC = 0.015;
 const FLAT_GAP_USD_PER_SEC = 0.012;
 const FLAT_PROB_PER_SEC = 0.00008;
 
-function spotAtOrBefore(pts: SpotTick[], targetMs: number): number | null {
+export function spotAtOrBefore(pts: SpotTick[], targetMs: number): number | null {
   if (!pts.length) return null;
   for (let i = pts.length - 1; i >= 0; i--) {
     const p = pts[i]!;

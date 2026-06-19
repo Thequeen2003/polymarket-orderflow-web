@@ -2,9 +2,17 @@
  * Keep local `sent` trade-history rows aligned with Bullpen/CLOB open-order snapshots.
  */
 
-import { loadTradeHistory, saveTradeHistory, TRADE_HISTORY_MAX_ROWS, updateTradeHistoryRow } from './tradeHistory';
+import {
+  loadTradeHistory,
+  saveTradeHistory,
+  TRADE_HISTORY_MAX_ROWS,
+  updateTradeHistoryRow,
+  type TradeHistoryRow,
+} from './tradeHistory';
 import { rowShowsExchangeFill } from './liveTradeTruth';
 import { roundPrice01 } from './tradingRound';
+
+export const OPEN_ORDER_ABSENT_STALE_MS = 5_000;
 
 function asNum(x: unknown): number | null {
   const n = typeof x === 'number' ? x : typeof x === 'string' ? Number(x) : NaN;
@@ -47,9 +55,29 @@ function orderRemainingFromOpenOrder(o: unknown): number | null {
   return size;
 }
 
+function isLocalOpenOrderStatus(status: TradeHistoryRow['status']): boolean {
+  return status === 'sent' || status === 'sending' || status === 'pending' || status === 'partial';
+}
+
+export function localLiveOrderAbsentFromOpenOrders(
+  row: Pick<TradeHistoryRow, 'mode' | 'status' | 'orderId' | 'ts'>,
+  openOrderIds: ReadonlySet<string>,
+  nowMs: number,
+  staleMs = OPEN_ORDER_ABSENT_STALE_MS,
+): boolean {
+  if (row.mode !== 'live') return false;
+  const oid = row.orderId?.trim();
+  if (!oid) return false;
+  if (!isLocalOpenOrderStatus(row.status)) return false;
+  if (openOrderIds.has(oid)) return false;
+  const ts = Number(row.ts ?? 0);
+  if (!Number.isFinite(ts) || ts <= 0) return false;
+  return nowMs - ts >= staleMs;
+}
+
 /** Patch open `sent` rows with exchange remaining / matched (0/5 not 5/5). */
 export function syncSentRowsFromOpenOrders(orders: unknown[]): number {
-  if (!Array.isArray(orders) || orders.length === 0) return 0;
+  if (!Array.isArray(orders)) return 0;
   const byOid = new Map<string, { size: number | null; rem: number | null; px: number | null }>();
   for (const o of orders) {
     const oid = orderIdFromOpenOrder(o);
@@ -60,18 +88,29 @@ export function syncSentRowsFromOpenOrders(orders: unknown[]): number {
       px: orderPrice01FromOpenOrder(o),
     });
   }
-  if (byOid.size === 0) return 0;
 
   let updates = 0;
+  const nowMs = Date.now();
   const rows = loadTradeHistory();
   for (const row of rows) {
     if (row.mode !== 'live') continue;
     const oid = row.orderId?.trim();
     if (!oid) continue;
-    if (row.status !== 'sent' && row.status !== 'sending' && row.status !== 'pending') continue;
+    if (!isLocalOpenOrderStatus(row.status)) continue;
     if (rowShowsExchangeFill(row)) continue;
     const snap = byOid.get(oid);
-    if (!snap) continue;
+    if (!snap) {
+      if (!localLiveOrderAbsentFromOpenOrders(row, byOid, nowMs)) continue;
+      const filled = Math.max(0, Number(row.shares ?? 0));
+      updateTradeHistoryRow(row.id, {
+        status: filled > 1e-6 ? 'partial' : 'no_fill',
+        remainingShares: 0,
+        shares: filled,
+        auditNote: row.auditNote ? `${row.auditNote} · open_orders_absent` : 'open_orders_absent',
+      });
+      updates += 1;
+      continue;
+    }
     const req = snap.size ?? row.requestedShares ?? null;
     const rem = snap.rem ?? row.remainingShares ?? req;
     const matched =

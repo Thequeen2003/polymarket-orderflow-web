@@ -41,20 +41,26 @@ import {
   type TradeHistoryRow,
 } from './tradeHistory';
 import { playTradeClick, playTradeError, playTradeFill } from './tradeSounds';
-import { buildBracketMomentumUi } from './bracketMomentumReadout';
+import { buildBracketMomentumUi, buildOutcomeMomentumXs, type OutcomeMomentumXs } from './bracketMomentumReadout';
 import { computeBookIntel } from './bookIntel';
 import type { SpotPoint } from './SpotLevelChart';
 import { buildBracketAutomationExplain, type BracketLegExplain } from './tradeAutomationExplain';
 import { PAPER_ACCOUNT_SYNC_EVENT } from './paperAccountSync';
 import { paperSettlementCaption } from './paperMarketSettlement';
 import { parseRestingOrderSnapshot } from './orderStatusParse';
-import { floorShares4, roundPrice01, roundShares4, roundUsd2 } from './tradingRound';
+import { floorShares4, floorSharesWhole, floorUsdWhole, roundPrice01, roundShares4, roundUsd2 } from './tradingRound';
+import { computeHeldLaneTpOutlook, computePreBuyTpOutlook } from './positionTpOutlook';
+import { PositionTpOutlookCard } from './PositionTpOutlookCard';
 import { bullpenOutcomeForOrder } from './bullpenOutcome';
 import { formatTradeApiError } from './formatTradeApiError';
+import { bracketCentsStrTo01 } from './bracketCentsInput';
 import {
+  bracketAutomationAsk01,
   bracketAutomationBid01,
+  bracketTpMark01,
   evaluateStopLossCross,
   evaluateTakeProfitCross,
+  evaluateTrailingProfitExit,
   stopLossExecLimit01,
   takeProfitExecLimit01,
 } from './bracketTrigger';
@@ -81,7 +87,7 @@ import {
 import { filledSharesFromRow, netMatchedSharesFromHistory, remainingSharesFromRow } from './tradeHistoryDisplay';
 import { LiveTradingHud } from './LiveTradingHud';
 import { LivePositionStrip } from './LivePositionStrip';
-import { submitLiveBracketExit } from './liveBracketExit';
+import { marketBuyUsdFromIntent } from './liveAggressiveBuy';
 import { resolveLiveLaneShares, resolveLiveOutcomeShares } from './livePositionTruth';
 import { resolveLiveSellOutcome } from './liveSellOutcome';
 import { loadTradeAccountMode, saveTradeAccountMode } from './tradeAccountMode';
@@ -126,9 +132,29 @@ import {
   type ResetPhantomPositionDetail,
 } from './signalsDeskHold';
 import { dispatchOutcomePositions } from './signalsDeskPosition';
+import { isExternallyFlatPosition } from './externalPositionFlat';
 import { BracketTriggerInput } from './BracketTriggerInput';
 import { loadBracketLevelsDraft, saveBracketLevelsDraft } from './bracketLevelDraft';
+import {
+  buildQuoteAssistTargets,
+  EMERGENCY_STOP_BUNDLE_PREFS_KEY,
+  loadEmergencyStopBundlePrefs,
+  readStagedBuyBundleLevels,
+  resolveAutoBundleChaseLevels,
+  flushPendingBracketDraft,
+  EMPTY_BRACKET_INPUT_DRAFT,
+  type BracketInputDraftState,
+  resolveStagedBuyBundleLevels,
+  shouldChaseAutoBundleLevel,
+  shouldPrefillBuyBundleTpOnClick,
+  type EmergencyStopBundlePrefs,
+} from './buyBundleStaging';
+import { loadNowPriceDeskScalpPrefs, NOW_PRICE_DESK_SCALP_PREFS_EVENT, resolveGlobalStopForEntry, deskTpBelowEntry, liveDeskTp01FromBook } from './nowPriceDeskScalp';
+import { useTradeFloatChrome } from './TradeFloatChromeContext';
+import { readSlideDockTab, writeSlideDockTab, type SlideDockTab } from './tradeSlideDock';
 import { resolveBracketRef } from './lib/bracketLevelInput';
+import { ShouldBuyCard } from './ShouldBuyCard';
+import { pickStrongerBuyAdvisory, shouldBuyWhichSide, type BuySideAdvisory } from './shouldBuyWhichSide';
 
 function isOk<T>(res: { ok: boolean } & Record<string, unknown>): res is { ok: true; data: T } {
   return res.ok === true;
@@ -267,6 +293,88 @@ function loadTakeProfitConfigFromStorage(tokenId: string): TakeProfitConfig | nu
   }
 }
 
+function saveStopLossConfigToStorage(tokenId: string, cfg: StopLossConfig): void {
+  const tok = tokenId.trim();
+  if (!tok) return;
+  try {
+    window.localStorage.setItem(stopLossStorageKey(tok), JSON.stringify(cfg));
+  } catch {
+    /* ignore */
+  }
+}
+
+function saveTakeProfitConfigToStorage(tokenId: string, cfg: TakeProfitConfig): void {
+  const tok = tokenId.trim();
+  if (!tok) return;
+  try {
+    window.localStorage.setItem(takeProfitStorageKey(tok), JSON.stringify(cfg));
+  } catch {
+    /* ignore */
+  }
+}
+
+function resolveArmedStopLoss(args: {
+  automationTok: string;
+  enabled: boolean;
+  stopCents: string;
+  limitCents: string;
+  sharesStr: string;
+  simple: boolean;
+  dualBook: boolean;
+  laneDraftSl: string;
+}): StopLossConfig | null {
+  if (!args.enabled) return null;
+  let stop01 = bracketCentsStrTo01(args.stopCents.trim());
+  let limit01 = bracketCentsStrTo01(args.limitCents.trim());
+  if (stop01 == null && args.laneDraftSl.trim()) stop01 = bracketCentsStrTo01(args.laneDraftSl);
+  if (limit01 == null && stop01 != null) limit01 = stop01;
+  let shares = Number(args.sharesStr);
+  const stored = loadStopLossConfigFromStorage(args.automationTok);
+  if (stop01 == null && stored?.enabled) stop01 = stored.stop01;
+  if (limit01 == null && stored?.enabled) limit01 = stored.limit01;
+  if (!(shares > 0) && stored?.enabled) shares = stored.shares;
+  if (stop01 == null || limit01 == null || !Number.isFinite(shares) || shares <= 0) return null;
+  return {
+    enabled: true,
+    stop01: clamp01(stop01),
+    limit01: clamp01(limit01),
+    shares,
+    simple: args.simple,
+    dualBook: args.dualBook,
+  };
+}
+
+function resolveArmedTakeProfit(args: {
+  automationTok: string;
+  enabled: boolean;
+  takeCents: string;
+  limitCents: string;
+  sharesStr: string;
+  simple: boolean;
+  dualBook: boolean;
+  laneDraftTp: string;
+}): TakeProfitConfig | null {
+  if (!args.enabled) return null;
+  let take01 = bracketCentsStrTo01(args.takeCents.trim());
+  let limit01 = bracketCentsStrTo01(args.limitCents.trim());
+  if (take01 == null && args.laneDraftTp.trim()) take01 = bracketCentsStrTo01(args.laneDraftTp);
+  if (limit01 == null && take01 != null) limit01 = take01;
+  let shares = Number(args.sharesStr);
+  const stored = loadTakeProfitConfigFromStorage(args.automationTok);
+  if (take01 == null && stored?.enabled) take01 = stored.take01;
+  if (limit01 == null && stored?.enabled) limit01 = stored.limit01;
+  if (!(shares > 0) && stored?.enabled) shares = stored.shares;
+  if (take01 == null || limit01 == null || !Number.isFinite(shares) || shares <= 0) return null;
+  return {
+    enabled: true,
+    take01: clamp01(take01),
+    limit01: clamp01(limit01),
+    shares,
+    simple: args.simple,
+    dualBook: args.dualBook,
+  };
+}
+
 function bracketAutomationActive(args: {
   bracketPollToken: string | null;
   stopLossEnabled: boolean;
@@ -279,6 +387,43 @@ function bracketAutomationActive(args: {
     return Boolean(sl?.enabled || tp?.enabled);
   }
   return args.stopLossEnabled || args.takeProfitEnabled;
+}
+
+/** UP/DOWN outcome label with directional arrow stacked above. */
+function OutcomeLaneHeader(props: {
+  lane: 'up' | 'down';
+  label: string;
+  /** Sell flow prefixes “Sell” on the label row. */
+  mode?: 'buy' | 'sell';
+  momentum?: OutcomeMomentumXs | null;
+}): ReactElement {
+  const { lane, label, mode = 'buy', momentum } = props;
+  const arrowCls = lane === 'up' ? 'text-emerald-400' : 'text-rose-400';
+  const labelCls =
+    mode === 'sell' ? 'text-[11px] font-black uppercase tracking-wide text-rose-200' : 'text-[11px] font-semibold uppercase tracking-wide text-zinc-500';
+  const momCls =
+    momentum?.tone === 'up'
+      ? 'text-emerald-400/95'
+      : momentum?.tone === 'down'
+        ? 'text-rose-400/95'
+        : 'text-zinc-500';
+  return (
+    <div className="flex flex-col gap-0.5">
+      <span className={`text-xl font-black leading-none ${arrowCls}`} aria-hidden>
+        {lane === 'up' ? '↑' : '↓'}
+      </span>
+      <span className={labelCls}>{mode === 'sell' ? `Sell ${label}` : label}</span>
+      {momentum ? (
+        <span className={`text-xs font-mono tabular-nums leading-tight ${momCls}`} title="15s prob momentum">
+          <span aria-hidden>{momentum.arrow} </span>
+          {momentum.deltaLabel}
+          {momentum.speedLabel ? <span className="text-zinc-600"> · {momentum.speedLabel}</span> : null}
+        </span>
+      ) : (
+        <span className="text-xs font-mono text-zinc-600">—</span>
+      )}
+    </div>
+  );
 }
 
 function parseUsdcBalance(raw: string): number | null {
@@ -311,18 +456,63 @@ function buyAmountFromCashPct(args: {
   if (!(cashUsd > 0) || !(pct > 0)) return '0';
   const budget = cashUsd * Math.min(1, pct);
   if (unit === 'dollars') {
-    const v = roundUsd2(Math.floor(budget * 100) / 100);
+    const v = floorUsdWhole(budget);
     return v > 0 ? String(v) : '0';
   }
   if (price01 == null || !(price01 > 0)) return '0';
-  const sh = floorShares4(budget / price01);
+  const sh = floorSharesWhole(budget / price01);
   return sh > 0 ? String(sh) : '0';
 }
 
 function clampBuyUsdPreset(usd: number, cashUsd: number): string {
   if (!(cashUsd > 0)) return '0';
-  const v = roundUsd2(Math.min(usd, Math.floor(cashUsd * 100) / 100));
+  const v = floorUsdWhole(Math.min(usd, cashUsd));
   return v > 0 ? String(v) : '0';
+}
+
+/** Shrink buy amount to fit available cash (returns unchanged when already valid). */
+function clampBuyAmountWithinCash(args: {
+  amountStr: string;
+  unit: 'dollars' | 'shares';
+  cashUsd: number;
+  price01: number | null;
+}): string {
+  const n = Number(args.amountStr);
+  if (!Number.isFinite(n) || n <= 0 || !(args.cashUsd > 0)) return args.amountStr;
+  if (args.unit === 'dollars') {
+    if (n <= args.cashUsd + 0.01) return args.amountStr;
+    return clampBuyUsdPreset(n, args.cashUsd);
+  }
+  const px = args.price01;
+  if (px == null || !(px > 0)) return args.amountStr;
+  const cost = n * px;
+  if (cost <= args.cashUsd + 0.015) return args.amountStr;
+  const maxSh = floorSharesWhole(args.cashUsd / px);
+  return maxSh > 0 ? String(maxSh) : '0';
+}
+
+/** Worst-case buy price for cash sizing — limit first, then quote, then mid. */
+function resolveBuySizingPrice01(args: {
+  limit01: number | null | undefined;
+  previewPrice01: number | null | undefined;
+  mid01: number | null | undefined;
+}): number | null {
+  for (const p of [args.limit01, args.previewPrice01, args.mid01]) {
+    if (p != null && Number.isFinite(p) && p > 0 && p < 1) return p;
+  }
+  return null;
+}
+
+function buyAmountExceedsCash(args: {
+  amtNum: number;
+  unit: 'dollars' | 'shares';
+  cashUsd: number;
+  price01: number | null;
+}): boolean {
+  if (!(args.cashUsd > 0) || !(args.amtNum > 0)) return false;
+  if (args.unit === 'dollars') return args.amtNum > args.cashUsd + 0.01;
+  if (args.price01 == null || !(args.price01 > 0)) return false;
+  return args.amtNum * args.price01 > args.cashUsd + 0.015;
 }
 
 function fmtCents(p01: number | null): string {
@@ -347,16 +537,11 @@ function clamp01(x: number): number {
 }
 
 function centsStrTo01(raw: string): number | null {
-  const s = raw.trim();
-  if (!s) return null;
-  const n = Number(s);
-  if (!Number.isFinite(n)) return null;
-  if (!(n > 0) || n >= 100) return null;
-  return clamp01(n / 100);
+  return bracketCentsStrTo01(raw);
 }
 
 /** Re-evaluate armed SL/TP this often (chart mid can move without bid poll changing). */
-const BRACKET_EVAL_MS = 100;
+const BRACKET_EVAL_MS = 250;
 /** CLOB top-of-book poll interval while SL/TP armed. */
 const BRACKET_POLL_MS = 150;
 /** Min gap between live bracket exit attempts when the prior exit did not fill. */
@@ -364,6 +549,19 @@ const BRACKET_EXIT_RETRY_MS = 600;
 
 function bracketExitCooldownActive(lastAttemptMs: number): boolean {
   return lastAttemptMs > 0 && Date.now() - lastAttemptMs < BRACKET_EXIT_RETRY_MS;
+}
+
+/** After cooldown, allow another exit attempt if the prior bracket sell did not fill. */
+function bracketExitReadyToFire(args: {
+  tok: string;
+  lastFireTokRef: { current: string | null };
+  lastAttemptMsRef: { current: number };
+}): boolean {
+  if (args.lastFireTokRef.current === args.tok) {
+    if (bracketExitCooldownActive(args.lastAttemptMsRef.current)) return false;
+    args.lastFireTokRef.current = null;
+  }
+  return true;
 }
 
 /** Clear edge memory so the next bid tick can cross (re-arm, tap-to-arm, or level change). */
@@ -666,8 +864,14 @@ export type SignalsTradePanelProps = {
     spreadCents: number | null;
     footnote: string;
   } | null;
+  /** Optional: ms until market end — tightens TP odds near expiry. */
+  endsInMs?: number | null;
+  /** Optional: PTB cross probability (0..1) from spot machine. */
+  crossProb?: number | null;
   lane?: 'up' | 'down';
   onLaneChange?: (lane: 'up' | 'down') => void;
+  /** Fused advisory from Signals desk (auto-ask). Falls back to book mids when null. */
+  buySideAdvisory?: BuySideAdvisory | null;
   visualStyle?: 'default' | 'sidebar' | 'slide';
 };
 
@@ -695,8 +899,11 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     bookDown = null,
     ptbContext = null,
     executionBrief = null,
+    endsInMs = null,
+    crossProb = null,
     lane: controlledLane,
     onLaneChange,
+    buySideAdvisory: buySideAdvisoryProp = null,
     visualStyle = 'default',
   } = props;
   const idBase = useId();
@@ -850,6 +1057,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     lane: 'up' | 'down';
     token: string;
   } | null>(null);
+  /** After buy submit / fill — stop auto TP/SL chase on the buy bundle until next session. */
+  const buyBundleChaseFrozenRef = useRef(false);
   const [pendingAutoBuy, setPendingAutoBuy] = useState<{
     lane: 'up' | 'down';
     at: number;
@@ -1111,10 +1320,18 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   );
 
   const isSlide = visualStyle === 'slide';
+  const tradeFloatChrome = useTradeFloatChrome();
   /** Slide trade dock: outcome trade vs brackets vs ledger. */
-  const [slideDockTab, setSlideDockTab] = useState<'outcome' | 'brackets' | 'ledger'>('outcome');
-  /** Keep Brackets tab when UP/DOWN token changes — avoid snapping to Outcome mid TP/SL edit. */
-  const preserveBracketsDockRef = useRef(false);
+  const [slideDockTab, setSlideDockTabState] = useState<SlideDockTab>(() => readSlideDockTab(marketSlug));
+  const setSlideDockTab = useCallback(
+    (tab: SlideDockTab) => {
+      writeSlideDockTab(tab, marketSlug);
+      setSlideDockTabState(tab);
+    },
+    [marketSlug],
+  );
+  /** Keep non-Outcome slide tab when UP/DOWN token changes — avoid snapping mid TP/SL or orders view. */
+  const preserveSlideDockRef = useRef(false);
   const showOutcomeDock = !isSlide || slideDockTab === 'outcome';
   const showBracketsDock = !isSlide || slideDockTab === 'brackets';
   const showLedgerDock = !isSlide || slideDockTab === 'ledger';
@@ -1162,11 +1379,41 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const positionSharesRef = useRef<number | null>(null);
   positionSharesRef.current = positionShares ?? null;
 
+  /** Best-effort max sell for a lane — cache first (sell policy, then display/history). */
+  const resolveInstantMaxSellShares = useCallback(
+    (L: 'up' | 'down'): number => {
+      if (accountMode === 'paper') {
+        const tok = L === 'up' ? upToken?.trim() : downToken?.trim();
+        const sh = tok ? getPaperPosition(paperAccount, tok).shares : 0;
+        return sh > 0 ? floorShares4(sh) : 0;
+      }
+      const sell = liveLaneShares('sell', L);
+      if (sell > 0) return sell;
+      const display = liveLaneShares('display', L);
+      return display > 0 ? display : 0;
+    },
+    [accountMode, liveLaneShares, paperAccount, upToken, downToken],
+  );
+
   /** Re-run bracket triggers on a timer while armed (live mids can update without React state churn). */
   /** CLOB poll target while SL/TP armed — tracks bracket token even when the UP/DOWN tab differs. */
   const [bracketPollToken, setBracketPollToken] = useState<string | null>(null);
   /** SL/TP editor + localStorage follow the visible UP/DOWN tab (like limit price). */
   const riskPrefsToken = token?.trim() || '';
+  const pinBracketAutomationToken = useCallback(
+    (tok: string, laneHint?: 'up' | 'down') => {
+      const id = tok.trim();
+      if (!id) return;
+      const L =
+        laneHint ??
+        (id === upToken?.trim() ? 'up' : id === downToken?.trim() ? 'down' : bracketOutcomeLaneRef.current ?? lane);
+      bracketOutcomeTokenRef.current = id;
+      bracketOutcomeLaneRef.current = L;
+      bracketHadPositionRef.current = true;
+      setBracketPollToken(id);
+    },
+    [lane, upToken, downToken],
+  );
   const armedBracketLane = useMemo((): 'up' | 'down' | null => {
     const pt = bracketPollToken?.trim();
     if (!pt) return null;
@@ -1174,6 +1421,12 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     if (downToken?.trim() && pt === downToken.trim()) return 'down';
     return bracketOutcomeLaneRef.current;
   }, [bracketPollToken, upToken, downToken]);
+
+  const bracketPositionShares = useMemo((): number | null => {
+    const L = armedBracketLane ?? bracketOutcomeLaneRef.current ?? lane;
+    const sh = resolveInstantMaxSellShares(L);
+    return sh > 0 ? sh : null;
+  }, [armedBracketLane, lane, resolveInstantMaxSellShares]);
 
   const resolvedBullpenOutcome = useMemo(
     () =>
@@ -1202,8 +1455,13 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const [stopPollBid01, setStopPollBid01] = useState<number | null>(null);
   const [stopPollAsk01, setStopPollAsk01] = useState<number | null>(null);
   const [stopPollAtMs, setStopPollAtMs] = useState<number | null>(null);
-  /** Forces SL/TP trigger loops to re-run between bid polls (chart mid / last trade). */
-  const [bracketEvalTick, setBracketEvalTick] = useState(0);
+  /** Ref-based bracket eval — avoids 10Hz React re-renders from a tick counter. */
+  const slBracketEvalRef = useRef<() => void>(() => {});
+  const tpBracketEvalRef = useRef<() => void>(() => {});
+  const deskScalpPrefsRef = useRef(loadNowPriceDeskScalpPrefs());
+  /** Track armed bracket lane had size — detect manual sells when CLOB goes flat. */
+  const bracketHadPositionRef = useRef(false);
+  const externalFlatNotifiedTokRef = useRef<string | null>(null);
   const stopLossFireLockRef = useRef(false);
   const stopLossLastAttemptMsRef = useRef(0);
   const stopLossLastFireTokRef = useRef<string | null>(null);
@@ -1242,6 +1500,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const [suggestedTpCents, setSuggestedTpCents] = useState('');
   /** Emergency stop (+ optional TP) staged before buy — arms SL on fill; SL persists per lane. */
   const [buyBundleByLane, setBuyBundleByLane] = useState(() => {
+    const prefs = loadEmergencyStopBundlePrefs();
+    if (!prefs.autoFillSl) return { ...EMPTY_BUY_BUNDLE_BY_LANE };
     const em = loadEmergencyStopByLane();
     return {
       up: { sl: em.up, tp: '' },
@@ -1252,6 +1512,37 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   buyBundleByLaneRef.current = buyBundleByLane;
   const buyBundleSlCents = buyBundleByLane[lane].sl;
   const buyBundleTpCents = buyBundleByLane[lane].tp;
+  /** Last auto-applied buy-bundle TP per lane — lets quote assist chase the book until operator overrides. */
+  const autoBundleTpLaneRef = useRef<{ lane: 'up' | 'down'; cents: string } | null>(null);
+  const autoBundleSlLaneRef = useRef<{ lane: 'up' | 'down'; cents: string } | null>(null);
+  const buyBundleSlManualLanesRef = useRef<{ up: boolean; down: boolean }>({ up: false, down: false });
+  const buyBundleTpManualLanesRef = useRef<{ up: boolean; down: boolean }>({ up: false, down: false });
+  const buyBundleTpDraftRef = useRef<{ up: BracketInputDraftState; down: BracketInputDraftState }>({
+    up: EMPTY_BRACKET_INPUT_DRAFT,
+    down: EMPTY_BRACKET_INPUT_DRAFT,
+  });
+  const buyBundleSlDraftRef = useRef<{ up: BracketInputDraftState; down: BracketInputDraftState }>({
+    up: EMPTY_BRACKET_INPUT_DRAFT,
+    down: EMPTY_BRACKET_INPUT_DRAFT,
+  });
+  /** Buy submit intent — survives until exchange fill so staged ¢ beats stale Brackets-tab TP. */
+  const pendingBuyBundleIntentRef = useRef<{
+    lane: 'up' | 'down';
+    token: string;
+    sl: string;
+    tp: string;
+  } | null>(null);
+  /** Pin buy-bundle entry/size readouts while composing — ignore live quote ticks until amount/limit/lane changes. */
+  const buyBracketSizingPinRef = useRef<{
+    key: string;
+    entry01: number | null;
+    shares: number | null;
+    notional: number | null;
+  } | null>(null);
+  const bracketSharesSyncRef = useRef<number | null>(null);
+  const [emergencyStopBundlePrefs, setEmergencyStopBundlePrefs] = useState<EmergencyStopBundlePrefs>(() =>
+    loadEmergencyStopBundlePrefs(),
+  );
   const [takeProfitSimple, setTakeProfitSimple] = useState(true);
   const [takeProfitDualBook, setTakeProfitDualBook] = useState(false);
   const takeProfitFireLockRef = useRef(false);
@@ -1262,6 +1553,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const takeProfitPrevAskRef = useRef<number | null>(null);
   /** Strip mid (chart line) edge memory when TP dual-book mode is on. */
   const takeProfitPrevStripMidRef = useRef<number | null>(null);
+  /** Trailing-profit peak mark per armed token. */
+  const trailingTpPeakByTokRef = useRef<Map<string, number>>(new Map());
 
   const syncBracketPinFromOperatorEdits = useCallback(
     (partial?: { stopCents?: string; tpCents?: string }) => {
@@ -1284,8 +1577,9 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     [lane, stopLossStopCents, takeProfitTakeCents, downToken, upToken],
   );
 
-  /** Keep armed pin aligned with the ¢ fields automation actually watches (localStorage load, edits, etc.). */
+  /** Keep armed pin aligned with operator edits — never chase live quote after a desk buy lock. */
   useEffect(() => {
+    if (operatorSlTpLockedRef.current) return;
     if (!stopLossEnabled && !takeProfitEnabled) return;
     if (!stopLossStopCents.trim() && !takeProfitTakeCents.trim()) return;
     syncBracketPinFromOperatorEdits();
@@ -1301,12 +1595,36 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const [riskSellSheet, setRiskSellSheet] = useState<null | 'sl' | 'tp' | 'settings'>(null);
 
   useEffect(() => {
-    preserveBracketsDockRef.current =
+    preserveSlideDockRef.current =
       slideDockTab !== 'outcome' ||
       riskSellSheet === 'sl' ||
       riskSellSheet === 'tp' ||
       riskSellSheet === 'settings';
   }, [slideDockTab, riskSellSheet]);
+
+  const slideDockTabsEl = useMemo(
+    () =>
+      isSlide ? (
+        <TradeSegmentedControl
+          value={slideDockTab}
+          onChange={(v) => setSlideDockTab(v as SlideDockTab)}
+          options={[
+            { value: 'outcome', label: 'Outcome', title: 'Pick side, size, buy / sell' },
+            { value: 'brackets', label: 'Brackets', title: 'Stop-loss & take-profit automation' },
+            { value: 'ledger', label: 'Orders & position', title: 'Open orders, book, balances' },
+          ]}
+          className="w-full"
+          size="md"
+        />
+      ) : null,
+    [isSlide, setSlideDockTab, slideDockTab],
+  );
+
+  useEffect(() => {
+    if (!tradeFloatChrome || !isSlide) return;
+    tradeFloatChrome.setSubHeader(slideDockTabsEl);
+    return () => tradeFloatChrome.setSubHeader(null);
+  }, [isSlide, slideDockTabsEl, tradeFloatChrome]);
 
   useEffect(() => {
     const onRisk = (ev: Event) => {
@@ -1449,8 +1767,39 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const [armRiskAfterBuy, setArmRiskAfterBuy] = useState<ArmRiskAfterBuyPrefs>(() => loadArmRiskAfterBuyPrefs());
   /** Latest trade-card TP/SL from Signals desk (see `dispatchSignalRiskLevels`). */
   const signalRiskRef = useRef<SignalRiskSnapshot | null>(null);
+  const [signalRiskSnapshot, setSignalRiskSnapshot] = useState<SignalRiskSnapshot | null>(null);
   /** Planning reference (PTB overlays / drag sync; does not auto-trade). */
   const [planStandardCents, setPlanStandardCents] = useState('');
+
+  const bookFallbackBuyAdvisory = useMemo(() => {
+    const lastUp = probMomentumUp?.length ? probMomentumUp[probMomentumUp.length - 1]!.v : null;
+    const lastDown = probMomentumDown?.length ? probMomentumDown[probMomentumDown.length - 1]!.v : null;
+    const midU = bookMidUp ?? upMid;
+    const midD = bookMidDown ?? downMid;
+    return shouldBuyWhichSide({
+      machine: null,
+      book: {
+        dual: null,
+        wallFlow: null,
+        probUp: lastUp != null && Number.isFinite(lastUp) ? lastUp : midU,
+        probDown: lastDown != null && Number.isFinite(lastDown) ? lastDown : midD,
+        midUp: midU != null && Number.isFinite(midU) ? midU : null,
+        midDown: midD != null && Number.isFinite(midD) ? midD : null,
+      },
+      tape: null,
+      tapeLane: null,
+      forecast: null,
+      directive: null,
+      stability: null,
+      upLabel,
+      downLabel,
+    });
+  }, [bookMidDown, bookMidUp, downLabel, downMid, probMomentumDown, probMomentumUp, upLabel, upMid]);
+
+  const effectiveBuySideAdvisory = useMemo(
+    () => pickStrongerBuyAdvisory(buySideAdvisoryProp, bookFallbackBuyAdvisory),
+    [bookFallbackBuyAdvisory, buySideAdvisoryProp],
+  );
 
   useEffect(() => {
     const slugKey = marketSlug?.trim() ?? '';
@@ -1467,10 +1816,17 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       ) {
         return;
       }
-      signalRiskRef.current = { ...d, updatedAtMs: Date.now() };
+      const snap: SignalRiskSnapshot = { ...d, updatedAtMs: Date.now() };
+      signalRiskRef.current = snap;
+      setSignalRiskSnapshot(snap);
     };
     window.addEventListener(BPX_SIGNAL_RISK_LEVELS_EVENT, onSignalRisk as EventListener);
     return () => window.removeEventListener(BPX_SIGNAL_RISK_LEVELS_EVENT, onSignalRisk as EventListener);
+  }, [marketSlug]);
+
+  useEffect(() => {
+    signalRiskRef.current = null;
+    setSignalRiskSnapshot(null);
   }, [marketSlug]);
 
   const riskCardRef = useRef<HTMLDivElement | null>(null);
@@ -1576,13 +1932,38 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       });
     };
     tick();
-    // Fallback polling while tab is visible (WS / REST books are primary; this keeps mark/TP honest).
-    const id = window.setInterval(tick, 2_500);
+    const bracketWatch =
+      stopLossEnabled || takeProfitEnabled || Boolean(bracketPollToken?.trim());
+    const lastTradeMs = bracketWatch ? 600 : 2_500;
+    const id = window.setInterval(tick, lastTradeMs);
     return () => {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [accountMode, upToken, downToken, fetchLastTradesBoth]);
+  }, [accountMode, upToken, downToken, fetchLastTradesBoth, bracketPollToken, stopLossEnabled, takeProfitEnabled]);
+
+  /** Resume CLOB polling for whichever outcome still has armed SL/TP in storage (survives refresh / tab switch). */
+  useEffect(() => {
+    if (!upToken?.trim() && !downToken?.trim()) return;
+    const cur = bracketPollToken?.trim();
+    if (cur) {
+      const sl = loadStopLossConfigFromStorage(cur);
+      const tp = loadTakeProfitConfigFromStorage(cur);
+      if (sl?.enabled || tp?.enabled) return;
+    }
+    for (const entry of [
+      { tok: upToken?.trim(), lane: 'up' as const },
+      { tok: downToken?.trim(), lane: 'down' as const },
+    ]) {
+      if (!entry.tok) continue;
+      const sl = loadStopLossConfigFromStorage(entry.tok);
+      const tp = loadTakeProfitConfigFromStorage(entry.tok);
+      if (sl?.enabled || tp?.enabled) {
+        pinBracketAutomationToken(entry.tok, entry.lane);
+        return;
+      }
+    }
+  }, [bracketPollToken, downToken, pinBracketAutomationToken, upToken]);
 
   const liveAvgEntry = lane === 'up' ? avgEntryUp : avgEntryDown;
   const paperUpPos = useMemo(() => getPaperPosition(paperAccount, upToken), [paperAccount, upToken]);
@@ -1693,7 +2074,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     const now = Date.now();
     return historyRows
       .filter((r) => r.mode === 'live' && r.token.trim() === tid)
-      .filter((r) => r.status === 'sending' || r.status === 'pending' || r.status === 'sent' || r.status === 'partial')
+      .filter((r) => liveRowCancelable(r))
       .filter((r) => (r.ts ?? 0) > 0 && now - (r.ts ?? 0) <= 5 * 60_000)
       .slice()
       .sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))
@@ -1708,19 +2089,6 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       const a = String(audit ?? '').toLowerCase();
       return a.includes('stop_loss') || a.includes('take_profit');
     };
-    // Always show local fills immediately; merge in confirmed CLOB fills when available.
-    const localBase = historyRows
-      .filter((r) => {
-        if (r.token.trim() !== tid || r.mode !== modeWant) return false;
-        if (r.status === 'filled' || r.status === 'partial') {
-          if (modeWant === 'live' && !rowShowsExchangeFill(r)) return false;
-          return true;
-        }
-        return false;
-      })
-      .slice()
-      .sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0));
-
     type TapeAgg = { sumPxSh: number; sumSh: number; lastMs: number };
     const fillsForTok = accountMode === 'live' ? myFills.filter((f) => f.token_id.trim() === tid) : [];
     const tapeAggByOrderId = new Map<string, TapeAgg>();
@@ -1768,7 +2136,18 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       return r;
     };
 
-    const local = localBase.map(upgradeBracketRowFromTape);
+    // Upgrade local SL/TP rows from tape before filtering for fills. A live TP can still be
+    // locally `sent` when the CLOB tape already confirms the sell.
+    const local = historyRows
+      .filter((r) => r.token.trim() === tid && r.mode === modeWant)
+      .map(upgradeBracketRowFromTape)
+      .filter((r) => {
+        if (r.status !== 'filled' && r.status !== 'partial') return false;
+        if (modeWant === 'live' && !rowShowsExchangeFill(r)) return false;
+        return true;
+      })
+      .slice()
+      .sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0));
 
     if (accountMode !== 'live' || !myFills.length) return local.slice(0, 12);
 
@@ -1986,27 +2365,13 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   ]);
 
   const targets = useMemo(() => {
-    const quote = executableQuote01;
-    if (quote == null || !Number.isFinite(quote) || quote <= 0) return null;
-    const bid = bookTouch?.bestBid != null && bookTouch.bestBid > 0 ? roundPrice01(bookTouch.bestBid) : null;
-    const ask = bookTouch?.bestAsk != null && bookTouch.bestAsk > 0 ? roundPrice01(bookTouch.bestAsk) : null;
-    const spread01 = bid != null && ask != null ? Math.max(0, ask - bid) : 0;
-    const tick01 = 0.001; // 0.1¢
-    const base = Math.max(tick01 * 3, spread01 || tick01 * 5);
-    const tp01 = Math.min(0.99, Math.max(0.01, quote + base * 3));
-    const stop01 = Math.min(0.99, Math.max(0.01, quote - base * 2));
-    const tpCents = (tp01 * 100).toFixed(1);
-    const stopCents = (stop01 * 100).toFixed(1);
     const sideLabel = action === 'buy' ? 'TP (sell)' : 'TP (buyback)';
-    return {
-      tp01,
-      stop01,
-      tpCents,
-      stopCents,
+    return buildQuoteAssistTargets({
+      quote01: executableQuote01,
+      bestBid: bookTouch?.bestBid,
+      bestAsk: bookTouch?.bestAsk,
       sideLabel,
-      quoteCents: (quote * 100).toFixed(1),
-      spreadCents: (spread01 * 100).toFixed(2),
-    };
+    });
   }, [action, bookTouch, executableQuote01]);
 
   /** Seed resting bid (¢) from the book when the outcome changes; do not chase every tick once set for that token. */
@@ -2238,6 +2603,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       bracketOutcomeTokenRef.current = null;
       bracketOutcomeLaneRef.current = null;
       setBracketPollToken(null);
+      trailingTpPeakByTokRef.current.clear();
       dispatchSignalsClearHold({ lane });
       if (!stopLossEnabled && !takeProfitEnabled) return;
       if (stopLossEnabled) {
@@ -2281,6 +2647,111 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       setTakeProfitStatus('ARMED');
     }
   }, [lane, stopLossEnabled, takeProfitEnabled]);
+
+  /** Disarm SL/TP / desk exits when the exchange shows zero shares (sold on Polymarket / Bullpen). */
+  const maybeDisarmOnManualFlat = useCallback(() => {
+    const deskRisk =
+      deskScalpPrefsRef.current.trailingProfit || deskScalpPrefsRef.current.takeLossWhenDeskTpBelowEntry;
+    const automationOn =
+      stopLossEnabled ||
+      takeProfitEnabled ||
+      Boolean(bracketPollToken?.trim()) ||
+      deskRisk;
+    if (!automationOn) {
+      bracketHadPositionRef.current = false;
+      externalFlatNotifiedTokRef.current = null;
+      return;
+    }
+
+    const L = armedBracketLane ?? bracketOutcomeLaneRef.current ?? lane;
+    const tok =
+      bracketPollToken?.trim() ||
+      bracketOutcomeTokenRef.current?.trim() ||
+      (L === 'up' ? upToken?.trim() : downToken?.trim()) ||
+      '';
+    const clobBal = L === 'up' ? balUp : balDown;
+    const sellSh = liveLaneShares('sell', L);
+
+    if (sellSh > 0) {
+      bracketHadPositionRef.current = true;
+      externalFlatNotifiedTokRef.current = null;
+      return;
+    }
+    if (!isExternallyFlatPosition({ clobBal, sellShares: sellSh })) return;
+
+    const hadTracked =
+      bracketHadPositionRef.current ||
+      stopLossEnabled ||
+      takeProfitEnabled ||
+      Boolean(bracketPollToken?.trim());
+    if (!hadTracked) return;
+
+    bracketHadPositionRef.current = false;
+    syncRiskAutomationAfterSellFill(0);
+
+    if (externalFlatNotifiedTokRef.current !== tok) {
+      externalFlatNotifiedTokRef.current = tok;
+      pushTradeActivity('Position flat (sold elsewhere) — automation disarmed');
+      pushToast('info', 'Position closed manually — SL/TP and desk exits turned off.', 6500);
+      if (tok && accountMode === 'live') {
+        void reconcileTradeHistoryFromClob(tok, { force: true }).then(() => setHistoryRows(loadTradeHistory()));
+      }
+    }
+  }, [
+    accountMode,
+    armedBracketLane,
+    balDown,
+    balUp,
+    bracketPollToken,
+    lane,
+    liveLaneShares,
+    pushToast,
+    pushTradeActivity,
+    stopLossEnabled,
+    syncRiskAutomationAfterSellFill,
+    takeProfitEnabled,
+    downToken,
+    upToken,
+  ]);
+
+  const applyInstantMaxSellQty = useCallback(
+    (shares: number) => {
+      const v = floorSharesWhole(shares);
+      if (!(v > 0)) {
+        setSellQty('0');
+        syncRiskAutomationAfterSellFill(0);
+        return;
+      }
+      setSellQty(String(v));
+      syncRiskAutomationAfterSellFill(v);
+    },
+    [syncRiskAutomationAfterSellFill],
+  );
+
+  const applyMaxSellFromCache = useCallback(
+    (targetLane?: 'up' | 'down') => {
+      const L = targetLane ?? lane;
+      const sh = resolveInstantMaxSellShares(L);
+      applyInstantMaxSellQty(sh);
+      return sh;
+    },
+    [applyInstantMaxSellQty, lane, resolveInstantMaxSellShares],
+  );
+
+  const syncBracketSharesFromPosition = useCallback(
+    (shares: number) => {
+      const rem = floorShares4(shares);
+      if (!(rem > 0)) return;
+      const s = String(rem);
+      if (stopLossEnabled && (stopLossSimple || !stopLossShares.trim())) {
+        setStopLossShares((prev) => (prev === s ? prev : s));
+      }
+      if (takeProfitEnabled && (takeProfitSimple || !takeProfitShares.trim())) {
+        setTakeProfitShares((prev) => (prev === s ? prev : s));
+      }
+    },
+    [stopLossEnabled, stopLossShares, stopLossSimple, takeProfitEnabled, takeProfitShares, takeProfitSimple],
+  );
 
   useEffect(() => {
     if (!okMsg) return;
@@ -2482,7 +2953,15 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   }, [armRiskAfterBuy]);
 
   useEffect(() => {
-    const keepSlideDock = isSlide && preserveBracketsDockRef.current;
+    try {
+      window.localStorage.setItem(EMERGENCY_STOP_BUNDLE_PREFS_KEY, JSON.stringify(emergencyStopBundlePrefs));
+    } catch {
+      /* ignore */
+    }
+  }, [emergencyStopBundlePrefs]);
+
+  useEffect(() => {
+    const keepSlideDock = isSlide && preserveSlideDockRef.current;
     if (!keepSlideDock) {
       setRiskSellSheet(null);
     }
@@ -2492,20 +2971,31 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     if (!keepSlideDock) {
       bracketArmedPinRef.current = null;
       operatorSlTpLockedRef.current = false;
+      buyBundleChaseFrozenRef.current = false;
     }
   }, [token, isSlide]);
 
+  const prevMarketSlugForDockRef = useRef<string | undefined>(undefined);
   useEffect(() => {
-    preserveBracketsDockRef.current = false;
+    const slug = marketSlug?.trim() ?? '';
+    const prev = prevMarketSlugForDockRef.current;
+    const marketChanged = prev !== undefined && prev !== slug;
+    prevMarketSlugForDockRef.current = slug;
+    if (marketChanged) {
+      preserveSlideDockRef.current = false;
+      setSlideDockTab('outcome');
+    }
     setRiskSellSheet(null);
     setPlanStandardCents('');
-    setSlideDockTab('outcome');
     buyRiskArmedRowIdsRef.current.clear();
     buyReconcileToastRowIdsRef.current.clear();
-    bracketArmedPinRef.current = null;
-    operatorSlTpLockedRef.current = false;
-    setBracketPollToken(null);
-  }, [marketSlug]);
+    if (marketChanged) {
+      bracketArmedPinRef.current = null;
+      operatorSlTpLockedRef.current = false;
+      buyBundleChaseFrozenRef.current = false;
+      setBracketPollToken(null);
+    }
+  }, [marketSlug, setSlideDockTab]);
 
   const avgEntry = accountMode === 'paper' ? paperPos.avgCost01 : liveAvgEntry;
 
@@ -2577,7 +3067,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
             : 0;
       const shStr = sh > 0 ? String(sh) : null;
       const overwrite = opts.forceOverwrite === true;
-      if (overwrite) {
+      if (overwrite && !operatorSlTpLockedRef.current) {
         operatorSlTpLockedRef.current = false;
         bracketArmedPinRef.current = null;
       }
@@ -2678,6 +3168,9 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       const sh = floorShares4(sharesFilled);
       if (!(sh > 0)) return;
       const rl = riskLane ?? deskBuyLaneRef.current ?? lane;
+      if (operatorSlTpLockedRef.current || buyBundleChaseFrozenRef.current || buyBundleArmRef.current) {
+        return;
+      }
       const signalSnap = cloneSignalRiskSnapshot(signalRiskRef.current);
       const deskHasLevels =
         (stopLossEnabled && stopLossStopCents.trim()) || (takeProfitEnabled && takeProfitTakeCents.trim());
@@ -2702,12 +3195,47 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     [applyArmRiskLevels, pushToast],
   );
 
+  const syncDeskTakeProfitArm = useCallback(
+    (tpCents: string, shares: number | null | undefined, storageTok?: string | null) => {
+      const t = tpCents.trim();
+      if (!t) return;
+      setTakeProfitTakeCents(t);
+      setTakeProfitLimitCents(t);
+      setTakeProfitEnabled(true);
+      setTakeProfitStatus('ARMED');
+      const sh =
+        shares != null && Number.isFinite(shares) && shares > 0 ? floorShares4(shares) : NaN;
+      if (Number.isFinite(sh) && sh > 0) setTakeProfitShares(String(sh));
+      const tok = (storageTok ?? bracketOutcomeTokenRef.current ?? token)?.trim() ?? '';
+      if (tok && Number.isFinite(sh) && sh > 0) {
+        const take01 = bracketCentsStrTo01(t);
+        if (take01 != null) {
+          saveTakeProfitConfigToStorage(tok, {
+            enabled: true,
+            take01: clamp01(take01),
+            limit01: clamp01(take01),
+            shares: sh,
+            simple: takeProfitSimple,
+            dualBook: takeProfitDualBook,
+          });
+        }
+      }
+    },
+    [takeProfitDualBook, takeProfitSimple, token],
+  );
+
   const applyFilledBuyBundle = useCallback(
     (params: { rowTok: string; riskLane: 'up' | 'down'; shares: number; sl: string; tp: string }) => {
       const shStr = params.shares > 0 ? String(floorShares4(params.shares)) : '';
+      const shNum = shStr ? Number(shStr) : NaN;
+      const storageTok = params.rowTok.trim();
       operatorSlTpLockedRef.current = true;
       bracketOutcomeLaneRef.current = params.riskLane;
       bracketOutcomeTokenRef.current = params.rowTok;
+      bracketLaneDraftRef.current[params.riskLane] = {
+        sl: params.sl || bracketLaneDraftRef.current[params.riskLane].sl,
+        tp: params.tp || bracketLaneDraftRef.current[params.riskLane].tp,
+      };
       if (params.sl) {
         setStopLossStopCents(params.sl);
         setStopLossLimitCents(params.sl);
@@ -2716,11 +3244,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         if (shStr) setStopLossShares(shStr);
       }
       if (params.tp) {
-        setTakeProfitTakeCents(params.tp);
-        setTakeProfitLimitCents(params.tp);
-        setTakeProfitEnabled(true);
-        setTakeProfitStatus('ARMED');
-        if (shStr) setTakeProfitShares(shStr);
+        syncDeskTakeProfitArm(params.tp, shNum, storageTok);
       }
       bracketArmedPinRef.current = {
         token: params.rowTok,
@@ -2731,8 +3255,41 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         armedAtMs: Date.now(),
       };
       setBracketPollToken(params.rowTok);
+      if (storageTok) {
+        saveBracketLevelsDraft(storageTok, {
+          sl: params.sl || bracketLaneDraftRef.current[params.riskLane].sl,
+          tp: params.tp || bracketLaneDraftRef.current[params.riskLane].tp,
+        });
+        if (params.sl && Number.isFinite(shNum) && shNum > 0) {
+          const stop01 = bracketCentsStrTo01(params.sl);
+          if (stop01 != null) {
+            saveStopLossConfigToStorage(storageTok, {
+              enabled: true,
+              stop01: clamp01(stop01),
+              limit01: clamp01(stop01),
+              shares: shNum,
+              simple: stopLossSimple,
+              dualBook: stopLossDualBook,
+            });
+          }
+        }
+        if (params.tp && Number.isFinite(shNum) && shNum > 0) {
+          const take01 = bracketCentsStrTo01(params.tp);
+          if (take01 != null) {
+            saveTakeProfitConfigToStorage(storageTok, {
+              enabled: true,
+              take01: clamp01(take01),
+              limit01: clamp01(take01),
+              shares: shNum,
+              simple: takeProfitSimple,
+              dualBook: takeProfitDualBook,
+            });
+          }
+        }
+      }
+      setBuyBundleByLane((prev) => ({ ...prev, [params.riskLane]: { sl: '', tp: '' } }));
     },
-    [],
+    [stopLossDualBook, stopLossSimple, syncDeskTakeProfitArm, takeProfitDualBook, takeProfitSimple],
   );
 
   /** When Auto-arm SL/TP is checked — apply card/spread levels immediately (not only after next buy). */
@@ -2740,10 +3297,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     const prefs = prefsOverride ?? armRiskAfterBuy;
     const { armSl, armTp } = resolveArmFlags(armRiskAfterBuy, prefsOverride);
     if (!armSl && !armTp) return;
-    if (operatorSlTpLockedRef.current && bracketArmedPinRef.current) {
-      return;
-    }
-    operatorSlTpLockedRef.current = false;
+    if (operatorSlTpLockedRef.current) return;
     const riskLane = deskBuyLaneRef.current ?? lane;
     const snap = signalRiskRef.current;
     const riskMid =
@@ -2806,11 +3360,9 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
           ...p,
           autoArmEnabled: enabled,
           armSl: enabled ? p.armSl || true : false,
-          armTp: enabled ? p.armTp || true : false,
+          armTp: enabled ? p.armTp : false,
         };
-        if (enabled) {
-          operatorSlTpLockedRef.current = false;
-          bracketArmedPinRef.current = null;
+        if (enabled && !operatorSlTpLockedRef.current) {
           queueMicrotask(() => applyArmRiskNow(merged));
         }
         return merged;
@@ -2823,9 +3375,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     (checked: boolean) => {
       setArmRiskAfterBuy((p) => {
         const merged = { ...p, autoArmEnabled: checked || p.autoArmEnabled, armSl: checked };
-        if (checked) {
-          operatorSlTpLockedRef.current = false;
-          bracketArmedPinRef.current = null;
+        if (checked && !operatorSlTpLockedRef.current) {
           queueMicrotask(() => applyArmRiskNow(merged));
         }
         return merged;
@@ -2838,9 +3388,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     (checked: boolean) => {
       setArmRiskAfterBuy((p) => {
         const merged = { ...p, autoArmEnabled: checked || p.autoArmEnabled, armTp: checked };
-        if (checked) {
-          operatorSlTpLockedRef.current = false;
-          bracketArmedPinRef.current = null;
+        if (checked && !operatorSlTpLockedRef.current) {
           queueMicrotask(() => applyArmRiskNow(merged));
         }
         return merged;
@@ -2922,8 +3470,33 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         setTakeProfitTakeCents(takeStr);
         if (takeProfitSimple) setTakeProfitLimitCents(takeStr);
       }
-      if (!takeProfitShares.trim() && positionShares != null && positionShares > 0) {
-        setTakeProfitShares(String(floorShares4(positionShares)));
+      const sh =
+        Number(takeProfitShares) > 0
+          ? floorShares4(Number(takeProfitShares))
+          : positionShares != null && positionShares > 0
+            ? floorShares4(positionShares)
+            : NaN;
+      if (!takeProfitShares.trim() && Number.isFinite(sh) && sh > 0) {
+        setTakeProfitShares(String(sh));
+      }
+      if (pollTokTp && takeStr && Number.isFinite(sh) && sh > 0) {
+        const take01 = bracketCentsStrTo01(takeStr);
+        const limitStr = takeProfitSimple ? takeStr : takeProfitLimitCents.trim() || takeStr;
+        const limit01 = bracketCentsStrTo01(limitStr) ?? take01;
+        if (take01 != null && limit01 != null) {
+          saveTakeProfitConfigToStorage(pollTokTp, {
+            enabled: true,
+            take01: clamp01(take01),
+            limit01: clamp01(limit01),
+            shares: sh,
+            simple: takeProfitSimple,
+            dualBook: takeProfitDualBook,
+          });
+          saveBracketLevelsDraft(pollTokTp, {
+            sl: stopLossStopCentsRef.current,
+            tp: takeStr,
+          });
+        }
       }
       return { applied: Boolean(takeStr), tpCents: takeStr };
     },
@@ -2938,6 +3511,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       lane,
       positionShares,
       riskTargetsFromEntry,
+      takeProfitDualBook,
+      takeProfitLimitCents,
       takeProfitSimple,
       takeProfitTakeCents,
       takeProfitShares,
@@ -3021,8 +3596,33 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         setStopLossStopCents(stopStr);
         if (stopLossSimple) setStopLossLimitCents(stopStr);
       }
-      if (!stopLossShares.trim() && positionShares != null && positionShares > 0) {
-        setStopLossShares(String(floorShares4(positionShares)));
+      const sh =
+        Number(stopLossShares) > 0
+          ? floorShares4(Number(stopLossShares))
+          : positionShares != null && positionShares > 0
+            ? floorShares4(positionShares)
+            : NaN;
+      if (!stopLossShares.trim() && Number.isFinite(sh) && sh > 0) {
+        setStopLossShares(String(sh));
+      }
+      if (pollTokSl && stopStr && Number.isFinite(sh) && sh > 0) {
+        const stop01 = bracketCentsStrTo01(stopStr);
+        const limitStr = stopLossSimple ? stopStr : stopLossLimitCents.trim() || stopStr;
+        const limit01 = bracketCentsStrTo01(limitStr) ?? stop01;
+        if (stop01 != null && limit01 != null) {
+          saveStopLossConfigToStorage(pollTokSl, {
+            enabled: true,
+            stop01: clamp01(stop01),
+            limit01: clamp01(limit01),
+            shares: sh,
+            simple: stopLossSimple,
+            dualBook: stopLossDualBook,
+          });
+          saveBracketLevelsDraft(pollTokSl, {
+            sl: stopStr,
+            tp: takeProfitTakeCentsRef.current,
+          });
+        }
       }
       return { applied: Boolean(stopStr), stopCents: stopStr };
     },
@@ -3037,6 +3637,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       lane,
       positionShares,
       riskTargetsFromEntry,
+      stopLossDualBook,
+      stopLossLimitCents,
       stopLossSimple,
       stopLossStopCents,
       stopLossShares,
@@ -3122,17 +3724,54 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       setStopLossLimitCents(v);
       setBuyBundleByLane((prev) => ({ ...prev, [lane]: { ...prev[lane], sl: v } }));
       syncBracketPinFromOperatorEdits({ stopCents: v });
+      const storageTok =
+        bracketPollToken?.trim() ||
+        bracketOutcomeTokenRef.current?.trim() ||
+        riskPrefsToken ||
+        '';
       if (riskPrefsToken) {
         saveBracketLevelsDraft(riskPrefsToken, {
           sl: v,
           tp: takeProfitTakeCentsRef.current,
         });
       }
+      if (storageTok) {
+        saveBracketLevelsDraft(storageTok, { sl: v, tp: takeProfitTakeCentsRef.current });
+      }
       if (positionShares != null && positionShares > 0) {
         setStopLossShares(String(floorShares4(positionShares)));
       }
+      if (stopLossEnabled && storageTok) {
+        const stop01 = bracketCentsStrTo01(v);
+        const sh =
+          Number(stopLossShares) > 0
+            ? Number(stopLossShares)
+            : positionShares != null && positionShares > 0
+              ? floorShares4(positionShares)
+              : NaN;
+        if (stop01 != null && Number.isFinite(sh) && sh > 0) {
+          saveStopLossConfigToStorage(storageTok, {
+            enabled: true,
+            stop01: clamp01(stop01),
+            limit01: clamp01(stop01),
+            shares: sh,
+            simple: stopLossSimple,
+            dualBook: stopLossDualBook,
+          });
+        }
+      }
     },
-    [lane, positionShares, riskPrefsToken, syncBracketPinFromOperatorEdits],
+    [
+      bracketPollToken,
+      lane,
+      positionShares,
+      riskPrefsToken,
+      stopLossDualBook,
+      stopLossEnabled,
+      stopLossShares,
+      stopLossSimple,
+      syncBracketPinFromOperatorEdits,
+    ],
   );
 
   const applyTakeProfitTriggerCents = useCallback(
@@ -3143,17 +3782,54 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       setTakeProfitLimitCents(v);
       setBuyBundleByLane((prev) => ({ ...prev, [lane]: { ...prev[lane], tp: v } }));
       syncBracketPinFromOperatorEdits({ tpCents: v });
+      const storageTok =
+        bracketPollToken?.trim() ||
+        bracketOutcomeTokenRef.current?.trim() ||
+        riskPrefsToken ||
+        '';
       if (riskPrefsToken) {
         saveBracketLevelsDraft(riskPrefsToken, {
           sl: stopLossStopCentsRef.current,
           tp: v,
         });
       }
+      if (storageTok) {
+        saveBracketLevelsDraft(storageTok, { sl: stopLossStopCentsRef.current, tp: v });
+      }
       if (positionShares != null && positionShares > 0) {
         setTakeProfitShares(String(floorShares4(positionShares)));
       }
+      if (takeProfitEnabled && storageTok) {
+        const take01 = bracketCentsStrTo01(v);
+        const sh =
+          Number(takeProfitShares) > 0
+            ? Number(takeProfitShares)
+            : positionShares != null && positionShares > 0
+              ? floorShares4(positionShares)
+              : NaN;
+        if (take01 != null && Number.isFinite(sh) && sh > 0) {
+          saveTakeProfitConfigToStorage(storageTok, {
+            enabled: true,
+            take01: clamp01(take01),
+            limit01: clamp01(take01),
+            shares: sh,
+            simple: takeProfitSimple,
+            dualBook: takeProfitDualBook,
+          });
+        }
+      }
     },
-    [lane, positionShares, riskPrefsToken, syncBracketPinFromOperatorEdits],
+    [
+      bracketPollToken,
+      lane,
+      positionShares,
+      riskPrefsToken,
+      takeProfitDualBook,
+      takeProfitEnabled,
+      takeProfitShares,
+      takeProfitSimple,
+      syncBracketPinFromOperatorEdits,
+    ],
   );
 
   const bidTouch01ForExplain = useMemo(() => {
@@ -3176,10 +3852,11 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     const book = L === 'up' ? (bookMidUp ?? null) : (bookMidDown ?? null);
     const c = chart != null && Number.isFinite(chart) && chart > 0 ? chart : null;
     const b = book != null && Number.isFinite(book) && book > 0 ? book : null;
+    const lt = L === 'up' ? lastTradeUp01 : lastTradeDown01;
     let raw: number | null;
     if (accountMode === 'live') {
-      const lt = L === 'up' ? lastTradeUp01 : lastTradeDown01;
-      raw = lt ?? b ?? c;
+      // Chart/book update faster than last-trade poll — don't let stale prints block TP.
+      raw = c ?? b ?? lt;
     } else {
       raw = c ?? b;
     }
@@ -3257,6 +3934,9 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       }),
     [bracketRiskBookIntel, probMomentumDown, probMomentumUp, downLabel, lane, upLabel],
   );
+
+  const outcomeMomentumUp = useMemo(() => buildOutcomeMomentumXs(probMomentumUp), [probMomentumUp]);
+  const outcomeMomentumDown = useMemo(() => buildOutcomeMomentumXs(probMomentumDown), [probMomentumDown]);
 
   const midCents = mid != null ? mid * 100 : null;
   const defaultLimitCents = useMemo(() => {
@@ -3385,7 +4065,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
 
   const liveBalancesRefreshRef = useRef<{ gen: number; inflight: boolean }>({ gen: 0, inflight: false });
 
-  const readLiveBalancesOnce = useCallback(async () => {
+  const readLiveBalancesOnce = useCallback(async (opts?: { keepStaleOnFail?: boolean }) => {
     if (!upToken || !downToken) return;
     const [rC, rU, rD] = await Promise.all([
       tradeBalanceAllowance({ assetType: 'collateral' }),
@@ -3393,8 +4073,11 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       tradeBalanceAllowance({ tokenId: downToken, assetType: 'conditional', marketSlug: marketSlug ?? '', outcome: downLabel }),
     ]);
     if (isOk(rC)) setAvailUsdc(parseUsdcBalance(rC.data.balance));
+    else if (!opts?.keepStaleOnFail) setAvailUsdc(null);
     if (isOk(rU)) setBalUp(parseOutcomeSharesBalance(rU.data.balance));
+    else if (!opts?.keepStaleOnFail) setBalUp(null);
     if (isOk(rD)) setBalDown(parseOutcomeSharesBalance(rD.data.balance));
+    else if (!opts?.keepStaleOnFail) setBalDown(null);
     if (!isOk(rU) || !isOk(rD)) {
       const err = !isOk(rU) ? (rU as ApiErr).error : (rD as ApiErr).error;
       setBalError(
@@ -3405,13 +4088,14 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     }
   }, [downToken, downLabel, marketSlug, upToken, upLabel]);
 
-  const refreshLiveBalances = useCallback(async () => {
+  const refreshLiveBalances = useCallback(async (opts?: { silent?: boolean }) => {
     if (accountMode !== 'live') return;
     if (!upToken || !downToken) return;
-    setBalError(null);
+    const silent = opts?.silent === true;
+    if (!silent) setBalError(null);
     if (liveBalancesRefreshRef.current.inflight) return;
     liveBalancesRefreshRef.current.inflight = true;
-    setBalLoading(true);
+    if (!silent) setBalLoading(true);
     const gen = (liveBalancesRefreshRef.current.gen += 1);
     try {
       await Promise.all([
@@ -3420,31 +4104,34 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         tradeUpdateBalanceAllowance({ tokenId: downToken, assetType: 'conditional' }),
       ]);
       if (gen !== liveBalancesRefreshRef.current.gen) return;
-      await readLiveBalancesOnce();
+      await readLiveBalancesOnce({ keepStaleOnFail: silent });
     } catch {
-      setBalError('Could not load balances.');
+      if (!silent) setBalError('Could not load balances.');
     } finally {
       liveBalancesRefreshRef.current.inflight = false;
-      setBalLoading(false);
+      if (!silent) setBalLoading(false);
     }
   }, [accountMode, downToken, readLiveBalancesOnce, upToken]);
 
-  const refreshLiveBalancesThrottled = useCallback(() => {
-    const minGapMs = 600;
-    const now = Date.now();
-    const ref = liveBalThrottleRef.current;
-    if (now - ref.lastMs >= minGapMs) {
-      ref.lastMs = now;
-      void refreshLiveBalances();
-      return;
-    }
-    if (ref.timer != null) return;
-    ref.timer = window.setTimeout(() => {
-      ref.timer = null;
-      ref.lastMs = Date.now();
-      void refreshLiveBalances();
-    }, Math.max(0, minGapMs - (now - ref.lastMs)));
-  }, [refreshLiveBalances]);
+  const refreshLiveBalancesThrottled = useCallback(
+    (opts?: { silent?: boolean }) => {
+      const minGapMs = 600;
+      const now = Date.now();
+      const ref = liveBalThrottleRef.current;
+      if (now - ref.lastMs >= minGapMs) {
+        ref.lastMs = now;
+        void refreshLiveBalances(opts);
+        return;
+      }
+      if (ref.timer != null) return;
+      ref.timer = window.setTimeout(() => {
+        ref.timer = null;
+        ref.lastMs = Date.now();
+        void refreshLiveBalances(opts);
+      }, Math.max(0, minGapMs - (now - ref.lastMs)));
+    },
+    [refreshLiveBalances],
+  );
 
   useEffect(() => {
     const onResetPhantom = (ev: Event) => {
@@ -3541,20 +4228,10 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const refreshPositionAndMaxSell = useCallback(async () => {
     if (!token) return;
     setErr(null);
+    applyMaxSellFromCache(lane);
     setBusyRefresh(true);
     try {
-      if (accountMode === 'paper') {
-        const sh = paperPos.shares;
-        if (sh <= 0) {
-          setSellQty('0');
-          syncRiskAutomationAfterSellFill(0);
-          return;
-        }
-        const v = floorShares4(sh);
-        setSellQty(v > 0 ? String(v) : '0');
-        if (stopLossEnabled || takeProfitEnabled) syncRiskAutomationAfterSellFill(v);
-        return;
-      }
+      if (accountMode === 'paper') return;
       await tradeUpdateBalanceAllowance({ tokenId: token, assetType: 'conditional' });
       const res = await tradeBalanceAllowance({ tokenId: token, assetType: 'conditional' });
       if (!isOk(res)) {
@@ -3571,28 +4248,20 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         policy: 'sell',
         msSinceBuyFill: msSinceBuyFillForToken(token),
       });
-      if (!(sellable > 0)) {
-        setSellQty('0');
-        syncRiskAutomationAfterSellFill(0);
-        return;
-      }
-      const v = sellable;
-      setSellQty(v > 0 ? String(v) : '0');
-      if (stopLossEnabled || takeProfitEnabled) syncRiskAutomationAfterSellFill(floorShares4(v));
+      applyInstantMaxSellQty(sellable);
     } finally {
       setBusyRefresh(false);
     }
   }, [
     accountMode,
+    applyInstantMaxSellQty,
+    applyMaxSellFromCache,
     estSharesDown,
     estSharesUp,
+    lane,
     msSinceBuyFillForToken,
-    paperPos.shares,
     posSharesDown,
     posSharesUp,
-    stopLossEnabled,
-    syncRiskAutomationAfterSellFill,
-    takeProfitEnabled,
     token,
     upToken,
     downToken,
@@ -3609,6 +4278,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       if (rowTok) lastBuyFillMsByTokenRef.current[rowTok] = Date.now();
       const riskLane: 'up' | 'down' | undefined =
         rowTok && rowTok === upToken?.trim() ? 'up' : rowTok && rowTok === downToken?.trim() ? 'down' : undefined;
+      if (riskLane) applyMaxSellFromCache(riskLane);
+      if (sh > 0) syncBracketSharesFromPosition(sh);
       const firstToast = !buyReconcileToastRowIdsRef.current.has(rowId);
       if (firstToast) {
         buyReconcileToastRowIdsRef.current.add(rowId);
@@ -3630,18 +4301,37 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         bundle.lane === riskLane;
       if (bundleMatch) {
         buyBundleArmRef.current = null;
+        pendingBuyBundleIntentRef.current = null;
         buyRiskArmedRowIdsRef.current.add(rowId);
         applyFilledBuyBundle({ rowTok, riskLane, shares: sh, sl: bundle.sl, tp: bundle.tp });
-        setBuyBundleByLane((prev) => ({ ...prev, [riskLane]: { sl: '', tp: prev[riskLane].tp } }));
         saveEmergencyStopForLane(riskLane, '');
         if (firstToast) {
           pushToast('info', emergencyStopFillToast(bundle.sl, bundle.tp), 5200);
         }
       } else {
-        const laneDraft = riskLane ? bracketLaneDraftRef.current[riskLane] : { sl: '', tp: '' };
-        const emergDraft = riskLane ? buyBundleByLaneRef.current[riskLane] : { sl: '', tp: '' };
-        const preSl = emergDraft.sl.trim() || laneDraft.sl.trim();
-        const preTp = emergDraft.tp.trim();
+        const pending = pendingBuyBundleIntentRef.current;
+        const pendingMatch =
+          pending &&
+          rowTok &&
+          riskLane &&
+          pending.lane === riskLane &&
+          pending.token === rowTok &&
+          (pending.sl || pending.tp);
+        if (pendingMatch) {
+          pendingBuyBundleIntentRef.current = null;
+          buyRiskArmedRowIdsRef.current.add(rowId);
+          applyFilledBuyBundle({ rowTok, riskLane, shares: sh, sl: pending.sl, tp: pending.tp });
+          if (pending.sl) saveEmergencyStopForLane(riskLane, '');
+          if (firstToast) {
+            pushToast('info', emergencyStopFillToast(pending.sl, pending.tp), 5200);
+          }
+        } else {
+        const staged =
+          riskLane != null
+            ? readStagedBuyBundleLevels(riskLane, buyBundleByLaneRef.current)
+            : { sl: '', tp: '' };
+        const preSl = staged.sl;
+        const preTp = staged.tp;
         const deskAlreadyArmed =
           (stopLossEnabled && stopLossStopCents.trim()) || (takeProfitEnabled && takeProfitTakeCents.trim());
         if (buyRiskArmedRowIdsRef.current.has(rowId)) {
@@ -3652,10 +4342,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         } else if ((preSl || preTp) && rowTok && riskLane) {
           buyRiskArmedRowIdsRef.current.add(rowId);
           applyFilledBuyBundle({ rowTok, riskLane, shares: sh, sl: preSl, tp: preTp });
-          if (preSl) {
-            setBuyBundleByLane((prev) => ({ ...prev, [riskLane]: { sl: '', tp: prev[riskLane].tp } }));
-            saveEmergencyStopForLane(riskLane, '');
-          }
+          if (preSl) saveEmergencyStopForLane(riskLane, '');
           if (firstToast) {
             pushToast('info', emergencyStopFillToast(preSl, preTp), 5200);
           }
@@ -3678,6 +4365,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         } else {
           buyRiskArmedRowIdsRef.current.add(rowId);
           applyArmRiskAfterBuyFill(px, sh, riskLane);
+        }
         }
       }
       if (row.token?.trim() === token?.trim()) {
@@ -3748,7 +4436,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       setHistoryRows(loadTradeHistory());
       void refreshOpenOrders();
       void refreshMyFills();
-      refreshLiveBalancesThrottled();
+      refreshLiveBalancesThrottled({ silent: true });
       if (token?.trim()) {
         void reconcileTradeHistoryFromClob(token.trim(), { force: true }).then(() => setHistoryRows(loadTradeHistory()));
       }
@@ -4051,7 +4739,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     if (!needsPoll) return;
     const tick = () => {
       if (document.visibilityState === 'hidden') return;
-      refreshLiveBalancesThrottled();
+      refreshLiveBalancesThrottled({ silent: true });
       refreshAvgEntryThrottled();
     };
     tick();
@@ -4146,9 +4834,20 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
 
   const applyMaxBuy = useCallback(async () => {
     setErr(null);
+    const touchAsk = bookTouch?.bestAsk;
+    const price =
+      execMode === 'touch' && touchAsk != null && touchAsk > 0 && touchAsk < 1
+        ? roundPrice01(touchAsk)
+        : mid != null && mid > 0
+          ? mid
+          : null;
+    const cachedCash = availableBuyUsd ?? 0;
+    if (cachedCash > 0 && (unit === 'dollars' || (price != null && price > 0))) {
+      setAmount(buyAmountFromCashPct({ pct: 1, unit, cashUsd: cachedCash, price01: price }));
+    }
     setMaxBuyBusy(true);
     try {
-      let cashUsd = availableBuyUsd ?? 0;
+      let cashUsd = cachedCash;
       if (accountMode === 'live') {
         await tradeUpdateBalanceAllowance({ assetType: 'collateral' });
         const res = await tradeBalanceAllowance({ assetType: 'collateral' });
@@ -4161,7 +4860,6 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         cashUsd = usdc ?? 0;
       }
       if (cashUsd <= 0) return;
-      const price = mid != null && mid > 0 ? mid : null;
       if (unit === 'shares' && (price == null || price <= 0)) {
         setErr('Need a valid mid to convert USDC to shares for Max');
         return;
@@ -4170,7 +4868,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     } finally {
       setMaxBuyBusy(false);
     }
-  }, [accountMode, availableBuyUsd, mid, unit]);
+  }, [accountMode, availableBuyUsd, bookTouch?.bestAsk, execMode, mid, unit]);
 
   // Load persisted stop-loss config whenever token changes (paper + live).
   useEffect(() => {
@@ -4229,6 +4927,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       );
       setStopLossShares(shares != null ? String(shares) : '');
       setStopLossStatus(enabled ? 'ARMED' : 'OFF');
+      if (enabled) pinBracketAutomationToken(tok);
     } catch {
       setStopLossEnabled(false);
       setStopLossStatus('OFF');
@@ -4295,6 +4994,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       );
       setTakeProfitShares(shares != null ? String(shares) : '');
       setTakeProfitStatus(enabled ? 'ARMED' : 'OFF');
+      if (enabled) pinBracketAutomationToken(tok);
     } catch {
       setTakeProfitEnabled(false);
       setTakeProfitStatus('OFF');
@@ -4347,79 +5047,71 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     return () => window.removeEventListener('pm-clear-risk-prefs', onClearPrefs as EventListener);
   }, [token]);
 
-  // Persist stop-loss config.
+  // Persist stop-loss config (armed outcome token — survives lane tab switches).
   useEffect(() => {
-    const tok = token?.trim();
-    if (!tok) return;
+    const storageTok = bracketPollToken?.trim() || token?.trim();
+    if (!storageTok) return;
     if (!stopLossEnabled) {
       try {
-        window.localStorage.removeItem(stopLossKey);
+        window.localStorage.removeItem(stopLossStorageKey(storageTok));
       } catch {
         /* ignore */
       }
       return;
     }
-    const stop01 = centsStrTo01(stopLossStopCents);
-    const limit01 = centsStrTo01(stopLossLimitCents);
-    const sh = Number(stopLossShares);
-    if (stop01 == null || limit01 == null || !Number.isFinite(sh) || sh <= 0) return;
-    const cfg: StopLossConfig = {
+    const cfg = resolveArmedStopLoss({
+      automationTok: storageTok,
       enabled: true,
-      stop01: clamp01(stop01),
-      limit01: clamp01(limit01),
-      shares: sh,
+      stopCents: stopLossStopCents,
+      limitCents: stopLossLimitCents,
+      sharesStr: stopLossShares,
       simple: stopLossSimple,
       dualBook: stopLossDualBook,
-    };
-    try {
-      window.localStorage.setItem(stopLossKey, JSON.stringify(cfg));
-    } catch {
-      /* ignore */
-    }
+      laneDraftSl: bracketLaneDraftRef.current[bracketOutcomeLaneRef.current ?? lane].sl,
+    });
+    if (!cfg) return;
+    saveStopLossConfigToStorage(storageTok, cfg);
   }, [
+    bracketPollToken,
+    lane,
     stopLossDualBook,
     stopLossEnabled,
     stopLossLimitCents,
     stopLossShares,
     stopLossSimple,
     stopLossStopCents,
-    stopLossKey,
     token,
   ]);
 
-  // Persist take-profit config.
+  // Persist take-profit config (armed outcome token — survives lane tab switches).
   useEffect(() => {
-    const tok = token?.trim();
-    if (!tok) return;
+    const storageTok = bracketPollToken?.trim() || token?.trim();
+    if (!storageTok) return;
     if (!takeProfitEnabled) {
       try {
-        window.localStorage.removeItem(takeProfitKey);
+        window.localStorage.removeItem(takeProfitStorageKey(storageTok));
       } catch {
         /* ignore */
       }
       return;
     }
-    const take01 = centsStrTo01(takeProfitTakeCents);
-    const limit01 = centsStrTo01(takeProfitLimitCents);
-    const sh = Number(takeProfitShares);
-    if (take01 == null || limit01 == null || !Number.isFinite(sh) || sh <= 0) return;
-    const cfg: TakeProfitConfig = {
+    const cfg = resolveArmedTakeProfit({
+      automationTok: storageTok,
       enabled: true,
-      take01: clamp01(take01),
-      limit01: clamp01(limit01),
-      shares: sh,
+      takeCents: takeProfitTakeCents,
+      limitCents: takeProfitLimitCents,
+      sharesStr: takeProfitShares,
       simple: takeProfitSimple,
       dualBook: takeProfitDualBook,
-    };
-    try {
-      window.localStorage.setItem(takeProfitKey, JSON.stringify(cfg));
-    } catch {
-      /* ignore */
-    }
+      laneDraftTp: bracketLaneDraftRef.current[bracketOutcomeLaneRef.current ?? lane].tp,
+    });
+    if (!cfg) return;
+    saveTakeProfitConfigToStorage(storageTok, cfg);
   }, [
+    bracketPollToken,
+    lane,
     takeProfitDualBook,
     takeProfitEnabled,
-    takeProfitKey,
     takeProfitLimitCents,
     takeProfitShares,
     takeProfitSimple,
@@ -4436,19 +5128,15 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   }, [stopLossSimple, stopLossEnabled, stopLossStopCents]);
 
   useEffect(() => {
-    if (!stopLossSimple || !stopLossEnabled) return;
-    if (operatorSlTpLockedRef.current) return;
-    if (positionShares == null || !(positionShares > 0)) return;
-    setStopLossShares(String(floorShares4(positionShares)));
-  }, [stopLossSimple, stopLossEnabled, positionShares, token]);
-
-  // If you pre-set SL before owning shares, auto-size when a position appears.
-  useEffect(() => {
-    if (!stopLossEnabled) return;
-    if (positionShares == null || !(positionShares > 0)) return;
-    if (stopLossShares.trim()) return;
-    setStopLossShares(String(floorShares4(positionShares)));
-  }, [stopLossEnabled, positionShares, stopLossShares, token]);
+    if (!stopLossEnabled && !takeProfitEnabled) return;
+    if (bracketPositionShares == null) return;
+    const rem = floorShares4(bracketPositionShares);
+    if (!(rem > 0)) return;
+    const prev = bracketSharesSyncRef.current;
+    if (prev != null && Math.abs(rem - prev) < 0.25) return;
+    bracketSharesSyncRef.current = rem;
+    syncBracketSharesFromPosition(bracketPositionShares);
+  }, [bracketPositionShares, stopLossEnabled, takeProfitEnabled, syncBracketSharesFromPosition]);
 
   useEffect(() => {
     if (!takeProfitSimple || !takeProfitEnabled) return;
@@ -4456,21 +5144,6 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     if (!s) return;
     setTakeProfitLimitCents(s);
   }, [takeProfitSimple, takeProfitEnabled, takeProfitTakeCents]);
-
-  useEffect(() => {
-    if (!takeProfitSimple || !takeProfitEnabled) return;
-    if (operatorSlTpLockedRef.current) return;
-    if (positionShares == null || !(positionShares > 0)) return;
-    setTakeProfitShares(String(floorShares4(positionShares)));
-  }, [takeProfitSimple, takeProfitEnabled, positionShares, token]);
-
-  // If you pre-set TP before owning shares, auto-size when a position appears.
-  useEffect(() => {
-    if (!takeProfitEnabled) return;
-    if (positionShares == null || !(positionShares > 0)) return;
-    if (takeProfitShares.trim()) return;
-    setTakeProfitShares(String(floorShares4(positionShares)));
-  }, [positionShares, takeProfitEnabled, takeProfitShares, token]);
 
   // Reset crossing memory when stop level or watch mode changes (avoid stale edges / stuck latch).
   useEffect(() => {
@@ -4491,6 +5164,15 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     takeProfitFireLockRef.current = false;
   }, [takeProfitTakeCents, takeProfitDualBook, token]);
 
+  useEffect(() => {
+    const syncDeskScalpPrefs = () => {
+      deskScalpPrefsRef.current = loadNowPriceDeskScalpPrefs();
+    };
+    syncDeskScalpPrefs();
+    window.addEventListener(NOW_PRICE_DESK_SCALP_PREFS_EVENT, syncDeskScalpPrefs);
+    return () => window.removeEventListener(NOW_PRICE_DESK_SCALP_PREFS_EVENT, syncDeskScalpPrefs);
+  }, []);
+
   // If the user enables SL/TP after we've already observed price, clear memory so "enable" evaluates immediately.
   useEffect(() => {
     if (!stopLossEnabled) return;
@@ -4508,21 +5190,28 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     takeProfitPrevStripMidRef.current = null;
   }, [takeProfitEnabled, token]);
 
-  // Re-run bracket triggers on a timer while armed (live mids can update without React state churn).
+  // Re-run bracket triggers on a timer while armed — ref callbacks, no tick state (avoids render storms).
   useEffect(() => {
+    const deskRisk =
+      deskScalpPrefsRef.current.trailingProfit || deskScalpPrefsRef.current.takeLossWhenDeskTpBelowEntry;
     const armed =
       (accountMode === 'live' || accountMode === 'paper') &&
-      bracketAutomationActive({ bracketPollToken, stopLossEnabled, takeProfitEnabled });
+      (bracketAutomationActive({ bracketPollToken, stopLossEnabled, takeProfitEnabled }) || deskRisk);
     if (!armed) return;
-    const id = window.setInterval(() => setBracketEvalTick((t) => t + 1), BRACKET_EVAL_MS);
+    const id = window.setInterval(() => {
+      slBracketEvalRef.current();
+      tpBracketEvalRef.current();
+    }, BRACKET_EVAL_MS);
     return () => window.clearInterval(id);
   }, [accountMode, bracketPollToken, stopLossEnabled, takeProfitEnabled]);
 
   // Fast REST top-of-book while SL/TP armed — bid can move faster than chart-driven props.
   useEffect(() => {
+    const deskRisk =
+      deskScalpPrefsRef.current.trailingProfit || deskScalpPrefsRef.current.takeLossWhenDeskTpBelowEntry;
     const needPoll =
       (accountMode === 'live' || accountMode === 'paper') &&
-      bracketAutomationActive({ bracketPollToken, stopLossEnabled, takeProfitEnabled });
+      (bracketAutomationActive({ bracketPollToken, stopLossEnabled, takeProfitEnabled }) || deskRisk);
     if (!needPoll) {
       setStopPollBid01(null);
       setStopPollAsk01(null);
@@ -4552,9 +5241,12 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
           const tob = topOfBook(res.data);
           const b = tob.bestBid != null && tob.bestBid > 0 ? roundPrice01(tob.bestBid) : null;
           const a = tob.bestAsk != null && tob.bestAsk > 0 ? roundPrice01(tob.bestAsk) : null;
-          setStopPollBid01(b);
-          setStopPollAsk01(a);
-          setStopPollAtMs(Date.now());
+          setStopPollBid01((prev) => (prev === b ? prev : b));
+          setStopPollAsk01((prev) => (prev === a ? prev : a));
+          setStopPollAtMs((prev) => {
+            const next = Date.now();
+            return prev != null && next - prev < 50 ? prev : next;
+          });
         })
         .finally(() => {
           inFlight = false;
@@ -4570,37 +5262,57 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
 
   // Stop-loss trigger loop: uses best bid when available, else last-trade/mid mark; paper fills at limit when crossed.
   useEffect(() => {
+    const runStopLossEval = () => {
     const tok = bracketOutcomeTokenRef.current?.trim() || token?.trim();
     if (!tok) return;
     const automationTok = bracketPollToken?.trim() || tok;
-    const useStoredCfg = Boolean(bracketPollToken?.trim() && bracketPollToken.trim() !== token?.trim());
-    const storedSl = useStoredCfg ? loadStopLossConfigFromStorage(automationTok) : null;
-    const slEnabled = storedSl?.enabled ?? stopLossEnabled;
-    if (!slEnabled) {
-      setStopLossStatus('OFF');
-      return;
-    }
-    const stop01 = storedSl?.stop01 ?? centsStrTo01(stopLossStopCents);
-    const limit01 = storedSl?.limit01 ?? centsStrTo01(stopLossLimitCents);
-    const shReq = storedSl?.shares ?? Number(stopLossShares);
-    const slSimple = storedSl?.simple ?? stopLossSimple;
-    if (stop01 == null || limit01 == null || !Number.isFinite(shReq) || shReq <= 0) {
-      setStopLossStatus('ARMED');
-      return;
+    if (!stopLossEnabled) {
+      const storedSl = loadStopLossConfigFromStorage(automationTok);
+      if (!storedSl?.enabled) return;
     }
     const bracketLane: 'up' | 'down' =
       bracketOutcomeLaneRef.current ??
       (tok === upToken?.trim() ? 'up' : tok === downToken?.trim() ? 'down' : lane);
+    const pin = bracketArmedPinRef.current;
+    const deskLocked = operatorSlTpLockedRef.current;
+    const stopCentsEffective =
+      deskLocked && pin?.stopCents?.trim() && pin.token === tok && pin.lane === bracketLane
+        ? pin.stopCents
+        : stopLossStopCents;
+    const armedSl = resolveArmedStopLoss({
+      automationTok,
+      enabled: stopLossEnabled,
+      stopCents: stopCentsEffective,
+      limitCents: stopCentsEffective,
+      sharesStr: stopLossShares,
+      simple: stopLossSimple,
+      dualBook: stopLossDualBook,
+      laneDraftSl: bracketLaneDraftRef.current[bracketLane].sl,
+    });
+    if (!armedSl) {
+      if (stopLossEnabled) setStopLossStatus('ARMED');
+      else setStopLossStatus('OFF');
+      return;
+    }
+    const { stop01, limit01, shares: shReq, simple: slSimple, dualBook: slDualBook } = armedSl;
     const heldForSl =
       accountMode === 'paper' ? getPaperPosition(paperAccount, tok).shares : liveLaneShares('display', bracketLane);
     if (!(heldForSl > 0)) {
-      setStopLossStatus('ARMED');
+      if (isExternallyFlatPosition({
+        clobBal: bracketLane === 'up' ? balUp : balDown,
+        sellShares: liveLaneShares('sell', bracketLane),
+      })) {
+        maybeDisarmOnManualFlat();
+      } else if (stopLossEnabled) {
+        setStopLossStatus('ARMED');
+      }
       return;
     }
     const positionForSl =
       accountMode === 'paper' ? heldForSl : liveLaneShares('sell', bracketLane);
     const touch = bracketLane === 'up' ? (bookTouchUp ?? null) : (bookTouchDown ?? null);
     const bidTouch = touch?.bestBid != null && touch.bestBid > 0 ? roundPrice01(touch.bestBid) : null;
+    const askTouch = touch?.bestAsk != null && touch.bestAsk > 0 ? roundPrice01(touch.bestAsk) : null;
     const stripMid01 = bracketStripMid01;
     const bidForSl = bracketAutomationBid01({
       pollBid01: stopPollBid01,
@@ -4609,12 +5321,21 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       forPaper: accountMode === 'paper',
       allowMidFallback: accountMode === 'live',
     });
+    const askForSl = bracketAutomationAsk01({
+      pollAsk01: stopPollAsk01,
+      touchAsk01: askTouch,
+      fallback01: stripMid01 ?? displayMark01,
+      forPaper: accountMode === 'paper',
+      allowMidFallback: accountMode === 'live',
+    });
     const slEval = evaluateStopLossCross({
       stop01,
       bid01: bidForSl,
+      ask01: askForSl,
       prevBid01: stopLossPrevBidRef.current,
       stripMid01,
       honorChartMid: true,
+      watchAsk: slDualBook,
     });
     if (bidForSl != null) stopLossPrevBidRef.current = bidForSl;
     if (stripMid01 != null) stopLossPrevStripMidRef.current = stripMid01;
@@ -4623,7 +5344,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     if (ref01 != null) stopLossLastCrossRef.current = ref01;
 
     if (!crossed) {
-      if (!stopLossFireLockRef.current) {
+      if (!stopLossFireLockRef.current && stopLossEnabled) {
         stopLossLastFireTokRef.current = null;
         stopLossLastAttemptMsRef.current = 0;
         setStopLossStatus('ARMED');
@@ -4646,8 +5367,15 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     }
     if (stopLossFireLockRef.current) return;
     if (takeProfitFireLockRef.current) return;
-    if (stopLossLastFireTokRef.current === tok) return;
-    if (bracketExitCooldownActive(stopLossLastAttemptMsRef.current)) return;
+    if (
+      !bracketExitReadyToFire({
+        tok,
+        lastFireTokRef: stopLossLastFireTokRef,
+        lastAttemptMsRef: stopLossLastAttemptMsRef,
+      })
+    ) {
+      return;
+    }
 
     stopLossFireLockRef.current = true;
     stopLossLastAttemptMsRef.current = Date.now();
@@ -4876,6 +5604,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
               ? `Stop-loss market sell (${sizeLive.toFixed(4)} sh) — confirming…`
               : `Stop-loss FAK @ ${(px * 100).toFixed(1)}¢ (${sizeLive.toFixed(4)} sh)${refCents != null ? ` · bid was ${refCents.toFixed(1)}¢` : ''} — confirming…`,
           );
+          stopLossLastFireTokRef.current = tok;
           scheduleTruthRefreshBurst(tok, oid ?? null, () =>
             afterLiveSellRowReconcile(slRowId, {
               sl: { stop01, limit01: px, sizeLive, oid: oid ?? null, refCents },
@@ -4886,18 +5615,24 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         stopLossFireLockRef.current = false;
       }
     })();
+    };
+    slBracketEvalRef.current = runStopLossEval;
+    runStopLossEval();
   }, [
     accountMode,
+    balDown,
+    balUp,
     bookTouchUp?.bestAsk,
     bookTouchUp?.bestBid,
     bookTouchDown?.bestAsk,
     bookTouchDown?.bestBid,
     bracketStripMid01,
-    bracketEvalTick,
     displayMark01,
     label,
     lane,
+    liveLaneShares,
     marketSlug,
+    maybeDisarmOnManualFlat,
     positionShares,
     refreshAvgEntry,
     refreshOpenOrders,
@@ -4920,40 +5655,30 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     tradeHistoryMarketMeta,
   ]);
 
-  // Take-profit: bid or chart mid at/through take → immediate market sell on live.
+  // Take-profit: bid or chart mid at/through take → FAK at TP/touch first, market fallback.
   useEffect(() => {
+    const runTakeProfitEval = () => {
     const tok = bracketOutcomeTokenRef.current?.trim() || token?.trim();
     if (!tok) return;
+    const prefs = deskScalpPrefsRef.current;
+    const needsDeskRisk = prefs.trailingProfit || prefs.takeLossWhenDeskTpBelowEntry;
+    if (!takeProfitEnabled && !needsDeskRisk) {
+      const automationTokEarly = bracketPollToken?.trim() || tok;
+      const storedTpEarly = loadTakeProfitConfigFromStorage(automationTokEarly);
+      if (!storedTpEarly?.enabled) return;
+    }
     const automationTok = bracketPollToken?.trim() || tok;
-    const useStoredCfg = Boolean(bracketPollToken?.trim() && bracketPollToken.trim() !== token?.trim());
-    const storedTp = useStoredCfg ? loadTakeProfitConfigFromStorage(automationTok) : null;
-    const storedSl = useStoredCfg ? loadStopLossConfigFromStorage(automationTok) : null;
-    const tpEnabled = storedTp?.enabled ?? takeProfitEnabled;
-    if (!tpEnabled) {
-      setTakeProfitStatus('OFF');
-      return;
-    }
-    const take01 = storedTp?.take01 ?? centsStrTo01(takeProfitTakeCents);
-    const limit01 = storedTp?.limit01 ?? centsStrTo01(takeProfitLimitCents);
-    const shReq = storedTp?.shares ?? Number(takeProfitShares);
-    const tpSimple = storedTp?.simple ?? takeProfitSimple;
-    const slEnabledForLock = storedSl?.enabled ?? stopLossEnabled;
-    if (take01 == null || limit01 == null || !Number.isFinite(shReq) || shReq <= 0) {
-      setTakeProfitStatus('ARMED');
-      return;
-    }
     const bracketLane: 'up' | 'down' =
       bracketOutcomeLaneRef.current ??
       (tok === upToken?.trim() ? 'up' : tok === downToken?.trim() ? 'down' : lane);
-    const heldForTp =
-      accountMode === 'paper' ? getPaperPosition(paperAccount, tok).shares : liveLaneShares('display', bracketLane);
-    if (!(heldForTp > 0)) {
-      setTakeProfitStatus('ARMED');
-      return;
-    }
+    const pin = bracketArmedPinRef.current;
+    const deskLocked = operatorSlTpLockedRef.current;
     const touch = bracketLane === 'up' ? (bookTouchUp ?? null) : (bookTouchDown ?? null);
     const bidTouch = touch?.bestBid != null && touch.bestBid > 0 ? roundPrice01(touch.bestBid) : null;
+    const askTouch = touch?.bestAsk != null && touch.bestAsk > 0 ? roundPrice01(touch.bestAsk) : null;
     const stripMid01 = bracketStripMid01;
+    const heldForTp =
+      accountMode === 'paper' ? getPaperPosition(paperAccount, tok).shares : liveLaneShares('display', bracketLane);
     const bidForTp = bracketAutomationBid01({
       pollBid01: stopPollBid01,
       touchBid01: bidTouch,
@@ -4961,21 +5686,130 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       forPaper: accountMode === 'paper',
       allowMidFallback: accountMode === 'live',
     });
-    const tpEval = evaluateTakeProfitCross({
-      take01,
-      bid01: bidForTp,
-      prevBid01: takeProfitPrevBidRef.current,
-      stripMid01,
-      honorChartMid: true,
+    const askForTp = bracketAutomationAsk01({
+      pollAsk01: stopPollAsk01,
+      touchAsk01: askTouch,
+      fallback01: stripMid01 ?? displayMark01,
+      forPaper: accountMode === 'paper',
+      allowMidFallback: accountMode === 'live',
     });
+
+    const scalpPrefs = prefs;
+    const entryForRisk =
+      bracketLane === 'up'
+        ? accountMode === 'paper'
+          ? paperUpPos.avgCost01
+          : avgEntryUp
+        : accountMode === 'paper'
+          ? paperDownPos.avgCost01
+          : avgEntryDown;
+    const liveDeskTp01 = liveDeskTp01FromBook(touch, stripMid01 ?? displayMark01);
+    const deskTpLossCrossed =
+      scalpPrefs.takeLossWhenDeskTpBelowEntry &&
+      heldForTp > 0 &&
+      deskTpBelowEntry(entryForRisk, liveDeskTp01);
+
+    const storedTpCfg = loadTakeProfitConfigFromStorage(automationTok);
+    const tpEnabledForAutomation = takeProfitEnabled || storedTpCfg?.enabled === true;
+    const tpSharesForAutomation =
+      takeProfitShares.trim() ||
+      (storedTpCfg != null && storedTpCfg.shares > 0 ? String(storedTpCfg.shares) : '') ||
+      (bracketPositionShares != null && bracketPositionShares > 0 ? String(floorShares4(bracketPositionShares)) : '');
+    const takeCentsFromStored =
+      storedTpCfg?.enabled && storedTpCfg.take01 != null
+        ? formatBracketCentsFromNumber(Math.round(storedTpCfg.take01 * 100))
+        : '';
+    const takeCentsEffective =
+      deskLocked && pin?.tpCents?.trim() && pin.token === tok && pin.lane === bracketLane
+        ? pin.tpCents
+        : takeCentsFromStored || takeProfitTakeCents;
+    const armedTp = resolveArmedTakeProfit({
+      automationTok,
+      enabled: tpEnabledForAutomation,
+      takeCents: takeCentsEffective,
+      limitCents: takeCentsEffective,
+      sharesStr: tpSharesForAutomation,
+      simple: takeProfitSimple,
+      dualBook: takeProfitDualBook,
+      laneDraftTp: bracketLaneDraftRef.current[bracketLane].tp,
+    });
+    const armedSlForLock = resolveArmedStopLoss({
+      automationTok,
+      enabled: stopLossEnabled,
+      stopCents: stopLossStopCents,
+      limitCents: stopLossLimitCents,
+      sharesStr: stopLossShares,
+      simple: stopLossSimple,
+      dualBook: stopLossDualBook,
+      laneDraftSl: bracketLaneDraftRef.current[bracketLane].sl,
+    });
+    if (!armedTp && !deskTpLossCrossed) {
+      if (tpEnabledForAutomation) setTakeProfitStatus('ARMED');
+      else if (takeProfitEnabled) setTakeProfitStatus('OFF');
+      return;
+    }
+    const tpResolved = armedTp ?? {
+      take01: entryForRisk != null && entryForRisk > 0 ? entryForRisk : 0.01,
+      limit01: bidForTp ?? entryForRisk ?? 0.01,
+      shares: floorShares4(heldForTp),
+      simple: true,
+      dualBook: false,
+      enabled: true,
+    };
+    const { take01, limit01, shares: shReq, simple: tpSimple, dualBook: tpDualBook } = tpResolved;
+    const slEnabledForLock = armedSlForLock?.enabled ?? false;
+    if (!(heldForTp > 0)) {
+      if (isExternallyFlatPosition({
+        clobBal: bracketLane === 'up' ? balUp : balDown,
+        sellShares: liveLaneShares('sell', bracketLane),
+      })) {
+        maybeDisarmOnManualFlat();
+      } else if (tpEnabledForAutomation || takeProfitEnabled) {
+        setTakeProfitStatus('ARMED');
+      }
+      return;
+    }
+    const tpEval = armedTp
+      ? evaluateTakeProfitCross({
+          take01,
+          bid01: bidForTp,
+          ask01: askForTp,
+          prevBid01: takeProfitPrevBidRef.current,
+          stripMid01,
+          honorChartMid: true,
+          watchAsk: tpDualBook,
+        })
+      : { crossed: false, ref01: bidForTp };
     if (bidForTp != null) takeProfitPrevBidRef.current = bidForTp;
     if (stripMid01 != null) takeProfitPrevStripMidRef.current = stripMid01;
-    const crossed = tpEval.crossed;
+
+    let trailingCrossed = false;
+    if (scalpPrefs.trailingProfit && entryForRisk != null && entryForRisk > 0 && entryForRisk < 1) {
+      const mark01 = bracketTpMark01({
+        bid01: bidForTp,
+        ask01: askForTp,
+        stripMid01,
+        honorChartMid: true,
+      });
+      const peakKey = `${automationTok}|trail`;
+      const peakPrev = trailingTpPeakByTokRef.current.get(peakKey) ?? null;
+      const trailEval = evaluateTrailingProfitExit({
+        entry01: entryForRisk,
+        currentMark01: mark01,
+        peakMark01: peakPrev,
+      });
+      if (trailEval.peakMark01 != null) {
+        trailingTpPeakByTokRef.current.set(peakKey, trailEval.peakMark01);
+      }
+      trailingCrossed = trailEval.shouldExit;
+    }
+
+    const crossed = deskTpLossCrossed || tpEval.crossed || trailingCrossed;
     const ref01 = tpEval.ref01;
     if (ref01 != null) takeProfitLastCrossRef.current = ref01;
 
     if (!crossed) {
-      if (!takeProfitFireLockRef.current) {
+      if (!takeProfitFireLockRef.current && (tpEnabledForAutomation || takeProfitEnabled)) {
         takeProfitLastFireTokRef.current = null;
         takeProfitLastAttemptMsRef.current = 0;
         setTakeProfitStatus('ARMED');
@@ -4989,7 +5823,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
           ? stripMid01
           : take01;
     if (!(execRef01 > 0) || execRef01 >= 1) {
-      if (!takeProfitFireLockRef.current) {
+      if (!takeProfitFireLockRef.current && (tpEnabledForAutomation || takeProfitEnabled)) {
         takeProfitLastFireTokRef.current = null;
         takeProfitLastAttemptMsRef.current = 0;
         setTakeProfitStatus('ARMED');
@@ -4998,8 +5832,15 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     }
     if (takeProfitFireLockRef.current) return;
     if (slEnabledForLock && stopLossFireLockRef.current) return;
-    if (takeProfitLastFireTokRef.current === tok) return;
-    if (bracketExitCooldownActive(takeProfitLastAttemptMsRef.current)) return;
+    if (
+      !bracketExitReadyToFire({
+        tok,
+        lastFireTokRef: takeProfitLastFireTokRef,
+        lastAttemptMsRef: takeProfitLastAttemptMsRef,
+      })
+    ) {
+      return;
+    }
 
     takeProfitFireLockRef.current = true;
     takeProfitLastAttemptMsRef.current = Date.now();
@@ -5116,9 +5957,10 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
           return;
         }
 
-        // Fire sell immediately — refresh balance in background after.
+        // Take profit should first try to realize the armed level. Market sell is only fallback.
         void tradeUpdateBalanceAllowance({ tokenId: tok, assetType: 'conditional' }).catch(() => {});
 
+        const tpFakFloor01 = tpSimple ? take01 : Math.min(limit01, take01);
         const refCents = execRef01 * 100;
         const optimistic = appendTradeHistoryWithId({
           ...tradeHistoryMarketMeta,
@@ -5138,7 +5980,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
           remainingShares: sizeLive,
           usdCents: Math.abs(Math.round(px * sizeLive * 100)),
           status: 'sending',
-          auditNote: `take_profit_market take=${(take01 * 100).toFixed(1)}¢ ref=${refCents.toFixed(1)}¢`,
+          auditNote: `take_profit_limit_first take=${(take01 * 100).toFixed(1)}¢ ref=${refCents.toFixed(1)}¢ floor=${(tpFakFloor01 * 100).toFixed(1)}¢`,
         });
         setHistoryRows(optimistic.rows);
         const controller = new AbortController();
@@ -5150,15 +5992,19 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
           lane: bracketLane,
           price01: px,
           sizeShares: sizeLive,
-          floor01: take01,
-          urgency: 'immediate',
+          floor01: tpFakFloor01,
+          urgency: 'limit_first',
           signal: controller.signal,
         });
         const clientMs = Math.round(performance.now() - tClient0);
         if (!exitRes.ok) {
           const e = exitRes.apiErr ?? ({ error: exitRes.error } as ApiErr);
           takeProfitLastFireTokRef.current = null;
-          const errMsg = formatTradeApiError(e);
+          const formattedErr = formatTradeApiError(e);
+          const errMsg =
+            exitRes.error && exitRes.error !== e.error && !formattedErr.includes(exitRes.error)
+              ? `${exitRes.error} · ${formattedErr}`
+              : formattedErr;
           setTakeProfitStatus('ARMED');
           setLastAutoSell({
             kind: 'tp',
@@ -5227,6 +6073,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
               ? `Take-profit market sell (${sizeLive.toFixed(4)} sh) — confirming…`
               : `Take-profit FAK @ ${(px * 100).toFixed(1)}¢ (${sizeLive.toFixed(4)} sh)${refCents != null ? ` · bid was ${refCents.toFixed(1)}¢` : ''} — confirming…`,
           );
+          takeProfitLastFireTokRef.current = tok;
           scheduleTruthRefreshBurst(tok, oid ?? null, () =>
             afterLiveSellRowReconcile(tpRowId, {
               tp: { take01, limit01: px, sizeLive, oid: oid ?? null, refCents },
@@ -5237,18 +6084,26 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         takeProfitFireLockRef.current = false;
       }
     })();
+    };
+    tpBracketEvalRef.current = runTakeProfitEval;
+    runTakeProfitEval();
   }, [
     accountMode,
+    avgEntryDown,
+    avgEntryUp,
+    balDown,
+    balUp,
     bookTouchUp?.bestAsk,
     bookTouchUp?.bestBid,
     bookTouchDown?.bestAsk,
     bookTouchDown?.bestBid,
     bracketStripMid01,
-    bracketEvalTick,
     displayMark01,
     label,
     lane,
+    liveLaneShares,
     marketSlug,
+    maybeDisarmOnManualFlat,
     positionShares,
     refreshAvgEntry,
     refreshOpenOrders,
@@ -5256,6 +6111,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     resolvedBullpenOutcome,
     afterLiveSellRowReconcile,
     bracketPollToken,
+    bracketPositionShares,
     stopLossEnabled,
     stopPollAsk01,
     stopPollBid01,
@@ -5272,17 +6128,72 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     scheduleTruthRefreshBurst,
   ]);
 
-  // Keep live Sell view feeling instant: when switching to Sell (or swapping lane),
-  // proactively refresh position + open orders in the background and auto-fill sell qty.
+  // Keep sell + bracket sizing instant from cache; reconcile CLOB in background.
   useEffect(() => {
-    if (accountMode !== 'live') return;
     if (action !== 'sell') return;
     if (!token) return;
-    void refreshPositionAndMaxSell();
-    void refreshOpenOrders();
-    refreshAvgEntryThrottled();
-    refreshLiveBalancesThrottled();
-  }, [accountMode, action, token, refreshAvgEntryThrottled, refreshLiveBalancesThrottled, refreshOpenOrders, refreshPositionAndMaxSell]);
+    applyMaxSellFromCache(lane);
+    if (accountMode === 'live') {
+      void refreshPositionAndMaxSell();
+      void refreshOpenOrders();
+      refreshAvgEntryThrottled();
+      refreshLiveBalancesThrottled({ silent: true });
+    }
+  }, [
+    accountMode,
+    action,
+    applyMaxSellFromCache,
+    lane,
+    token,
+    refreshAvgEntryThrottled,
+    refreshLiveBalancesThrottled,
+    refreshOpenOrders,
+    refreshPositionAndMaxSell,
+  ]);
+
+  /** Faster CLOB balance reads while selling or SL/TP armed (no allowance refresh on poll). */
+  useEffect(() => {
+    if (accountMode !== 'live') return;
+    if (!upToken || !downToken) return;
+    const deskRiskActive = () =>
+      deskScalpPrefsRef.current.trailingProfit || deskScalpPrefsRef.current.takeLossWhenDeskTpBelowEntry;
+    const shouldPoll = () =>
+      action === 'sell' || stopLossEnabled || takeProfitEnabled || deskRiskActive() || Boolean(bracketPollToken?.trim());
+    if (!shouldPoll()) return;
+    const tick = () => {
+      if (!shouldPoll()) return;
+      void readLiveBalancesOnce().then(() => maybeDisarmOnManualFlat());
+    };
+    tick();
+    const id = window.setInterval(tick, 750);
+    return () => window.clearInterval(id);
+  }, [
+    accountMode,
+    action,
+    bracketPollToken,
+    downToken,
+    maybeDisarmOnManualFlat,
+    readLiveBalancesOnce,
+    stopLossEnabled,
+    takeProfitEnabled,
+    upToken,
+  ]);
+
+  /** React to balance drops from manual sells on Polymarket / Bullpen (outside this UI). */
+  useEffect(() => {
+    maybeDisarmOnManualFlat();
+  }, [balUp, balDown, posSharesUp, posSharesDown, maybeDisarmOnManualFlat]);
+
+  useEffect(() => {
+    if (action !== 'sell') return;
+    const sh = resolveInstantMaxSellShares(lane);
+    if (!(sh > 0)) return;
+    setSellQty((prev) => {
+      const t = prev.trim();
+      if (!t || t === '0') return String(sh);
+      return prev;
+    });
+  }, [action, lane, liveSellableShares, livePositionShares, resolveInstantMaxSellShares]);
 
   useEffect(() => {
     if (accountMode !== 'live') return;
@@ -5563,7 +6474,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
               requestedShares: orig,
             });
             setHistoryRows(loadTradeHistory());
-            void refreshLiveBalancesThrottled();
+            void refreshLiveBalancesThrottled({ silent: true });
           }
         }
 
@@ -5591,7 +6502,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
               (n) => n > 0 && setHistoryRows(loadTradeHistory()),
             );
           }
-          void refreshLiveBalancesThrottled();
+          void refreshLiveBalancesThrottled({ silent: true });
         }
 
         if (performance.now() - started < 120_000) {
@@ -5678,25 +6589,40 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const applyPct = useCallback(
     (pct: number) => {
       if (positionShares == null || positionShares <= 0) return;
-      const v = floorShares4(positionShares * pct);
+      const v = floorSharesWhole(positionShares * pct);
       setSellQty(v > 0 ? String(v) : '0');
     },
     [positionShares],
   );
 
-  // Avoid `Number('') === 0` → clamp to 1¢: that produced absurd live touch/limit prices before mid/book loaded.
-  const explicitLimitCents = limitPriceCents.trim() !== '' ? Number(limitPriceCents) : NaN;
-  const autoLimitCents =
-    execMode === 'touch'
-      ? touchLimitCents.trim() !== ''
-        ? Number(touchLimitCents)
-        : NaN
-      : defaultLimitCents.trim() !== ''
-        ? Number(defaultLimitCents)
-        : NaN;
-  const limitCents = Number.isFinite(explicitLimitCents) ? explicitLimitCents : autoLimitCents;
-  const limit01 =
-    Number.isFinite(limitCents) && limitCents > 0 ? Math.min(0.99, Math.max(0.01, limitCents / 100)) : null;
+  /** Quick mode tracks live bid/ask every book tick — never freeze on a typed ¢ from custom mode. */
+  const quickLimit01 = useMemo(() => {
+    if (execMode !== 'touch') return null;
+    if (executableQuote01 != null && executableQuote01 > 0.01 && executableQuote01 < 0.99) {
+      return roundPrice01(executableQuote01);
+    }
+    const tc = touchLimitCents.trim() !== '' ? Number(touchLimitCents) : NaN;
+    if (Number.isFinite(tc) && tc > 0) return Math.min(0.99, Math.max(0.01, tc / 100));
+    return null;
+  }, [execMode, executableQuote01, touchLimitCents]);
+
+  const quickLimitCentsDisplay = useMemo(() => {
+    if (quickLimit01 == null) return touchLimitCents || defaultLimitCents || '';
+    const c = quickLimit01 * 100;
+    return Math.abs(c - Math.round(c)) < 0.05 ? String(Math.round(c)) : c.toFixed(1);
+  }, [quickLimit01, touchLimitCents, defaultLimitCents]);
+
+  const customLimit01 = useMemo(() => {
+    const c = limitPriceCents.trim() !== '' ? Number(limitPriceCents) : NaN;
+    if (!Number.isFinite(c) || c <= 0) {
+      const d = defaultLimitCents.trim() !== '' ? Number(defaultLimitCents) : NaN;
+      if (!Number.isFinite(d) || d <= 0) return null;
+      return Math.min(0.99, Math.max(0.01, d / 100));
+    }
+    return Math.min(0.99, Math.max(0.01, c / 100));
+  }, [limitPriceCents, defaultLimitCents]);
+
+  const limit01 = execMode === 'touch' ? quickLimit01 : customLimit01;
 
   const mid01 = mid != null && Number.isFinite(mid) ? mid : null;
 
@@ -5714,6 +6640,14 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       : mid01 != null && mid01 > 0.01 && mid01 < 0.99
         ? mid01
         : null;
+
+  const buySizingPrice01 = useMemo(
+    () => resolveBuySizingPrice01({ limit01, previewPrice01, mid01 }),
+    [limit01, mid01, previewPrice01],
+  );
+  const buySizingPrice01Ref = useRef<number | null>(null);
+  buySizingPrice01Ref.current = buySizingPrice01;
+
   const estShares =
     previewPrice01 != null && amtOk ? (unit === 'dollars' ? amtNum / previewPrice01 : amtNum) : null;
 
@@ -5725,15 +6659,73 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     return null;
   }, [action, limit01, previewPrice01]);
 
+  /** Single entry anchor for buy-bundle ¢ / % / $ math — matches submit limit/ask, not chart mid alone. */
+  const buyBracketSizingEntry01 = useMemo(() => {
+    if (action !== 'buy') return null;
+    return buySizingPrice01 ?? bracketPlannedEntry01 ?? previewPrice01;
+  }, [action, bracketPlannedEntry01, buySizingPrice01, previewPrice01]);
+
   /** Entry + size for buy-bundle SL/TP — the order being placed, not prior avg entry or held shares. */
-  const buyBundleEntry01 = bracketPlannedEntry01;
+  const buyBundleEntry01 = buyBracketSizingEntry01;
   const buyBundleShares = useMemo(() => {
     if (action !== 'buy' || !amtOk) return null;
-    if (estShares != null && Number.isFinite(estShares) && estShares > 0) return estShares;
-    if (buyBundleEntry01 == null) return null;
-    const sh = unit === 'dollars' ? amtNum / buyBundleEntry01 : amtNum;
+    const entry = buyBracketSizingEntry01;
+    if (entry == null || !(entry > 0)) return unit === 'shares' ? amtNum : null;
+    if (unit === 'shares') return amtNum;
+    const sh = amtNum / entry;
     return Number.isFinite(sh) && sh > 0 ? sh : null;
-  }, [action, amtOk, amtNum, buyBundleEntry01, estShares, unit]);
+  }, [action, amtOk, amtNum, buyBracketSizingEntry01, unit]);
+
+  const buyBundleNotionalUsd = useMemo(() => {
+    if (action !== 'buy' || !amtOk) return null;
+    if (unit === 'dollars') return amtNum;
+    if (buyBundleShares != null && buyBracketSizingEntry01 != null && buyBracketSizingEntry01 > 0) {
+      return buyBundleShares * buyBracketSizingEntry01;
+    }
+    return null;
+  }, [action, amtOk, amtNum, buyBracketSizingEntry01, buyBundleShares, unit]);
+
+  const buyBracketComposeKey = useMemo(() => {
+    if (action !== 'buy') return '';
+    return `${lane}|${unit}|${amount.trim()}|${limitPriceCents.trim()}|${execMode}`;
+  }, [action, amount, execMode, lane, limitPriceCents, unit]);
+
+  const pinnedBuyBracketSizing = useMemo(() => {
+    if (action !== 'buy') {
+      return {
+        entry01: buyBracketSizingEntry01,
+        shares: buyBundleShares,
+        notional: buyBundleNotionalUsd,
+      };
+    }
+    const key = buyBracketComposeKey;
+    const pin = buyBracketSizingPinRef.current;
+    if (!pin || pin.key !== key) {
+      const next = {
+        key,
+        entry01: buyBracketSizingEntry01,
+        shares: buyBundleShares,
+        notional: buyBundleNotionalUsd,
+      };
+      buyBracketSizingPinRef.current = next;
+      return next;
+    }
+    return pin;
+  }, [action, buyBracketComposeKey, buyBracketSizingEntry01, buyBundleNotionalUsd, buyBundleShares]);
+
+  const buyBundleEntry01Display = pinnedBuyBracketSizing.entry01;
+  const buyBundleSharesDisplay = pinnedBuyBracketSizing.shares;
+  const buyBundleNotionalDisplay = pinnedBuyBracketSizing.notional;
+  /** Pin entry/size for bracket readouts — live quote chase updates placeholder only, not sizing props. */
+  const buyBundleQuoteChaseActive =
+    action === 'buy' && (emergencyStopBundlePrefs.autoFillSl || emergencyStopBundlePrefs.autoTpOnFill);
+  const buyBundleBracketEntry01 = buyBundleEntry01Display;
+  const buyBundleBracketShares = buyBundleSharesDisplay;
+  const buyBundleBracketNotional = buyBundleNotionalDisplay;
+  const buyBundleBracketRef01 = useMemo(
+    () => resolveBracketRef({ avgEntry01: null, plannedEntry01: buyBundleBracketEntry01, mid01 }).ref01,
+    [buyBundleBracketEntry01, mid01],
+  );
 
   const bracketEntry01 = useMemo(
     () => resolveBracketRef({ avgEntry01: avgEntry ?? null, plannedEntry01: bracketPlannedEntry01, mid01 }).ref01,
@@ -5774,27 +6766,191 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const suggestedTpDisplay =
     liveSuggestedLevels?.tpCents ?? riskTargetsFromEntry?.tpCents ?? targets?.tpCents ?? '';
 
+  /** Targets (assist) card — TP/SL from spread bracket on the executable quote (Set TP on fill + auto TP use these). */
+  const quoteAssistTpCents = targets?.tpCents?.trim() ?? '';
+  const quoteAssistSlCents = targets?.stopCents?.trim() ?? '';
+  const bundleSuggestedTpCents = quoteAssistTpCents || suggestedTpDisplay;
+  const bundleSuggestedSlCents = quoteAssistSlCents || suggestedSlDisplay;
+
+  const autoBundleChaseLevels = useMemo(() => {
+    if (action !== 'buy') return { tpCents: '', slCents: '', source: 'spread' as const };
+    const laneTouch = lane === 'up' ? (bookTouchUp ?? null) : (bookTouchDown ?? null);
+    const entry01 =
+      (buyBundleQuoteChaseActive ? executableQuote01 : null) ??
+      bracketPlannedEntry01 ??
+      executableQuote01 ??
+      (mid01 != null && mid01 > 0 && mid01 < 1 ? mid01 : null);
+    return resolveAutoBundleChaseLevels({
+      lane,
+      useSignalLevels: armRiskAfterBuy.useSignalLevels,
+      signal: signalRiskSnapshot,
+      quoteAssist: targets,
+      entry01,
+      bookTouch: laneTouch,
+    });
+  }, [
+    action,
+    armRiskAfterBuy.useSignalLevels,
+    bookTouchDown,
+    bookTouchUp,
+    bracketPlannedEntry01,
+    buyBundleQuoteChaseActive,
+    executableQuote01,
+    lane,
+    mid01,
+    signalRiskSnapshot,
+    targets,
+  ]);
+
+  const autoBundleChaseTpCents = autoBundleChaseLevels.tpCents.trim();
+  const autoBundleChaseSlCents = autoBundleChaseLevels.slCents.trim();
+
+  const buyBundleSuggestTp =
+    action === 'buy' && autoBundleChaseTpCents ? autoBundleChaseTpCents : suggestedTpDisplay;
+  const buyBundleSuggestSl =
+    action === 'buy' && autoBundleChaseSlCents ? autoBundleChaseSlCents : suggestedSlDisplay;
+
   const applyBuyBundleSlCents = useCallback(
-    (v: string) => {
+    (v: string, opts?: { auto?: boolean }) => {
+      const trimmed = v.trim();
+      const curSl = buyBundleByLaneRef.current[lane].sl;
+      if (curSl === v) {
+        if (opts?.auto === true) {
+          buyBundleSlManualLanesRef.current = { ...buyBundleSlManualLanesRef.current, [lane]: false };
+        } else if (trimmed) {
+          buyBundleSlManualLanesRef.current = { ...buyBundleSlManualLanesRef.current, [lane]: true };
+          autoBundleSlLaneRef.current = { lane, cents: trimmed };
+        }
+        return;
+      }
+      buyBundleByLaneRef.current = {
+        ...buyBundleByLaneRef.current,
+        [lane]: { ...buyBundleByLaneRef.current[lane], sl: v },
+      };
       bracketLaneDraftRef.current[lane] = { ...bracketLaneDraftRef.current[lane], sl: v };
-      saveEmergencyStopForLane(lane, v);
       setBuyBundleByLane((prev) => ({ ...prev, [lane]: { ...prev[lane], sl: v } }));
+      if (opts?.auto === true) {
+        buyBundleSlManualLanesRef.current = { ...buyBundleSlManualLanesRef.current, [lane]: false };
+      } else {
+        buyBundleSlManualLanesRef.current = { ...buyBundleSlManualLanesRef.current, [lane]: Boolean(trimmed) };
+        saveEmergencyStopForLane(lane, trimmed);
+        if (trimmed) autoBundleSlLaneRef.current = { lane, cents: trimmed };
+      }
     },
     [lane],
   );
 
   const applyBuyBundleTpCents = useCallback(
-    (v: string) => {
+    (v: string, opts?: { auto?: boolean }) => {
+      const trimmed = v.trim();
+      const curTp = buyBundleByLaneRef.current[lane].tp;
+      if (curTp === v) {
+        if (opts?.auto === true) {
+          buyBundleTpManualLanesRef.current = { ...buyBundleTpManualLanesRef.current, [lane]: false };
+        } else if (trimmed) {
+          buyBundleTpManualLanesRef.current = { ...buyBundleTpManualLanesRef.current, [lane]: true };
+          autoBundleTpLaneRef.current = { lane, cents: trimmed };
+        }
+        return;
+      }
+      buyBundleByLaneRef.current = {
+        ...buyBundleByLaneRef.current,
+        [lane]: { ...buyBundleByLaneRef.current[lane], tp: v },
+      };
       bracketLaneDraftRef.current[lane] = { ...bracketLaneDraftRef.current[lane], tp: v };
       setBuyBundleByLane((prev) => ({ ...prev, [lane]: { ...prev[lane], tp: v } }));
+      if (opts?.auto === true) {
+        buyBundleTpManualLanesRef.current = { ...buyBundleTpManualLanesRef.current, [lane]: false };
+      } else {
+        buyBundleTpManualLanesRef.current = { ...buyBundleTpManualLanesRef.current, [lane]: Boolean(trimmed) };
+        if (trimmed) autoBundleTpLaneRef.current = { lane, cents: trimmed };
+      }
     },
     [lane],
   );
+
+  const flushBuyBundleDraftsForLane = useCallback(() => {
+    const bundle = buyBundleByLaneRef.current[lane];
+    const slState = buyBundleSlDraftRef.current[lane];
+    const slFlush = flushPendingBracketDraft({
+      draft: slState.draft,
+      mode: slState.mode,
+      committed: bundle.sl,
+      kind: 'sl',
+      ref01: buyBundleBracketRef01,
+      shares: buyBundleBracketShares,
+    });
+    if (slFlush) applyBuyBundleSlCents(slFlush);
+    const tpState = buyBundleTpDraftRef.current[lane];
+    const tpFlush = flushPendingBracketDraft({
+      draft: tpState.draft,
+      mode: tpState.mode,
+      committed: bundle.tp,
+      kind: 'tp',
+      ref01: buyBundleBracketRef01,
+      shares: buyBundleBracketShares,
+    });
+    if (tpFlush) applyBuyBundleTpCents(tpFlush);
+  }, [
+    applyBuyBundleSlCents,
+    applyBuyBundleTpCents,
+    buyBundleBracketRef01,
+    buyBundleBracketShares,
+    lane,
+  ]);
+
+  /** Same ¢ as Targets assist “Set TP on fill” — `locked` freezes the level; auto mode keeps syncing assist until you edit. */
+  const applyTargetsAssistTpOnFill = useCallback(
+    (opts?: { locked?: boolean }) => {
+      const tp = quoteAssistTpCents;
+      if (!tp) return;
+      buyBundleChaseFrozenRef.current = Boolean(opts?.locked);
+      buyBundleTpDraftRef.current = { ...buyBundleTpDraftRef.current, [lane]: { draft: tp, mode: 'cents' } };
+      if (opts?.locked) {
+        applyBuyBundleTpCents(tp);
+      } else {
+        applyBuyBundleTpCents(tp, { auto: true });
+      }
+    },
+    [applyBuyBundleTpCents, lane, quoteAssistTpCents],
+  );
+
+  /** Live chase: Targets assist quote TP → Auto TP on fill until operator edits or locks. */
+  useEffect(() => {
+    if (action !== 'buy' || !emergencyStopBundlePrefs.autoTpOnFill) return;
+    const tp = quoteAssistTpCents;
+    if (!tp) return;
+    const cur = buyBundleByLaneRef.current[lane].tp;
+    if (
+      !shouldChaseAutoBundleLevel({
+        manualLane: buyBundleTpManualLanesRef.current[lane],
+        deskLocked: buyBundleChaseFrozenRef.current,
+        quoteCents: tp,
+        curCents: cur,
+      })
+    ) {
+      return;
+    }
+    applyBuyBundleTpCents(tp, { auto: true });
+    autoBundleTpLaneRef.current = { lane, cents: tp };
+    buyBundleTpDraftRef.current = { ...buyBundleTpDraftRef.current, [lane]: EMPTY_BRACKET_INPUT_DRAFT };
+  }, [action, applyBuyBundleTpCents, emergencyStopBundlePrefs.autoTpOnFill, lane, quoteAssistTpCents]);
 
   const applySuggestedBuyBundleLevels = useCallback(() => {
     const sl = suggestedSlDisplay.trim();
     const tp = suggestedTpDisplay.trim();
     if (!sl && !tp) return;
+    bracketLaneDraftRef.current[lane] = {
+      sl: sl || bracketLaneDraftRef.current[lane].sl,
+      tp: tp || bracketLaneDraftRef.current[lane].tp,
+    };
+    buyBundleByLaneRef.current = {
+      ...buyBundleByLaneRef.current,
+      [lane]: {
+        sl: sl || buyBundleByLaneRef.current[lane].sl,
+        tp: tp || buyBundleByLaneRef.current[lane].tp,
+      },
+    };
     setBuyBundleByLane((prev) => ({
       ...prev,
       [lane]: {
@@ -5804,8 +6960,49 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     }));
   }, [lane, suggestedSlDisplay, suggestedTpDisplay]);
 
-  const emergencyStopStaged = Boolean(buyBundleSlCents.trim());
-  const buyBundleStaged = emergencyStopStaged || Boolean(buyBundleTpCents.trim());
+  const globalSlCentsForBuy = useMemo(
+    () => resolveGlobalStopForEntry(limit01, loadNowPriceDeskScalpPrefs()),
+    [limit01],
+  );
+
+  const resolvedEmergencyBundle = useMemo(() => {
+    const staged = resolveStagedBuyBundleLevels(lane, buyBundleByLane, {
+      prefs: emergencyStopBundlePrefs,
+      suggestedSl: emergencyStopBundlePrefs.autoFillSl ? bundleSuggestedSlCents : buyBundleSuggestSl,
+      suggestedTp: emergencyStopBundlePrefs.autoTpOnFill ? bundleSuggestedTpCents : buyBundleSuggestTp,
+      manualSl: buyBundleSlManualLanesRef.current[lane],
+      manualTp: buyBundleTpManualLanesRef.current[lane],
+      globalSlCents: globalSlCentsForBuy,
+    });
+    if (action === 'buy') return staged;
+    if (takeProfitEnabled && takeProfitTakeCents.trim()) {
+      return {
+        sl: stopLossStopCents.trim() || staged.sl,
+        tp: takeProfitTakeCents.trim() || staged.tp,
+      };
+    }
+    if (stopLossEnabled && stopLossStopCents.trim()) {
+      return { sl: stopLossStopCents.trim(), tp: staged.tp };
+    }
+    return staged;
+  }, [
+    action,
+    buyBundleByLane,
+    buyBundleSuggestSl,
+    buyBundleSuggestTp,
+    bundleSuggestedSlCents,
+    bundleSuggestedTpCents,
+    emergencyStopBundlePrefs,
+    globalSlCentsForBuy,
+    lane,
+    stopLossEnabled,
+    stopLossStopCents,
+    takeProfitEnabled,
+    takeProfitTakeCents,
+  ]);
+
+  const emergencyStopStaged = Boolean(resolvedEmergencyBundle.sl);
+  const buyBundleStaged = emergencyStopStaged || Boolean(resolvedEmergencyBundle.tp);
 
   const stageBuyBundleForSubmit = useCallback(
     (
@@ -5813,9 +7010,14 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       submitToken: string,
       estSizeShares: number | null,
     ): { ok: true; armed: boolean } | { ok: false; reason: string } => {
-      const laneDraft = bracketLaneDraftRef.current[submitLane];
-      const sl = buyBundleSlCents.trim() || laneDraft.sl.trim();
-      const tp = buyBundleTpCents.trim();
+      const { sl, tp } = resolveStagedBuyBundleLevels(submitLane, buyBundleByLaneRef.current, {
+        prefs: emergencyStopBundlePrefs,
+        suggestedSl: emergencyStopBundlePrefs.autoFillSl ? bundleSuggestedSlCents : buyBundleSuggestSl,
+        suggestedTp: emergencyStopBundlePrefs.autoTpOnFill ? bundleSuggestedTpCents : buyBundleSuggestTp,
+        manualSl: buyBundleSlManualLanesRef.current[submitLane],
+        manualTp: buyBundleTpManualLanesRef.current[submitLane],
+        globalSlCents: globalSlCentsForBuy,
+      });
       if (!sl && !tp) {
         buyBundleArmRef.current = null;
         return { ok: true, armed: false };
@@ -5834,6 +7036,12 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       }
       const tok = submitToken.trim();
       buyBundleArmRef.current = { sl, tp, lane: submitLane, token: tok };
+      if (sl || tp) {
+        pendingBuyBundleIntentRef.current = { lane: submitLane, token: tok, sl, tp };
+      } else {
+        pendingBuyBundleIntentRef.current = null;
+      }
+      buyBundleChaseFrozenRef.current = true;
       deskBuyLaneRef.current = submitLane;
       bracketOutcomeLaneRef.current = submitLane;
       bracketOutcomeTokenRef.current = tok;
@@ -5843,12 +7051,19 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         if (tp) setTakeProfitShares(shStr);
       }
       if (sl) {
+        operatorSlTpLockedRef.current = true;
+        setStopLossStopCents(sl);
+        setStopLossLimitCents(sl);
         setStopLossEnabled(true);
         setStopLossStatus('ARMED');
       }
       if (tp) {
-        setTakeProfitEnabled(true);
-        setTakeProfitStatus('ARMED');
+        operatorSlTpLockedRef.current = true;
+        syncDeskTakeProfitArm(
+          tp,
+          estSizeShares != null && Number.isFinite(estSizeShares) ? estSizeShares : null,
+          tok,
+        );
       }
       bracketArmedPinRef.current = {
         token: tok,
@@ -5861,16 +7076,24 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       setBracketPollToken(tok);
       return { ok: true, armed: true };
     },
-    [buyBundleSlCents, buyBundleTpCents, limit01],
+    [
+      buyBundleSuggestSl,
+      buyBundleSuggestTp,
+      bundleSuggestedSlCents,
+      bundleSuggestedTpCents,
+      emergencyStopBundlePrefs,
+      limit01,
+      syncDeskTakeProfitArm,
+    ],
   );
 
   /** Held shares or estimated buy size — powers total-$ TP/SL (e.g. $50 profit on $1000). */
   const bracketOrderShares = useMemo(() => {
+    if (action === 'buy' && buyBundleShares != null && buyBundleShares > 0) return buyBundleShares;
     if (positionShares != null && positionShares > 0) return positionShares;
     if (liveSellableShares != null && liveSellableShares > 0) return liveSellableShares;
-    if (buyBundleShares != null && buyBundleShares > 0) return buyBundleShares;
-    if (action === 'buy' && amtOk && bracketPlannedEntry01 != null) {
-      const sh = unit === 'dollars' ? amtNum / bracketPlannedEntry01 : amtNum;
+    if (action === 'buy' && amtOk && buyBracketSizingEntry01 != null && buyBracketSizingEntry01 > 0) {
+      const sh = unit === 'dollars' ? amtNum / buyBracketSizingEntry01 : amtNum;
       return Number.isFinite(sh) && sh > 0 ? sh : null;
     }
     return null;
@@ -5878,7 +7101,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     action,
     amtOk,
     amtNum,
-    bracketPlannedEntry01,
+    buyBracketSizingEntry01,
     buyBundleShares,
     liveSellableShares,
     positionShares,
@@ -5893,15 +7116,44 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       : unit === 'dollars' && amtOk
         ? amtNum
         : null;
-  const buyExceedsCash = useMemo(() => {
-    if (action !== 'buy' || !amtOk) return false;
+  const buyAmountRef = useRef(amount);
+  buyAmountRef.current = amount;
+
+  const clampBuyAmountIfNeeded = useCallback(() => {
+    if (action !== 'buy') return;
     const cash = availableBuyUsd;
-    if (cash == null || !(cash > 0)) return false;
-    if (unit === 'dollars') return amtNum > cash + 0.01;
-    const px = previewPrice01 ?? mid;
-    if (px == null || !(px > 0)) return false;
-    return amtNum * px > cash + 0.01;
-  }, [action, amtOk, amtNum, availableBuyUsd, mid, previewPrice01, unit]);
+    if (cash == null || !(cash > 0)) return;
+    const raw = buyAmountRef.current.trim();
+    if (!raw) return;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) return;
+    if (!buyAmountExceedsCash({ amtNum: n, unit, cashUsd: cash, price01: buySizingPrice01 })) return;
+    const next = clampBuyAmountWithinCash({ amountStr: raw, unit, cashUsd: cash, price01: buySizingPrice01 });
+    if (next !== raw) setAmount(next);
+  }, [action, availableBuyUsd, buySizingPrice01, unit]);
+
+  useEffect(() => {
+    if (action !== 'buy') return;
+    const raw = amount.trim();
+    if (!raw) return;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) return;
+    const cash = availableBuyUsd;
+    if (cash == null || !(cash > 0)) return;
+    if (!buyAmountExceedsCash({ amtNum: n, unit, cashUsd: cash, price01: buySizingPrice01 })) return;
+    clampBuyAmountIfNeeded();
+  }, [amount, action, availableBuyUsd, buySizingPrice01, unit, clampBuyAmountIfNeeded]);
+
+  const buyMaxAffordableHint = useMemo(() => {
+    const cash = availableBuyUsd;
+    if (cash == null || !(cash > 0)) return null;
+    const px = buySizingPrice01;
+    if (unit === 'dollars') return `Max $${floorUsdWhole(cash)}`;
+    if (px == null || !(px > 0)) return null;
+    const sh = floorSharesWhole(cash / px);
+    return sh > 0 ? `Max ${sh} sh @ ${fmtCents(px)}` : null;
+  }, [availableBuyUsd, buySizingPrice01, unit]);
+
   const canSizeBuy =
     !busySubmit &&
     !outcomeLocked &&
@@ -5916,14 +7168,14 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         setErr('No cash available.');
         return;
       }
-      const price = previewPrice01 ?? (mid != null && mid > 0 ? mid : null);
+      const price = buySizingPrice01;
       if (unit === 'shares' && (price == null || price <= 0)) {
         setErr('Need a valid price to size in shares.');
         return;
       }
       setAmount(buyAmountFromCashPct({ pct, unit, cashUsd: cash, price01: price }));
     },
-    [availableBuyUsd, mid, previewPrice01, unit],
+    [availableBuyUsd, buySizingPrice01, unit],
   );
   const applyBuyUsdPreset = useCallback(
     (usd: number) => {
@@ -5958,11 +7210,12 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       const c = (limit01 * 100).toFixed(1);
       const mode = accountMode === 'paper' ? 'Paper' : 'Live';
       const exec = execMode === 'touch' ? 'Quick limit buy' : 'Custom limit buy';
-      const bracketNote = emergencyStopStaged
-        ? ` · Emergency stop ${buyBundleSlCents.trim()}¢ on fill`
-        : buyBundleTpCents.trim()
-          ? ` · TP ${buyBundleTpCents.trim()}¢ on fill`
-          : '';
+      const bracketParts: string[] = [];
+      const slNote = buyBundleSlCents.trim();
+      const tpNote = buyBundleTpCents.trim();
+      if (slNote) bracketParts.push(`Emergency stop ${slNote}¢`);
+      if (tpNote) bracketParts.push(`TP ${tpNote}¢`);
+      const bracketNote = bracketParts.length ? ` · ${bracketParts.join(' · ')} on fill` : '';
       if (unit === 'shares' && estShares != null) {
         return `${mode} · ${exec} · ${c}¢ · ~${estShares.toFixed(2)} sh · ${label}${bracketNote}`;
       }
@@ -5985,10 +7238,9 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     action,
     amtNum,
     amtOk,
-    buyGate.ok,
     buyBundleSlCents,
     buyBundleTpCents,
-    emergencyStopStaged,
+    buyGate.ok,
     estShares,
     execMode,
     executableQuote01,
@@ -6092,8 +7344,147 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     balDown,
   ]);
 
-  const maxSellStr =
-    positionShares != null && positionShares > 0 ? fmtShares(positionShares, 'compact') : accountMode === 'live' && balLoading ? '…' : '—';
+  const buySubmitDisabled =
+    busySubmit ||
+    outcomeLocked ||
+    !amtOk ||
+    limit01 == null ||
+    !Number.isFinite(limit01) ||
+    !buyGate.ok;
+
+  const buyButtonLabelText = `Buy ${label}`;
+
+  const triggerBuySubmit = useCallback(() => {
+    buyButtonRef.current?.click();
+  }, []);
+
+  const buyCtaBusyLabel = isSlide ? 'SENDING…' : 'Submitting…';
+
+  const buyCtaButtonClass = (variant: 'primary' | 'compact' | 'header') => {
+    if (variant === 'header') {
+      return `max-w-[9.5rem] truncate rounded-lg px-3 py-2 text-[12px] font-black disabled:cursor-not-allowed disabled:opacity-40 ${
+        buySubmitDisabled && !busySubmit
+          ? 'border border-zinc-700/60 bg-zinc-900/40 text-zinc-500'
+          : 'bg-emerald-400 text-black hover:bg-emerald-300'
+      } ${busySubmit ? 'inline-flex min-h-[40px] items-center justify-center gap-1.5' : 'min-h-[40px]'}`;
+    }
+    if (variant === 'compact') {
+      return `w-full rounded-xl px-4 py-2.5 text-[13px] font-black text-black disabled:cursor-not-allowed disabled:opacity-40 ${
+        isSlide
+          ? 'min-h-[44px] bg-emerald-400/70 hover:bg-emerald-300/80'
+          : 'min-h-[46px] bg-emerald-400/90 shadow-md shadow-emerald-950/20 hover:bg-emerald-300'
+      } ${isSlide ? 'inline-flex items-center justify-center gap-2' : ''}`;
+    }
+    return `w-full rounded-xl px-4 py-3 text-sm font-black text-black disabled:cursor-not-allowed disabled:opacity-40 ${
+      isSlide
+        ? 'min-h-[48px] bg-emerald-400/70 shadow-none hover:bg-emerald-300/80'
+        : 'min-h-[52px] bg-emerald-400 shadow-lg shadow-emerald-950/30 hover:bg-emerald-300'
+    } ${isSlide ? 'inline-flex items-center justify-center gap-2' : ''}`;
+  };
+
+  const renderBuyCtaContent = (variant: 'primary' | 'compact' | 'header' = 'primary') =>
+    busySubmit ? (
+      <>
+        {isSlide || variant === 'header' ? (
+          <span className="size-3.5 shrink-0 animate-spin rounded-full border-2 border-black/25 border-t-black" aria-hidden />
+        ) : null}
+        {buyCtaBusyLabel}
+      </>
+    ) : (
+      <span className="inline-flex items-center justify-center gap-1.5">
+        {buyButtonLabelText}
+        {buyBundleStaged ? (
+          <span className="rounded bg-black/20 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide">
+            SL/TP
+          </span>
+        ) : null}
+      </span>
+    );
+
+  const renderSecondaryBuyCta = (variant: 'compact' | 'header' = 'compact') => (
+    <button
+      type="button"
+      disabled={buySubmitDisabled}
+      aria-busy={busySubmit}
+      title={buyGate.ok ? buyButtonLabelText : (buyGate.reason ?? 'Buy unavailable')}
+      className={buyCtaButtonClass(variant)}
+      onClick={triggerBuySubmit}
+    >
+      {renderBuyCtaContent(variant)}
+    </button>
+  );
+
+  const maxSellStr = useMemo(() => {
+    const instant = resolveInstantMaxSellShares(lane);
+    const whole = instant > 0 ? floorSharesWhole(instant) : 0;
+    if (whole > 0) return String(whole);
+    if (positionShares != null && positionShares > 0) return String(floorSharesWhole(positionShares));
+    return accountMode === 'live' && balLoading ? '…' : '—';
+  }, [accountMode, balLoading, lane, positionShares, resolveInstantMaxSellShares]);
+
+  const positionTpOutlookTrade = useMemo(() => {
+    if (positionShares == null || !(positionShares > 0)) return null;
+    const entry01 = avgEntry;
+    const currentMid01 = mid;
+    const armedTp01 = takeProfitTakeCents.trim() ? centsStrTo01(takeProfitTakeCents) : null;
+    const tp01 = armedTp01 ?? targets?.tp01 ?? null;
+    const probSeries = lane === 'up' ? (probMomentumUp ?? []) : (probMomentumDown ?? []);
+    const touch = lane === 'up' ? bookTouchUp : bookTouchDown;
+    return computeHeldLaneTpOutlook({
+      heldLane: lane,
+      currentMid01,
+      entry01,
+      tp01,
+      probSeries,
+      bestAsk: touch?.bestAsk ?? null,
+      bestBid: touch?.bestBid ?? null,
+      crossProb,
+      endsInMs,
+    });
+  }, [
+    positionShares,
+    avgEntry,
+    mid,
+    takeProfitTakeCents,
+    targets?.tp01,
+    lane,
+    probMomentumUp,
+    probMomentumDown,
+    bookTouchUp,
+    bookTouchDown,
+    crossProb,
+    endsInMs,
+  ]);
+
+  const preBuyTpOutlook = useMemo(() => {
+    if (action !== 'buy') return null;
+    const tpCents = resolvedEmergencyBundle.tp;
+    if (!tpCents?.trim()) return null;
+    const entry01 =
+      buyBundleBracketEntry01 ??
+      bracketPlannedEntry01 ??
+      (mid != null && mid > 0 && mid < 1 ? mid : null);
+    const probSeries = lane === 'up' ? (probMomentumUp ?? []) : (probMomentumDown ?? []);
+    return computePreBuyTpOutlook({
+      entry01,
+      tpCents,
+      current01: mid,
+      probSeries,
+      crossProb,
+      endsInMs,
+    });
+  }, [
+    action,
+    resolvedEmergencyBundle.tp,
+    buyBundleBracketEntry01,
+    bracketPlannedEntry01,
+    mid,
+    lane,
+    probMomentumUp,
+    probMomentumDown,
+    crossProb,
+    endsInMs,
+  ]);
 
   const [quickSellMode, setQuickSellMode] = useState<'market' | 'touch_limit'>('market');
 
@@ -6109,9 +7500,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     for (const r of historyRows) {
       if (r.mode !== 'live') continue;
       if (r.token?.trim() !== tok) continue;
-      if (r.status === 'sending' || r.status === 'pending' || r.status === 'sent') return r;
+      if (liveRowCancelable(r)) return r;
       if ((r.status === 'partial' || r.status === 'filled') && !rowShowsExchangeFill(r)) return r;
-      if (r.status === 'partial' && rowShowsExchangeFill(r)) return r;
       if (r.status === 'filled' && rowShowsExchangeFill(r) && now - (r.ts ?? 0) <= SHOW_FILLED_MS) return r;
     }
     return null;
@@ -6379,12 +7769,9 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         buyBundleArmRef.current = null;
         applyFilledBuyBundle({ rowTok: fillTok, riskLane: fillLane, shares: totalSh, sl: bundle.sl, tp: bundle.tp });
       } else if (fillLane) {
-        const laneDraft = bracketLaneDraftRef.current[fillLane];
-        const emergDraft = buyBundleByLaneRef.current[fillLane];
-        const preSl = emergDraft.sl.trim() || laneDraft.sl.trim();
-        const preTp = emergDraft.tp.trim();
-        if (preSl || preTp) {
-          applyFilledBuyBundle({ rowTok: fillTok, riskLane: fillLane, shares: totalSh, sl: preSl, tp: preTp });
+        const staged = readStagedBuyBundleLevels(fillLane, buyBundleByLaneRef.current);
+        if (staged.sl || staged.tp) {
+          applyFilledBuyBundle({ rowTok: fillTok, riskLane: fillLane, shares: totalSh, sl: staged.sl, tp: staged.tp });
         } else {
           applyArmRiskAfterBuyFill(last.fillPrice01, totalSh, fillLane);
         }
@@ -6710,8 +8097,9 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                             centsValue={stopLossStopCents}
                             onCentsChange={applyStopLossTriggerCents}
                             avgEntry01={avgEntry ?? null}
-                            plannedEntry01={bracketPlannedEntry01}
+                            plannedEntry01={action === 'buy' ? buyBracketSizingEntry01 : bracketPlannedEntry01}
                             orderShares={bracketOrderShares}
+                            orderNotionalUsd={action === 'buy' ? buyBundleNotionalUsd : null}
                             mid01={mid ?? null}
                             placeholderCents={targets?.stopCents}
                             suggestedCents={suggestedSlDisplay || undefined}
@@ -6778,8 +8166,11 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                                   className="rounded-lg border border-zinc-700/60 bg-black/20 px-2.5 py-1.5 text-[10px] font-bold text-zinc-200 hover:bg-black/30 disabled:opacity-40"
                                   title="Set shares to your full position (floored to 4dp)"
                                   onClick={() => {
-                                    if (positionShares == null || !(positionShares > 0)) return;
-                                    setStopLossShares(String(floorShares4(positionShares)));
+                                    const sh = bracketPositionShares ?? positionShares;
+                                    if (sh == null || !(sh > 0)) return;
+                                    const s = String(floorShares4(sh));
+                                    setStopLossShares(s);
+                                    syncBracketSharesFromPosition(sh);
                                   }}
                                 >
                                   = Max
@@ -6789,7 +8180,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                                     type="button"
                                     className="rounded-lg border border-rose-800/35 bg-rose-950/20 px-2.5 py-1.5 text-[10px] font-bold text-rose-100 hover:bg-rose-950/35"
                                     title="Use assist stop as trigger"
-                                    onClick={() => setStopLossStopCents(targets.stopCents)}
+                                    onClick={() => applyStopLossTriggerCents(targets.stopCents)}
                                   >
                                     Use assist stop
                                   </button>
@@ -6857,8 +8248,9 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                             centsValue={takeProfitTakeCents}
                             onCentsChange={applyTakeProfitTriggerCents}
                             avgEntry01={avgEntry ?? null}
-                            plannedEntry01={bracketPlannedEntry01}
+                            plannedEntry01={action === 'buy' ? buyBracketSizingEntry01 : bracketPlannedEntry01}
                             orderShares={bracketOrderShares}
+                            orderNotionalUsd={action === 'buy' ? buyBundleNotionalUsd : null}
                             mid01={mid ?? null}
                             placeholderCents={riskTargetsFromEntry?.tpCents ?? targets?.tpCents}
                             suggestedCents={suggestedTpDisplay || undefined}
@@ -6925,8 +8317,11 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                                   className="rounded-lg border border-zinc-700/60 bg-black/20 px-2.5 py-1.5 text-[10px] font-bold text-zinc-200 hover:bg-black/30 disabled:opacity-40"
                                   title="Set shares to your full position (floored to 4dp)"
                                   onClick={() => {
-                                    if (positionShares == null || !(positionShares > 0)) return;
-                                    setTakeProfitShares(String(floorShares4(positionShares)));
+                                    const sh = bracketPositionShares ?? positionShares;
+                                    if (sh == null || !(sh > 0)) return;
+                                    const s = String(floorShares4(sh));
+                                    setTakeProfitShares(s);
+                                    syncBracketSharesFromPosition(sh);
                                   }}
                                 >
                                   = Max
@@ -6938,10 +8333,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                                     title="Use assist or entry-anchored TP as trigger"
                                     onClick={() => {
                                       const c = riskTargetsFromEntry?.tpCents ?? targets?.tpCents;
-                                      if (c) {
-                                        setTakeProfitTakeCents(c);
-                                        setTakeProfitLimitCents(c);
-                                      }
+                                      if (c) applyTakeProfitTriggerCents(c);
                                     }}
                                   >
                                     Use assist TP
@@ -6973,9 +8365,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                                         onClick={() => {
                                           const v = Math.min(99.9, Math.max(0.1, Math.round((bracketMidCentsDisplay + d) * 10) / 10));
                                           const s = v % 1 === 0 ? String(Math.round(v)) : String(v);
-                                          setStopLossStopCents(s);
-                                          setStopLossLimitCents(s);
-                                          if (positionShares != null && positionShares > 0) setStopLossShares(String(floorShares4(positionShares)));
+                                          applyStopLossTriggerCents(s);
                                         }}
                                       >
                                         {d}¢
@@ -6985,11 +8375,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                                       <button
                                         type="button"
                                         className="min-h-[34px] rounded-lg border border-rose-700/50 bg-rose-950/35 px-2.5 text-[10px] font-bold text-rose-50 hover:bg-rose-950/55"
-                                        onClick={() => {
-                                          setStopLossStopCents(targets.stopCents);
-                                          setStopLossLimitCents(targets.stopCents);
-                                          if (positionShares != null && positionShares > 0) setStopLossShares(String(floorShares4(positionShares)));
-                                        }}
+                                        onClick={() => applyStopLossTriggerCents(targets.stopCents)}
                                       >
                                         Assist
                                       </button>
@@ -7006,9 +8392,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                                         onClick={() => {
                                           const v = Math.min(99.9, Math.max(0.1, Math.round((bracketMidCentsDisplay + d) * 10) / 10));
                                           const s = v % 1 === 0 ? String(Math.round(v)) : String(v);
-                                          setTakeProfitTakeCents(s);
-                                          setTakeProfitLimitCents(s);
-                                          if (positionShares != null && positionShares > 0) setTakeProfitShares(String(floorShares4(positionShares)));
+                                          applyTakeProfitTriggerCents(s);
                                         }}
                                       >
                                         +{d}¢
@@ -7017,11 +8401,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                                     <button
                                       type="button"
                                       className="min-h-[34px] min-w-[3rem] rounded-lg border border-emerald-700/50 bg-emerald-950/35 px-2 text-[11px] font-bold text-emerald-50 hover:bg-emerald-950/55"
-                                      onClick={() => {
-                                        setTakeProfitTakeCents('99');
-                                        setTakeProfitLimitCents('99');
-                                        if (positionShares != null && positionShares > 0) setTakeProfitShares(String(floorShares4(positionShares)));
-                                      }}
+                                      onClick={() => applyTakeProfitTriggerCents('99')}
                                     >
                                       99¢
                                     </button>
@@ -7031,11 +8411,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                                         className="min-h-[34px] rounded-lg border border-emerald-700/50 bg-emerald-950/35 px-2.5 text-[10px] font-bold text-emerald-50 hover:bg-emerald-950/55"
                                         onClick={() => {
                                           const c = riskTargetsFromEntry?.tpCents ?? targets?.tpCents;
-                                          if (c) {
-                                            setTakeProfitTakeCents(c);
-                                            setTakeProfitLimitCents(c);
-                                            if (positionShares != null && positionShares > 0) setTakeProfitShares(String(floorShares4(positionShares)));
-                                          }
+                                          if (c) applyTakeProfitTriggerCents(c);
                                         }}
                                       >
                                         Assist
@@ -7064,7 +8440,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
 
   return (
     <div
-      className={`${
+      className={`${isSlide ? 'relative' : ''} ${
         isSlide
           ? 'border-0 bg-transparent p-0 shadow-none ring-0'
           : `border ring-1 ring-white/[0.04] ${
@@ -7084,25 +8460,28 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
               <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Order flow</div>
             )}
             {isSlide ? (
-              <div className="flex shrink-0 items-center gap-1 rounded-xl border border-zinc-800/60 bg-black/20 p-1">
-                <button
-                  type="button"
-                  onClick={() => chooseAction('buy')}
-                  className={`min-h-[40px] rounded-lg px-3.5 text-[14px] font-bold transition-colors ${
-                    action === 'buy' ? 'bg-zinc-800 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
-                  }`}
-                >
-                  BUY
-                </button>
-                <button
-                  type="button"
-                  onClick={() => chooseAction('sell')}
-                  className={`min-h-[40px] rounded-lg px-3.5 text-[14px] font-bold transition-colors ${
-                    action === 'sell' ? 'bg-rose-500 text-black' : 'text-zinc-400 hover:text-zinc-200'
-                  }`}
-                >
-                  SELL
-                </button>
+              <div className="flex shrink-0 items-center gap-1.5">
+                <div className="flex shrink-0 items-center gap-1 rounded-xl border border-zinc-800/60 bg-black/20 p-1">
+                  <button
+                    type="button"
+                    onClick={() => chooseAction('buy')}
+                    className={`min-h-[40px] rounded-lg px-3.5 text-[14px] font-bold transition-colors ${
+                      action === 'buy' ? 'bg-zinc-800 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
+                    }`}
+                  >
+                    BUY
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => chooseAction('sell')}
+                    className={`min-h-[40px] rounded-lg px-3.5 text-[14px] font-bold transition-colors ${
+                      action === 'sell' ? 'bg-rose-500 text-black' : 'text-zinc-400 hover:text-zinc-200'
+                    }`}
+                  >
+                    SELL
+                  </button>
+                </div>
+                {action === 'buy' ? renderSecondaryBuyCta('header') : null}
               </div>
             ) : null}
           </div>
@@ -7448,6 +8827,12 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                         }`
                       : liveStatusRow.status === 'filled' || liveStatusRow.status === 'partial'
                         ? 'MATCHED (confirming on exchange tape…)'
+                        : liveStatusRow.status === 'no_fill'
+                          ? 'CLOSED · no active order on exchange'
+                          : liveStatusRow.status === 'cancelled'
+                            ? 'CANCELLED'
+                            : liveStatusRow.status === 'failed'
+                              ? 'FAILED'
                         : liveStatusRow.status === 'sent'
                           ? 'RESTING (OPEN) · 0 filled on exchange'
                           : liveStatusRow.status === 'pending'
@@ -7561,7 +8946,22 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
             Sell
           </button>
         </div> : null}
+        {!isSlide && action === 'buy' ? <div className="mt-2">{renderSecondaryBuyCta('compact')}</div> : null}
       </div>
+
+      {!isSlide ? (
+        <div className="mt-4">
+          <ShouldBuyCard
+            advisory={effectiveBuySideAdvisory}
+            autoAsk
+            upLabel={upLabel}
+            downLabel={downLabel}
+            onAsk={() => {
+              /* auto-ask recomputes live; Re-ask is a no-op refresh hook for future use */
+            }}
+          />
+        </div>
+      ) : null}
 
       {accountMode === 'live' ? (
         <div className="mt-4">
@@ -7608,6 +9008,11 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
               />
             );
           })()}
+        </div>
+      ) : null}
+      {positionTpOutlookTrade ? (
+        <div className={isSlide ? 'mt-3' : 'mt-4'}>
+          <PositionTpOutlookCard outlook={positionTpOutlookTrade} compact={isSlide} />
         </div>
       ) : null}
       {busySubmit && submitAbort ? (
@@ -7679,21 +9084,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
         </div>
       ) : null}
 
-      {isSlide ? (
-        <div className="mt-3">
-          <TradeSegmentedControl
-            value={slideDockTab}
-            onChange={(v) => setSlideDockTab(v as 'outcome' | 'brackets' | 'ledger')}
-            options={[
-              { value: 'outcome', label: 'Outcome', title: 'Pick side, size, buy / sell' },
-              { value: 'brackets', label: 'Brackets', title: 'Stop-loss & take-profit automation' },
-              { value: 'ledger', label: 'Orders & position', title: 'Open orders, book, balances' },
-            ]}
-            className="w-full"
-            size="md"
-          />
-        </div>
-      ) : null}
+      {isSlide && !tradeFloatChrome ? slideDockTabsEl : null}
 
       {isSlide && showOutcomeDock ? (
         <div className="mt-3 space-y-2">
@@ -7707,34 +9098,35 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
               {busySubmit ? 'SENDING…' : err ? 'FAILED' : okMsg ? 'FILLED / OK' : 'READY'}
             </span>
           </div>
-          {flashToast ? (
-            <div className="min-w-0 break-words rounded-lg border border-zinc-700/50 bg-zinc-900/80 px-3 py-2 text-left text-[12px] leading-snug text-zinc-100">
-              {flashToast}
-            </div>
-          ) : null}
-          {lastAutoSell && Date.now() - lastAutoSell.ts <= 10 * 60_000 ? (
-            <div
-              className={`min-w-0 break-words rounded-lg border px-3 py-2 text-left text-[12px] leading-snug ${
-                lastAutoSell.status === 'filled'
-                  ? 'border-emerald-800/35 bg-emerald-950/20 text-emerald-100'
-                  : lastAutoSell.status === 'sent'
-                    ? 'border-amber-800/35 bg-amber-950/15 text-amber-100'
-                    : 'border-rose-800/35 bg-rose-950/15 text-rose-100'
-              }`}
-              title={lastAutoSell.msg ?? undefined}
-            >
-              <span className="font-black">
-                {lastAutoSell.status === 'filled' ? 'AUTO-SOLD' : lastAutoSell.status === 'sent' ? 'AUTO-SELL SENT' : 'AUTO-SELL FAILED'}
-              </span>{' '}
-              <span className="font-mono">
-                {lastAutoSell.kind === 'sl' ? 'SL' : 'TP'} stop {lastAutoSell.triggerCents.toFixed(1)}¢
-                {lastAutoSell.refCents != null ? ` · bid ${lastAutoSell.refCents.toFixed(1)}¢` : ''} → limit{' '}
-                {lastAutoSell.limitCents.toFixed(1)}¢ · {lastAutoSell.shares.toFixed(4)} sh
-                {lastAutoSell.orderId ? ` · oid ${lastAutoSell.orderId.slice(0, 6)}…${lastAutoSell.orderId.slice(-4)}` : ''}
-              </span>
-              {lastAutoSellAvgCallout}
-            </div>
-          ) : null}
+          <div className="min-h-[2.75rem]">
+            {flashToast ? (
+              <div className="min-w-0 break-words rounded-lg border border-zinc-700/50 bg-zinc-900/80 px-3 py-2 text-left text-[12px] leading-snug text-zinc-100">
+                {flashToast}
+              </div>
+            ) : lastAutoSell && Date.now() - lastAutoSell.ts <= 10 * 60_000 ? (
+              <div
+                className={`min-w-0 break-words rounded-lg border px-3 py-2 text-left text-[12px] leading-snug ${
+                  lastAutoSell.status === 'filled'
+                    ? 'border-emerald-800/35 bg-emerald-950/20 text-emerald-100'
+                    : lastAutoSell.status === 'sent'
+                      ? 'border-amber-800/35 bg-amber-950/15 text-amber-100'
+                      : 'border-rose-800/35 bg-rose-950/15 text-rose-100'
+                }`}
+                title={lastAutoSell.msg ?? undefined}
+              >
+                <span className="font-black">
+                  {lastAutoSell.status === 'filled' ? 'AUTO-SOLD' : lastAutoSell.status === 'sent' ? 'AUTO-SELL SENT' : 'AUTO-SELL FAILED'}
+                </span>{' '}
+                <span className="font-mono">
+                  {lastAutoSell.kind === 'sl' ? 'SL' : 'TP'} stop {lastAutoSell.triggerCents.toFixed(1)}¢
+                  {lastAutoSell.refCents != null ? ` · bid ${lastAutoSell.refCents.toFixed(1)}¢` : ''} → limit{' '}
+                  {lastAutoSell.limitCents.toFixed(1)}¢ · {lastAutoSell.shares.toFixed(4)} sh
+                  {lastAutoSell.orderId ? ` · oid ${lastAutoSell.orderId.slice(0, 6)}…${lastAutoSell.orderId.slice(-4)}` : ''}
+                </span>
+                {lastAutoSellAvgCallout}
+              </div>
+            ) : null}
+          </div>
         </div>
       ) : null}
 
@@ -7859,7 +9251,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                 : 'border-zinc-800/70 bg-black/25 hover:bg-black/35'
             }`}
           >
-            <span className="text-[11px] font-black uppercase tracking-wide text-rose-200">Sell {upLabel}</span>
+            <OutcomeLaneHeader lane="up" label={upLabel} mode="sell" momentum={outcomeMomentumUp} />
             <span className="font-mono text-2xl font-black tabular-nums text-emerald-100">{fmtCents(midUpEff)}</span>
             <span className="text-[10px] text-zinc-500">
               Hold{' '}
@@ -7883,7 +9275,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                 : 'border-zinc-800/70 bg-black/25 hover:bg-black/35'
             }`}
           >
-            <span className="text-[11px] font-black uppercase tracking-wide text-rose-200">Sell {downLabel}</span>
+            <OutcomeLaneHeader lane="down" label={downLabel} mode="sell" momentum={outcomeMomentumDown} />
             <span className="font-mono text-2xl font-black tabular-nums text-zinc-100">{fmtCents(midDownEff)}</span>
             <span className="text-[10px] text-zinc-500">
               Hold{' '}
@@ -7912,7 +9304,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                 : 'border-zinc-800/70 bg-black/20 hover:bg-black/30'
             }`}
           >
-            <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">{upLabel}</div>
+            <OutcomeLaneHeader lane="up" label={upLabel} momentum={outcomeMomentumUp} />
             <div className={`mt-1 font-black tabular-nums text-emerald-100 ${isSlide ? 'text-3xl' : 'text-2xl'}`}>{fmtCents(midUpEff)}</div>
             <div className="mt-0.5 text-[10px] font-mono text-zinc-500">{upToken ? `${upToken.slice(0, 6)}…${upToken.slice(-4)}` : '—'}</div>
             <div className="mt-1 text-[11px] text-zinc-500">
@@ -7939,7 +9331,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                 : 'border-zinc-800/70 bg-black/20 hover:bg-black/30'
             }`}
           >
-            <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">{downLabel}</div>
+            <OutcomeLaneHeader lane="down" label={downLabel} momentum={outcomeMomentumDown} />
             <div className={`mt-1 font-black tabular-nums text-zinc-100 ${isSlide ? 'text-3xl' : 'text-2xl'}`}>{fmtCents(midDownEff)}</div>
             <div className="mt-0.5 text-[10px] font-mono text-zinc-500">{downToken ? `${downToken.slice(0, 6)}…${downToken.slice(-4)}` : '—'}</div>
             <div className="mt-1 text-[11px] text-zinc-500">
@@ -7957,6 +9349,9 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
           </button>
         </div>
         )}
+        {action === 'buy' ? (
+          <div className={isSlide ? 'mt-3' : 'mt-4'}>{renderSecondaryBuyCta('compact')}</div>
+        ) : null}
       </div>
 
       {!isSlide && bracketsDockPanel}
@@ -8208,9 +9603,32 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                         });
                         setHistoryRows(optimistic.rows);
                         const tClient0 = performance.now();
-                        const res = await tradeCreateOrderWithOpts(
-                          { token, side: 'buy', price: bestAsk, size: sharesReq, signatureType: null, marketSlug: marketSlug ?? '', outcome: resolvedBullpenOutcome,
-            lane },
+                        const marketUsd = marketBuyUsdFromIntent({
+                          unit: 'shares',
+                          dollars: 0,
+                          shares: sharesReq,
+                          refAsk01: bestAsk,
+                        });
+                        if (!(marketUsd >= 1)) {
+                          setErr('Market buy notional must be at least $1 pUSD.');
+                          setHistoryRows(
+                            updateTradeHistoryRow(optimistic.id, {
+                              status: 'failed',
+                              error: 'bad_amount · min $1',
+                            }),
+                          );
+                          return;
+                        }
+                        const res = await tradeMarketOrderWithOpts(
+                          {
+                            token,
+                            side: 'buy',
+                            amount: marketUsd,
+                            signatureType: null,
+                            marketSlug: marketSlug ?? '',
+                            outcome: resolvedBullpenOutcome,
+                            lane,
+                          },
                           { timeoutMs: 25_000 },
                         );
                         const clientMs = Math.round(performance.now() - tClient0);
@@ -8232,20 +9650,17 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                         setHistoryRows(
                           updateTradeHistoryRow(optimistic.id, {
                             status: 'sent',
-                            submittedPrice01: null,
+                            shares: 0,
+                            requestedShares: sharesReq,
+                            remainingShares: sharesReq,
+                            submittedPrice01: execution?.submitted_price_01 ?? null,
                             orderId: oid ?? undefined,
                             roundTripMs: rt,
                             price01: quoted01,
                             error: undefined,
                           }),
                         );
-                        if (oid) {
-                          pollRestingOrderFill(optimistic.id, oid, sharesReq, bestAsk, quoted01);
-                          window.setTimeout(() => {
-                            void tradeCancelOrder(oid);
-                          }, cancelMs);
-                        }
-                        setOkMsg(`Buy sent · intended ${(bestAsk * 100).toFixed(1)}¢ — reading exchange state…`);
+                        setOkMsg(`Market buy submitted · best available (ref ${(bestAsk * 100).toFixed(1)}¢) — confirming…`);
                         scheduleTruthRefreshBurst(token, oid ?? null, () => afterLiveBuyRowReconcile(optimistic.id));
                       } finally {
                         setBusySubmit(false);
@@ -8688,10 +10103,10 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
             <span className="min-w-[5.5rem] text-right font-mono tabular-nums text-zinc-500" title="USDC available for buys">
               {accountMode === 'paper'
                 ? `Cash ${fmtUsdCents(paperAccount.cashUsdCents)}`
-                : balLoading
-                  ? 'Loading…'
-                  : availUsdc != null
-                    ? `Cash $${availUsdc.toFixed(2)}`
+                : availUsdc != null
+                  ? `Cash $${availUsdc.toFixed(2)}`
+                  : balLoading
+                    ? 'Loading…'
                     : 'Cash —'}
             </span>
           </div>
@@ -8797,22 +10212,15 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
             })}
           </div>
 
-          <div className="mt-1.5 min-h-[2rem]" aria-live="polite">
-            <p
-              className={`text-[11px] font-semibold text-amber-200/90 ${buyExceedsCash ? '' : 'invisible'}`}
-              aria-hidden={!buyExceedsCash}
-            >
-              Amount exceeds available cash (
-              {accountMode === 'paper'
-                ? fmtUsdCents(paperAccount.cashUsdCents)
-                : availUsdc != null
-                  ? `$${availUsdc.toFixed(2)}`
-                  : '—'}
-              ). Use a % button or lower the amount.
-            </p>
+          <div className="mt-1.5 min-h-[1.25rem]" aria-live="polite">
+            {buyMaxAffordableHint ? (
+              <p className="text-[11px] font-mono tabular-nums text-zinc-500">{buyMaxAffordableHint} · auto-sized to cash</p>
+            ) : null}
           </div>
 
-          {executionBrief ? (
+          <div className="mt-3">{renderSecondaryBuyCta('compact')}</div>
+
+          {executionBrief && !isSlide ? (
             <div
               className={`mt-3 rounded-xl border px-3 py-2 text-[11px] leading-relaxed ${
                 executionBrief.tier === 'A'
@@ -8851,7 +10259,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
             </div>
           ) : null}
 
-          {action === 'buy' && ptbContext ? (
+          {action === 'buy' && ptbContext && !isSlide ? (
             <div className="mt-3 rounded-xl border border-zinc-800/60 bg-black/20 px-3 py-2 text-[11px] text-zinc-400">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="font-semibold text-zinc-300">
@@ -8867,12 +10275,15 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   Quarter size while in SETUP
                 </label>
               </div>
-              {chopAdvisory ? (
-                <div className="mt-1 text-amber-200/85">
-                  Chop / NO_EDGE on tape — desk suggests smaller size or wider limits; touch buys are not blocked.
-                </div>
-              ) : null}
-              {buyGate.ok ? null : <div className="mt-1 text-amber-200/90">{buyGate.reason}</div>}
+              <div className="mt-1 min-h-[1.25rem]">
+                {chopAdvisory ? (
+                  <div className="text-amber-200/85">
+                    Chop / NO_EDGE on tape — desk suggests smaller size or wider limits; touch buys are not blocked.
+                  </div>
+                ) : buyGate.ok ? null : (
+                  <div className="text-amber-200/90">{buyGate.reason}</div>
+                )}
+              </div>
               {ptbContext.readinessWhy ? <div className="mt-1 text-zinc-500">{ptbContext.readinessWhy}</div> : null}
             </div>
           ) : null}
@@ -8884,20 +10295,26 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
             <div className="mt-1 rounded-xl border border-zinc-800/70 bg-black/25 px-3 py-3 focus-within:border-zinc-600/70">
               <input
                 id={idLimitBuy}
-                value={limitPriceCents}
-                onChange={(e) => setLimitPriceCents(e.target.value)}
+                value={execMode === 'touch' ? quickLimitCentsDisplay : limitPriceCents}
+                onChange={(e) => {
+                  if (execMode === 'touch') return;
+                  setLimitPriceCents(e.target.value);
+                }}
+                readOnly={execMode === 'touch'}
                 inputMode="numeric"
                 aria-describedby={`${idLimitBuy}-hint`}
-                className="min-h-[44px] w-full bg-transparent text-lg font-semibold tabular-nums text-zinc-100 outline-none"
+                className={`min-h-[44px] w-full bg-transparent text-lg font-semibold tabular-nums text-zinc-100 outline-none ${
+                  execMode === 'touch' ? 'text-emerald-100/95' : ''
+                }`}
                 placeholder={execMode === 'touch' ? touchLimitCents || defaultLimitCents || '50' : defaultLimitCents || '50'}
               />
             </div>
             <p id={`${idLimitBuy}-hint`} className="mt-1 text-[11px] text-zinc-500">
               {execMode === 'touch'
-                ? `Quick mode uses a fast limit near mid (≤ ${limitPriceCents || touchLimitCents || defaultLimitCents || '—'}¢).`
+                ? `Quick tracks live ${action === 'buy' ? 'ask' : 'bid'} (now ${quickLimitCentsDisplay || '—'}¢) — updates every book tick.`
                 : `Your buy fills when the market trades at or below ${limitPriceCents || defaultLimitCents || '—'}¢.`}
             </p>
-            <p className="mt-2 text-[10px] text-zinc-500">Then tap the main <span className="text-zinc-400">Buy</span> below.</p>
+            <div className="mt-2">{renderSecondaryBuyCta('compact')}</div>
           </div>
 
           <details
@@ -8956,7 +10373,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                     Based on current quote{targets.spreadCents !== '0.00' ? ` (spread ~${targets.spreadCents}¢)` : ''}. Not a guarantee.
                   </div>
                 </div>
-                {ptbContext ? (
+                {ptbContext && !isSlide ? (
                   <div
                     className="rounded-lg border border-zinc-700/60 bg-black/25 px-2 py-1 text-[10px] font-mono text-zinc-400"
                     title={`Spot vs PTB context\nPTB ${ptbContext.ptbUsd.toFixed(2)}\nBand ±$${ptbContext.bandUsd.toFixed(
@@ -8972,7 +10389,10 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
               <div className="mt-3 grid gap-2 sm:grid-cols-2">
                 <div className="rounded-lg border border-emerald-800/45 bg-emerald-950/20 px-3 py-2">
                   <div className="text-[10px] font-semibold uppercase tracking-wide text-emerald-200/80">{targets.sideLabel}</div>
-                  <div className="mt-1 font-mono text-lg font-black tabular-nums text-emerald-100">{targets.tpCents}¢</div>
+                  {targets.quoteCents ? (
+                    <div className="mt-0.5 font-mono text-[10px] tabular-nums text-zinc-500">Quote {targets.quoteCents}¢</div>
+                  ) : null}
+                  <div className="mt-1 font-mono text-lg font-black tabular-nums text-emerald-100">TP {targets.tpCents}¢</div>
                   <div className="mt-1 text-[10px] text-emerald-200/70">
                     {targets.quoteCents ? (
                       <>Δ {Number(targets.tpCents) >= Number(targets.quoteCents) ? '+' : ''}{(Number(targets.tpCents) - Number(targets.quoteCents)).toFixed(1)}¢ vs quote</>
@@ -8994,7 +10414,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                     type="button"
                     className="mt-2 w-full rounded-lg border border-emerald-700/30 bg-emerald-950/20 px-3 py-2 text-[11px] font-bold text-emerald-100 hover:bg-emerald-950/35"
                     onClick={() => {
-                      applyBuyBundleTpCents(targets.tpCents);
+                      applyTargetsAssistTpOnFill({ locked: true });
                       setErr(null);
                       setOkMsg(null);
                     }}
@@ -9013,7 +10433,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                             chooseAction('sell');
                             setExecMode('limit');
                             setLimitPriceCents(targets.tpCents);
-                            const sh = floorShares4(positionShares * pct);
+                            const sh = floorSharesWhole(positionShares * pct);
                             setSellQty(sh > 0 ? String(sh) : '0');
                             setErr(null);
                             setOkMsg(null);
@@ -9068,7 +10488,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                             chooseAction('sell');
                             setExecMode('limit');
                             setLimitPriceCents(targets.stopCents);
-                            const sh = floorShares4(positionShares * pct);
+                            const sh = floorSharesWhole(positionShares * pct);
                             setSellQty(sh > 0 ? String(sh) : '0');
                             setErr(null);
                             setOkMsg(null);
@@ -9122,26 +10542,72 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
           <div className="mt-2 rounded-lg border border-rose-900/45 bg-rose-950/20 px-2.5 py-2 ring-1 ring-rose-500/10">
             <div className="flex flex-wrap items-start justify-between gap-2">
               <div className="min-w-0">
-                <div className="text-[10px] font-black uppercase tracking-[0.14em] text-rose-200/95">
-                  Emergency stop
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="text-[10px] font-black uppercase tracking-[0.14em] text-rose-200/95">
+                    Emergency stop
+                  </div>
                 </div>
                 <p className="mt-0.5 text-[10px] leading-snug text-rose-200/65">
-                  Set before you buy — if the trade goes wrong, this stop arms automatically on fill. Leave empty for no backup.
+                  Optional backup stop on fill — turn on Auto SL to track Targets assist, or type a level manually.
                 </p>
               </div>
-              {suggestedSlDisplay && !buyBundleSlCents.trim() ? (
-                <button
-                  type="button"
-                  className="shrink-0 rounded border border-rose-700/45 bg-rose-950/35 px-2 py-0.5 text-[9px] font-bold text-rose-100 hover:bg-rose-900/45"
-                  onClick={() => {
-                    const v = suggestedSlDisplay;
-                    if (!v) return;
-                    applyBuyBundleSlCents(v);
-                  }}
-                >
-                  Use suggested
-                </button>
-              ) : null}
+              <div className="flex min-h-[1.375rem] shrink-0 items-center">
+                {suggestedSlDisplay && !buyBundleSlCents.trim() && !emergencyStopBundlePrefs.autoFillSl ? (
+                  <button
+                    type="button"
+                    className="rounded border border-rose-700/45 bg-rose-950/35 px-2 py-0.5 text-[9px] font-bold text-rose-100 hover:bg-rose-900/45"
+                    onClick={() => {
+                      const v = suggestedSlDisplay;
+                      if (!v) return;
+                      applyBuyBundleSlCents(v);
+                    }}
+                  >
+                    Use suggested
+                  </button>
+                ) : null}
+              </div>
+            </div>
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-md border border-zinc-800/50 bg-black/20 px-2 py-1.5">
+              <div className="min-w-0">
+                <div className="text-[9px] font-semibold text-zinc-300">Auto SL on fill</div>
+                <p className="mt-0.5 min-h-[2.125rem] text-[9px] leading-snug text-zinc-500 line-clamp-2">
+                  {emergencyStopBundlePrefs.autoFillSl
+                    ? 'Prefill from Targets assist before buy — locks at Buy click.'
+                    : 'Off — enable auto or type a level manually.'}
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={emergencyStopBundlePrefs.autoFillSl}
+                aria-label="Auto stop-loss on fill"
+                onClick={() => {
+                  const nextOn = !emergencyStopBundlePrefs.autoFillSl;
+                  if (nextOn) {
+                    buyBundleSlManualLanesRef.current = { ...buyBundleSlManualLanesRef.current, [lane]: false };
+                    const sl = autoBundleChaseSlCents;
+                    if (sl) {
+                      applyBuyBundleSlCents(sl, { auto: true });
+                      autoBundleSlLaneRef.current = { lane, cents: sl };
+                    }
+                  } else if (!buyBundleSlManualLanesRef.current[lane]) {
+                    applyBuyBundleSlCents('', { auto: true });
+                    autoBundleSlLaneRef.current = null;
+                  }
+                  setEmergencyStopBundlePrefs((p) => ({ ...p, autoFillSl: nextOn }));
+                }}
+                className={`relative h-6 w-10 shrink-0 rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500/40 ${
+                  emergencyStopBundlePrefs.autoFillSl
+                    ? 'border-rose-600/60 bg-rose-500'
+                    : 'border-zinc-600/70 bg-zinc-800'
+                }`}
+              >
+                <span
+                  className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition-transform ${
+                    emergencyStopBundlePrefs.autoFillSl ? 'translate-x-[18px]' : 'translate-x-0.5'
+                  }`}
+                />
+              </button>
             </div>
             <div className="mt-2">
               <BracketTriggerInput
@@ -9150,72 +10616,137 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                 kind="sl"
                 centsValue={buyBundleSlCents}
                 onCentsChange={applyBuyBundleSlCents}
+                onDraftSync={(state) => {
+                  buyBundleSlDraftRef.current = { ...buyBundleSlDraftRef.current, [lane]: state };
+                }}
                 avgEntry01={null}
-                plannedEntry01={buyBundleEntry01}
-                orderShares={buyBundleShares}
+                plannedEntry01={buyBundleBracketEntry01}
+                orderShares={buyBundleBracketShares}
+                orderNotionalUsd={buyBundleBracketNotional}
                 mid01={mid ?? null}
-                placeholderCents={targets?.stopCents}
-                suggestedCents={suggestedSlDisplay || undefined}
+                placeholderCents={autoBundleChaseSlCents || quoteAssistSlCents || targets?.stopCents}
+                suggestedCents={buyBundleSuggestSl || undefined}
                 onApplySuggested={() => {
-                  const v = suggestedSlDisplay;
+                  const v = buyBundleSuggestSl;
                   if (!v) return;
                   applyBuyBundleSlCents(v);
+                  autoBundleSlLaneRef.current = { lane, cents: v.trim() };
                 }}
               />
             </div>
-            <details className="mt-2 rounded-md border border-zinc-800/50 bg-black/20 px-2 py-1.5">
-              <summary className="cursor-pointer text-[9px] font-semibold text-zinc-500 hover:text-zinc-300">
-                Optional take-profit on fill (not emergency)
-              </summary>
-              <div className="mt-1.5">
-                <BracketTriggerInput
-                  key={`buy-tp-${lane}`}
-                  compact
-                  kind="tp"
-                  centsValue={buyBundleTpCents}
-                  onCentsChange={applyBuyBundleTpCents}
-                  avgEntry01={null}
-                  plannedEntry01={buyBundleEntry01}
-                  orderShares={buyBundleShares}
-                  mid01={mid ?? null}
-                  placeholderCents={riskTargetsFromEntry?.tpCents ?? targets?.tpCents}
-                  suggestedCents={suggestedTpDisplay || undefined}
-                  onApplySuggested={() => {
-                    const v = suggestedTpDisplay;
-                    if (!v) return;
-                    applyBuyBundleTpCents(v);
-                  }}
-                />
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-md border border-zinc-800/50 bg-black/20 px-2 py-1.5">
+              <div className="min-w-0">
+                <div className="text-[9px] font-semibold text-zinc-300">Auto TP on fill</div>
+                <p className="mt-0.5 min-h-[2.125rem] text-[9px] leading-snug text-zinc-500 line-clamp-2">
+                  {emergencyStopBundlePrefs.autoTpOnFill
+                    ? 'Tracks Targets quote TP live — updates until you type your own level.'
+                    : 'Optional — turn on to mirror quote TP, or tap Set TP on fill in Targets.'}
+                </p>
               </div>
-            </details>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={emergencyStopBundlePrefs.autoTpOnFill}
+                aria-label="Auto take-profit on fill"
+                onClick={() => {
+                  const nextOn = !emergencyStopBundlePrefs.autoTpOnFill;
+                  if (nextOn) {
+                    buyBundleTpManualLanesRef.current = { ...buyBundleTpManualLanesRef.current, [lane]: false };
+                    buyBundleChaseFrozenRef.current = false;
+                    applyTargetsAssistTpOnFill();
+                  } else if (!buyBundleTpManualLanesRef.current[lane]) {
+                    applyBuyBundleTpCents('', { auto: true });
+                    buyBundleTpDraftRef.current = {
+                      ...buyBundleTpDraftRef.current,
+                      [lane]: EMPTY_BRACKET_INPUT_DRAFT,
+                    };
+                    autoBundleTpLaneRef.current = null;
+                  }
+                  setEmergencyStopBundlePrefs((p) => ({ ...p, autoTpOnFill: nextOn }));
+                }}
+                className={`relative h-6 w-10 shrink-0 rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/40 ${
+                  emergencyStopBundlePrefs.autoTpOnFill
+                    ? 'border-emerald-600/60 bg-emerald-500'
+                    : 'border-zinc-600/70 bg-zinc-800'
+                }`}
+              >
+                <span
+                  className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition-transform ${
+                    emergencyStopBundlePrefs.autoTpOnFill ? 'translate-x-[18px]' : 'translate-x-0.5'
+                  }`}
+                />
+              </button>
+            </div>
+            <div className="mt-2">
+              {!emergencyStopBundlePrefs.autoTpOnFill ? (
+                <p className="mb-1 text-[9px] font-semibold text-zinc-500">
+                  Optional take-profit on fill — leave empty to buy without TP
+                </p>
+              ) : null}
+              <BracketTriggerInput
+                key={`buy-tp-${lane}`}
+                compact
+                kind="tp"
+                centsValue={buyBundleTpCents}
+                onCentsChange={applyBuyBundleTpCents}
+                onDraftSync={(state) => {
+                  buyBundleTpDraftRef.current = { ...buyBundleTpDraftRef.current, [lane]: state };
+                }}
+                avgEntry01={null}
+                plannedEntry01={buyBundleBracketEntry01}
+                orderShares={buyBundleBracketShares}
+                orderNotionalUsd={buyBundleBracketNotional}
+                mid01={mid ?? null}
+                placeholderCents={bundleSuggestedTpCents || riskTargetsFromEntry?.tpCents}
+                suggestedCents={
+                  emergencyStopBundlePrefs.autoTpOnFill ? bundleSuggestedTpCents || undefined : buyBundleSuggestTp || undefined
+                }
+                onApplySuggested={() => {
+                  const v = bundleSuggestedTpCents;
+                  if (!v) return;
+                  applyBuyBundleTpCents(v);
+                  autoBundleTpLaneRef.current = { lane, cents: v.trim() };
+                }}
+              />
+            </div>
+            {preBuyTpOutlook ? (
+              <div className="mt-2">
+                <PositionTpOutlookCard outlook={preBuyTpOutlook} compact={isSlide} variant="pre_buy" />
+              </div>
+            ) : null}
           </div>
 
-          {executeIntentSummary && action === 'buy' ? (
-            <div className="mt-3 rounded-xl border border-zinc-700/50 bg-zinc-900/30 px-3 py-2 text-[11px] leading-snug text-zinc-300">
-              <span className="font-semibold text-zinc-200">You&apos;re about to: </span>
-              {executeIntentSummary}
+          {action === 'buy' ? (
+            <div
+              className={`mt-3 min-h-[3rem] rounded-xl border px-3 py-2 text-[11px] leading-snug ${
+                executeIntentSummary
+                  ? 'border-zinc-700/50 bg-zinc-900/30 text-zinc-300'
+                  : 'pointer-events-none border-transparent bg-transparent'
+              }`}
+              aria-hidden={!executeIntentSummary}
+            >
+              <span className={`font-semibold ${executeIntentSummary ? 'text-zinc-200' : 'text-transparent'}`}>
+                You&apos;re about to:{' '}
+              </span>
+              <span className={executeIntentSummary ? undefined : 'text-transparent'}>
+                {executeIntentSummary ?? '—'}
+              </span>
             </div>
           ) : null}
 
-          <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto] sm:items-stretch">
+          <div
+            className={`mt-4 grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto] sm:items-stretch ${
+              isSlide
+                ? 'sticky bottom-0 z-10 -mx-3 border-t border-zinc-800/80 bg-zinc-950/95 px-3 py-3 backdrop-blur-sm'
+                : ''
+            }`}
+          >
             <button
               ref={buyButtonRef}
               type="button"
-              disabled={
-                busySubmit ||
-                outcomeLocked ||
-                !amtOk ||
-                buyExceedsCash ||
-                limit01 == null ||
-                !Number.isFinite(limit01) ||
-                !buyGate.ok
-              }
+              disabled={buySubmitDisabled}
               aria-busy={busySubmit}
-              className={`w-full rounded-xl px-4 py-3 text-sm font-black text-black disabled:cursor-not-allowed disabled:opacity-40 ${
-                isSlide
-                  ? 'min-h-[48px] bg-emerald-400/70 shadow-none hover:bg-emerald-300/80'
-                  : 'min-h-[52px] bg-emerald-400 shadow-lg shadow-emerald-950/30 hover:bg-emerald-300'
-              } ${isSlide ? 'inline-flex items-center justify-center gap-2' : ''}`}
+              className={buyCtaButtonClass('primary')}
               onClick={async () => {
               if (submitLockRef.current) return;
               submitLockRef.current = true;
@@ -9223,6 +10754,16 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
               playTradeClick();
               setErr(null);
               setOkMsg(null);
+              flushBuyBundleDraftsForLane();
+              if (
+                emergencyStopBundlePrefs.autoTpOnFill ||
+                emergencyStopBundlePrefs.autoFillSl ||
+                buyBundleTpCents.trim() ||
+                buyBundleSlCents.trim()
+              ) {
+                operatorSlTpLockedRef.current = true;
+                buyBundleChaseFrozenRef.current = true;
+              }
               setBusySubmit(true);
               try {
                 if (outcomeLocked) {
@@ -9233,9 +10774,42 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   setErr(buyGate.reason ?? 'Buy blocked by gate.');
                   return;
                 }
-                if (buyExceedsCash) {
-                  setErr('Amount exceeds available cash — use a smaller size.');
+                const cashForBuy = availableBuyUsd ?? 0;
+                const clampedAmountStr =
+                  cashForBuy > 0 && amtOk
+                    ? clampBuyAmountWithinCash({
+                        amountStr: amount,
+                        unit,
+                        cashUsd: cashForBuy,
+                        price01: buySizingPrice01,
+                      })
+                    : amount;
+                if (clampedAmountStr !== amount) setAmount(clampedAmountStr);
+                const submitAmtNum = Number(clampedAmountStr);
+                const submitAmtOk = Number.isFinite(submitAmtNum) && submitAmtNum > 0;
+                if (!submitAmtOk) {
+                  setErr('Buy amount too small for available cash.');
                   return;
+                }
+                let submitForcedShares = deskForcedShares;
+                if (
+                  submitForcedShares != null &&
+                  submitForcedShares > 0 &&
+                  cashForBuy > 0 &&
+                  buySizingPrice01 != null &&
+                  buySizingPrice01 > 0
+                ) {
+                  const maxSh = floorSharesWhole(cashForBuy / buySizingPrice01);
+                  if (maxSh <= 0) {
+                    setErr('Buy amount too small for available cash.');
+                    return;
+                  }
+                  if (submitForcedShares > maxSh) {
+                    submitForcedShares = maxSh;
+                    forcedAutoBuySharesRef.current = maxSh;
+                    setUnit('shares');
+                    setAmount(String(maxSh));
+                  }
                 }
                 const submitLane = lane;
                 const submitToken = submitLane === 'up' ? upToken : downToken;
@@ -9245,20 +10819,30 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                     ? 0.25
                     : 1;
                 const effAmtEarly =
-                  deskForcedShares != null && deskForcedShares > 0
-                    ? deskForcedShares
+                  submitForcedShares != null && submitForcedShares > 0
+                    ? submitForcedShares
                     : unit === 'dollars'
-                      ? amtNum * setupScaleEarly
-                      : amtNum;
+                      ? submitAmtNum * setupScaleEarly
+                      : submitAmtNum;
                 const pxEarly = limit01;
                 const estSizeForBundle =
-                  deskForcedShares != null && deskForcedShares > 0
-                    ? deskForcedShares
+                  submitForcedShares != null && submitForcedShares > 0
+                    ? submitForcedShares
                     : unit === 'shares'
                       ? effAmtEarly
                       : pxEarly != null && pxEarly > 0
                         ? effAmtEarly / pxEarly
                         : null;
+                if (
+                  shouldPrefillBuyBundleTpOnClick({
+                    autoTpOnFill: emergencyStopBundlePrefs.autoTpOnFill,
+                    chaseTpCents: quoteAssistTpCents,
+                    stagedTp: buyBundleByLaneRef.current[submitLane].tp,
+                    manualLane: buyBundleTpManualLanesRef.current[submitLane],
+                  })
+                ) {
+                  applyBuyBundleTpCents(quoteAssistTpCents, { auto: true });
+                }
                 const bundleStage = stageBuyBundleForSubmit(
                   submitLane,
                   submitToken?.trim() ?? '',
@@ -9290,10 +10874,10 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                     autoSizeSetup && ptbContext?.readinessState === 'SETUP' && ptbContext?.readinessLane === submitLane
                       ? 0.25
                       : 1;
-                  const scaledAmt = unit === 'dollars' ? amtNum * setupScale : amtNum;
+                  const scaledAmt = unit === 'dollars' ? submitAmtNum * setupScale : submitAmtNum;
                   const shares =
-                    deskForcedShares != null && deskForcedShares > 0
-                      ? deskForcedShares
+                    submitForcedShares != null && submitForcedShares > 0
+                      ? submitForcedShares
                       : unit === 'shares'
                         ? scaledAmt
                         : px != null && px > 0
@@ -9332,19 +10916,19 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                         );
                         if (bundleStage.armed) {
                           const bundle = buyBundleArmRef.current;
+                          const staged = readStagedBuyBundleLevels(submitLane, buyBundleByLaneRef.current);
                           applyFilledBuyBundle({
                             rowTok: submitToken.trim(),
                             riskLane: submitLane,
                             shares: r.fill.shares,
-                            sl: bundle?.sl ?? buyBundleSlCents.trim(),
-                            tp: bundle?.tp ?? buyBundleTpCents.trim(),
+                            sl: bundle?.sl ?? staged.sl,
+                            tp: bundle?.tp ?? staged.tp,
                           });
                           buyBundleArmRef.current = null;
-                          setBuyBundleByLane((prev) => ({ ...prev, [submitLane]: { sl: '', tp: '' } }));
                         } else {
                           applyArmRiskAfterBuyFill(r.fill.price01, r.fill.shares, submitLane);
                         }
-                        if (deskForcedShares != null) forcedAutoBuySharesRef.current = null;
+                        if (submitForcedShares != null) forcedAutoBuySharesRef.current = null;
                       }
                     } else {
                       const o = addPaperOrder({ tokenId: submitToken, side: 'buy', limit01: limit, shares });
@@ -9375,7 +10959,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                     autoSizeSetup && ptbContext?.readinessState === 'SETUP' && ptbContext?.readinessLane === submitLane
                       ? 0.25
                       : 1;
-                  const effAmtNum = unit === 'dollars' ? amtNum * setupScale : amtNum;
+                  const effAmtNum = unit === 'dollars' ? submitAmtNum * setupScale : submitAmtNum;
                   const pxPreview = limit01;
                   const px =
                     pxPreview != null && Number.isFinite(pxPreview) && pxPreview > 0 && pxPreview < 1 ? pxPreview : null;
@@ -9418,37 +11002,60 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                       ? 0.25
                       : 1;
                   const effAmtNum =
-                    deskForcedShares != null && deskForcedShares > 0
-                      ? deskForcedShares
+                    submitForcedShares != null && submitForcedShares > 0
+                      ? submitForcedShares
                       : unit === 'dollars'
-                        ? amtNum * setupScale
-                        : amtNum;
-                  const sizeSharesRaw = unit === 'shares' || deskForcedShares != null ? effAmtNum : price > 0 ? effAmtNum / price : NaN;
+                        ? submitAmtNum * setupScale
+                        : submitAmtNum;
+                  const sizeSharesRaw =
+                    unit === 'shares' || submitForcedShares != null ? effAmtNum : price > 0 ? effAmtNum / price : NaN;
                   const sizeShares = Number.isFinite(sizeSharesRaw) ? floorShares4(sizeSharesRaw) : NaN;
                   if (!Number.isFinite(sizeShares) || sizeShares < 1e-4) {
                     setErr('Buy size is too small after rounding to 4 decimal shares.');
                     return;
                   }
-                  if (deskForcedShares != null) forcedAutoBuySharesRef.current = null;
+                  if (submitForcedShares != null) forcedAutoBuySharesRef.current = null;
                   liveSubmitGenRef.current += 1;
                   const quoted01 = Number.isFinite(price) ? roundPrice01(price) : null;
                   const mark01 = mid != null && mid > 0 ? roundPrice01(mid) : null;
+                  const useMarketBuy = execMode === 'touch';
+                  const refAsk01 =
+                    executableQuote01 != null && executableQuote01 > 0 && executableQuote01 < 1
+                      ? executableQuote01
+                      : quoted01;
+                  if (useMarketBuy) {
+                    const marketUsd = marketBuyUsdFromIntent({
+                      unit,
+                      dollars: effAmtNum,
+                      shares: sizeShares,
+                      refAsk01: refAsk01 ?? price,
+                    });
+                    if (!(marketUsd >= 1)) {
+                      setErr('Market buy notional must be at least $1 pUSD.');
+                      return;
+                    }
+                  }
                   const optimistic = appendTradeHistoryWithId({ ...tradeHistoryMarketMeta,
                     mode: 'live',
-                    exec: execMode,
+                    exec: useMarketBuy ? 'market' : execMode,
                     side: 'buy',
                     token: submitToken,
                     label: submitLabel,
                     price01: quoted01,
                     quotedPrice01: quoted01,
-                    intendedPrice01: price,
+                    intendedPrice01: useMarketBuy ? (refAsk01 ?? price) : price,
                     submittedPrice01: null,
                     fillAvgPrice01: null,
                     markPrice01: mark01,
-                    shares: sizeShares,
+                    shares: useMarketBuy ? 0 : sizeShares,
                     requestedShares: sizeShares,
                     remainingShares: sizeShares,
-                    usdCents: Number.isFinite(price) ? Math.abs(Math.round(price * sizeShares * 100)) : null,
+                    usdCents:
+                      unit === 'dollars' && Number.isFinite(effAmtNum)
+                        ? Math.abs(Math.round(effAmtNum * 100))
+                        : Number.isFinite(price)
+                          ? Math.abs(Math.round(price * sizeShares * 100))
+                          : null,
                     status: 'sending',
                   });
                   setHistoryRows(optimistic.rows);
@@ -9457,19 +11064,37 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                   const controller = new AbortController();
                   setSubmitAbort(controller);
                   const tClient0 = performance.now();
-                  const res = await tradeCreateOrderWithOpts(
-                    {
-                      token: submitToken,
-                      side: 'buy',
-                      price,
-                      size: sizeShares,
-                      signatureType: null,
-                      marketSlug: marketSlug ?? '',
-                      outcome: submitOutcome,
-                      lane: submitLane,
-                    },
-                    { signal: controller.signal, timeoutMs: 25_000 },
-                  );
+                  const res = useMarketBuy
+                    ? await tradeMarketOrderWithOpts(
+                        {
+                          token: submitToken,
+                          side: 'buy',
+                          amount: marketBuyUsdFromIntent({
+                            unit,
+                            dollars: effAmtNum,
+                            shares: sizeShares,
+                            refAsk01: refAsk01 ?? price,
+                          }),
+                          signatureType: null,
+                          marketSlug: marketSlug ?? '',
+                          outcome: submitOutcome,
+                          lane: submitLane,
+                        },
+                        { signal: controller.signal, timeoutMs: 25_000 },
+                      )
+                    : await tradeCreateOrderWithOpts(
+                        {
+                          token: submitToken,
+                          side: 'buy',
+                          price,
+                          size: sizeShares,
+                          signatureType: null,
+                          marketSlug: marketSlug ?? '',
+                          outcome: submitOutcome,
+                          lane: submitLane,
+                        },
+                        { signal: controller.signal, timeoutMs: 25_000 },
+                      );
                   const clientMs = Math.round(performance.now() - tClient0);
                   if (!isOk(res)) {
                     const e = res as ApiErr;
@@ -9491,16 +11116,18 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                         shares: 0,
                         requestedShares: sizeShares,
                         remainingShares: sizeShares,
-                        submittedPrice01: null,
+                        submittedPrice01: execution?.submitted_price_01 ?? null,
                         orderId: oid ?? undefined,
                         roundTripMs: rt,
                         price01: quoted01,
                         error: undefined,
                       }),
                     );
-                    if (oid) pollRestingOrderFill(optimistic.id, oid, sizeShares, price, quoted01);
+                    if (!useMarketBuy && oid) pollRestingOrderFill(optimistic.id, oid, sizeShares, price, quoted01);
                     setOkMsg(
-                      `${execMode === 'touch' ? 'Quick' : 'Limit'} buy sent · intended ${(price * 100).toFixed(1)}¢ · ack ${rt}ms — reading exchange state…`,
+                      useMarketBuy
+                        ? `Market buy submitted · ack ${rt}ms — filling at best available price…`
+                        : `${execMode === 'touch' ? 'Quick' : 'Limit'} buy sent · intended ${(price * 100).toFixed(1)}¢ · ack ${rt}ms — reading exchange state…`,
                     );
                     scheduleTruthRefreshBurst(submitToken, oid ?? null, () => afterLiveBuyRowReconcile(optimistic.id));
                   }
@@ -9513,21 +11140,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
               }
               }}
             >
-            {busySubmit ? (
-              <>
-                {isSlide ? (
-                  <span
-                    className="size-4 shrink-0 animate-spin rounded-full border-2 border-black/25 border-t-black"
-                    aria-hidden
-                  />
-                ) : null}
-                {isSlide ? 'SENDING…' : 'Submitting…'}
-              </>
-            ) : action === 'buy' ? (
-              buyBundleStaged ? `Buy ${label} + SL/TP` : `Buy ${label}`
-            ) : (
-              `Sell ${label}`
-            )}
+              {renderBuyCtaContent('primary')}
             </button>
             {accountMode === 'live' && activeLiveOrderRow?.orderId && liveRowCancelable(activeLiveOrderRow) ? (
               <button
@@ -9703,10 +11316,16 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
               <div className="mt-1 rounded-lg border border-zinc-800/70 bg-black/20 px-3 py-2.5">
                 <input
                   id={idLimitSell}
-                  value={limitPriceCents}
-                  onChange={(e) => setLimitPriceCents(e.target.value)}
+                  value={execMode === 'touch' ? quickLimitCentsDisplay : limitPriceCents}
+                  onChange={(e) => {
+                    if (execMode === 'touch') return;
+                    setLimitPriceCents(e.target.value);
+                  }}
+                  readOnly={execMode === 'touch'}
                   inputMode="numeric"
-                  className="min-h-[40px] w-full bg-transparent text-base font-semibold tabular-nums text-zinc-100 outline-none"
+                  className={`min-h-[40px] w-full bg-transparent text-base font-semibold tabular-nums text-zinc-100 outline-none ${
+                    execMode === 'touch' ? 'text-emerald-100/95' : ''
+                  }`}
                   placeholder={execMode === 'touch' ? touchLimitCents || defaultLimitCents || '50' : defaultLimitCents || '50'}
                 />
               </div>
@@ -10178,7 +11797,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
           {toasts.map((t) => (
             <div
               key={t.id}
-              className={`flex items-start justify-between gap-2 rounded-xl border px-3 py-2.5 text-[11px] leading-snug ${
+              className={`pointer-events-auto flex items-start justify-between gap-2 rounded-xl border px-3 py-2.5 text-[11px] leading-snug ${
                 t.kind === 'err'
                   ? 'border-rose-800/35 bg-rose-950/15 text-rose-100'
                   : t.kind === 'ok'
@@ -10609,7 +12228,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
           const selAvg = tabLane === 'up' ? upAvg : downAvg;
           const selPx = tabLane === 'up' ? upPx : downPx;
           const selVal = selSh != null && selPx != null ? Math.round(selSh * selPx * 100) : null;
-          const selMax = selSellSh > 0 ? selSellSh : 0;
+          const selMax =
+            selSellSh > 0 ? floorSharesWhole(selSellSh) : selSh != null && selSh > 0 ? floorSharesWhole(selSh) : 0;
 
           const pnlBadge = (p: number | null) => {
             if (p == null) return '—';
@@ -10634,7 +12254,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                       tabLane === 'up' ? 'border-emerald-500/70 bg-emerald-950/25 ring-2 ring-emerald-500/20' : 'border-zinc-800/60 bg-black/15 hover:bg-black/20'
                     }`}
                   >
-                    <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">{upLabel}</div>
+                    <OutcomeLaneHeader lane="up" label={upLabel} momentum={outcomeMomentumUp} />
                     <div className="mt-0.5 flex items-center justify-between gap-2">
                       <div className="font-mono text-[12px] font-bold text-zinc-100">{upSh == null ? '—' : upSh.toFixed(2)} sh</div>
                       <div className="text-[11px] font-semibold">{pnlBadge(upPnl)}</div>
@@ -10647,7 +12267,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                       tabLane === 'down' ? 'border-rose-500/70 bg-rose-950/20 ring-2 ring-rose-500/20' : 'border-zinc-800/60 bg-black/15 hover:bg-black/20'
                     }`}
                   >
-                    <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">{downLabel}</div>
+                    <OutcomeLaneHeader lane="down" label={downLabel} momentum={outcomeMomentumDown} />
                     <div className="mt-0.5 flex items-center justify-between gap-2">
                       <div className="font-mono text-[12px] font-bold text-zinc-100">{downSh == null ? '—' : downSh.toFixed(2)} sh</div>
                       <div className="text-[11px] font-semibold">{pnlBadge(downPnl)}</div>
@@ -10712,13 +12332,13 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                       value={sellQty}
                       onChange={(e) => setSellQty(e.target.value)}
                       inputMode="decimal"
-                      placeholder={`Qty (max ${selMax.toFixed(2)})`}
+                      placeholder={`Qty (max ${selMax})`}
                       className="min-h-[42px] flex-1 rounded-xl border border-zinc-800/70 bg-black/20 px-3 font-mono text-[13px] text-zinc-100 outline-none focus:border-zinc-600/70"
                     />
                     <button
                       type="button"
                       disabled={!Number.isFinite(selMax) || selMax <= 0 || busySubmit || busyRefresh}
-                      onClick={() => setSellQty(selMax > 0 ? String(floorShares4(selMax)) : '0')}
+                      onClick={() => setSellQty(selMax > 0 ? String(selMax) : '0')}
                       className="min-h-[42px] rounded-xl border border-zinc-800/70 bg-black/20 px-3 text-[11px] font-bold text-zinc-200 hover:bg-black/30 disabled:opacity-40"
                     >
                       Max

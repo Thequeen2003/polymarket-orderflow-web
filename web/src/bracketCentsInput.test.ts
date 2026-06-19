@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  bracketCentsStrTo01,
   effectiveBracketCents01,
   effectiveBracketCentsStr,
   formatBracketCentsFromRaw,
@@ -28,9 +29,23 @@ describe('bracketCentsInput', () => {
     ).toBe(true);
   });
 
+  it('rejects blur after a partial auto-commit while typing a multi-digit price', () => {
+    expect(
+      shouldCommitBracketCentsOnBlur({ draftRaw: '58', committedRaw: '5', pressedEnter: false }),
+    ).toBe(false);
+    expect(
+      shouldCommitBracketCentsOnBlur({ draftRaw: '58', committedRaw: '5', pressedEnter: true }),
+    ).toBe(true);
+  });
+
   it('formats commit strings', () => {
     expect(formatBracketCentsFromRaw('58')).toBe('58');
     expect(formatBracketCentsFromRaw('58.0')).toBe('58');
+  });
+
+  it('bracketCentsStrTo01 supports decimal trigger cents for automation', () => {
+    expect(bracketCentsStrTo01('52.5')).toBeCloseTo(0.53, 6);
+    expect(bracketCentsStrTo01('58')).toBeCloseTo(0.58, 6);
   });
 
   it('effectiveBracketCents prefers pending draft while editing', () => {

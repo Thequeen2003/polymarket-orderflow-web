@@ -7,8 +7,17 @@ const UP_DOWN_TZ = 'America/New_York';
  * Floor `nowSec` to the start of the active Polymarket-style bucket in `America/New_York`.
  * - 1h: top of the hour ET
  * - 4h: 00:00, 04:00, … 20:00 ET within the calendar day
- * - 1d: midnight ET (start of calendar day)
+ * - 1d: midnight ET (calendar day; use `bucketFloorNoonEtUnixSec` for live daily desks)
  */
+export function bucketFloorNoonEtUnixSec(nowSec: number): number {
+  const dt = DateTime.fromSeconds(nowSec, { zone: UP_DOWN_TZ });
+  const todayNoon = dt.startOf('day').plus({ hours: 12 });
+  if (dt.toSeconds() >= todayNoon.toSeconds()) {
+    return Math.floor(todayNoon.toSeconds());
+  }
+  return Math.floor(todayNoon.minus({ days: 1 }).toSeconds());
+}
+
 export function bucketFloorEtUnixSec(stepSec: number, nowSec: number): number {
   const dt = DateTime.fromSeconds(nowSec, { zone: UP_DOWN_TZ });
   if (stepSec === 3600) {
@@ -29,7 +38,10 @@ export function bucketFloorEtUnixSec(stepSec: number, nowSec: number): number {
 /** UTC grid floor + ET grid floor (same value when interval does not use ET alignment). */
 export function updownShortcutAnchorFloors(stepSec: number, nowSec: number): { utc: number; et: number } {
   const utc = Math.floor(nowSec / stepSec) * stepSec;
-  if (stepSec !== 3600 && stepSec !== 14400 && stepSec !== 86400) {
+  if (stepSec === 86400) {
+    return { utc, et: bucketFloorNoonEtUnixSec(nowSec) };
+  }
+  if (stepSec !== 3600 && stepSec !== 14400) {
     return { utc, et: utc };
   }
   return { utc, et: bucketFloorEtUnixSec(stepSec, nowSec) };
@@ -96,8 +108,9 @@ export function buildUpdownCanonicalTryTs(args: {
       }
     }
   }
-  const preferLive = interval === '15m' || interval === '1h';
-  const anchor = interval === '1h' ? etAnchor : floorSec;
+  const preferLive = interval === '15m' || interval === '1h' || interval === '4h' || interval === '1d';
+  const anchor =
+    interval === '1h' || interval === '4h' || interval === '1d' ? etAnchor : floorSec;
   return Array.from(new Set(tryTs)).sort((a, c) =>
     compareUpdownCanonicalTryTs(a, c, { nowSec, stepSec, anchorSec: anchor, preferLiveBucket: preferLive }),
   );

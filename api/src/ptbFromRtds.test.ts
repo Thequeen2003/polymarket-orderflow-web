@@ -4,6 +4,8 @@ import {
   chainlinkUsdHistory,
   dedupeRtdsHistPreferChainlink,
   derivePtbFromRtdsHistory,
+  derivePtbFromRtdsHistoryBestEffort,
+  derivePtbNearestOpenTick,
   derivePtbPreview,
   historyCoversBucketOpen,
   isLockedPtbSource,
@@ -115,5 +117,26 @@ describe('isLockedPtbSource', () => {
   it('locks window open sources only', () => {
     expect(isLockedPtbSource('rtds_chainlink_window_open')).toBe(true);
     expect(isLockedPtbSource('rtds_chainlink_preview_pre_open')).toBe(false);
+  });
+});
+
+describe('derivePtbNearestOpenTick', () => {
+  const open = 1_700_000_000_000;
+
+  it('picks the first chainlink tick within maxAfterOpenMs of window open', () => {
+    const hist = [
+      { t: open + 120_000, v: 73_750, src: 'chainlink' as const },
+      { t: open + 240_000, v: 73_800, src: 'chainlink' as const },
+    ];
+    expect(derivePtbNearestOpenTick(hist, open)).toBeCloseTo(73_750, 2);
+  });
+});
+
+describe('derivePtbFromRtdsHistoryBestEffort', () => {
+  const open = 1_700_000_000_000;
+
+  it('falls back to nearest open tick when strict grace misses', () => {
+    const hist = [{ t: open + 90_000, v: 73_740, src: 'chainlink' as const }];
+    expect(derivePtbFromRtdsHistoryBestEffort(hist, open, 120_000)).toBeCloseTo(73_740, 2);
   });
 });

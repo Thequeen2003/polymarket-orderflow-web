@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { bullpenCancelAlreadyDone, interpretBullpenTradeCli, parseBullpenTradeStdout } from './bullpenCli.js';
+import { bullpenCancelAlreadyDone, interpretBullpenTradeCli, isBullpenLiquidityKill, parseBullpenTradeStdout } from './bullpenCli.js';
 
 const FOK_STDOUT = `{
   "preview": { "amount_usd": 1.0, "outcome": "Up" },
@@ -38,5 +38,11 @@ describe('bullpenCli trade parse', () => {
     if (t.ok) return;
     expect(t.message).toContain('FOK');
     expect(t.hint.toLowerCase()).toContain('limit');
+  });
+
+  it('isBullpenLiquidityKill covers FOK and no-match paths', () => {
+    expect(isBullpenLiquidityKill('order could not be fully filled. FOK orders are fully filled or killed.')).toBe(true);
+    expect(isBullpenLiquidityKill('no orders found to match with FAK order')).toBe(true);
+    expect(isBullpenLiquidityKill('balance_insufficient')).toBe(false);
   });
 });

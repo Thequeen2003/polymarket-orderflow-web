@@ -6,6 +6,8 @@ type Props = {
   onAsk: () => void;
   upLabel?: string;
   downLabel?: string;
+  /** When true, advisory refreshes automatically — no manual ask button when empty. */
+  autoAsk?: boolean;
 };
 
 function verdictColor(verdict: BuySideAdvisory['verdict']): string {
@@ -55,12 +57,22 @@ export function shouldBuyPromptLabel(upLabel?: string, downLabel?: string): stri
   return `Should I buy ${shortOutcomeLabel(upLabel, 'UP')} or ${shortOutcomeLabel(downLabel, 'DOWN')}?`;
 }
 
-export function ShouldBuyCard({ advisory, onAsk, upLabel, downLabel }: Props): ReactElement {
+export function ShouldBuyCard({ advisory, onAsk, upLabel, downLabel, autoAsk = false }: Props): ReactElement {
   const [expanded, setExpanded] = useState(false);
   const scoreUp = shortOutcomeLabel(upLabel, 'UP');
   const scoreDown = shortOutcomeLabel(downLabel, 'DOWN');
 
   if (!advisory) {
+    if (autoAsk) {
+      return (
+        <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-3">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[11px] font-semibold text-zinc-400">{shouldBuyPromptLabel(upLabel, downLabel)}</span>
+            <span className="text-[10px] font-medium text-zinc-500">Auto-asking…</span>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-3">
         <button

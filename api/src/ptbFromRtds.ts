@@ -105,6 +105,51 @@ export function derivePtbFromRtdsHistory(
   return Number.isFinite(v) ? v : null;
 }
 
+/**
+ * When the ring buffer no longer includes the open print (4h / 1d desks after restart),
+ * use the Chainlink tick closest to window open within `maxAfterOpenMs` (default 5m).
+ */
+export function derivePtbNearestOpenTick(
+  hist: RtdsHistPoint[],
+  bucketStartMs: number,
+  maxAfterOpenMs = 300_000,
+): number | null {
+  const clean = chainlinkUsdHistory(hist);
+  if (clean.length === 0) return null;
+  let best: RtdsHistPoint | null = null;
+  let bestDist = Infinity;
+  for (const p of clean) {
+    if (p.t < bucketStartMs) continue;
+    const dist = p.t - bucketStartMs;
+    if (dist > maxAfterOpenMs) break;
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = p;
+    }
+  }
+  if (!best) return null;
+  const v = Number(best.v);
+  return Number.isFinite(v) ? v : null;
+}
+
+/** Strict open print, then nearest tick within grace when the bucket is already live. */
+export function derivePtbFromRtdsHistoryBestEffort(
+  hist: RtdsHistPoint[],
+  bucketStartMs: number,
+  bucketAgeMs: number,
+  opts?: DerivePtbOptions,
+): number | null {
+  const openTickGraceMs = opts?.openTickGraceMs ?? openTickGraceMsForBucket(bucketAgeMs);
+  const strict = derivePtbFromRtdsHistory(hist, bucketStartMs, {
+    ...opts,
+    openTickGraceMs,
+  });
+  if (strict != null) return strict;
+  if (bucketAgeMs < 45_000) return null;
+  const nearest = derivePtbNearestOpenTick(hist, bucketStartMs, Math.max(openTickGraceMs, 300_000));
+  return nearest;
+}
+
 export function bucketPtbCacheKey(symbol: string, bucketStartMs: number): string {
   return `${symbol.trim().toLowerCase()}|${bucketStartMs}`;
 }
@@ -130,5 +175,9 @@ export function derivePtbPreview(
 }
 
 export function isLockedPtbSource(source: string): boolean {
-  return source === 'rtds_chainlink_window_open' || source === 'rtds_chainlink_pre_open_tick';
+  return (
+    source === 'rtds_chainlink_window_open' ||
+    source === 'rtds_chainlink_pre_open_tick' ||
+    source === 'polymarket_page_price_to_beat'
+  );
 }

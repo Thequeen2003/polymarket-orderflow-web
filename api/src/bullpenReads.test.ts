@@ -36,4 +36,21 @@ describe('bullpenReads', () => {
     expect(positionAvgEntry01({ avg_price: 53, cur_price: 53 })).toBeNull();
     expect(positionAvgEntry01({ avg_entry: 47, avg_price: 53 })).toBeCloseTo(0.47, 6);
   });
+
+  it('positionAvgEntry01 uses invested_usd and keeps entry when mark is close after fill', () => {
+    expect(
+      positionAvgEntry01({
+        shares: 7.29,
+        invested_usd: 6.9984,
+        avg_price: 0.96,
+        current_price: 0.965,
+      }),
+    ).toBeCloseTo(6.9984 / 7.29, 4);
+    expect(
+      positionAvgEntry01({
+        avg_price: 0.96,
+        current_price: 0.965,
+      }),
+    ).toBeCloseTo(0.96, 4);
+  });
 });

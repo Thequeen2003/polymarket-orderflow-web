@@ -5,6 +5,7 @@
 import type { DeskSpeedSnapshot, LayerSpeed } from './deskSpeedLayers';
 import { formatProbSpeedPpMin, formatSpotSpeedPerMin } from './deskSpeedLayers';
 import type { MtfConsensus } from './multiTimeframeConsensus';
+import type { PressureTiming } from './pressureTiming';
 
 export function formatPctSigned(n: number, decimals = 2): string {
   if (!Number.isFinite(n)) return '—';
@@ -91,6 +92,68 @@ export function computeContractEntryJump(params: {
     headline,
     projLine,
   };
+}
+
+/** Min contract ¢ move before showing the jump readout (filters chop like +1¢ / 30s). */
+export const PRESSURE_ENTRY_JUMP_MIN_CENTS = 2.5;
+
+export type PressureEntryJumpDisplay = {
+  title: string;
+  jump: ContractEntryJump;
+  lateNote: string | null;
+};
+
+/** Only surface contract jumps worth acting on — not noise or duplicate 30s confirm cards. */
+export function resolvePressureEntryJumpDisplay(args: {
+  timing: PressureTiming;
+  timingNote: string;
+  entryJump: ContractEntryJump | null;
+  earlyEntryJump: ContractEntryJump | null;
+  earlyHorizonSec: number;
+  confirmHorizonSec: number;
+}): PressureEntryJumpDisplay | null {
+  const { timing, timingNote, entryJump, earlyEntryJump, earlyHorizonSec, confirmHorizonSec } = args;
+
+  if (timing === 'CHASING' || timing === 'EXTENDED') {
+    if (!entryJump) return null;
+    return {
+      title: `Too late · ${confirmHorizonSec}s confirm`,
+      jump: entryJump,
+      lateNote: timingNote,
+    };
+  }
+
+  const lead = earlyEntryJump;
+  if (lead && Math.abs(lead.gainCents) >= PRESSURE_ENTRY_JUMP_MIN_CENTS) {
+    return {
+      title: `${earlyHorizonSec}s lead · contract ¢`,
+      jump: lead,
+      lateNote: null,
+    };
+  }
+
+  if (entryJump && Math.abs(entryJump.gainCents) >= PRESSURE_ENTRY_JUMP_MIN_CENTS + 1) {
+    return {
+      title: `${confirmHorizonSec}s move · contract ¢`,
+      jump: entryJump,
+      lateNote: null,
+    };
+  }
+
+  return null;
+}
+
+/** @deprecated UI no longer shows 1m projections — kept for tests. */
+export function entryJumpProjLineForTiming(jump: ContractEntryJump, timing: PressureTiming): string {
+  const gainStr = formatCentsDelta(jump.gain01);
+  const pctStr = formatPctSigned(jump.gainPct, 1);
+  if (timing === 'CHASING') {
+    return `Too late for fresh entry — ${gainStr} (${pctStr}) already repriced on ${jump.horizonSec}s confirm. Hunt pullback or catch the next 10s lead.`;
+  }
+  if (timing === 'EXTENDED') {
+    return `Confirm window is late — ${gainStr} (${pctStr}) is mostly in. Do not chase the +1m extension; watch 10s pressure instead.`;
+  }
+  return jump.projLine;
 }
 
 export function spotEntryJumpLine(

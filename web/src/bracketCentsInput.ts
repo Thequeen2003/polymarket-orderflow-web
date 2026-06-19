@@ -12,6 +12,11 @@ export function sanitizeBracketCentsDraft(raw: string): string {
   return s.replace(/\D/g, '');
 }
 
+/** Parse committed SL/TP ¢ field → price 0..1 (supports decimals like 52.5¢). */
+export function bracketCentsStrTo01(raw: string): number | null {
+  return parseBracketCentsCommit(raw);
+}
+
 export function parseBracketCentsCommit(raw: string): number | null {
   const s = raw.trim();
   if (!s) return null;

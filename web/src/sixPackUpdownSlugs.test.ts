@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
   inferUpdownHintFromMarketJson,
+  isTitledUpdownSlug,
   isUpdownDeskMarket,
   nextUpdownSlug,
   parseUpdownSlug,
   parseUpdownSlugWithHints,
   slugFromUpdownShortcutResponse,
   tradingSlugFromLiveShortcut,
+  updownSlugAtBucket,
 } from './sixPackUpdownSlugs';
 
 describe('sixPackUpdownSlugs', () => {
@@ -67,5 +69,38 @@ describe('sixPackUpdownSlugs', () => {
     });
     expect(p?.interval).toBe('1d');
     expect(p?.ts).toBe(bucket);
+  });
+
+  it('infers 4h bucket from eventStartTime on canonical slug market json', () => {
+    const hint = inferUpdownHintFromMarketJson('btc-updown-4h-1781121600', {
+      endDate: '2026-06-11T00:00:00Z',
+      eventStartTime: '2026-06-10T20:00:00Z',
+    });
+    expect(hint?.interval).toBe('4h');
+    expect(hint?.bucketStartSec).toBe(1_781_121_600);
+  });
+
+  it('steps titled hourly slugs with hints', () => {
+    const slug = 'bitcoin-up-or-down-june-10-2026-7pm-et';
+    const bucket = 1_781_132_400; // 7pm ET Jun 10 2026
+    const hints = { [slug]: { asset: 'btc' as const, interval: '1h' as const, bucketStartSec: bucket } };
+    expect(isTitledUpdownSlug(slug)).toBe(true);
+    const next = nextUpdownSlug(slug, 1, hints);
+    expect(next).toBe(updownSlugAtBucket('btc', '1h', bucket + 3600, true));
+    expect(next).toMatch(/8pm-et$/);
+    const prev = nextUpdownSlug(slug, -1, hints);
+    expect(prev).toBe(updownSlugAtBucket('btc', '1h', bucket - 3600, true));
+    expect(prev).toMatch(/6pm-et$/);
+  });
+
+  it('steps titled daily slugs with hints', () => {
+    const slug = 'bitcoin-up-or-down-on-june-11-2026';
+    const bucket = 1_781_107_200; // noon ET Jun 10 → resolves Jun 11
+    const hints = { [slug]: { asset: 'btc' as const, interval: '1d' as const, bucketStartSec: bucket } };
+    expect(updownSlugAtBucket('btc', '1d', bucket, true)).toBe(slug);
+    const next = nextUpdownSlug(slug, 1, hints);
+    expect(next).toBe('bitcoin-up-or-down-on-june-12-2026');
+    const prev = nextUpdownSlug(slug, -1, hints);
+    expect(prev).toBe('bitcoin-up-or-down-on-june-10-2026');
   });
 });

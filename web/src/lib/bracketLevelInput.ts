@@ -190,6 +190,33 @@ export type BracketConversionPreview = {
   usdUsesTotal: boolean;
 };
 
+/** Re-derive trigger ¢ from a committed % or $ draft when buy size / entry ref changes. */
+export function bracketCentsFromAltModeDraft(params: {
+  mode: Exclude<BracketInputMode, 'cents'>;
+  draft: string;
+  kind: BracketLegKind;
+  ref01: number;
+  shares?: number | null;
+}): string | null {
+  const trimmed = params.draft.trim();
+  if (!trimmed) return null;
+  const target01 = target01FromBracketInput({
+    mode: params.mode,
+    raw: trimmed,
+    kind: params.kind,
+    ref01: params.ref01,
+    shares: params.shares,
+  });
+  if (target01 == null) return null;
+  return centsStrFromTarget01(target01);
+}
+
+export function bracketSizingKey(ref01: number | null, shares: number | null | undefined): string {
+  const r = ref01 != null && Number.isFinite(ref01) ? ref01.toFixed(6) : '—';
+  const s = shares != null && Number.isFinite(shares) && shares > 0 ? shares.toFixed(4) : '—';
+  return `${r}|${s}`;
+}
+
 /** Live ¢ / % / $ readout while the operator edits any bracket input mode. */
 export function bracketConversionFromInput(params: {
   mode: BracketInputMode;

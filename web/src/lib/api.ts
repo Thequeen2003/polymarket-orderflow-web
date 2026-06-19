@@ -439,6 +439,41 @@ export function marketsUpdownShortcut(asset: UpdownShortcutAsset, interval: Updo
   });
 }
 
+export type SportsLeagueId = 'mlb' | 'nba' | 'nfl' | 'nhl' | 'epl' | 'ucl' | 'mls' | 'cfb' | 'cbb' | 'wnba' | 'ufc' | 'atp' | 'wta';
+
+export type SportsShortcutPayload = {
+  slug: string;
+  league: string;
+  question: string | null;
+  gameStartTime: string | null;
+  market?: unknown;
+};
+
+export type SportsLiveRow = SportsShortcutPayload & {
+  endDate?: string | null;
+  volume24hr?: number;
+  active?: boolean;
+  closed?: boolean;
+};
+
+export function marketsSportsShortcut(league: SportsLeagueId) {
+  return getJsonWithRetry<SportsShortcutPayload>(
+    `/api/markets/sports-shortcut?league=${encodeURIComponent(league)}`,
+    { timeoutMs: 35_000, retries: 3, retryDelayMs: 700 },
+  );
+}
+
+export function marketsSportsLive(league?: SportsLeagueId, limit = 16) {
+  const q = new URLSearchParams();
+  if (league) q.set('league', league);
+  q.set('limit', String(limit));
+  return getJsonWithRetry<SportsLiveRow[]>(`/api/markets/sports-live?${q.toString()}`, {
+    timeoutMs: 35_000,
+    retries: 2,
+    retryDelayMs: 600,
+  });
+}
+
 export async function marketsGet(slugOrId: string) {
   const path = `/api/markets/get/${encodeURIComponent(slugOrId)}`;
   return getJsonWithRetry<unknown>(path, { timeoutMs: 14_000, retries: 3, retryDelayMs: 500 });

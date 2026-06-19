@@ -12,7 +12,8 @@
     "test": "npm test -w api && npm test -w web",
     "lint": "npm run lint -w api && npm run lint -w web",
     "backtest": "tsx web/scripts/backtest.ts",
-    "verify:live": "npm run verify:live -w api"
+    "verify:live": "npm run verify:live -w api",
+    "agent:snapshot": "node api/scripts/agent-snapshot.mjs --asset btc --interval 5m"
   },
   "devDependencies": {
     "concurrently": "^9.2.0",
