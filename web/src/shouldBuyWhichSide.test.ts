@@ -131,6 +131,8 @@ describe('shouldBuyWhichSide', () => {
     const result = shouldBuyWhichSide(baseInput());
     expect(result.verdict).toBe('BUY_UP');
     expect(result.confidence).not.toBe('LOW');
+    expect(result.confidencePct).toBeGreaterThanOrEqual(48);
+    expect(result.momentumScore).toBeGreaterThan(0);
     expect(result.suggestedSize).toBeGreaterThan(0);
     expect(result.edgePerShareUsd).toBe(0.10);
   });

@@ -67,6 +67,14 @@ export type PtbUnifiedLineChartSvgProps = {
   emitGap: (side: 'up' | 'down', g: GapBlock | null, entryNow: number) => void;
   /** CLOB token for this panel — when set, bracket overlay must match event tokens (same market). */
   bracketOutcomeToken?: string | null;
+  /** Mirror layout: each panel uses its own enter/target on the same top→bottom structure. */
+  mirrorPanelLayout?: boolean;
+  panelEnterLine?: number | null;
+  panelTargetNext01?: number | null;
+  panelTargetLo01?: number | null;
+  panelTargetHi01?: number | null;
+  /** Stretch SVG to fill its panel shell (flex parent must supply height). */
+  fillContainer?: boolean;
 };
 
 function clamp01(x: number): number {
@@ -146,6 +154,12 @@ export function PtbUnifiedLineChartSvg(p: PtbUnifiedLineChartSvgProps): ReactEle
     onTapProb,
     emitGap,
     bracketOutcomeToken = null,
+    mirrorPanelLayout = false,
+    panelEnterLine = null,
+    panelTargetNext01 = null,
+    panelTargetLo01 = null,
+    panelTargetHi01 = null,
+    fillContainer = false,
   } = p;
 
   const [bracketOverlay, setBracketOverlay] = useState<BpxBracketOverlayDetail | null>(null);
@@ -210,7 +224,11 @@ export function PtbUnifiedLineChartSvg(p: PtbUnifiedLineChartSvgProps): ReactEle
   }
 
   const enterLine =
-    tradeTrigger.line != null ? probOnChart(tradeTrigger.lane, tradeTrigger.line, chartLane) : null;
+    mirrorPanelLayout && panelEnterLine != null
+      ? clamp01(panelEnterLine)
+      : tradeTrigger.line != null
+        ? probOnChart(tradeTrigger.lane, tradeTrigger.line, chartLane)
+        : null;
   const counterLine =
     counterEnter != null ? probOnChart(counterEnter.lane, counterEnter.line, chartLane) : null;
   const fadeLine =
@@ -221,9 +239,21 @@ export function PtbUnifiedLineChartSvg(p: PtbUnifiedLineChartSvgProps): ReactEle
   const projX0 = xT(lastSample.t);
   const projY0 = yLine(lastSample.v);
   const projX1 = padL + plotW * 0.93;
-  const projY1 = yLine(probOnChart(ptbTarget.engineLane, ptbTarget.next01, chartLane));
-  const projYLo = yLine(probOnChart(ptbTarget.engineLane, ptbTarget.lo01, chartLane));
-  const projYHi = yLine(probOnChart(ptbTarget.engineLane, ptbTarget.hi01, chartLane));
+  const targetNext01 =
+    mirrorPanelLayout && panelTargetNext01 != null
+      ? clamp01(panelTargetNext01)
+      : probOnChart(ptbTarget.engineLane, ptbTarget.next01, chartLane);
+  const targetLo01 =
+    mirrorPanelLayout && panelTargetLo01 != null
+      ? clamp01(panelTargetLo01)
+      : probOnChart(ptbTarget.engineLane, ptbTarget.lo01, chartLane);
+  const targetHi01 =
+    mirrorPanelLayout && panelTargetHi01 != null
+      ? clamp01(panelTargetHi01)
+      : probOnChart(ptbTarget.engineLane, ptbTarget.hi01, chartLane);
+  const projY1 = yLine(targetNext01);
+  const projYLo = yLine(targetLo01);
+  const projYHi = yLine(targetHi01);
   const primaryLanePanel = tradeTrigger.lane === chartLane;
   const laneRoleLabel = primaryLanePanel ? 'PRIMARY PANEL' : 'ALT PANEL';
   const laneRoleTone = primaryLanePanel
@@ -345,8 +375,10 @@ export function PtbUnifiedLineChartSvg(p: PtbUnifiedLineChartSvgProps): ReactEle
     <svg
       ref={svgRef}
       viewBox={`0 0 ${width} ${height}`}
-      className="block h-auto min-h-0 w-full max-w-full rounded-lg bg-[#070709]"
-      style={{ aspectRatio: `${width} / ${height}` }}
+      className={`block w-full max-w-full rounded-lg bg-[#070709] ${
+        fillContainer ? 'h-full min-h-0' : 'h-auto min-h-0'
+      }`}
+      style={fillContainer ? undefined : { aspectRatio: `${width} / ${height}` }}
       preserveAspectRatio="xMidYMid meet"
     >
       <defs>
@@ -592,7 +624,7 @@ export function PtbUnifiedLineChartSvg(p: PtbUnifiedLineChartSvgProps): ReactEle
       ) : null}
 
       {/* Projection to PTB target (mapped onto anchored leg) */}
-      {showTarget ? (
+      {(mirrorPanelLayout ? panelTargetNext01 != null : showTarget) ? (
         <>
           <line
             x1={projX0}
@@ -736,7 +768,7 @@ export function PtbUnifiedLineChartSvg(p: PtbUnifiedLineChartSvgProps): ReactEle
         {fmtChartWindowMin(tMin, tMax)} · line = {winningLabel} · green / yellow / red = segment momentum · {speedLabel} tape
       </text>
 
-      {enterLine != null && tradeTrigger.line != null ? (
+      {enterLine != null && (mirrorPanelLayout ? panelEnterLine != null : tradeTrigger.line != null) ? (
         <g>
           <line
             x1={padL}
@@ -756,7 +788,11 @@ export function PtbUnifiedLineChartSvg(p: PtbUnifiedLineChartSvgProps): ReactEle
             stroke="rgba(253, 224, 71, 0.98)"
             strokeWidth={2.6}
             className="cursor-pointer"
-            onClick={() => onTapProb?.(tradeTrigger.line!, { lane: tradeTrigger.lane })}
+            onClick={() =>
+              onTapProb?.(mirrorPanelLayout && panelEnterLine != null ? panelEnterLine : tradeTrigger.line!, {
+                lane: chartLane,
+              })
+            }
           />
           <g className="pointer-events-none">
             <title>

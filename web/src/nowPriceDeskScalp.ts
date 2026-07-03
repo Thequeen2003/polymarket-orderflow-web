@@ -10,6 +10,10 @@ import {
 import { buildQuoteAssistTargets, loadEmergencyStopBundlePrefs } from './buyBundleStaging';
 import { loadAutoTradeSizeShares } from './signalsPagePersist';
 import type { BuySideAdvisory } from './shouldBuyWhichSide';
+import type { EntryMoment } from './entryMoment';
+import { entryMomentDeskScalpBlockReason } from './entryMoment';
+import type { ContractLeadSignal } from './contractLeadSignal';
+import type { PressureTiming } from './pressureTiming';
 import {
   executeTakeSignal,
   roundTimerExecuteBlockReason,
@@ -31,6 +35,8 @@ export type NowPriceDeskScalpPrefs = {
   autoDeskScalp: boolean;
   /** Submit limit buy on take (live + shares); off = prefill trade panel only. */
   submitBuyOnTake: boolean;
+  /** Auto-trade checklist (checkboxes + shares/SL) expanded in desk scalp panel. */
+  checklistVisible: boolean;
 };
 
 export const NOW_PRICE_DESK_SCALP_PREFS_KEY = 'pm:nowPriceDeskScalpPrefs:v1';
@@ -43,6 +49,7 @@ export const DEFAULT_NOW_PRICE_DESK_SCALP_PREFS: NowPriceDeskScalpPrefs = {
   takeLossWhenDeskTpBelowEntry: false,
   autoDeskScalp: false,
   submitBuyOnTake: false,
+  checklistVisible: true,
 };
 
 export function loadNowPriceDeskScalpPrefs(): NowPriceDeskScalpPrefs {
@@ -58,6 +65,7 @@ export function loadNowPriceDeskScalpPrefs(): NowPriceDeskScalpPrefs {
       takeLossWhenDeskTpBelowEntry: j.takeLossWhenDeskTpBelowEntry === true,
       autoDeskScalp: j.autoDeskScalp === true,
       submitBuyOnTake: j.submitBuyOnTake === true,
+      checklistVisible: j.checklistVisible !== false,
     };
   } catch {
     return DEFAULT_NOW_PRICE_DESK_SCALP_PREFS;
@@ -140,6 +148,9 @@ export function buildNowPriceDeskScalpPlan(args: {
   endsInMs?: number | null;
   slug?: string | null;
   scalpPrefs?: NowPriceDeskScalpPrefs;
+  entryMoment?: EntryMoment | null;
+  contractLead?: ContractLeadSignal | null;
+  pressureTiming?: PressureTiming | null;
 }): DeskScalpPlan {
   const fail = (reason: string, label = 'Take desk scalp'): DeskScalpPlan => ({
     canTake: false,
@@ -176,6 +187,14 @@ export function buildNowPriceDeskScalpPlan(args: {
   const timerBlock = roundTimerExecuteBlockReason(args.endsInMs, args.slug);
   if (timerBlock) {
     return fail(timerBlock, 'Desk scalp — wait for bell');
+  }
+
+  const momentBlock = entryMomentDeskScalpBlockReason(args.entryMoment, {
+    contractLead: args.contractLead ?? null,
+    pressureTiming: args.pressureTiming ?? null,
+  });
+  if (momentBlock) {
+    return fail(momentBlock, 'Desk scalp — wait for entry');
   }
 
   const tpCentsStr = resolveLaneTpCents(entry01, touch);

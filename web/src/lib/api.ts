@@ -412,6 +412,31 @@ export function marketsSearch(q: string, limit = 20) {
 export type UpdownShortcutAsset = 'btc' | 'eth' | 'sol' | 'hype';
 export type UpdownInterval = '5m' | '15m' | '1h' | '4h' | '1d';
 
+export type AgentSnapshotData = {
+  schema: string;
+  generatedAtMs: number;
+  query: { asset: UpdownShortcutAsset; interval: UpdownInterval };
+  window?: { remainingMs?: number | null };
+  market: { slug: string };
+  underlying?: {
+    spotVsPtbUsd?: number | null;
+    spot?: { history?: { usd: number }[] };
+  };
+  outcomes?: {
+    up?: { lane: 'up'; impliedMid: number | null; recentTrades?: { price: number; side: string }[] };
+    down?: { lane: 'down'; impliedMid: number | null; recentTrades?: { price: number; side: string }[] };
+  };
+};
+
+export function agentSnapshot(asset: UpdownShortcutAsset, interval: UpdownInterval = '15m') {
+  const q = new URLSearchParams({ asset, interval });
+  return getJsonWithRetry<AgentSnapshotData>(`/api/agent/snapshot?${q.toString()}`, {
+    timeoutMs: 28_000,
+    retries: 2,
+    retryDelayMs: 600,
+  });
+}
+
 export function marketsUpdownShortcut(asset: UpdownShortcutAsset, interval: UpdownInterval = '5m') {
   return getJsonWithRetry<{
     slug: string;
@@ -488,7 +513,7 @@ export function priceToBeat(slugOrId: string) {
     opens_at_ms?: number;
   }>(
     `/api/price-to-beat/${encodeURIComponent(slugOrId)}`,
-    { timeoutMs: 22_000, retries: 2, retryDelayMs: 600 },
+    { timeoutMs: 12_000, retries: 1, retryDelayMs: 400 },
   );
 }
 

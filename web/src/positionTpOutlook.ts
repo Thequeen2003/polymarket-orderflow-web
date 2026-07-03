@@ -1,5 +1,6 @@
 import type { LaneEdges } from './tradeEdgeCalculator';
 import type { SpotPoint } from './SpotLevelChart';
+import type { DeskMomentumReadout } from './deskMomentumTracker';
 import { suggestLevelsForLane, type TradeLevels } from './tradeLevels';
 import { computeLiveGuidance, estimateHiddenRanges, type TradeAction } from './tradePlanAssistant';
 import {
@@ -81,6 +82,12 @@ function estimateTpHitProb(args: {
     else if (endsInMs < 480_000 && progress < 0.55) prob -= 0.08;
   }
 
+  const spanCents = span * 100;
+  if (spanCents > 0 && spanCents <= 5.5) {
+    const scalpFloor = 0.34 - Math.min(0.1, reversalRisk01 * 0.12);
+    prob = Math.max(prob, scalpFloor);
+  }
+
   return clamp01(prob);
 }
 
@@ -145,6 +152,75 @@ function detailFor(posture: TpPosture, guidanceDetail: string, distanceCents: nu
     return 'Most of the move is done — trail or sell clips into strength; let a runner only with a hard worst-case exit.';
   }
   return guidanceDetail || 'Structure still supports the bracket — invalidation is your stop and time, not every dip.';
+}
+
+/** Fold live desk momentum into TP odds — fading tape lowers hit probability immediately. */
+export function adjustTpOutlookWithMomentum(
+  outlook: PositionTpOutlook,
+  momentum: DeskMomentumReadout | null | undefined,
+): PositionTpOutlook {
+  if (!momentum) return outlook;
+
+  let prob = outlook.tpHitProb01;
+  let reversal = outlook.reversalRisk01;
+
+  switch (momentum.phase) {
+    case 'climbing':
+      prob += 0.08;
+      reversal = Math.max(0, reversal - 0.06);
+      break;
+    case 'fading':
+      prob -= 0.16;
+      reversal += 0.18;
+      break;
+    case 'stagnating':
+      prob -= 0.22;
+      reversal += 0.22;
+      break;
+    case 'reversing':
+    case 'switched':
+      prob -= 0.38;
+      reversal += 0.32;
+      break;
+    default:
+      break;
+  }
+
+  if (momentum.deskTpLeadDropCents != null && momentum.deskTpLeadDropCents >= 0.35) {
+    prob -= Math.min(0.18, momentum.deskTpLeadDropCents * 0.05);
+    reversal += Math.min(0.2, momentum.deskTpLeadDropCents * 0.06);
+  }
+
+  prob = clamp01(prob);
+  reversal = clamp01(reversal);
+
+  const posture =
+    momentum.phase === 'switched' || momentum.phase === 'reversing' || momentum.phase === 'fading'
+      ? prob < 0.4
+        ? 'stop_pushing'
+        : outlook.posture
+      : outlook.posture;
+
+  const pct = Math.round(prob * 100);
+  const headline =
+    momentum.phase === 'fading' || momentum.phase === 'stagnating'
+      ? `TP odds falling — ~${pct}% with ${momentum.phase} tape`
+      : momentum.phase === 'reversing' || momentum.phase === 'switched'
+        ? `TP unlikely — ~${pct}% · ${momentum.headline}`
+        : headlineFor(posture, prob, outlook.distanceToTpCents);
+
+  return {
+    ...outlook,
+    tpHitProb01: prob,
+    reversalRisk01: reversal,
+    posture,
+    postureLabel: POSTURE_LABEL[posture],
+    headline,
+    detail:
+      momentum.phase === 'idle' || momentum.phase === 'climbing'
+        ? outlook.detail
+        : `${momentum.detail} ${outlook.detail}`,
+  };
 }
 
 /**

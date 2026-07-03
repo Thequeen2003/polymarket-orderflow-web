@@ -10,6 +10,8 @@ import { computePtbNet4cRoom } from './ptbNet4cTradeability';
 import { computePtbPathToTarget } from './ptbPathToTarget';
 import { computePtbTargetEngine, pickWinningChartLane, topBookBias01 } from './ptbTargetEngine';
 import { PtbUnifiedLineChartSvg } from './PtbUnifiedLineChartSvg';
+import { computeDualPtbBattleDesk } from './dualPtbBattleMetrics';
+import { DualPtbBattleMeter, DualPtbBattleStrip, DualPtbCompactEngine, DualPtbDecisionHero } from './DualPtbBattleDesk.tsx';
 
 const BUCKET_N = 26;
 const BIN_N = 28;
@@ -382,6 +384,8 @@ export function PtbDualProbabilityChart(props: {
   combinedColumn?: boolean;
   /** Skip onSummary — use a hidden full chart instance for cross-check. */
   suppressSummary?: boolean;
+  /** Decision-first layout: hero signal, battle meter, trade scores, mirrored panels. */
+  decisionFirst?: boolean;
 }): ReactElement | null {
   const {
     probUp,
@@ -408,7 +412,9 @@ export function PtbDualProbabilityChart(props: {
     laneOnly = null,
     combinedColumn = false,
     suppressSummary = false,
+    decisionFirst: decisionFirstProp,
   } = props;
+  const decisionFirst = decisionFirstProp ?? (compactHeader || signalsLayout);
   const compactChrome = compactHeader || signalsLayout || combinedColumn;
   const effectiveHideReadingGuide = hideReadingGuide || signalsLayout || combinedColumn;
   const showSharedChrome = laneOnly == null && !combinedColumn;
@@ -707,9 +713,11 @@ export function PtbDualProbabilityChart(props: {
     });
   }, [model, onGapsUpdate]);
 
-  /** Signals desk: wide viewBox + no artificial max-height cap so panels scale with width (aspect-ratio preserved). */
-  const width = combinedColumn ? 520 : largeCharts ? 1200 : 680;
-  const height = combinedColumn ? 280 : largeCharts ? 800 : 460;
+  /** Signals desk: wide viewBox; decision-first layout fills panel height. */
+  const chartTall = largeCharts || decisionFirst;
+  const chartFill = chartTall || signalsLayout;
+  const width = combinedColumn ? 520 : chartTall ? 1100 : 680;
+  const height = combinedColumn ? 280 : chartTall ? 720 : 460;
   const padL = 12;
   const padR = 58;
   const padY = 10;
@@ -717,15 +725,30 @@ export function PtbDualProbabilityChart(props: {
   const topY0 = padY + 40;
   const plotH = height - topY0 - padY - 12;
 
-  const svgPanelShellClass = `${largeCharts ? 'w-full min-w-0 p-0.5 sm:p-1' : 'w-full min-w-0 p-1 sm:p-1.5'} [&_svg]:w-full [&_svg]:max-w-full ${
-    combinedColumn
-      ? '[&_svg]:max-h-[min(200px,26svh)]'
-      : largeCharts
-      ? '[&_svg]:block [&_svg]:h-auto [&_svg]:max-h-none [&_svg]:min-h-[min(640px,52svh)] sm:[&_svg]:min-h-[min(760px,56svh)] lg:[&_svg]:min-h-[min(900px,58svh)] xl:[&_svg]:min-h-[min(1020px,60svh)]'
+  const svgPanelShellClass = chartFill
+    ? 'flex min-h-0 flex-1 flex-col w-full min-w-0 p-0.5 sm:p-1 [&_svg]:block [&_svg]:h-full [&_svg]:min-h-0 [&_svg]:w-full [&_svg]:max-h-none [&_svg]:max-w-full'
+    : `${combinedColumn ? 'w-full min-w-0 p-1' : 'w-full min-w-0 p-1 sm:p-1.5'} [&_svg]:w-full [&_svg]:max-w-full ${
+        combinedColumn
+          ? '[&_svg]:max-h-[min(200px,26svh)]'
+          : '[&_svg]:max-h-[min(220px,32svh)] sm:[&_svg]:max-h-[min(300px,40svh)] lg:[&_svg]:max-h-[min(440px,48svh)]'
+      }`;
+  const panelBoxClass = chartFill
+    ? `min-h-0 flex-1 h-full${
+        decisionFirst
+          ? ' min-w-[min(86vw,440px)] shrink-0 snap-center md:min-w-0 md:shrink'
+          : ''
+      }`
+    : '';
+  const chartGridClass =
+    decisionFirst && laneOnly == null
+      ? [
+          'flex min-h-[min(36svh,420px)] flex-1 items-stretch gap-2 overflow-x-auto overscroll-x-contain px-2 snap-x snap-mandatory sm:gap-3 sm:px-3',
+          'md:grid md:min-h-[min(42svh,500px)] md:grid-cols-2 md:overflow-visible md:snap-none',
+          'xl:min-h-[min(52svh,680px)] xl:grid-cols-[minmax(0,1fr)_minmax(9.5rem,11.5rem)_minmax(0,1fr)] xl:gap-4',
+        ].join(' ')
       : signalsLayout
-        ? '[&_svg]:max-h-[min(240px,34svh)] sm:[&_svg]:max-h-[min(320px,42svh)] lg:[&_svg]:max-h-[min(420px,50svh)]'
-        : '[&_svg]:max-h-[min(220px,32svh)] sm:[&_svg]:max-h-[min(300px,40svh)] lg:[&_svg]:max-h-[min(440px,48svh)]'
-  }`;
+        ? 'grid min-h-[min(38svh,460px)] flex-1 grid-cols-2 items-stretch gap-2 sm:gap-3 md:min-h-[min(42svh,500px)] lg:gap-4'
+        : 'contents';
 
   // `stale` is now driven by the tick effect above (re-renders only on flip).
   const pathUpActive = engine.pathUpActive;
@@ -1279,6 +1302,84 @@ export function PtbDualProbabilityChart(props: {
 
   const showUpPanel = laneOnly == null || laneOnly === 'up';
   const showDownPanel = laneOnly == null || laneOnly === 'down';
+
+  const upSpeedCentsPerMin = useMemo(
+    () => Math.round(ptbDynamics.uSlope * 100 * 6 * 10) / 10,
+    [ptbDynamics.uSlope],
+  );
+  const downSpeedCentsPerMin = useMemo(
+    () => Math.round(ptbDynamics.dSlope * 100 * 6 * 10) / 10,
+    [ptbDynamics.dSlope],
+  );
+
+  const battleDesk = useMemo(() => {
+    if (!model) return null;
+    return computeDualPtbBattleDesk({
+      lastU,
+      lastD,
+      upRising,
+      dnRising,
+      upSpeedCentsPerMin,
+      downSpeedCentsPerMin,
+      pathUpActive,
+      pathDnActive,
+      gapUpActive: !!gapU?.active,
+      gapDownActive: !!gapD?.active,
+      upReady: preMove.up.ready,
+      downReady: preMove.down.ready,
+      displayVerdict,
+      gateArmed: tradeTrigger.triggerPill === 'ARMED',
+      goNoGo: goNoGo.go,
+      laneLockLane: laneLock.lane,
+      laneLockConfidence: laneLock.confidence,
+      primaryLane: directionCall.lane,
+      edgeScore: engine.edgeScore,
+      ptbTarget,
+      upLabel,
+      downLabel,
+    });
+  }, [
+    model,
+    lastU,
+    lastD,
+    upRising,
+    dnRising,
+    upSpeedCentsPerMin,
+    downSpeedCentsPerMin,
+    pathUpActive,
+    pathDnActive,
+    gapU?.active,
+    gapD?.active,
+    preMove.up.ready,
+    preMove.down.ready,
+    displayVerdict,
+    tradeTrigger.triggerPill,
+    goNoGo.go,
+    laneLock.lane,
+    laneLock.confidence,
+    directionCall.lane,
+    engine.edgeScore,
+    ptbTarget,
+    upLabel,
+    downLabel,
+  ]);
+
+  const panelTargets = useMemo(() => {
+    const forLane = (lane: 'up' | 'down') => {
+      const gap = lane === 'up' ? gapU : gapD;
+      const trig = lane === 'up' ? preMove.up.trigger : preMove.down.trigger;
+      if (ptbTarget.engineLane === lane) {
+        return { next01: ptbTarget.next01, lo01: ptbTarget.lo01, hi01: ptbTarget.hi01 };
+      }
+      const next01 = gap?.hi ?? (trig != null ? Math.min(0.98, trig + 0.02) : null);
+      const lo01 = gap?.lo ?? trig;
+      const hi01 = gap?.hi ?? next01;
+      return { next01, lo01, hi01 };
+    };
+    return { up: forLane('up'), down: forLane('down') };
+  }, [gapD, gapU, preMove.down.trigger, preMove.up.trigger, ptbTarget]);
+
+  const winningLane = battleDesk?.winningLane ?? directionCall.lane;
   const liveMeter = useMemo(() => {
     const uPrev = candlesUp.length >= 2 ? candlesUp[candlesUp.length - 2]!.c : null;
     const dPrev = candlesDn.length >= 2 ? candlesDn[candlesDn.length - 2]!.c : null;
@@ -1407,10 +1508,10 @@ export function PtbDualProbabilityChart(props: {
 
   return (
     <div
-      className={`w-full min-w-0 max-w-full border border-zinc-800/70 bg-gradient-to-b from-[#0c0c0f] to-[#08080a] ring-1 ${
+      className={`flex h-full w-full min-w-0 max-w-full flex-col border border-zinc-800/70 bg-gradient-to-b from-[#0c0c0f] to-[#08080a] ring-1 ${
         combinedColumn
           ? 'rounded-xl shadow-md shadow-black/20 ring-zinc-700/30'
-          : `rounded-2xl shadow-2xl ${largeCharts ? 'flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-visible' : 'overflow-hidden'} ${signalsLayout ? 'ring-amber-500/35 shadow-amber-950/20' : 'ring-amber-500/20'}`
+          : `rounded-2xl shadow-2xl ${largeCharts || decisionFirst ? 'min-h-0 flex-1 overflow-x-hidden overflow-y-visible' : 'overflow-hidden'} ${signalsLayout ? 'ring-amber-500/35 shadow-amber-950/20' : 'ring-amber-500/20'}`
       }`}
     >
       {/* Scan-friendly title row */}
@@ -1521,7 +1622,17 @@ export function PtbDualProbabilityChart(props: {
           </div>
         </div>
       ) : null}
-      {!combinedColumn && enginePlacement === 'above' ? (
+
+      {decisionFirst && battleDesk && showUpPanel && showDownPanel ? (
+        <div className="space-y-2 border-b border-zinc-800/70 px-3 py-2 sm:space-y-3 sm:px-4 sm:py-3">
+          <DualPtbDecisionHero battle={battleDesk} upLabel={upLabel} downLabel={downLabel} />
+          <div className="xl:hidden">
+            <DualPtbBattleStrip battle={battleDesk} upLabel={upLabel} downLabel={downLabel} />
+          </div>
+        </div>
+      ) : null}
+
+      {!combinedColumn && enginePlacement === 'above' && !decisionFirst ? (
       <div className="max-h-[min(58svh,560px)] overflow-y-auto overscroll-contain border-b border-zinc-800/80 px-3 py-3 sm:px-4 [-webkit-overflow-scrolling:touch]">
         {compactChrome ? (
           <div className="space-y-2">
@@ -1991,11 +2102,11 @@ export function PtbDualProbabilityChart(props: {
       ) : null}
 
       <div
-        className={`min-h-0 w-full min-w-0 max-w-full space-y-3 overflow-x-auto px-0 pb-1 sm:space-y-4 sm:px-2 ${
-          largeCharts ? 'flex flex-1 flex-col sm:space-y-6 lg:space-y-7' : ''
+        className={`min-h-0 w-full min-w-0 max-w-full space-y-3 px-0 pb-1 sm:space-y-4 sm:px-2 ${
+          largeCharts || decisionFirst ? 'flex min-h-0 flex-1 flex-col sm:space-y-6 lg:space-y-7' : ''
         }`}
       >
-        {!effectiveHideReadingGuide ? (
+        {!effectiveHideReadingGuide && !decisionFirst ? (
           <div className="rounded-xl border border-zinc-800/60 bg-zinc-950/40 px-2.5 py-2 sm:px-4 sm:py-2.5">
             <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Reading these charts</div>
             <div className="mt-2 flex flex-wrap gap-x-3 gap-y-2 text-[9px] leading-snug text-zinc-400 sm:gap-x-4 sm:text-[10px]">
@@ -2021,25 +2132,21 @@ export function PtbDualProbabilityChart(props: {
           </div>
         ) : null}
 
-        <div
-          className={
-            signalsLayout
-              ? 'grid grid-cols-1 gap-3 lg:grid-cols-2 lg:items-stretch lg:gap-4'
-              : 'contents'
-          }
-        >
+        <div className={chartGridClass}>
         {showUpPanel ? (
         <div
-          className={`w-full min-w-0 rounded-xl border bg-zinc-950/50 shadow-inner shadow-black/30 ring-1 ring-emerald-500/10 ${
-            largeCharts ? 'overflow-x-hidden overflow-y-visible shadow-lg shadow-black/25 ring-2 ring-emerald-500/20' : 'overflow-hidden'
-          } ${signalsLayout ? 'border-emerald-800/45 lg:min-h-0' : largeCharts ? 'border-emerald-700/45' : 'border-emerald-800/35'}`}
+          className={`flex w-full min-w-0 flex-col rounded-xl border bg-zinc-950/50 shadow-inner shadow-black/30 ring-1 ring-emerald-500/10 ${panelBoxClass} ${
+            largeCharts || decisionFirst ? 'overflow-x-hidden overflow-y-visible shadow-lg shadow-black/25 ring-2 ring-emerald-500/20' : 'overflow-hidden'
+          } ${signalsLayout ? 'border-emerald-800/45 lg:min-h-0' : largeCharts ? 'border-emerald-700/45' : 'border-emerald-800/35'} ${
+            decisionFirst && winningLane === 'down' ? 'opacity-40 saturate-50' : ''
+          } ${decisionFirst && winningLane === 'up' ? 'ring-2 ring-emerald-400/45' : ''}`}
         >
           {!combinedColumn ? (
           <div
             className={`flex flex-wrap items-center justify-between gap-2 border-b border-emerald-900/30 bg-emerald-950/20 px-2 sm:px-3 ${largeCharts ? 'py-2.5' : 'py-2'}`}
           >
             <div className={`min-w-0 ${largeCharts ? 'text-sm' : 'text-[11px]'} font-semibold text-emerald-100/95`}>
-              {signalsLayout || largeCharts ? (
+              {signalsLayout || largeCharts || decisionFirst ? (
                 <span className="inline-flex items-center gap-1.5">
                   <span
                     className={`rounded-md bg-emerald-500/25 px-1.5 font-mono font-bold text-emerald-200 ${largeCharts ? 'text-[10px]' : 'text-[9px]'}`}
@@ -2047,6 +2154,7 @@ export function PtbDualProbabilityChart(props: {
                     UP
                   </span>
                   {upLabel}
+                  {decisionFirst && winningLane === 'up' ? <span className="text-amber-300">★</span> : null}
                 </span>
               ) : (
                 <>Panel A · {upLabel}</>
@@ -2089,7 +2197,12 @@ export function PtbDualProbabilityChart(props: {
           pathActive={pathUpActive}
           engine={engine}
           ptbTarget={ptbTarget}
-          showTarget={showPtbTargetOnChart && ptbTarget.engineLane === 'up'}
+          showTarget={decisionFirst ? showPtbTargetOnChart : showPtbTargetOnChart && ptbTarget.engineLane === 'up'}
+          mirrorPanelLayout={decisionFirst}
+          panelEnterLine={preMove.up.trigger}
+          panelTargetNext01={panelTargets.up.next01}
+          panelTargetLo01={panelTargets.up.lo01}
+          panelTargetHi01={panelTargets.up.hi01}
           speedLabel={speedLabel}
           speedScore01={speedScore01}
           tradeTrigger={{
@@ -2107,6 +2220,7 @@ export function PtbDualProbabilityChart(props: {
           onTapProb={onTapProb}
           emitGap={emitGap}
           bracketOutcomeToken={upOutcomeToken || null}
+          fillContainer={chartFill}
         />
           </div>
           {combinedColumn && laneOnly === 'up' ? (
@@ -2133,18 +2247,26 @@ export function PtbDualProbabilityChart(props: {
         </div>
         ) : null}
 
+        {decisionFirst && battleDesk && showUpPanel && showDownPanel ? (
+          <div className="hidden h-full xl:block xl:min-h-0">
+            <DualPtbBattleMeter battle={battleDesk} upLabel={upLabel} downLabel={downLabel} />
+          </div>
+        ) : null}
+
         {showDownPanel ? (
         <div
-          className={`w-full min-w-0 rounded-xl border bg-zinc-950/50 shadow-inner shadow-black/30 ring-1 ring-sky-500/10 ${
-            largeCharts ? 'overflow-x-hidden overflow-y-visible shadow-lg shadow-black/25 ring-2 ring-sky-500/20' : 'overflow-hidden'
-          } ${signalsLayout ? 'border-sky-800/45 lg:min-h-0' : largeCharts ? 'border-sky-700/45' : 'border-sky-800/35'}`}
+          className={`flex w-full min-w-0 flex-col rounded-xl border bg-zinc-950/50 shadow-inner shadow-black/30 ring-1 ring-sky-500/10 ${panelBoxClass} ${
+            largeCharts || decisionFirst ? 'overflow-x-hidden overflow-y-visible shadow-lg shadow-black/25 ring-2 ring-sky-500/20' : 'overflow-hidden'
+          } ${signalsLayout ? 'border-sky-800/45 lg:min-h-0' : largeCharts ? 'border-sky-700/45' : 'border-sky-800/35'} ${
+            decisionFirst && winningLane === 'up' ? 'opacity-40 saturate-50' : ''
+          } ${decisionFirst && winningLane === 'down' ? 'ring-2 ring-rose-400/45' : ''}`}
         >
           {!combinedColumn ? (
           <div
             className={`flex flex-wrap items-center justify-between gap-2 border-b border-sky-900/30 bg-sky-950/15 px-2 sm:px-3 ${largeCharts ? 'py-2.5' : 'py-2'}`}
           >
             <div className={`min-w-0 ${largeCharts ? 'text-sm' : 'text-[11px]'} font-semibold text-sky-100/95`}>
-              {signalsLayout || largeCharts ? (
+              {signalsLayout || largeCharts || decisionFirst ? (
                 <span className="inline-flex items-center gap-1.5">
                   <span
                     className={`rounded-md bg-sky-500/25 px-1.5 font-mono font-bold text-sky-200 ${largeCharts ? 'text-[10px]' : 'text-[9px]'}`}
@@ -2152,6 +2274,7 @@ export function PtbDualProbabilityChart(props: {
                     DN
                   </span>
                   {downLabel}
+                  {decisionFirst && winningLane === 'down' ? <span className="text-amber-300">★</span> : null}
                 </span>
               ) : (
                 <>Panel B · {downLabel}</>
@@ -2194,7 +2317,12 @@ export function PtbDualProbabilityChart(props: {
           pathActive={pathDnActive}
           engine={engine}
           ptbTarget={ptbTarget}
-          showTarget={showPtbTargetOnChart && ptbTarget.engineLane === 'down'}
+          showTarget={decisionFirst ? showPtbTargetOnChart : showPtbTargetOnChart && ptbTarget.engineLane === 'down'}
+          mirrorPanelLayout={decisionFirst}
+          panelEnterLine={preMove.down.trigger}
+          panelTargetNext01={panelTargets.down.next01}
+          panelTargetLo01={panelTargets.down.lo01}
+          panelTargetHi01={panelTargets.down.hi01}
           speedLabel={speedLabel}
           speedScore01={speedScore01}
           tradeTrigger={{
@@ -2212,6 +2340,7 @@ export function PtbDualProbabilityChart(props: {
           onTapProb={onTapProb}
           emitGap={emitGap}
           bracketOutcomeToken={downOutcomeToken || null}
+          fillContainer={chartFill}
         />
           </div>
           {combinedColumn && laneOnly === 'down' ? (
@@ -2354,7 +2483,9 @@ export function PtbDualProbabilityChart(props: {
             largeCharts ? 'max-h-[min(52svh,620px)]' : 'max-h-[min(72svh,680px)]'
           }`}
         >
-          {compactChrome ? (
+          {decisionFirst ? (
+            <DualPtbCompactEngine ptbTarget={ptbTarget} upLabel={upLabel} downLabel={downLabel} starred />
+          ) : compactChrome ? (
             <div className="space-y-2">
               <div
                 className={`rounded-xl border border-zinc-800/70 bg-zinc-950/60 px-2.5 py-2 ring-1 ring-white/[0.04] ${

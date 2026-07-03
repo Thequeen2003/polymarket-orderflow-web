@@ -2,7 +2,7 @@
  * Desk-level execution signal — shared by Now Price Signals and Take Signal gate.
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { SpotPoint } from './SpotLevelChart';
 import type { SpotBandGaugeSnapshot } from './spotBandDeskAction';
 import type { SpotPtbMachineReadout } from './spotPtbMachineSignals';
@@ -254,13 +254,89 @@ function confirmStateEqual(
   );
 }
 
-function advanceConfirmState(
+function numKey(n: number | null | undefined, digits = 4): string {
+  if (n == null || !Number.isFinite(n)) return '-';
+  return n.toFixed(digits);
+}
+
+function deskSpeedGateKey(s: DeskSpeedSnapshot | null | undefined): string {
+  if (!s) return '-';
+  const up = s.lanes.up;
+  const down = s.lanes.down;
+  return [
+    s.spot?.direction ?? '-',
+    s.ptbGap?.direction ?? '-',
+    s.ptbGap?.ptbGapMotion ?? '-',
+    up.mode,
+    up.alignment,
+    down.mode,
+    down.alignment,
+    numKey(up.prob, 3),
+    numKey(down.prob, 3),
+  ].join(',');
+}
+
+/** Stable key for execution gate inputs — avoids confirm timer resets on object identity churn. */
+export function executionInputMeaningKey(input: ExecutionSignalInput | null | undefined): string {
+  if (!input) return 'none';
+  return [
+    input.geo ?? '-',
+    numKey(input.modelPUp),
+    numKey(input.pMktUp),
+    numKey(input.pMktDown),
+    numKey(input.probUpDelta01),
+    numKey(input.probDownDelta01),
+    numKey(input.nowSpotUsd, 2),
+    deskSpeedGateKey(input.deskSpeedEarly),
+    deskSpeedGateKey(input.deskSpeedConfirm),
+    input.machine?.regime ?? '-',
+    input.machine?.verdict ?? '-',
+    input.machine?.focusLane ?? '-',
+    input.mtf?.consensus ?? '-',
+    input.pressureTiming ?? '-',
+    numKey(input.earlyProbGainCents, 1),
+    input.upLabel ?? '',
+    input.downLabel ?? '',
+  ].join('|');
+}
+
+export function advanceConfirmState(
   prev: ExecutionConfirmState | null,
   input: ExecutionSignalInput,
   nowMs: number,
 ): ExecutionConfirmState {
   const next = updateExecutionConfirm(prev, input, nowMs);
   return confirmStateEqual(prev, next) && prev ? prev : next;
+}
+
+/** Track execution gate confirmation — keyed on gate semantics, not input object identity. */
+export function useExecutionConfirmTracker(inputBase: ExecutionSignalInput | null): ExecutionConfirmState | null {
+  const inputBaseRef = useRef(inputBase);
+  inputBaseRef.current = inputBase;
+  const inputMeaningKey = executionInputMeaningKey(inputBase);
+
+  const [execConfirm, setExecConfirm] = useState<ExecutionConfirmState | null>(null);
+
+  useEffect(() => {
+    const base = inputBaseRef.current;
+    if (!base) {
+      setExecConfirm((prev) => (prev == null ? prev : null));
+      return;
+    }
+    setExecConfirm((prev) => advanceConfirmState(prev, base, Date.now()));
+  }, [inputMeaningKey]);
+
+  useEffect(() => {
+    if (inputMeaningKey === 'none') return;
+    const id = window.setInterval(() => {
+      const base = inputBaseRef.current;
+      if (!base) return;
+      setExecConfirm((prev) => advanceConfirmState(prev, base, Date.now()));
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [inputMeaningKey]);
+
+  return execConfirm;
 }
 
 /** Live execution signal with confirmation hold tracking. */
@@ -290,23 +366,7 @@ export function useDeskExecutionSignal(args: DeskExecutionSignalArgs): Execution
     ],
   );
 
-  const [execConfirm, setExecConfirm] = useState<ExecutionConfirmState | null>(null);
-
-  useEffect(() => {
-    if (!inputBase) {
-      setExecConfirm((prev) => (prev == null ? prev : null));
-      return;
-    }
-    setExecConfirm((prev) => advanceConfirmState(prev, inputBase, Date.now()));
-  }, [inputBase]);
-
-  useEffect(() => {
-    if (!inputBase) return;
-    const id = window.setInterval(() => {
-      setExecConfirm((prev) => advanceConfirmState(prev, inputBase, Date.now()));
-    }, 1000);
-    return () => window.clearInterval(id);
-  }, [inputBase]);
+  const execConfirm = useExecutionConfirmTracker(inputBase);
 
   return useMemo(() => {
     if (!inputBase) return null;

@@ -17,6 +17,8 @@ html {
   color-scheme: dark;
   overflow-anchor: none;
   overflow-x: clip;
+  /* Fallback when `zoom` is unavailable — hook sets --app-viewport-scale on <html>. */
+  --app-viewport-scale: 1;
 }
 
 body {

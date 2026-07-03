@@ -1,5 +1,7 @@
+import type { SwitchForecast } from './sectionalMomentum';
 import type { DeskSingleAction } from './deskSingleAction';
 import type { OperatorVerdict } from './operatorVerdict';
+import type { NoTradeScore } from './noTradeScore';
 import type { SpotBandGaugeSnapshot } from './spotBandDeskAction';
 import type { SpotPtbMachineReadout } from './spotPtbMachineSignals';
 import type { TradeDirective } from './tradeDirective';
@@ -45,6 +47,20 @@ export function machineReadoutMeaningKey(r: SpotPtbMachineReadout | null): strin
 export function bandGaugeMeaningKey(g: SpotBandGaugeSnapshot | null): string {
   if (!g) return '';
   return [g.mode, g.activeStep, g.separation, g.geo, g.favorableNow ? '1' : '0'].join('|');
+}
+
+export function noTradeScoreMeaningKey(s: NoTradeScore | null): string {
+  if (!s) return '';
+  const reasons = s.contributions
+    .map((c) => c.reason)
+    .sort()
+    .join(',');
+  return `${s.tier}|${Math.round(s.score)}|${reasons}`;
+}
+
+export function switchForecastMeaningKey(f: SwitchForecast | null): string {
+  if (!f) return '';
+  return [f.status, f.lane ?? '-', f.incomingLane ?? '-', f.confidence, f.headline.trim()].join('|');
 }
 
 export function deskActionHardKey(a: DeskSingleAction): string {

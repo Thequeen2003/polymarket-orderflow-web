@@ -1,3 +1,6 @@
+import type { PositionDeskSignal } from './positionDeskSignal';
+import type { PositionBracketCall } from './positionBracketCall';
+import type { DeskMomentumReadout } from './deskMomentumTracker';
 import type { TradeDirective } from './tradeDirective';
 import type { SwitchForecast } from './sectionalMomentum';
 import type { TapeVelocity } from './tapeVelocity';
@@ -29,9 +32,68 @@ export function computePositionExitReadout(input: {
   tape: Pick<TapeVelocity, 'reliable' | 'dominance' | 'netPressure' | 'summary'>;
   upLabel: string;
   downLabel: string;
+  /** Unified desk signal — bracket + momentum fused. */
+  deskSignal?: PositionDeskSignal | null;
+  /** @deprecated use deskSignal */
+  bracketCall?: PositionBracketCall | null;
+  /** @deprecated use deskSignal */
+  momentumTracker?: DeskMomentumReadout | null;
 }): PositionExitReadout {
-  const { heldLane, directive, forecast, tape, upLabel, downLabel } = input;
+  const { heldLane, directive, forecast, tape, upLabel, downLabel, deskSignal, bracketCall, momentumTracker } =
+    input;
   const myName = heldLane === 'up' ? upLabel : downLabel;
+
+  if (deskSignal?.action === 'sell_now' || deskSignal?.action === 'take_profit') {
+    return {
+      band: deskSignal.action === 'take_profit' ? 'trim' : 'exit_now',
+      headline: deskSignal.headline,
+      detail: deskSignal.detail,
+    };
+  }
+  if (deskSignal?.action === 'watch') {
+    return {
+      band: 'watch',
+      headline: deskSignal.headline,
+      detail: deskSignal.detail,
+    };
+  }
+
+  if (bracketCall?.action === 'sell_now') {
+    return {
+      band: 'exit_now',
+      headline: bracketCall.headline,
+      detail: bracketCall.detail,
+    };
+  }
+  if (bracketCall?.action === 'take_profit') {
+    return {
+      band: 'trim',
+      headline: bracketCall.headline,
+      detail: bracketCall.detail,
+    };
+  }
+  if (bracketCall?.action === 'watch_sl') {
+    return {
+      band: 'watch',
+      headline: bracketCall.headline,
+      detail: bracketCall.detail,
+    };
+  }
+
+  if (
+    momentumTracker &&
+    (momentumTracker.phase === 'switched' ||
+      momentumTracker.phase === 'reversing' ||
+      momentumTracker.phase === 'stagnating')
+  ) {
+    const band =
+      momentumTracker.phase === 'switched' || momentumTracker.phase === 'reversing' ? 'exit_now' : 'watch';
+    return {
+      band,
+      headline: momentumTracker.headline,
+      detail: momentumTracker.detail,
+    };
+  }
 
   const tapeAgainst =
     tape.reliable &&

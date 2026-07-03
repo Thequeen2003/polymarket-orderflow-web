@@ -1,5 +1,5 @@
-import { clobHasBookCached, gammaMarketCached } from './updownCanonicalProbe.js';
-import { parseClobTokenIds } from './polymarket/index.js';
+import { gammaMarketCached } from './updownCanonicalProbe.js';
+import { clobHasOrderbook, parseClobTokenIds } from './polymarket/index.js';
 
 /** Prior 5m bucket slug (`asset-updown-5m-<ts-300>`) when `liveSlug` is canonical. */
 export function priorCanonicalUpdownSlug(liveSlug: string): string | null {
@@ -22,8 +22,10 @@ export async function resolveUpdownTradingSlug(liveSlug: string, interval: strin
   try {
     const m = await gammaMarketCached(prior);
     if (!m) return live;
+    if (m.closed === true || m.active === false) return live;
     const t0 = parseClobTokenIds(m.clobTokenIds ?? m.clob_token_ids)[0];
-    if (t0 && (await clobHasBookCached(t0))) return prior;
+    // Fresh CLOB probe — cached "has book" can lag after a 5m roll and strand the desk on 404 books.
+    if (t0 && (await clobHasOrderbook(t0))) return prior;
   } catch {
     /* fall through */
   }

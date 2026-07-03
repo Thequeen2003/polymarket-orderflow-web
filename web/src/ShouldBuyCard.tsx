@@ -28,7 +28,7 @@ function verdictBg(verdict: BuySideAdvisory['verdict']): string {
   return 'bg-zinc-950/35';
 }
 
-function confBadge(conf: BuySideAdvisory['confidence']): ReactElement {
+export function confBadge(conf: BuySideAdvisory['confidence']): ReactElement {
   const cls =
     conf === 'HIGH'
       ? 'bg-emerald-900/50 text-emerald-300 border-emerald-700/40'
@@ -55,6 +55,57 @@ export function shouldBuyPromptLabel(upLabel?: string, downLabel?: string): stri
   const down = (downLabel ?? 'DOWN').toUpperCase();
   if (up === 'UP' && down === 'DOWN') return 'Should I buy UP or DOWN?';
   return `Should I buy ${shortOutcomeLabel(upLabel, 'UP')} or ${shortOutcomeLabel(downLabel, 'DOWN')}?`;
+}
+
+function verdictShort(advisory: BuySideAdvisory, upLabel?: string, downLabel?: string): string {
+  if (advisory.verdict === 'BUY_UP') return `BUY ${(upLabel ?? 'UP').toUpperCase()}`;
+  if (advisory.verdict === 'BUY_DOWN') return `BUY ${(downLabel ?? 'DOWN').toUpperCase()}`;
+  return 'NEITHER';
+}
+
+export function BuyAdvisoryMetricsStrip(props: {
+  advisory: BuySideAdvisory;
+  upLabel?: string;
+  downLabel?: string;
+  compact?: boolean;
+}): ReactElement {
+  const { advisory, upLabel, downLabel, compact = false } = props;
+  const scoreUp = shortOutcomeLabel(upLabel, 'UP');
+  const scoreDown = shortOutcomeLabel(downLabel, 'DOWN');
+  const total = advisory.scores.up + advisory.scores.down;
+
+  return (
+    <div className={`flex flex-wrap items-center gap-x-2 gap-y-1 ${compact ? 'text-[10px]' : 'text-[11px]'}`}>
+      <span className={`font-bold tracking-tight ${verdictColor(advisory.verdict)}`}>
+        {verdictShort(advisory, upLabel, downLabel)}
+      </span>
+      {confBadge(advisory.confidence)}
+      <span className="font-mono tabular-nums text-zinc-400">
+        Conf <span className="font-semibold text-zinc-200">{advisory.confidencePct}%</span>
+      </span>
+      <span className="font-mono tabular-nums text-zinc-400">
+        Mom <span className="font-semibold text-indigo-200/95">{advisory.momentumScore}</span>
+      </span>
+      {advisory.cautionFresh ? (
+        <span className="inline-block rounded-md border border-amber-700/40 bg-amber-900/30 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-amber-300">
+          FRESH
+        </span>
+      ) : null}
+      <div className="flex min-w-[8rem] flex-1 items-center gap-1.5 text-[9px] text-zinc-500">
+        <span className="shrink-0">{scoreUp}</span>
+        <div className="relative h-1.5 min-w-[4rem] flex-1 rounded-full bg-zinc-800/60 overflow-hidden">
+          <div
+            className="absolute inset-y-0 left-0 rounded-full bg-emerald-600/60"
+            style={{ width: `${(advisory.scores.up / Math.max(total, 1)) * 100}%` }}
+          />
+        </div>
+        <span className="shrink-0">{scoreDown}</span>
+        <span className="hidden font-mono tabular-nums text-zinc-600 sm:inline">
+          {advisory.scores.up.toFixed(1)}/{advisory.scores.down.toFixed(1)}
+        </span>
+      </div>
+    </div>
+  );
 }
 
 export function ShouldBuyCard({ advisory, onAsk, upLabel, downLabel, autoAsk = false }: Props): ReactElement {
@@ -122,6 +173,12 @@ export function ShouldBuyCard({ advisory, onAsk, upLabel, downLabel, autoAsk = f
 
       {verdict !== 'NEITHER' && (
         <div className="flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-zinc-400">
+          <span>
+            Conf <span className="font-semibold text-zinc-200">{advisory.confidencePct}%</span>
+          </span>
+          <span>
+            Mom <span className="font-semibold text-indigo-200/95">{advisory.momentumScore}</span>
+          </span>
           {edgePerShareUsd != null && (
             <span>Edge <span className="font-semibold text-zinc-200">{edgePerShareUsd >= 0 ? '+' : ''}{edgePerShareUsd.toFixed(3)}</span>/sh</span>
           )}

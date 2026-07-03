@@ -646,14 +646,26 @@ export function WorkspaceTab(props: {
     window.setTimeout(() => tileAll(), 40);
   }, [addFlowZones, addPtbDual, currentSlug, tileAll]);
 
+  useEffect(() => {
+    const slug = currentSlug.trim();
+    if (!slug) return;
+    const hasSlugWidget = widgets.some((w) => w.type === 'ptb_dual' && w.slug.trim().toLowerCase() === slug.toLowerCase());
+    if (hasSlugWidget) return;
+    const defaultOnlyFlow =
+      widgets.length === 1 && widgets[0]?.type === 'flow_zones' && widgets[0]?.id === 'flow-current';
+    if (!defaultOnlyFlow) return;
+    addPtbDual(slug);
+    window.setTimeout(() => tileAll(), 40);
+  }, [addPtbDual, currentSlug, tileAll, widgets]);
+
   return (
     <div className="mt-5 space-y-3">
       <div className="rounded-2xl border border-zinc-800/70 bg-gradient-to-b from-zinc-950/40 to-zinc-900/15 p-4 ring-1 ring-white/[0.03]">
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div className="min-w-0">
-            <div className="text-[15px] font-semibold tracking-tight text-zinc-50">Workspace</div>
+            <div className="text-[15px] font-semibold tracking-tight text-zinc-50">Mega workspace</div>
             <div className="mt-1 text-[12px] text-zinc-400">
-              Build a multi-market station. Open markets once, tile them fast, and keep the board live without constant tab-hopping.
+              Check the modules you want, tile the charts, and keep one live desk open instead of tab-hopping between views.
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -694,7 +706,7 @@ export function WorkspaceTab(props: {
             onClick={addCurrentStation}
             className="rounded-full border border-emerald-700/45 bg-emerald-950/30 px-3 py-1.5 text-[11px] font-semibold text-emerald-100 hover:bg-emerald-950/45"
           >
-            Current station
+            Current market preset
           </button>
           <button
             type="button"
@@ -767,7 +779,7 @@ export function WorkspaceTab(props: {
                 />
                 <div className="min-w-0">
                   <div className="font-semibold text-zinc-100">Dual PTB</div>
-                  <div className="mt-0.5 text-[11px] text-zinc-500">One tile per market slug (Up vs Down probability + PTB context).</div>
+                  <div className="mt-0.5 text-[11px] text-zinc-500">One dual-probability chart tile per market slug.</div>
                 </div>
               </label>
 
@@ -780,7 +792,7 @@ export function WorkspaceTab(props: {
                 />
                 <div className="min-w-0">
                   <div className="font-semibold text-zinc-100">Flow Zones</div>
-                  <div className="mt-0.5 text-[11px] text-zinc-500">Always shows the currently opened market’s flow / DOM intelligence.</div>
+                  <div className="mt-0.5 text-[11px] text-zinc-500">Keeps the current market’s flow / DOM module in the same workspace.</div>
                 </div>
               </label>
             </div>

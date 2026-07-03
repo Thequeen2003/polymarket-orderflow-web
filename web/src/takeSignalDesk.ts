@@ -20,6 +20,7 @@ import {
 
 export const BPX_TRADE_PANEL_OPEN_EVENT = 'bpx-trade-panel-open';
 export const BPX_TRADE_SUBMIT_BUY_EVENT = 'bpx-trade-submit-buy';
+export const BPX_TRADE_SUBMIT_SELL_EVENT = 'bpx-trade-submit-sell';
 /** Keep trade-panel amount in sync with Signals “Auto-trade size” (shares). */
 export const BPX_TRADE_SYNC_SIZE_SHARES_EVENT = 'bpx-trade-sync-size-shares';
 /** Desk toast from Signals page (trade panel listens and shows via pushToast). */
@@ -465,6 +466,36 @@ export function dispatchDeskSubmitBuyOnce(detail: {
           sizeShares: detail.sizeShares,
           sizeUsd: detail.sizeUsd,
           armSlTp: detail.armSlTp === true,
+        },
+      }),
+    );
+  }, 100);
+}
+
+let deskSubmitSellTimer: ReturnType<typeof setTimeout> | null = null;
+let lastDeskSubmitSellKey = '';
+let lastDeskSubmitSellAt = 0;
+
+/** One auto-sell request per lane+reason — market-sells full held size on that outcome. */
+export function dispatchDeskSubmitSellOnce(detail: {
+  slug: string;
+  lane: 'up' | 'down';
+  reason?: string;
+}): void {
+  if (typeof window === 'undefined') return;
+  const key = `${detail.slug}|${detail.lane}|${detail.reason ?? ''}`;
+  const now = Date.now();
+  if (key === lastDeskSubmitSellKey && now - lastDeskSubmitSellAt < 12_000) return;
+  lastDeskSubmitSellKey = key;
+  lastDeskSubmitSellAt = now;
+  if (deskSubmitSellTimer != null) window.clearTimeout(deskSubmitSellTimer);
+  deskSubmitSellTimer = window.setTimeout(() => {
+    deskSubmitSellTimer = null;
+    window.dispatchEvent(
+      new CustomEvent(BPX_TRADE_SUBMIT_SELL_EVENT, {
+        detail: {
+          lane: detail.lane,
+          reason: detail.reason,
         },
       }),
     );

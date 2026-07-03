@@ -15,8 +15,13 @@ import {
 } from './nowPriceDeskScalp';
 import { computePreBuyTpOutlook, type PositionTpOutlook } from './positionTpOutlook';
 import { loadAutoTradeSizeShares, saveAutoTradeSizeShares } from './signalsPagePersist';
-import { shouldBuyPromptLabel } from './ShouldBuyCard';
+import { shouldBuyPromptLabel, BuyAdvisoryMetricsStrip } from './ShouldBuyCard';
 import type { BuySideAdvisory } from './shouldBuyWhichSide';
+import type { EntryMoment } from './entryMoment';
+import type { NowPriceDeskTradeSignal } from './nowPriceDeskTradeSignal';
+import type { ContractLeadSignal } from './contractLeadSignal';
+import type { PressureTiming } from './pressureTiming';
+import { EntryMomentStrip } from './EntryMomentStrip';
 import { BPX_DESK_TOAST_EVENT, BPX_SIGNALS_LANE_SYNC_EVENT, BPX_TRADE_PANEL_OPEN_EVENT } from './takeSignalDesk';
 
 function fmtCents01(v01: number | null | undefined): string {
@@ -192,6 +197,10 @@ export function NowPriceBuyStrip(props: {
   bookTouchDown?: BookTouchForArmRisk | null;
   endsInMs?: number | null;
   leanLane?: 'up' | 'down' | null;
+  entryMoment?: EntryMoment | null;
+  deskTradeSignal?: NowPriceDeskTradeSignal | null;
+  contractLead?: ContractLeadSignal | null;
+  pressureTiming?: PressureTiming | null;
 }): ReactElement {
   const {
     slug,
@@ -206,6 +215,10 @@ export function NowPriceBuyStrip(props: {
     bookTouchDown = null,
     endsInMs,
     leanLane = null,
+    entryMoment = null,
+    deskTradeSignal = null,
+    contractLead = null,
+    pressureTiming = null,
   } = props;
 
   const [scalpPrefs, setScalpPrefs] = useState<NowPriceDeskScalpPrefs>(() => loadNowPriceDeskScalpPrefs());
@@ -235,8 +248,11 @@ export function NowPriceBuyStrip(props: {
         endsInMs,
         slug,
         scalpPrefs,
+        entryMoment,
+        contractLead,
+        pressureTiming,
       }),
-    [buySideAdvisory, bookTouchUp, bookTouchDown, midUp01, midDown01, endsInMs, slug, scalpPrefs],
+    [buySideAdvisory, bookTouchUp, bookTouchDown, midUp01, midDown01, endsInMs, slug, scalpPrefs, entryMoment, contractLead, pressureTiming],
   );
 
   const autoBlockReason = useMemo(
@@ -356,7 +372,22 @@ export function NowPriceBuyStrip(props: {
 
   return (
     <div className="rounded-xl border border-indigo-800/40 bg-indigo-950/15 px-3 py-3 ring-1 ring-indigo-500/10">
+      {entryMoment &&
+      (entryMoment.phase === 'ENTER_NOW' || entryMoment.phase === 'CONFIRMING') ? (
+        <div className="mb-3">
+          <EntryMomentStrip moment={entryMoment} compact showChecks={false} />
+        </div>
+      ) : deskTradeSignal && !deskTradeSignal.canTrade && deskTradeSignal.blockers.length > 0 ? (
+        <p className="mb-2 text-[10px] leading-snug text-amber-200/90">
+          Waiting on: {deskTradeSignal.blockers.join(' · ')}
+        </p>
+      ) : null}
       <div className="text-[11px] font-semibold text-zinc-300">{shouldBuyPromptLabel(upLabel, downLabel)}</div>
+      {buySideAdvisory ? (
+        <div className="mt-1.5">
+          <BuyAdvisoryMetricsStrip advisory={buySideAdvisory} upLabel={upLabel} downLabel={downLabel} compact />
+        </div>
+      ) : null}
       {advisoryLine ? (
         <p className="mt-1 text-[10px] leading-snug text-zinc-400">{advisoryLine}</p>
       ) : (
@@ -412,7 +443,24 @@ export function NowPriceBuyStrip(props: {
           <p className="mt-1.5 text-[10px] text-amber-200/90">{scalpPlan.disabledReason}</p>
         ) : null}
 
-        <div className="mt-2.5 space-y-2">
+        {scalpPrefs.checklistVisible ? (
+          <>
+            <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-zinc-800/50 pt-2.5">
+              <span className="text-[9px] font-bold uppercase tracking-[0.14em] text-zinc-500">Auto-trade options</span>
+              <button
+                type="button"
+                onClick={() => persistPrefs({ ...scalpPrefs, checklistVisible: false })}
+                className="flex h-6 w-6 items-center justify-center rounded-md border border-zinc-700/50 text-zinc-500 transition-colors hover:border-zinc-600 hover:bg-zinc-900/80 hover:text-zinc-200"
+                title="Hide auto-trade options"
+                aria-label="Close auto-trade options"
+              >
+                <span className="text-sm leading-none" aria-hidden>
+                  ×
+                </span>
+              </button>
+            </div>
+
+            <div className="mt-2 space-y-2">
           <label className="flex cursor-pointer items-start gap-2">
             <input
               type="checkbox"
@@ -521,6 +569,18 @@ export function NowPriceBuyStrip(props: {
             <span className="text-[10px] text-zinc-300">SL on every buy</span>
           </label>
         </div>
+          </>
+        ) : (
+          <button
+            type="button"
+            onClick={() => persistPrefs({ ...scalpPrefs, checklistVisible: true })}
+            className="mt-2.5 flex w-full items-center justify-between gap-2 rounded-lg border border-dashed border-zinc-700/50 bg-zinc-900/30 px-2.5 py-1.5 text-left transition-colors hover:border-indigo-600/40 hover:bg-indigo-950/20"
+            title="Show auto-trade options"
+          >
+            <span className="text-[10px] font-semibold text-zinc-400">Auto-trade options</span>
+            <span className="text-[10px] text-indigo-300/80">Show</span>
+          </button>
+        )}
       </div>
     </div>
   );

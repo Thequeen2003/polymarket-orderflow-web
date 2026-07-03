@@ -29,7 +29,7 @@ import { inferMarketKind, marketKindLabel, marketUsesPtbSpotDesk } from './marke
 import { dispatchSignalRiskLevels } from './armRiskFromSignal';
 import { resolveTradeLevelsForDirective, suggestLevelsForLane, suggestTradeLevels } from './tradeLevels';
 import { buildPositionDeskAlerts, computePositionExitReadout } from './positionDeskAlerts';
-import { updateStability, type DirectiveStability } from './directiveStability';
+import { useDirectiveStability } from './useDirectiveStability';
 import { detectDirectiveDiscrepancy } from './directiveDiscrepancyGuard';
 import {
   updateReEntryState,
@@ -47,7 +47,11 @@ import { useRecentTapePrints } from './useRecentTapePrints';
 import { computeTapeVelocity, type TapeVelocity } from './tapeVelocity';
 import type { SwitchForecast } from './sectionalMomentum';
 import { computeSignalTakenPlaybook } from './signalTakenPlaybook';
-import { computeHeldLaneTpOutlook } from './positionTpOutlook';
+import { computePositionBracketCall } from './positionBracketCall';
+import { buildPositionDeskSignal } from './positionDeskSignal';
+import { computeHeldLaneTpOutlook, adjustTpOutlookWithMomentum } from './positionTpOutlook';
+import { liveDeskTp01FromBook } from './nowPriceDeskScalp';
+import { useDeskMomentumTracker } from './useDeskMomentumTracker';
 import { SignalTakenAckPanel } from './SignalTakenAckPanel';
 import { buildHeldSideDeskMetrics } from './heldSideDeskMetrics';
 import { DeskClosePanel } from './DeskClosePanel';
@@ -56,16 +60,23 @@ import { shouldBuyWhichSide } from './shouldBuyWhichSide';
 import { dispatchBuySideAdvisory, buySideAdvisoryDetailEqual, type BuySideAdvisoryDetail } from './buySideAdvisoryEvent';
 import {
   loadAutoTradeOnDoThisNow,
+  loadAutoTradeArmSlTp,
+  loadAutoTradeExitMinPressure,
+  loadAutoTradeExitOnSignal,
   loadAutoTradeSizeShares,
   loadTakeSignalStrategyIds,
   readSignalsDeskBoot,
   saveAutoTradeOnDoThisNow,
+  saveAutoTradeArmSlTp,
+  saveAutoTradeExitMinPressure,
+  saveAutoTradeExitOnSignal,
   saveAutoTradeSizeShares,
   saveTakeSignalStrategyIds,
   saveSignalsDeskPersist,
   clearAllSignalsDeskHolds,
   clearSignalsDeskPersist,
   toggleTakeSignalStrategyId,
+  DEFAULT_AUTO_EXIT_MIN_PRESSURE,
 } from './signalsPagePersist';
 import type { ExecuteTakeSignalOpts } from './takeSignalDesk';
 import { loadTradeAccountMode } from './tradeAccountMode';
@@ -79,6 +90,7 @@ import {
   BPX_TRADE_SYNC_SIZE_SHARES_EVENT,
   buildTakeSignalPlan,
   BPX_SIGNALS_LANE_SYNC_EVENT,
+  dispatchDeskSubmitSellOnce,
   executeTakeSignal,
   formatRoundClock,
   pickDeskActionForTake,
@@ -86,21 +98,41 @@ import {
   roundTimerAllowsExecute,
   roundTimerExecuteBlockReason,
 } from './takeSignalDesk';
+import { deskAutoExitFireKey, shouldDispatchDeskAutoExit } from './deskAutoExit';
 import { TakeSignalNowButton } from './TakeSignalNowButton';
+import { computeEntryMoment } from './entryMoment';
+import { EntryMomentStrip } from './EntryMomentStrip';
 import { executionTakeMeaningKey, useDeskExecutionSignal } from './executionSignalDesk';
 import { DeskSyncBannerSlot } from './DeskSyncBannerSlot';
 import { FivePctGainSignalCard } from './FivePctGainSignalCard';
+import { OneSignalSessionPanel } from './OneSignalSessionPanel';
 import { useStableDeskAction } from './useStableDeskAction';
 import {
   bandGaugeMeaningKey,
   buildDeskMeaningKey,
   machineReadoutMeaningKey,
+  noTradeScoreMeaningKey,
   tradeDirectiveMeaningKey,
 } from './signalsDeskStable';
 import { NowPriceSignalsPanel } from './NowPriceSignalsPanel';
 import { NowProbSignalsPanel } from './NowProbSignalsPanel';
 import { BookProbabilityLagMonitorPanel } from './BookProbabilityLagPanelBody';
 import { ProbabilityLagMonitorPanel } from './ProbabilityLagMonitorPanel';
+import {
+  multiPanelMinH,
+  multiPanelTileClass,
+  readSignalsMultiPanel,
+  saveSignalsMultiPanel,
+  SIGNALS_PANEL_LABELS,
+  visibleSignalsPanels,
+  type SignalsPanelId,
+} from './signalsMultiPanel';
+import { ChartPanelChrome } from './ChartPanelChrome';
+import {
+  DEFAULT_CHART_PANEL_SCALE,
+  zoomInChartPanelScale,
+  zoomOutChartPanelScale,
+} from './chartPanelZoom';
 import { TakeSignalStrategyPanel } from './TakeSignalStrategyPanel';
 import { evaluateFivePctGainStrategy } from './fivePctGainStrategy';
 import { applyTakeSignalStrategies, type TakeSignalStrategyId } from './takeSignalStrategy';
@@ -131,15 +163,6 @@ import {
 } from './tradeCausalSignal';
 import { useSignalsDeskHoldPositionSync } from './signalsDeskPosition';
 
-/** Gray / WAIT sync copy — keep the prior “Do this now” line on screen when the live feed briefly drops here. */
-function deskActionIsWeakFall(a: DeskSingleAction): boolean {
-  if (a.tone === 'gray') return true;
-  return a.primary.trim().toUpperCase().startsWith('WAIT');
-}
-
-/** Brief hold when the live strip flickers to WAIT/sync — must not block playbook flips.
- *  Reduced from 6s→3s so re-entry ENTER signals appear faster after brief WAIT dips. */
-const DO_THIS_NOW_FALL_HOLD_MS = 3_000;
 /** Min gap between auto-trade fires on the same slug (prevents re-entry spam on flicker). */
 const AUTO_TRADE_COOLDOWN_MS = 45_000;
 
@@ -349,6 +372,64 @@ function synthesizeCrossCheckBookOnly(
       `Gate ${dual.gate.replace('_', ' ')} · lock ${dual.laneLock.status}`,
     ],
   };
+}
+
+function SignalsChartPanelShell(props: {
+  title: string;
+  panelId: SignalsPanelId;
+  visible: SignalsPanelId[];
+  workspaceChecked: boolean;
+  onWorkspaceCheckedChange: (on: boolean) => void;
+  showWorkspaceCheckbox: boolean;
+  scale: number;
+  onZoomIn: () => void;
+  onZoomOut: () => void;
+  onResetZoom: () => void;
+  variant: 'tile' | 'inline';
+  tileClassName?: string;
+  children: ReactElement;
+}): ReactElement {
+  const {
+    title,
+    panelId,
+    visible,
+    workspaceChecked,
+    onWorkspaceCheckedChange,
+    showWorkspaceCheckbox,
+    scale,
+    onZoomIn,
+    onZoomOut,
+    onResetZoom,
+    variant,
+    tileClassName = '',
+    children,
+  } = props;
+
+  const inner = (
+    <ChartPanelChrome
+      title={title}
+      workspaceChecked={workspaceChecked}
+      onWorkspaceCheckedChange={onWorkspaceCheckedChange}
+      showWorkspaceCheckbox={showWorkspaceCheckbox}
+      scale={scale}
+      onZoomIn={onZoomIn}
+      onZoomOut={onZoomOut}
+      onResetZoom={onResetZoom}
+      variant={variant}
+    >
+      {children}
+    </ChartPanelChrome>
+  );
+
+  if (variant === 'inline') return inner;
+
+  return (
+    <div
+      className={`flex min-h-0 min-w-0 flex-col overflow-hidden rounded-xl border border-zinc-800/60 bg-zinc-950/35 ring-1 ring-white/[0.02] ${multiPanelTileClass(panelId, visible)} ${multiPanelMinH(panelId)} ${tileClassName}`}
+    >
+      {inner}
+    </div>
+  );
 }
 
 /**
@@ -663,11 +744,8 @@ export function SignalsPtbOnly(props: {
     endsInMs,
     tradeLevelsBookPrices,
   ]);
-  const [stabilitySpot, setStabilitySpot] = useState<DirectiveStability | null>(null);
-  useEffect(() => {
-    if (!tradeDirectiveSpot) return;
-    setStabilitySpot((prev) => updateStability(prev, tradeDirectiveSpot, Date.now()));
-  }, [tradeDirectiveSpot]);
+  const [stabilityResetKey, setStabilityResetKey] = useState(0);
+  const stabilitySpot = useDirectiveStability(tradeDirectiveSpot, stabilityResetKey);
 
   const [switchForecastSpot, setSwitchForecastSpot] = useState<SwitchForecast | null>(null);
   const discrepancySpot = useMemo(
@@ -704,8 +782,16 @@ export function SignalsPtbOnly(props: {
   }, [tradeDirectiveSpot, stabilitySpot, discrepancySpot, machineVerdictSpot?.edges, reEntryCheckSpot]);
   /** Mirrored from `PtbOpportunityModeChart` so the Answer card below matches chart No-Trade math. */
   const [chartNoTradeScore, setChartNoTradeScore] = useState<NoTradeScore | null>(null);
+  const lastNoTradeScoreKeyRef = useRef('');
+  const onNoTradeScoreSpot = useCallback((score: NoTradeScore | null) => {
+    const key = noTradeScoreMeaningKey(score);
+    if (key === lastNoTradeScoreKeyRef.current) return;
+    lastNoTradeScoreKeyRef.current = key;
+    setChartNoTradeScore(score);
+  }, []);
   useEffect(() => {
     setChartNoTradeScore(null);
+    lastNoTradeScoreKeyRef.current = '';
   }, [slug]);
   /** Bump with "Reset desk" so the chart clears its embedded directive journal without a slug change. */
   const [deskResetKey, setDeskResetKey] = useState(0);
@@ -741,10 +827,17 @@ export function SignalsPtbOnly(props: {
   const [signalTakenMid01, setSignalTakenMid01] = useState<number | null>(deskSeed.signalTakenMid01);
   const prevDeskSlugRef = useRef<string | null>(null);
   const [autoTradeOnDoThisNow, setAutoTradeOnDoThisNow] = useState(() => loadAutoTradeOnDoThisNow());
+  const [autoTradeArmSlTp, setAutoTradeArmSlTp] = useState(() => loadAutoTradeArmSlTp());
+  const [autoTradeExitOnSignal, setAutoTradeExitOnSignal] = useState(() => loadAutoTradeExitOnSignal());
+  const [autoTradeExitMinPressureStr, setAutoTradeExitMinPressureStr] = useState(() =>
+    String(loadAutoTradeExitMinPressure()),
+  );
   const [autoTradeSizeSharesStr, setAutoTradeSizeSharesStr] = useState(() => String(loadAutoTradeSizeShares()));
   const [takeSignalStrategyIds, setTakeSignalStrategyIds] = useState(() => loadTakeSignalStrategyIds());
   const lastAutoTakeKeyRef = useRef<string | null>(null);
   const lastAutoTakeAtMsRef = useRef(0);
+  const lastAutoExitKeyRef = useRef<string | null>(null);
+  const lastAutoExitAtMsRef = useRef(0);
   const lastBuySideAdvisoryDetailRef = useRef<BuySideAdvisoryDetail | null>(null);
   const [stableTakePlanState, setStableTakePlanState] = useState<StableTakeSignalState | null>(null);
 
@@ -756,8 +849,14 @@ export function SignalsPtbOnly(props: {
 
   const autoTradeExecOpts = useMemo((): ExecuteTakeSignalOpts | null => {
     if (autoTradeSizeShares == null) return null;
-    return { submitBuy: true, sizeShares: autoTradeSizeShares, armSlTp: false, endsInMs };
-  }, [autoTradeSizeShares, endsInMs]);
+    return { submitBuy: true, sizeShares: autoTradeSizeShares, armSlTp: autoTradeArmSlTp, endsInMs };
+  }, [autoTradeSizeShares, autoTradeArmSlTp, endsInMs]);
+
+  const autoTradeExitMinPressure = useMemo(() => {
+    const n = Number(autoTradeExitMinPressureStr);
+    if (!Number.isFinite(n)) return DEFAULT_AUTO_EXIT_MIN_PRESSURE;
+    return Math.min(100, Math.max(0, Math.round(n)));
+  }, [autoTradeExitMinPressureStr]);
 
   useEffect(() => {
     if (autoTradeSizeShares == null) return;
@@ -780,7 +879,7 @@ export function SignalsPtbOnly(props: {
     lastBandGaugeKeyRef.current = '';
     setSwitchForecastSpot(null);
     setChartNoTradeScore(null);
-    lastAutoTakeKeyRef.current = null;
+    lastNoTradeScoreKeyRef.current = '';
     spotChartLaneLockedRef.current = false;
     lastSpotChartInferSlugRef.current = null;
     setDeskResetKey((k) => k + 1);
@@ -881,24 +980,27 @@ export function SignalsPtbOnly(props: {
     incomingSwitchLevelsSpot,
   ]);
 
-  const positionTpOutlookSpot = useMemo(() => {
+  const positionBracketCallSpot = useMemo(() => {
     if (manualPositionLane == null) return null;
     const currentMid01 = manualPositionLane === 'up' ? trackingUpMid : trackingDownMid;
     const book = manualPositionLane === 'up' ? bookAbove : bookBelow;
     const tob = topOfBook(book);
     const levelsForHeld =
       tradeLevelsSpot?.lane === manualPositionLane && !tradeLevelsSpot.collapsed ? tradeLevelsSpot : null;
-    return computeHeldLaneTpOutlook({
-      heldLane: manualPositionLane,
-      heldAtMid01: signalTakenMid01,
+    const entry01 =
+      signalTakenMid01 != null && signalTakenMid01 > 0 && signalTakenMid01 < 1
+        ? signalTakenMid01
+        : levelsForHeld?.entry ?? null;
+    const liveDeskTp01 = liveDeskTp01FromBook(
+      { bestBid: tob.bestBid, bestAsk: tob.bestAsk },
       currentMid01,
-      levels: levelsForHeld,
-      laneEdges: machineVerdictSpot?.edges ?? null,
-      probSeries: manualPositionLane === 'up' ? probUp : probDown,
-      crossProb: machineVerdictSpot?.crossProb ?? null,
-      endsInMs: endsInMs ?? null,
-      bestAsk: tob.bestAsk,
-      bestBid: tob.bestBid,
+    );
+    return computePositionBracketCall({
+      entry01,
+      armedTp01: levelsForHeld?.takeProfit ?? null,
+      armedSl01: levelsForHeld?.stopLoss ?? null,
+      liveDeskTp01,
+      bid01: tob.bestBid,
     });
   }, [
     manualPositionLane,
@@ -908,12 +1010,87 @@ export function SignalsPtbOnly(props: {
     bookAbove,
     bookBelow,
     tradeLevelsSpot,
-    machineVerdictSpot?.edges,
-    machineVerdictSpot?.crossProb,
-    endsInMs,
+  ]);
+
+  const momentumFocusMid01 =
+    manualPositionLane === 'up' ? trackingUpMid : manualPositionLane === 'down' ? trackingDownMid : null;
+  const momentumLiveDeskTp01 = useMemo(() => {
+    if (manualPositionLane == null) return null;
+    const book = manualPositionLane === 'up' ? bookAbove : bookBelow;
+    const tob = topOfBook(book);
+    return liveDeskTp01FromBook(
+      { bestBid: tob.bestBid, bestAsk: tob.bestAsk },
+      momentumFocusMid01,
+    );
+  }, [manualPositionLane, bookAbove, bookBelow, momentumFocusMid01]);
+
+  const deskMomentumSpot = useDeskMomentumTracker({
+    focusLane: manualPositionLane,
+    focusMid01: manualPositionLane != null ? momentumFocusMid01 : null,
+    liveDeskTp01: manualPositionLane != null ? momentumLiveDeskTp01 : null,
+    upMid01: manualPositionLane != null ? trackingUpMid : null,
+    downMid01: manualPositionLane != null ? trackingDownMid : null,
+    upLabel,
+    downLabel,
+    resetKey: slug?.trim() ?? null,
+  });
+
+  const heldTpOutlookSpotRaw = useMemo(() => {
+    if (manualPositionLane == null) return null;
+    const currentMid01 = manualPositionLane === 'up' ? trackingUpMid : trackingDownMid;
+    const levelsForHeld =
+      tradeLevelsSpot?.lane === manualPositionLane && !tradeLevelsSpot.collapsed ? tradeLevelsSpot : null;
+    const entry01 =
+      signalTakenMid01 != null && signalTakenMid01 > 0 && signalTakenMid01 < 1
+        ? signalTakenMid01
+        : levelsForHeld?.entry ?? null;
+    const tp01 = levelsForHeld?.takeProfit ?? null;
+    if (tp01 == null || entry01 == null) return null;
+    const book = manualPositionLane === 'up' ? bookAbove : bookBelow;
+    const tob = topOfBook(book);
+    const probSeries = manualPositionLane === 'up' ? probUp : probDown;
+    return computeHeldLaneTpOutlook({
+      heldLane: manualPositionLane,
+      heldAtMid01: signalTakenMid01,
+      currentMid01,
+      entry01,
+      tp01,
+      probSeries,
+      crossProb: machineVerdictSpot?.crossProb ?? null,
+      endsInMs,
+      bestAsk: tob.bestAsk,
+      bestBid: tob.bestBid,
+    });
+  }, [
+    manualPositionLane,
+    trackingUpMid,
+    trackingDownMid,
+    tradeLevelsSpot,
+    signalTakenMid01,
+    bookAbove,
+    bookBelow,
     probUp,
     probDown,
+    machineVerdictSpot?.crossProb,
+    endsInMs,
   ]);
+
+  const heldTpOutlookSpot = useMemo(
+    () => (heldTpOutlookSpotRaw ? adjustTpOutlookWithMomentum(heldTpOutlookSpotRaw, deskMomentumSpot) : null),
+    [heldTpOutlookSpotRaw, deskMomentumSpot],
+  );
+
+  const deskSignalSpot = useMemo(
+    () =>
+      buildPositionDeskSignal({
+        bracket: positionBracketCallSpot,
+        momentum: deskMomentumSpot,
+        tpHitProb01: heldTpOutlookSpot?.tpHitProb01 ?? null,
+      }),
+    [positionBracketCallSpot, deskMomentumSpot, heldTpOutlookSpot?.tpHitProb01],
+  );
+
+  const deskSignalKey = deskSignalSpot ? `${deskSignalSpot.action}|${deskSignalSpot.reason}` : '';
 
   const signalTakenPlaybookSpot = useMemo(() => {
     if (manualPositionLane == null) return null;
@@ -1150,7 +1327,7 @@ export function SignalsPtbOnly(props: {
     setSignalTakenMid01(null);
     manualPositionLaneRef.current = null;
     setJournalSpot(resetJournal());
-    setStabilitySpot(updateStability(null, tradeDirectiveSpot, Date.now()));
+    setStabilityResetKey((k) => k + 1);
     setReEntryStateSpot(null);
     previousDirectiveSpotRef.current = null;
     setSwitchForecastSpot(null);
@@ -1171,6 +1348,91 @@ export function SignalsPtbOnly(props: {
     bookOnlyDesk && hasDual ? 'dual' : 'spot',
   );
   const showChartTabs = hasDual || (priceToBeat != null && spot.length >= 1);
+  const showNowChartPanels = !bookOnlyDesk || sportsDesk;
+  const [multiPanel, setMultiPanel] = useState(() => readSignalsMultiPanel());
+  useEffect(() => {
+    saveSignalsMultiPanel(multiPanel);
+  }, [multiPanel]);
+  const visibleMultiPanels = useMemo(
+    () => visibleSignalsPanels(multiPanel, { hasDual, bookOnlyDesk, showNow: showNowChartPanels }),
+    [multiPanel, hasDual, bookOnlyDesk, showNowChartPanels],
+  );
+  const multiPanelActive = multiPanel.enabled && visibleMultiPanels.length > 0;
+
+  const setMultiPanelEnabled = useCallback((enabled: boolean) => {
+    setMultiPanel((mp) => {
+      const next = { ...mp, enabled };
+      if (enabled && !visibleSignalsPanels(next, { hasDual, bookOnlyDesk, showNow: showNowChartPanels }).length) {
+        return {
+          ...next,
+          panels: { spot: !bookOnlyDesk, dual: hasDual, now: showNowChartPanels, plm: false },
+        };
+      }
+      return next;
+    });
+  }, [bookOnlyDesk, hasDual, showNowChartPanels]);
+
+  const toggleMultiPanel = useCallback((id: SignalsPanelId, on: boolean) => {
+    setMultiPanel((mp) => {
+      const next = { ...mp, panels: { ...mp.panels, [id]: on } };
+      if (on && !mp.enabled) return { ...next, enabled: true };
+      return next;
+    });
+  }, []);
+
+  const setPanelScale = useCallback((id: SignalsPanelId, scale: number) => {
+    setMultiPanel((mp) => ({
+      ...mp,
+      panelScale: { ...mp.panelScale, [id]: scale },
+    }));
+  }, []);
+
+  const zoomPanelIn = useCallback(
+    (id: SignalsPanelId) => {
+      setMultiPanel((mp) => ({
+        ...mp,
+        panelScale: {
+          ...mp.panelScale,
+          [id]: zoomInChartPanelScale(mp.panelScale[id] ?? DEFAULT_CHART_PANEL_SCALE),
+        },
+      }));
+    },
+    [],
+  );
+
+  const zoomPanelOut = useCallback(
+    (id: SignalsPanelId) => {
+      setMultiPanel((mp) => ({
+        ...mp,
+        panelScale: {
+          ...mp.panelScale,
+          [id]: zoomOutChartPanelScale(mp.panelScale[id] ?? DEFAULT_CHART_PANEL_SCALE),
+        },
+      }));
+    },
+    [],
+  );
+
+  const resetPanelZoom = useCallback((id: SignalsPanelId) => {
+    setPanelScale(id, DEFAULT_CHART_PANEL_SCALE);
+  }, [setPanelScale]);
+
+  const chartPanelShellProps = useCallback(
+    (id: SignalsPanelId, title: string, variant: 'tile' | 'inline') => ({
+      title,
+      panelId: id,
+      visible: visibleMultiPanels,
+      workspaceChecked: multiPanel.panels[id],
+      onWorkspaceCheckedChange: (on: boolean) => toggleMultiPanel(id, on),
+      showWorkspaceCheckbox: true,
+      scale: multiPanel.panelScale[id] ?? DEFAULT_CHART_PANEL_SCALE,
+      onZoomIn: () => zoomPanelIn(id),
+      onZoomOut: () => zoomPanelOut(id),
+      onResetZoom: () => resetPanelZoom(id),
+      variant,
+    }),
+    [multiPanel.panels, multiPanel.panelScale, resetPanelZoom, toggleMultiPanel, visibleMultiPanels, zoomPanelIn, zoomPanelOut],
+  );
 
   useEffect(() => {
     chartTabUserPickedRef.current = false;
@@ -1356,6 +1618,9 @@ export function SignalsPtbOnly(props: {
       tape: tapeNowSpot,
       upLabel,
       downLabel,
+      bracketCall: positionBracketCallSpot,
+      momentumTracker: deskMomentumSpot,
+      deskSignal: deskSignalSpot,
     });
     const physics = buildExitPhysicsBrief({ ...deskPhysicsInput, heldLane: manualPositionLane });
     if (!physics) return base;
@@ -1369,7 +1634,15 @@ export function SignalsPtbOnly(props: {
     upLabel,
     downLabel,
     deskPhysicsInput,
+    deskSignalKey,
+    deskSignalSpot,
   ]);
+
+  const chartNoTradeScoreKey = noTradeScoreMeaningKey(chartNoTradeScore);
+  const chartNoTradeScoreForVerdict = useMemo(
+    () => chartNoTradeScore,
+    [chartNoTradeScoreKey],
+  );
 
   const operatorVerdictDesk = useMemo(
     () =>
@@ -1380,7 +1653,7 @@ export function SignalsPtbOnly(props: {
         discrepancy: discrepancySpot,
         reEntry: reEntryCheckSpot,
         sizingMultiplier: sizingMultiplierSpot,
-        noTradeScore: chartNoTradeScore,
+        noTradeScore: chartNoTradeScoreForVerdict,
         crossEngineLaneConflict,
         crossCheckSpotLane: spotChartCall?.lane ?? null,
         crossCheckDualLane: dualChartCall?.lane ?? null,
@@ -1392,7 +1665,7 @@ export function SignalsPtbOnly(props: {
       discrepancySpot,
       reEntryCheckSpot,
       sizingMultiplierSpot,
-      chartNoTradeScore,
+      chartNoTradeScoreForVerdict,
       crossEngineLaneConflict,
       spotChartCall?.lane,
       dualChartCall?.lane,
@@ -1434,24 +1707,6 @@ export function SignalsPtbOnly(props: {
     ],
   );
 
-  const deskSingleActionLiveRef = useRef(deskSingleActionLive);
-  deskSingleActionLiveRef.current = deskSingleActionLive;
-
-  const [deskSingleActionSpot, setDeskSingleActionSpot] = useState<DeskSingleAction>(() => deskSingleActionLive);
-  const deskSingleActionSpotRef = useRef(deskSingleActionSpot);
-  deskSingleActionSpotRef.current = deskSingleActionSpot;
-
-  const doThisNowFallTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
-  const doThisNowFallPendingRef = useRef<DeskSingleAction | null>(null);
-  const lastDeskSlugForStripRef = useRef<string | null>(slug);
-
-  const deskLiveSig = useMemo(
-    () =>
-      `${deskSingleActionLive.primary}\u0000${deskSingleActionLive.detail ?? ''}\u0000${deskSingleActionLive.tone}`,
-    [deskSingleActionLive.primary, deskSingleActionLive.detail, deskSingleActionLive.tone],
-  );
-
-  /** Lane / action / verdict — not entry/TP/SL ticks (those update via deskLiveSig only). */
   const deskMeaningKey = useMemo(
     () =>
       buildDeskMeaningKey({
@@ -1462,82 +1717,7 @@ export function SignalsPtbOnly(props: {
     [manualPositionLane, tradeDirectiveSpot, operatorVerdictDesk],
   );
 
-  const deskSingleActionDisplay = useStableDeskAction(deskSingleActionSpot, deskMeaningKey);
-
-  useEffect(() => {
-    if (lastDeskSlugForStripRef.current === slug) return;
-    lastDeskSlugForStripRef.current = slug;
-    if (doThisNowFallTimerRef.current != null) {
-      window.clearTimeout(doThisNowFallTimerRef.current);
-      doThisNowFallTimerRef.current = null;
-    }
-    doThisNowFallPendingRef.current = null;
-    setDeskSingleActionSpot(deskSingleActionLiveRef.current);
-  }, [slug]);
-
-  useEffect(() => {
-    if (doThisNowFallTimerRef.current != null) {
-      window.clearTimeout(doThisNowFallTimerRef.current);
-      doThisNowFallTimerRef.current = null;
-    }
-    doThisNowFallPendingRef.current = null;
-    setDeskSingleActionSpot(deskSingleActionLiveRef.current);
-  }, [deskMeaningKey]);
-
-  useEffect(() => {
-    const live = deskSingleActionLiveRef.current;
-    const clearFallTimer = () => {
-      if (doThisNowFallTimerRef.current != null) {
-        window.clearTimeout(doThisNowFallTimerRef.current);
-        doThisNowFallTimerRef.current = null;
-      }
-    };
-
-    const liveWeak = deskActionIsWeakFall(live);
-    const showing = deskSingleActionSpotRef.current;
-    const showingWeak = deskActionIsWeakFall(showing);
-
-    if (!liveWeak) {
-      clearFallTimer();
-      doThisNowFallPendingRef.current = null;
-      if (
-        showing.primary !== live.primary ||
-        (showing.detail ?? '') !== (live.detail ?? '') ||
-        showing.tone !== live.tone
-      ) {
-        setDeskSingleActionSpot(live);
-      }
-      return;
-    }
-
-    if (!showingWeak) {
-      doThisNowFallPendingRef.current = live;
-      if (doThisNowFallTimerRef.current == null) {
-        doThisNowFallTimerRef.current = window.setTimeout(() => {
-          doThisNowFallTimerRef.current = null;
-          const pending = doThisNowFallPendingRef.current;
-          doThisNowFallPendingRef.current = null;
-          if (pending != null) setDeskSingleActionSpot(pending);
-        }, DO_THIS_NOW_FALL_HOLD_MS);
-      } else {
-        doThisNowFallPendingRef.current = live;
-      }
-      return;
-    }
-
-    if (doThisNowFallTimerRef.current == null) {
-      if (
-        showing.primary !== live.primary ||
-        (showing.detail ?? '') !== (live.detail ?? '') ||
-        showing.tone !== live.tone
-      ) {
-        setDeskSingleActionSpot(live);
-      }
-    } else {
-      doThisNowFallPendingRef.current = live;
-    }
-    // Do not clear the fall timer on every deskLiveSig tick — that reset the 28s hold forever.
-  }, [deskLiveSig]);
+  const deskSingleActionDisplay = useStableDeskAction(deskSingleActionLive, deskMeaningKey);
 
   const [flowZonesOpen, setFlowZonesOpen] = useState(false);
 
@@ -1977,8 +2157,8 @@ export function SignalsPtbOnly(props: {
   );
 
   const deskActionForTake = useMemo(
-    () => pickDeskActionForTake(deskSingleActionSpot, deskSingleActionLive),
-    [deskSingleActionSpot, deskSingleActionLive],
+    () => pickDeskActionForTake(deskSingleActionDisplay, deskSingleActionLive),
+    [deskSingleActionDisplay, deskSingleActionLive],
   );
 
   const deskExecutionSignal = useDeskExecutionSignal({
@@ -2024,7 +2204,6 @@ export function SignalsPtbOnly(props: {
       downLabel,
       bookOnlyDesk,
       deskExecutionTakeKey,
-      deskExecutionSignal,
     ],
   );
 
@@ -2061,10 +2240,19 @@ export function SignalsPtbOnly(props: {
     () => applyTakeSignalStrategies(takeSignalPlanBase, takeSignalStrategyCtx, takeSignalStrategyIds),
     [takeSignalPlanBase, takeSignalStrategyCtx, takeSignalStrategyIds],
   );
+  const takePlanMeaningKey = takeSignalPlanMeaningKey(takeSignalPlanFiltered);
+  const takeSignalPlanFilteredRef = useRef(takeSignalPlanFiltered);
+  takeSignalPlanFilteredRef.current = takeSignalPlanFiltered;
 
   useEffect(() => {
-    setStableTakePlanState((prev) => updateStableTakeSignalPlan(prev, takeSignalPlanFiltered, Date.now()));
-  }, [takeSignalPlanFiltered]);
+    setStableTakePlanState((prev) => {
+      const next = updateStableTakeSignalPlan(prev, takeSignalPlanFilteredRef.current, Date.now());
+      if (prev && prev.meaningKey === next.meaningKey && prev.sinceMs === next.sinceMs) {
+        return prev;
+      }
+      return next;
+    });
+  }, [takePlanMeaningKey]);
 
   useEffect(() => {
     setStableTakePlanState(null);
@@ -2080,6 +2268,32 @@ export function SignalsPtbOnly(props: {
         tradeDirectiveSpot,
       ),
     [stableTakePlanState?.displayed, takeSignalPlanFiltered, stabilitySpot, tradeDirectiveSpot],
+  );
+
+  const entryMomentDesk = useMemo(
+    () =>
+      computeEntryMoment({
+        advisory: liveBuySideAdvisory,
+        execution: deskExecutionSignal,
+        stability: stabilitySpot,
+        directive: tradeDirectiveSpot,
+        takePlan: takeSignalPlanSpot,
+        machine: machineVerdictSpot,
+        upLabel,
+        downLabel,
+        bookOnly: bookOnlyDesk,
+      }),
+    [
+      liveBuySideAdvisory,
+      deskExecutionSignal,
+      stabilitySpot,
+      tradeDirectiveSpot,
+      takeSignalPlanSpot,
+      machineVerdictSpot,
+      upLabel,
+      downLabel,
+      bookOnlyDesk,
+    ],
   );
 
   const fivePctGainActive = takeSignalStrategyIds.includes('five-pct-gain');
@@ -2193,7 +2407,12 @@ export function SignalsPtbOnly(props: {
 
   useEffect(() => {
     lastAutoTakeKeyRef.current = null;
+    lastAutoExitKeyRef.current = null;
   }, [slug]);
+
+  useEffect(() => {
+    lastAutoExitKeyRef.current = null;
+  }, [manualPositionLane]);
 
   useEffect(() => {
     if (!autoTradeOnDoThisNow) return;
@@ -2223,6 +2442,60 @@ export function SignalsPtbOnly(props: {
     manualPositionLane,
   ]);
 
+  const autoExitBlockReason = useMemo((): string | null => {
+    if (!autoTradeExitOnSignal) return null;
+    return shouldDispatchDeskAutoExit({
+      enabled: true,
+      liveMode: loadTradeAccountMode() === 'live',
+      heldLane: manualPositionLane,
+      signal: deskSignalSpot,
+      minExitPressure: autoTradeExitMinPressure,
+    }).blockReason;
+  }, [autoTradeExitOnSignal, manualPositionLane, deskSignalSpot, autoTradeExitMinPressure]);
+
+  useEffect(() => {
+    if (!autoTradeExitOnSignal) return;
+    const heldLane = manualPositionLane;
+    if (heldLane == null) return;
+    const signal = deskSignalSpot;
+    const gate = shouldDispatchDeskAutoExit({
+      enabled: true,
+      liveMode: loadTradeAccountMode() === 'live',
+      heldLane,
+      signal,
+      minExitPressure: autoTradeExitMinPressure,
+    });
+    if (!gate.dispatch || !signal) return;
+
+    const now = Date.now();
+    if (now - lastAutoExitAtMsRef.current < AUTO_TRADE_COOLDOWN_MS) return;
+
+    const key = deskAutoExitFireKey(slug, heldLane, signal);
+    if (lastAutoExitKeyRef.current === key) return;
+    lastAutoExitKeyRef.current = key;
+    lastAutoExitAtMsRef.current = now;
+
+    dispatchDeskSubmitSellOnce({ slug: slug?.trim() || '', lane: heldLane, reason: signal.reason });
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent(BPX_DESK_TOAST_EVENT, {
+          detail: {
+            kind: 'info' as const,
+            message: `Auto-exit · ${signal.badge} on ${heldLane.toUpperCase()} (${Math.round(signal.exitPressure)}% pressure)`,
+            ttlMs: 7200,
+          },
+        }),
+      );
+    }
+  }, [
+    autoTradeExitOnSignal,
+    manualPositionLane,
+    deskSignalSpot,
+    deskSignalKey,
+    autoTradeExitMinPressure,
+    slug,
+  ]);
+
   /** Clear stale “filling…” if auto-buy never landed shares. */
   useEffect(() => {
     if (pendingHoldLane == null) return;
@@ -2237,6 +2510,17 @@ export function SignalsPtbOnly(props: {
     setAutoTradeOnDoThisNow(enabled);
     saveAutoTradeOnDoThisNow(enabled);
     if (!enabled) lastAutoTakeKeyRef.current = null;
+  }, []);
+
+  const onAutoTradeArmSlTpToggle = useCallback((enabled: boolean) => {
+    setAutoTradeArmSlTp(enabled);
+    saveAutoTradeArmSlTp(enabled);
+  }, []);
+
+  const onAutoTradeExitToggle = useCallback((enabled: boolean) => {
+    setAutoTradeExitOnSignal(enabled);
+    saveAutoTradeExitOnSignal(enabled);
+    if (!enabled) lastAutoExitKeyRef.current = null;
   }, []);
 
   const deskSingleActionSkin = useMemo(() => {
@@ -2264,7 +2548,7 @@ export function SignalsPtbOnly(props: {
 
   const spotVsPtbSection = (
     <div className="flex w-full min-w-0 flex-col gap-2">
-      <div className="w-full min-w-0">
+      <div className="w-full min-w-0 min-h-[min(52svh,520px)]">
         <PtbOpportunityModeChart
           slug={slug}
           mode={spotChartLane}
@@ -2295,7 +2579,7 @@ export function SignalsPtbOnly(props: {
           tapeLane={deskTapeLane}
           chartAreaRoomy
           signalsEmbed
-          onNoTradeScore={setChartNoTradeScore}
+          onNoTradeScore={onNoTradeScoreSpot}
           deskResetKey={deskResetKey}
           wallFlow={dualWallFlow}
         />
@@ -2384,7 +2668,13 @@ export function SignalsPtbOnly(props: {
             </span>
           ) : null
         }
-        defaultOpen={false}
+        defaultOpen={
+          deskSingleActionDisplay.tone === 'green' ||
+          deskSingleActionDisplay.tone === 'emerald' ||
+          entryMomentDesk.phase === 'ENTER_NOW' ||
+          entryMomentDesk.phase === 'CONFIRMING' ||
+          entryMomentDesk.canExecute
+        }
         bodyClassName="p-1"
       >
       <div className={`rounded-2xl border px-4 py-3.5 ${deskSingleActionSkin}`}>
@@ -2412,6 +2702,7 @@ export function SignalsPtbOnly(props: {
             </p>
           ) : null}
         </div>
+        <EntryMomentStrip moment={entryMomentDesk} />
         <TakeSignalNowButton
           plan={takeSignalPlanSpot}
           sizeShares={autoTradeSizeShares ?? 0}
@@ -2444,6 +2735,7 @@ export function SignalsPtbOnly(props: {
           signal={fivePctGainEval?.signal ?? null}
           blockedReason={fivePctGainEval?.ok ? null : fivePctGainEval?.reason ?? null}
         />
+        <OneSignalSessionPanel />
         <div className="space-y-2 rounded-lg border border-zinc-700/40 bg-black/20 px-3 py-2">
           <label className="flex items-center justify-between gap-3">
             <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-400">Auto-trade size</span>
@@ -2470,6 +2762,19 @@ export function SignalsPtbOnly(props: {
             <input
               type="checkbox"
               className="mt-0.5 shrink-0 accent-emerald-500"
+              checked={autoTradeArmSlTp}
+              onChange={(e) => onAutoTradeArmSlTpToggle(e.target.checked)}
+            />
+            <span className="text-[10px] leading-snug text-zinc-300">
+              <span className="font-bold text-emerald-200/95">Arm SL/TP on auto-entry</span>
+              {' — '}
+              when auto-buy fires, prefill bracket levels from the take-signal card and arm them after fill.
+            </span>
+          </label>
+          <label className="flex cursor-pointer items-start gap-2">
+            <input
+              type="checkbox"
+              className="mt-0.5 shrink-0 accent-emerald-500"
               checked={autoTradeOnDoThisNow}
               onChange={(e) => onAutoTradeToggle(e.target.checked)}
             />
@@ -2488,9 +2793,50 @@ export function SignalsPtbOnly(props: {
               , submit a limit buy at
               card entry for <span className="font-mono font-semibold text-zinc-100">{autoTradeSizeSharesStr}</span> sh,
               and tag I hold. Fires once per stable signal (lane · entry · size) after ~2–4s hold; 45s cooldown between fires.
-              Brackets are not auto-armed from take signal.
+              {autoTradeArmSlTp ? ' Brackets auto-arm from take signal.' : ' Brackets are not auto-armed unless you check above.'}
             </span>
           </label>
+          <label className="flex cursor-pointer items-start gap-2">
+            <input
+              type="checkbox"
+              className="mt-0.5 shrink-0 accent-amber-500"
+              checked={autoTradeExitOnSignal}
+              onChange={(e) => onAutoTradeExitToggle(e.target.checked)}
+            />
+            <span className="text-[10px] leading-snug text-zinc-300">
+              <span className="font-bold text-amber-200/95">Auto-exit on desk signal</span>
+              {' — '}
+              when you are tagged <span className="font-semibold text-zinc-100">I hold</span> and the fused desk card says{' '}
+              <span className="font-semibold text-rose-200">Sell now</span> or{' '}
+              <span className="font-semibold text-emerald-200">Take profit</span>, market-sell your full held size.
+              Fires once per signal; 45s cooldown.
+            </span>
+          </label>
+          {autoTradeExitOnSignal ? (
+            <div className="flex items-center justify-between gap-3 pl-6">
+              <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">Min exit pressure</span>
+              <input
+                type="number"
+                min={0}
+                max={100}
+                step={5}
+                inputMode="numeric"
+                value={autoTradeExitMinPressureStr}
+                onChange={(e) => setAutoTradeExitMinPressureStr(e.target.value)}
+                onBlur={() => {
+                  const n = Number(autoTradeExitMinPressureStr);
+                  if (!Number.isFinite(n)) {
+                    setAutoTradeExitMinPressureStr(String(DEFAULT_AUTO_EXIT_MIN_PRESSURE));
+                    return;
+                  }
+                  const clamped = Math.min(100, Math.max(0, Math.round(n)));
+                  setAutoTradeExitMinPressureStr(String(clamped));
+                  saveAutoTradeExitMinPressure(clamped);
+                }}
+                className="w-16 min-h-[32px] rounded-lg border border-zinc-700/60 bg-zinc-950/60 px-2 text-right font-mono text-xs font-bold tabular-nums text-zinc-100 outline-none focus:border-amber-600/50"
+              />
+            </div>
+          ) : null}
           {autoTradeOnDoThisNow && autoTradeBlockReason ? (
             <p className="text-[10px] leading-snug text-amber-200/90">{autoTradeBlockReason}</p>
           ) : autoTradeOnDoThisNow && takeSignalPlanSpot.canTake && endsInMs != null && Number.isFinite(endsInMs) ? (
@@ -2498,10 +2844,21 @@ export function SignalsPtbOnly(props: {
               Armed · bell {formatRoundClock(endsInMs)} · fires when take signal is ready
             </p>
           ) : null}
+          {autoTradeExitOnSignal && autoExitBlockReason ? (
+            <p className="text-[10px] leading-snug text-amber-200/90">{autoExitBlockReason}</p>
+          ) : autoTradeExitOnSignal && manualPositionLane != null && deskSignalSpot?.action === 'sell_now' ? (
+            <p className="text-[10px] leading-snug text-rose-200/80">
+              Exit armed · {deskSignalSpot.badge} · pressure {Math.round(deskSignalSpot.exitPressure)}%
+            </p>
+          ) : autoTradeExitOnSignal && manualPositionLane != null && deskSignalSpot?.action === 'take_profit' ? (
+            <p className="text-[10px] leading-snug text-emerald-200/70">
+              Exit armed · {deskSignalSpot.badge} · pressure {Math.round(deskSignalSpot.exitPressure)}%
+            </p>
+          ) : null}
           <p className="text-[10px] leading-snug text-zinc-500">
             <span className="font-semibold text-zinc-400">Take signal</span> uses the same size and submits the buy when the
             bell is under 5:00; <span className="font-semibold text-zinc-100">I hold</span> tags only after shares show in
-            your wallet. Set SL/TP manually in the trade panel Brackets tab if you want exits armed.
+            your wallet. Auto-exit clears the hold tag when your wallet goes flat.
           </p>
         </div>
         </DeskClosePanel>
@@ -2568,7 +2925,8 @@ export function SignalsPtbOnly(props: {
               playbook={signalTakenPlaybookSpot}
               positionAlerts={positionDeskAlertsSpot}
               heldMetrics={heldSideDeskMetricsSpot}
-              tpOutlook={positionTpOutlookSpot}
+              deskSignal={deskSignalSpot}
+              tpOutlook={heldTpOutlookSpot}
             />
           </TradeDirectiveCard>
         </DeskClosePanel>
@@ -2662,154 +3020,232 @@ export function SignalsPtbOnly(props: {
     deskBandGauge != null ? (deskBandGauge.bandHi - deskBandGauge.bandLo) / 2 : ptbContext?.bandUsd ?? null;
   const plmSlopeUsdPerSec = ptbContext?.slopeUsdPerSec ?? null;
 
-  const chartTabCard = showChartTabs ? (
-    <div className="flex min-w-0 max-w-full flex-col rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-2 sm:p-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Chart</div>
-        <div className="flex gap-1 rounded-xl border border-zinc-800/60 bg-black/20 p-1">
-          {!bookOnlyDesk ? (
-            <button
-              type="button"
-              onClick={() => pickChartTab('spot')}
-              className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
-                chartTab === 'spot' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
-              }`}
-            >
-              Spot vs PTB
-            </button>
-          ) : null}
-          {hasDual ? (
-            <button
-              type="button"
-              onClick={() => pickChartTab('dual')}
-              className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
-                chartTab === 'dual' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
-              }`}
-            >
-              {bookOnlyDesk ? 'Dual belief' : 'Dual PTB'}
-            </button>
-          ) : null}
-          {!bookOnlyDesk || sportsDesk ? (
-            <>
-              <button
-                type="button"
-                onClick={() => pickChartTab('now')}
-                className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
-                  chartTab === 'now' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
-                }`}
-              >
-                {sportsDesk ? 'Now Prob Signals' : 'Now Price Signals'}
-              </button>
-              <button
-                type="button"
-                onClick={() => pickChartTab('plm')}
-                title="Probability Lag Monitor — P_model vs P_mkt repricing"
-                className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
-                  chartTab === 'plm' ? 'bg-cyan-900/60 text-cyan-50' : 'text-zinc-400 hover:text-cyan-200'
-                }`}
-              >
-                PLM
-              </button>
-            </>
-          ) : null}
-        </div>
-      </div>
+  const dualChartPanel = hasDual ? (
+    <>
+      <PtbDualProbabilityChart
+        probUp={probUp}
+        probDown={probDown}
+        upLabel={upLabel}
+        downLabel={downLabel}
+        lastUpdateMs={probLastUpdateMs}
+        priceToBeatUsd={priceToBeat}
+        bookUp={bookAbove}
+        bookDown={bookBelow}
+        compactHeader
+        hideReadingGuide
+        signalsLayout
+        decisionFirst
+        enginePlacement="below"
+        onSummary={onDualSummary}
+        upOutcomeToken={upToken ?? ''}
+        downOutcomeToken={downToken ?? ''}
+      />
+      {bookOnlyDesk ? (
+        <DeskClosePanel
+          id="cross-check-book"
+          title="Cross-check"
+          summary={`${crossCheckMeta.pill} · ${crossCheckMeta.title}`}
+          defaultOpen={crossCheckWarn}
+          bodyClassName="p-1.5"
+        >
+          {crossCheckStrip}
+        </DeskClosePanel>
+      ) : null}
+    </>
+  ) : null;
 
-      <div className="mt-2 flex min-w-0 max-w-full flex-col">
-        {/* Spot + Dual stay mounted so cross-check sees both engines immediately. */}
-        <div className={chartTab === 'spot' ? 'flex min-w-0 flex-col gap-2' : 'hidden'}>
-          {spotVsPtbSection}
-          {spotVsPtbAnalyticsSection}
-        </div>
-        {hasDual ? (
-          <div className={chartTab === 'dual' ? 'flex min-w-0 flex-col gap-2' : 'hidden'}>
-            <PtbDualProbabilityChart
-              probUp={probUp}
-              probDown={probDown}
-              upLabel={upLabel}
-              downLabel={downLabel}
-              lastUpdateMs={probLastUpdateMs}
-              priceToBeatUsd={priceToBeat}
-              bookUp={bookAbove}
-              bookDown={bookBelow}
-              compactHeader
-              hideReadingGuide
-              enginePlacement="below"
-              onSummary={onDualSummary}
-              upOutcomeToken={upToken ?? ''}
-              downOutcomeToken={downToken ?? ''}
+  const nowSignalsPanel = sportsDesk ? (
+    <NowProbSignalsPanel
+      probUp={probUp}
+      probDown={probDown}
+      upLabel={upLabel}
+      downLabel={downLabel}
+      tape={tapeNowSpot}
+      dualCall={dualChartCall}
+      probLastUpdateMs={probLastUpdateMs}
+      booksFetchedAt={booksFetchedAt}
+    />
+  ) : (
+    <NowPriceSignalsPanel
+      slug={slug ?? 'unknown'}
+      spot={spot}
+      priceToBeat={priceToBeat}
+      endsInMs={endsInMs}
+      bandGauge={deskBandGauge}
+      ptbContext={ptbContext}
+      machineReadout={machineVerdictSpot}
+      tape={tapeNowSpot}
+      probUp={probUp}
+      probDown={probDown}
+      upLabel={upLabel}
+      downLabel={downLabel}
+      spotBookAlignment={spotBookAlignment}
+      physicsLine={causalHeadline ?? entryPhysicsLine}
+      probLastUpdateMs={probLastUpdateMs}
+      booksFetchedAt={booksFetchedAt}
+      buySideAdvisory={liveBuySideAdvisory}
+      bookTouchUp={topOfBook(bookAbove)}
+      bookTouchDown={topOfBook(bookBelow)}
+    />
+  );
+
+  const plmPanel = sportsDesk ? (
+    <BookProbabilityLagMonitorPanel
+      slug={slug ?? 'unknown'}
+      probUp={probUp}
+      pMktUp={plmPMktUp}
+      upLabel={upLabel}
+      enabled={multiPanelActive ? multiPanel.panels.plm : chartTab === 'plm'}
+    />
+  ) : (
+    <ProbabilityLagMonitorPanel
+      slug={slug ?? 'unknown'}
+      spot={spot}
+      priceToBeat={priceToBeat}
+      pMktUp={plmPMktUp}
+      slopeUsdPerSec={plmSlopeUsdPerSec}
+      bandUsd={plmBandUsd}
+      upLabel={upLabel}
+      enabled={multiPanelActive ? multiPanel.panels.plm : chartTab === 'plm'}
+    />
+  );
+
+  const spotPanelTitle = SIGNALS_PANEL_LABELS.spot;
+  const dualPanelTitle = bookOnlyDesk ? 'Dual belief' : SIGNALS_PANEL_LABELS.dual;
+  const nowPanelTitle = sportsDesk ? 'Now prob signals' : SIGNALS_PANEL_LABELS.now;
+  const plmPanelTitle = SIGNALS_PANEL_LABELS.plm;
+
+  const chartTabCard = showChartTabs ? (
+    <div className="flex min-h-0 min-w-0 max-w-full flex-col rounded-2xl border border-zinc-800/60 bg-zinc-950/35 p-2 sm:p-3">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">Chart workspace</div>
+          <label className="mt-2 flex cursor-pointer items-center gap-2 text-[11px] font-semibold text-zinc-300">
+            <input
+              type="checkbox"
+              className="rounded border-zinc-600"
+              checked={multiPanel.enabled}
+              onChange={(e) => setMultiPanelEnabled(e.target.checked)}
             />
-            {bookOnlyDesk ? (
-              <DeskClosePanel
-                id="cross-check-book"
-                title="Cross-check"
-                summary={`${crossCheckMeta.pill} · ${crossCheckMeta.title}`}
-                defaultOpen={crossCheckWarn}
-                bodyClassName="p-1.5"
+            Multi-panel view
+          </label>
+          <p className="mt-1 max-w-md text-[10px] leading-snug text-zinc-500">
+            Pin charts with each tile&apos;s checkbox and set zoom per chart (+/−) — no Chrome zoom needed. Use header{' '}
+            <span className="text-zinc-400">View zoom</span> for the whole app.
+          </p>
+        </div>
+        {!multiPanel.enabled ? (
+          <div className="flex gap-1 rounded-xl border border-zinc-800/60 bg-black/20 p-1">
+            {!bookOnlyDesk ? (
+              <button
+                type="button"
+                onClick={() => pickChartTab('spot')}
+                className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
+                  chartTab === 'spot' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
+                }`}
               >
-                {crossCheckStrip}
-              </DeskClosePanel>
+                Spot vs PTB
+              </button>
+            ) : null}
+            {hasDual ? (
+              <button
+                type="button"
+                onClick={() => pickChartTab('dual')}
+                className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
+                  chartTab === 'dual' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                {bookOnlyDesk ? 'Dual belief' : 'Dual PTB'}
+              </button>
+            ) : null}
+            {showNowChartPanels ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => pickChartTab('now')}
+                  className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
+                    chartTab === 'now' ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  {sportsDesk ? 'Now Prob Signals' : 'Now Price Signals'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => pickChartTab('plm')}
+                  title="Probability Lag Monitor — P_model vs P_mkt repricing"
+                  className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold ${
+                    chartTab === 'plm' ? 'bg-cyan-900/60 text-cyan-50' : 'text-zinc-400 hover:text-cyan-200'
+                  }`}
+                >
+                  PLM
+                </button>
+              </>
             ) : null}
           </div>
-        ) : null}
-        <div className={chartTab === 'now' ? 'flex min-w-0 flex-col' : 'hidden'}>
-          {sportsDesk ? (
-            <NowProbSignalsPanel
-              probUp={probUp}
-              probDown={probDown}
-              upLabel={upLabel}
-              downLabel={downLabel}
-              tape={tapeNowSpot}
-              dualCall={dualChartCall}
-              probLastUpdateMs={probLastUpdateMs}
-              booksFetchedAt={booksFetchedAt}
-            />
-          ) : (
-            <NowPriceSignalsPanel
-              slug={slug ?? 'unknown'}
-              spot={spot}
-              priceToBeat={priceToBeat}
-              endsInMs={endsInMs}
-              bandGauge={deskBandGauge}
-              ptbContext={ptbContext}
-              machineReadout={machineVerdictSpot}
-              tape={tapeNowSpot}
-              probUp={probUp}
-              probDown={probDown}
-              upLabel={upLabel}
-              downLabel={downLabel}
-              spotBookAlignment={spotBookAlignment}
-              physicsLine={causalHeadline ?? entryPhysicsLine}
-              probLastUpdateMs={probLastUpdateMs}
-              booksFetchedAt={booksFetchedAt}
-              buySideAdvisory={liveBuySideAdvisory}
-              bookTouchUp={topOfBook(bookAbove)}
-              bookTouchDown={topOfBook(bookBelow)}
-            />
-          )}
-        </div>
-        <div className={chartTab === 'plm' ? 'flex min-w-0 flex-col' : 'hidden'}>
-          {sportsDesk ? (
-            <BookProbabilityLagMonitorPanel
-              slug={slug ?? 'unknown'}
-              probUp={probUp}
-              pMktUp={plmPMktUp}
-              upLabel={upLabel}
-              enabled={chartTab === 'plm'}
-            />
-          ) : (
-            <ProbabilityLagMonitorPanel
-              slug={slug ?? 'unknown'}
-              spot={spot}
-              priceToBeat={priceToBeat}
-              pMktUp={plmPMktUp}
-              slopeUsdPerSec={plmSlopeUsdPerSec}
-              bandUsd={plmBandUsd}
-              upLabel={upLabel}
-              enabled={chartTab === 'plm'}
-            />
-          )}
-        </div>
+        ) : visibleMultiPanels.length === 0 ? (
+          <div className="rounded-xl border border-dashed border-amber-500/35 bg-amber-950/15 px-3 py-2 text-[11px] text-amber-100/90">
+            Pin at least one chart below to build your workspace.
+          </div>
+        ) : (
+          <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
+            {visibleMultiPanels.length} screen{visibleMultiPanels.length === 1 ? '' : 's'} pinned
+          </div>
+        )}
+      </div>
+
+      <div className="mt-2 flex min-h-0 min-w-0 max-w-full flex-1 flex-col">
+        {multiPanelActive ? (
+          <div className="grid grid-cols-1 gap-3 xl:grid-cols-12">
+            {visibleMultiPanels.includes('spot') ? (
+              <SignalsChartPanelShell {...chartPanelShellProps('spot', spotPanelTitle, 'tile')}>
+                {spotVsPtbSection}
+              </SignalsChartPanelShell>
+            ) : null}
+            {visibleMultiPanels.includes('dual') && dualChartPanel ? (
+              <SignalsChartPanelShell {...chartPanelShellProps('dual', dualPanelTitle, 'tile')}>
+                {dualChartPanel}
+              </SignalsChartPanelShell>
+            ) : null}
+            {visibleMultiPanels.includes('now') ? (
+              <SignalsChartPanelShell {...chartPanelShellProps('now', nowPanelTitle, 'tile')}>
+                {nowSignalsPanel}
+              </SignalsChartPanelShell>
+            ) : null}
+            {visibleMultiPanels.includes('plm') ? (
+              <SignalsChartPanelShell {...chartPanelShellProps('plm', plmPanelTitle, 'tile')}>
+                {plmPanel}
+              </SignalsChartPanelShell>
+            ) : null}
+          </div>
+        ) : (
+          <>
+            {!bookOnlyDesk ? (
+              <div className={chartTab === 'spot' ? 'flex min-w-0 flex-col gap-2' : 'hidden'}>
+                <SignalsChartPanelShell {...chartPanelShellProps('spot', spotPanelTitle, 'inline')}>
+                  {spotVsPtbSection}
+                </SignalsChartPanelShell>
+                {spotVsPtbAnalyticsSection}
+              </div>
+            ) : null}
+            {hasDual ? (
+              <div className={chartTab === 'dual' ? 'flex min-h-0 flex-1 flex-col gap-2' : 'hidden'}>
+                <SignalsChartPanelShell {...chartPanelShellProps('dual', dualPanelTitle, 'inline')}>
+                  {dualChartPanel}
+                </SignalsChartPanelShell>
+              </div>
+            ) : null}
+            <div className={chartTab === 'now' ? 'flex min-w-0 flex-col' : 'hidden'}>
+              <SignalsChartPanelShell {...chartPanelShellProps('now', nowPanelTitle, 'inline')}>
+                {nowSignalsPanel}
+              </SignalsChartPanelShell>
+            </div>
+            <div className={chartTab === 'plm' ? 'flex min-w-0 flex-col' : 'hidden'}>
+              <SignalsChartPanelShell {...chartPanelShellProps('plm', plmPanelTitle, 'inline')}>
+                {plmPanel}
+              </SignalsChartPanelShell>
+            </div>
+          </>
+        )}
       </div>
     </div>
   ) : null;

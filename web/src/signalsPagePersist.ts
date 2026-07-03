@@ -16,9 +16,13 @@ const STORAGE_V = 1 as const;
 const PREFIX = 'pm_signals_desk_v1:';
 const AUTO_TRADE_DO_THIS_NOW_KEY = 'pm_signals_auto_trade_do_this_now_v1';
 const AUTO_TRADE_SIZE_SHARES_KEY = 'pm_signals_auto_trade_size_shares_v1';
+const AUTO_TRADE_ARM_SL_TP_KEY = 'pm_signals_auto_trade_arm_sl_tp_v1';
+const AUTO_TRADE_EXIT_ON_SIGNAL_KEY = 'pm_signals_auto_trade_exit_on_signal_v1';
+const AUTO_TRADE_EXIT_MIN_PRESSURE_KEY = 'pm_signals_auto_trade_exit_min_pressure_v1';
 const TAKE_SIGNAL_STRATEGIES_KEY = 'pm_signals_take_strategies_v1';
 
 export const DEFAULT_AUTO_TRADE_SIZE_SHARES = 10;
+export const DEFAULT_AUTO_EXIT_MIN_PRESSURE = 65;
 
 /** After this long without a save, do not restore "I hold" — avoids looking like UP self-selected after a break. */
 export const SIGNALS_DESK_ACK_STALE_MS = 3 * 60 * 60 * 1000;
@@ -216,6 +220,66 @@ export function saveAutoTradeSizeShares(shares: number): void {
   if (!Number.isFinite(n) || n <= 0) return;
   try {
     localStorage.setItem(AUTO_TRADE_SIZE_SHARES_KEY, String(Math.min(100_000, n)));
+  } catch {
+    // ignore
+  }
+}
+
+export function loadAutoTradeArmSlTp(): boolean {
+  if (typeof localStorage === 'undefined') return false;
+  try {
+    return localStorage.getItem(AUTO_TRADE_ARM_SL_TP_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+export function saveAutoTradeArmSlTp(enabled: boolean): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.setItem(AUTO_TRADE_ARM_SL_TP_KEY, enabled ? '1' : '0');
+  } catch {
+    // ignore
+  }
+}
+
+export function loadAutoTradeExitOnSignal(): boolean {
+  if (typeof localStorage === 'undefined') return false;
+  try {
+    return localStorage.getItem(AUTO_TRADE_EXIT_ON_SIGNAL_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+export function saveAutoTradeExitOnSignal(enabled: boolean): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.setItem(AUTO_TRADE_EXIT_ON_SIGNAL_KEY, enabled ? '1' : '0');
+  } catch {
+    // ignore
+  }
+}
+
+export function loadAutoTradeExitMinPressure(): number {
+  if (typeof localStorage === 'undefined') return DEFAULT_AUTO_EXIT_MIN_PRESSURE;
+  try {
+    const raw = localStorage.getItem(AUTO_TRADE_EXIT_MIN_PRESSURE_KEY);
+    if (!raw) return DEFAULT_AUTO_EXIT_MIN_PRESSURE;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return DEFAULT_AUTO_EXIT_MIN_PRESSURE;
+    return Math.min(100, Math.max(0, Math.round(n)));
+  } catch {
+    return DEFAULT_AUTO_EXIT_MIN_PRESSURE;
+  }
+}
+
+export function saveAutoTradeExitMinPressure(pressure: number): void {
+  if (typeof localStorage === 'undefined') return;
+  const n = Number(pressure);
+  if (!Number.isFinite(n)) return;
+  try {
+    localStorage.setItem(AUTO_TRADE_EXIT_MIN_PRESSURE_KEY, String(Math.min(100, Math.max(0, Math.round(n)))));
   } catch {
     // ignore
   }

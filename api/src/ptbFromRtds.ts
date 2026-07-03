@@ -178,6 +178,7 @@ export function isLockedPtbSource(source: string): boolean {
   return (
     source === 'rtds_chainlink_window_open' ||
     source === 'rtds_chainlink_pre_open_tick' ||
-    source === 'polymarket_page_price_to_beat'
+    source === 'polymarket_page_price_to_beat' ||
+    source === 'polymarket_page_open_price'
   );
 }

@@ -117,6 +117,7 @@ describe('isLockedPtbSource', () => {
   it('locks window open sources only', () => {
     expect(isLockedPtbSource('rtds_chainlink_window_open')).toBe(true);
     expect(isLockedPtbSource('rtds_chainlink_preview_pre_open')).toBe(false);
+    expect(isLockedPtbSource('polymarket_page_open_price')).toBe(true);
   });
 });
 

@@ -31,7 +31,7 @@ import { TradePanelBody, TradePanelShell } from './TradePanelBody';
 import { SignalsTradePanel } from './SignalsTradePanel';
 import { TradeSegmentedControl } from './tradeUi';
 import { loadTradeUiPreferences, saveTradeUiPreferences } from './tradeUiPreferences';
-import { pickMarketSlug } from './gammaMarketSlug';
+import { pickMarketSlug, preloadedMarketForSlug } from './gammaMarketSlug';
 import { TradeSlidePanel } from './TradeSlidePanel';
 const PositionsCommandPanel = lazy(() =>
   import('./PositionsCommandPanel').then((m) => ({ default: m.PositionsCommandPanel })),
@@ -47,6 +47,7 @@ const PtbMultiAssetGrid = lazy(() => import('./PtbMultiAssetGrid').then((m) => (
 import type { PtbMultiAssetRow } from './PtbMultiAssetGrid';
 const TrackingTab = lazy(() => import('./TrackingTab').then((m) => ({ default: m.TrackingTab })));
 const RawProjectionsTab = lazy(() => import('./RawProjectionsTab').then((m) => ({ default: m.RawProjectionsTab })));
+const WorkspaceTab = lazy(() => import('./WorkspaceTab').then((m) => ({ default: m.WorkspaceTab })));
 import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
 import { releaseOrphanPointerCapture } from './pointerCaptureSafety';
 import type { SpotPoint } from './SpotLevelChart';
@@ -71,10 +72,15 @@ import {
   parseUpdownSlug,
   parseUpdownSlugWithHints,
   titledUpdownAssetFromSlug,
-  updownSlugAtBucket,
   type UpdownSlugHint,
 } from './sixPackUpdownSlugs';
 import { updownSlugToOpen } from './updownSlugToOpen';
+import {
+  readUpdownAutoRollEnabled,
+  saveUpdownAutoRollEnabled,
+  shouldAutoRollUpdownMarket,
+} from './updownAutoRoll';
+import { buildUpdownWindowPickerItems } from './updownWindowPicker';
 import { inferMarketKind, marketUsesPtbSpotDesk } from './marketKind';
 import { buySideAdvisoryDetailEqual, type BuySideAdvisoryDetail } from './buySideAdvisoryEvent';
 import type { BuySideAdvisory } from './shouldBuyWhichSide';
@@ -83,6 +89,18 @@ import { TradingViewBtcUsdtTab } from './TradingViewBtcUsdtTab';
 import { PerpsCommandCenter } from './PerpsCommandCenter';
 import { BinanceBtcUsdtMarketView } from './BinanceBtcUsdtMarketView';
 import { useTradeAccountMode } from './useTradeAccountMode';
+import {
+  executeOneSignalSessionTrade,
+  type OneSignalTradeRequest,
+} from './oneSignalSessionAutoTrade';
+import {
+  BPX_ONE_SIGNAL_SESSION_TRADE_EVENT,
+  useOneSignalSessionAutoTrade,
+} from './useOneSignalSessionAutoTrade';
+import {
+  clearOneSignalAssetInFlight,
+  saveOneSignalSessionTrade,
+} from './oneSignalSessionPersist';
 import { appendLiveMidSeries, appendLiveSpotSeries, lastPointMs, maxFeedMs, normalizeEpochMs } from './feedFreshness';
 import {
   fallbackUpdownSlug,
@@ -94,9 +112,22 @@ import {
 import { readSportsShortcutCache, writeSportsShortcutCache } from './sportsShortcutCache';
 import { inferSportsLeagueFromSlug, SPORTS_LEAGUE_CHIPS } from './sportsLeagues';
 import { SportsMarketPicker } from './SportsMarketPicker';
+import { useViewportZoom } from './useViewportZoom';
+import { ViewportZoomControls } from './ViewportZoomControls';
+import { ChartPanelChrome } from './ChartPanelChrome';
+import { useChartPanelZoom } from './useChartPanelZoom';
 
 function pretty(value: unknown) {
   return JSON.stringify(value, null, 2);
+}
+
+function ptbErrorLine(res: ApiErr): string {
+  if (res.error === 'fetch_failed') {
+    const hint = fetchFailedDetailLine(res.details);
+    return hint ? `PTB fetch failed — ${hint}` : 'PTB fetch timed out — is the API running on :8787?';
+  }
+  if (res.error === 'price_to_beat_failed') return 'Price-to-beat not available for this market yet — retry in a few seconds.';
+  return res.error || 'PTB request failed';
 }
 
 function fetchFailedDetailLine(details: unknown): string {
@@ -265,6 +296,82 @@ function normalizeMarketLookupRef(raw: string): string {
 /** Canonical slug for URL, tabs, and same-market checks (Polymarket slugs are lowercase). */
 function canonicalMarketSlug(raw: string): string {
   return normalizeMarketLookupRef(raw).trim().toLowerCase();
+}
+
+const LAST_MARKET_SLUG_KEY = 'pm:lastMarketSlug:v1';
+
+function readLastMarketSlug(): string {
+  try {
+    const raw = window.localStorage.getItem(LAST_MARKET_SLUG_KEY);
+    if (!raw?.trim()) return '';
+    return canonicalMarketSlug(raw);
+  } catch {
+    return '';
+  }
+}
+
+function writeLastMarketSlug(slug: string): void {
+  try {
+    const clean = canonicalMarketSlug(slug);
+    if (clean) window.localStorage.setItem(LAST_MARKET_SLUG_KEY, clean);
+  } catch {
+    /* ignore */
+  }
+}
+
+const LAST_MARKET_CACHE_KEY = 'pm:lastMarketCache:v1';
+const LAST_MARKET_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+
+type LastMarketCacheV1 = { slug: string; market: unknown; savedAt: number };
+
+function readLastMarketCache(): LastMarketCacheV1 | null {
+  try {
+    const raw = window.localStorage.getItem(LAST_MARKET_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as LastMarketCacheV1;
+    if (!parsed || typeof parsed !== 'object') return null;
+    const slug = canonicalMarketSlug(String(parsed.slug ?? ''));
+    if (!slug || parsed.market == null || typeof parsed.market !== 'object') return null;
+    const savedAt = Number(parsed.savedAt);
+    if (!Number.isFinite(savedAt) || Date.now() - savedAt > LAST_MARKET_CACHE_TTL_MS) return null;
+    if (isMarketClosed(parsed.market)) return null;
+    if (pickTokenIds(parsed.market).length < 2) return null;
+    return { slug, market: parsed.market, savedAt };
+  } catch {
+    return null;
+  }
+}
+
+function writeLastMarketCache(slug: string, market: unknown): void {
+  try {
+    const clean = canonicalMarketSlug(slug);
+    if (!clean || market == null || typeof market !== 'object') return;
+    if (pickTokenIds(market).length < 2) return;
+    const payload: LastMarketCacheV1 = { slug: clean, market, savedAt: Date.now() };
+    window.localStorage.setItem(LAST_MARKET_CACHE_KEY, JSON.stringify(payload));
+  } catch {
+    /* ignore */
+  }
+}
+
+function bootMarketHydration(): { slug: string; market: unknown | null } {
+  const params = new URLSearchParams(window.location.search);
+  const urlSlug = canonicalMarketSlug((params.get('slug') ?? params.get('market') ?? '').trim());
+  if (urlSlug) {
+    const cached = readLastMarketCache();
+    if (cached?.slug === urlSlug) return { slug: urlSlug, market: cached.market };
+    return { slug: urlSlug, market: null };
+  }
+  const cached = readLastMarketCache();
+  if (cached) return { slug: cached.slug, market: cached.market };
+  const slugOnly = readLastMarketSlug();
+  return { slug: slugOnly, market: null };
+}
+
+const bootMarketState = bootMarketHydration();
+
+function booksKickKey(slug: string, ids: string[]): string {
+  return `${canonicalMarketSlug(slug)}:${ids.join(',')}`;
 }
 
 function pickMarketQuestion(m: unknown): string {
@@ -557,6 +664,7 @@ type MainTab =
   | 'flowzones'
   | 'signals'
   | 'sports'
+  | 'workspace'
   | 'tracking'
   | 'tradehistory'
   | 'btc'
@@ -576,6 +684,8 @@ function mainTabTitle(tab: MainTab): string {
       return 'Signals';
     case 'sports':
       return 'Sports';
+    case 'workspace':
+      return 'Mega workspace';
     case 'tracking':
       return 'Tracking';
     case 'tradehistory':
@@ -642,19 +752,24 @@ function useMediaQuery(query: string): boolean {
 
 function App() {
   const mobileLayout = useMediaQuery('(max-width: 767px)');
+  const viewportZoom = useViewportZoom();
+  const bookPriceZoom = useChartPanelZoom('book-price');
+  const bookFlowZoom = useChartPanelZoom('book-flow');
   const tradeAccountMode = useTradeAccountMode();
   const [apiHealth, setApiHealth] = useState<string>('Checking API…');
   const [q, setQ] = useState('');
   const [markets, setMarkets] = useState<unknown[]>([]);
-  const [selectedSlug, setSelectedSlug] = useState<string>('');
-  const [marketJson, setMarketJson] = useState<unknown | null>(null);
+  const [selectedSlug, setSelectedSlug] = useState(bootMarketState.slug);
+  const [marketJson, setMarketJson] = useState<unknown | null>(bootMarketState.market);
   const [books, setBooks] = useState<ClobBookEntry[] | null>(null);
-  const [booksLoading, setBooksLoading] = useState(false);
+  const [booksLoading, setBooksLoading] = useState(
+    () => Boolean(bootMarketState.slug && bootMarketState.market && pickTokenIds(bootMarketState.market).length >= 2),
+  );
   const [error, setError] = useState<string | null>(null);
   const [marketsError, setMarketsError] = useState<string | null>(null);
   const [marketsNotice, setMarketsNotice] = useState<string | null>(null);
   const [marketsListLoading, setMarketsListLoading] = useState(true);
-  const [slugInput, setSlugInput] = useState('');
+  const [slugInput, setSlugInput] = useState(bootMarketState.slug);
   const [outcomeTab, setOutcomeTab] = useState(0);
   const [assistantAvailable, setAssistantAvailable] = useState(false);
   const [shortcutBusy, setShortcutBusy] = useState<{ asset: UpdownShortcutAsset; interval: UpdownInterval } | null>(null);
@@ -707,7 +822,8 @@ function App() {
   const [watchMetaBySlug, setWatchMetaBySlug] = useState<Record<string, { ptb: number | null; endsInMs: number | null }>>({});
   const [now, setNow] = useState(() => Date.now());
   const spotBySymbolRef = useRef<Record<string, SpotPoint[]>>({});
-  const selectedSlugRef = useRef<string>('');
+  const selectedSlugRef = useRef<string>(bootMarketState.slug);
+  const booksRef = useRef<ClobBookEntry[] | null>(null);
   /** Bumped on every `loadMarket` — stale book/PTB fetches must not apply after a newer slug load. */
   const marketSyncGenRef = useRef(0);
   const marketBootRef = useRef(false);
@@ -719,6 +835,8 @@ function App() {
   const loadBooksRef = useRef<
     (ids: string[], opts?: { updateSeries?: boolean; updateFlow?: boolean }) => Promise<void>
   >(async () => {});
+  /** `loadMarket` already kicked books for this slug+token key — skip duplicate `tokenIds` effect fetch. */
+  const booksKickKeyRef = useRef<string | null>(null);
   /** True once CLOB books have hydrated — background polls must not flash the loading shell. */
   const booksHydratedRef = useRef(false);
   /** Last RTDS underlying symbol — only cold-reset spot ring when asset changes, not every slug tick. */
@@ -743,6 +861,7 @@ function App() {
   const [globalTradeLocked, setGlobalTradeLocked] = useState(false);
   const [buySideAdvisoryBySlug, setBuySideAdvisoryBySlug] = useState<Record<string, BuySideAdvisoryDetail>>({});
   const [updownPickerOpen, setUpdownPickerOpen] = useState(false);
+  const [updownAutoRoll, setUpdownAutoRoll] = useState(() => readUpdownAutoRollEnabled());
   /** Titled Polymarket hourly/daily slugs: map slug → bucket start so RTDS + PTB align like `btc-updown-1h-*`. */
   const [updownSlugHints, setUpdownSlugHints] = useState<Record<string, UpdownSlugHint>>({});
   const updownParsed = useMemo(
@@ -763,6 +882,8 @@ function App() {
   const shortcutOpenSeqRef = useRef(0);
   /** So closing all tabs does not immediately auto-reseed (user can run empty, then add a new tab). */
   const tradeSessionAutoSeededRef = useRef(false);
+  const updownAutoRollBusyRef = useRef(false);
+  const updownAutoRollKeyRef = useRef('');
   const [globalTradeContext, setGlobalTradeContext] = useState<{
     slug: string;
     question: string;
@@ -779,6 +900,10 @@ function App() {
   useEffect(() => {
     selectedSlugRef.current = selectedSlug;
   }, [selectedSlug]);
+
+  useEffect(() => {
+    booksRef.current = books;
+  }, [books]);
 
   useEffect(() => {
     const onLaneSync = (ev: Event) => {
@@ -831,8 +956,10 @@ function App() {
   }, [marketJson, selectedSlug]);
 
   useEffect(() => {
-    wantSeriesRef.current = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports';
-    wantFlowRef.current = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports';
+    wantSeriesRef.current =
+      mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports' || mainTab === 'workspace';
+    wantFlowRef.current =
+      mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports' || mainTab === 'workspace';
   }, [mainTab]);
 
   const prevDepthMapsRef = useRef<Record<string, { bids: Map<string, number>; asks: Map<string, number> }>>({});
@@ -869,10 +996,23 @@ function App() {
   useEffect(() => {
     if (globalTradeLocked) return;
     if (!currentTradeContext.slug) {
-      setGlobalTradeContext(null);
+      setGlobalTradeContext((prev) => (prev == null ? prev : null));
       return;
     }
-    setGlobalTradeContext(currentTradeContext);
+    setGlobalTradeContext((prev) => {
+      if (
+        prev &&
+        prev.slug === currentTradeContext.slug &&
+        prev.question === currentTradeContext.question &&
+        prev.upLabel === currentTradeContext.upLabel &&
+        prev.downLabel === currentTradeContext.downLabel &&
+        prev.upToken === currentTradeContext.upToken &&
+        prev.downToken === currentTradeContext.downToken
+      ) {
+        return prev;
+      }
+      return currentTradeContext;
+    });
   }, [currentTradeContext, globalTradeLocked]);
 
   /** Unpin trade panel when the chart loads a different market so Signals / positions stay aligned. */
@@ -1068,29 +1208,65 @@ function App() {
         /* ignore */
       }
     }
+    if (clean && (!sameMarket || force)) {
+      void priceToBeat(clean).then((ptb) => {
+        if (syncGen !== marketSyncGenRef.current) return;
+        if (selectedSlugRef.current.trim() !== clean) return;
+        if (isOk(ptb)) {
+          setSsrPriceToBeat(ptb.data.price_to_beat);
+          setSsrPtbSource(ptb.data.source);
+          setPtbError(null);
+        }
+      });
+    }
     if (!clean) {
       setBooksLoading(false);
       clearPendingTab();
       return { ok: false };
     }
-    const preloaded = opts?.market;
-    if (preloaded != null && typeof preloaded === 'object' && (!sameMarket || force)) {
+    writeLastMarketSlug(clean);
+    const cachedForSlug = readLastMarketCache();
+    const preloaded = preloadedMarketForSlug(
+      opts?.market ?? (cachedForSlug?.slug === clean ? cachedForSlug.market : undefined),
+      clean,
+    );
+    if (preloaded != null && typeof preloaded === 'object') {
       if (syncGen !== marketSyncGenRef.current) {
         clearPendingTab();
         return { ok: false };
       }
-      setMarketJson(preloaded);
+      const applyMeta = !sameMarket || force;
+      if (applyMeta) setMarketJson(preloaded);
       const ids = pickTokenIds(preloaded);
-      if (ids.length >= 2) {
-        queueMicrotask(() => {
-          void loadBooksRef.current(ids, {
-            updateSeries: wantSeriesRef.current,
-            updateFlow: wantFlowRef.current,
-          });
+      if (ids.length >= 2 && (!booksHydratedRef.current || applyMeta)) {
+        booksKickKeyRef.current = booksKickKey(clean, ids);
+        void loadBooksRef.current(ids, {
+          updateSeries: wantSeriesRef.current,
+          updateFlow: wantFlowRef.current,
         });
-      } else if (!sameMarket || force) {
+      } else if (ids.length < 2 && applyMeta) {
         setBooksLoading(false);
       }
+      writeLastMarketCache(clean, preloaded);
+      if (applyMeta) {
+        return { ok: true, slug: clean, data: preloaded };
+      }
+      void marketsGet(clean).then((res) => {
+        if (syncGen !== marketSyncGenRef.current) return;
+        if (selectedSlugRef.current.trim().toLowerCase() !== clean) return;
+        if (isOk(res)) {
+          setMarketJson(res.data);
+          writeLastMarketCache(clean, res.data);
+          const freshIds = pickTokenIds(res.data);
+          if (freshIds.length >= 2 && freshIds.join(',') !== ids.join(',')) {
+            booksKickKeyRef.current = booksKickKey(clean, freshIds);
+            void loadBooksRef.current(freshIds, {
+              updateSeries: wantSeriesRef.current,
+              updateFlow: wantFlowRef.current,
+            });
+          }
+        }
+      });
       return { ok: true, slug: clean, data: preloaded };
     }
     const res = await marketsGet(clean);
@@ -1100,13 +1276,13 @@ function App() {
     }
     if (isOk(res)) {
       setMarketJson(res.data);
+      writeLastMarketCache(clean, res.data);
       const ids = pickTokenIds(res.data);
       if (ids.length >= 2) {
-        queueMicrotask(() => {
-          void loadBooksRef.current(ids, {
-            updateSeries: wantSeriesRef.current,
-            updateFlow: wantFlowRef.current,
-          });
+        booksKickKeyRef.current = booksKickKey(clean, ids);
+        void loadBooksRef.current(ids, {
+          updateSeries: wantSeriesRef.current,
+          updateFlow: wantFlowRef.current,
         });
       } else {
         setBooksLoading(false);
@@ -1138,13 +1314,72 @@ function App() {
       }
       if (mobileLayout) setMobileMarketPanelOpen(false);
       return loadMarket(clean, {
-        market: opts?.market,
+        market: opts?.market ? preloadedMarketForSlug(opts.market, clean) : undefined,
         force: alreadyOn && !switchingTab,
         fromTab: switchingTab,
       });
     },
     [loadMarket, tradeSessionTabs, activeTradeSessionTabId, mobileLayout],
   );
+
+  useOneSignalSessionAutoTrade({
+    tradeAccountMode,
+    tradingReady: globalTradeReady,
+  });
+
+  const oneSignalQueueRef = useRef<OneSignalTradeRequest[]>([]);
+  const oneSignalDrainBusyRef = useRef(false);
+
+  const drainOneSignalQueue = useCallback(async () => {
+    if (oneSignalDrainBusyRef.current) return;
+    const next = oneSignalQueueRef.current.shift();
+    if (!next) return;
+    oneSignalDrainBusyRef.current = true;
+    try {
+      const opened = await loadMarket(next.slug, { force: true, market: next.market });
+      if (!opened.ok) return;
+      const deadline = Date.now() + 18_000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => window.setTimeout(r, 350));
+        const slugOk = selectedSlugRef.current.trim().toLowerCase() === next.slug.trim().toLowerCase();
+        const booksOk = (booksRef.current?.length ?? 0) >= 2;
+        if (slugOk && booksOk) break;
+      }
+      const result = executeOneSignalSessionTrade(next.plan, next.slug, {
+        sizeUsd: next.sizeUsd,
+        takeProfit01: next.takeProfit01,
+        watchStop01: next.watchStop01,
+        endsInMs: next.endsInMs,
+      });
+      if (result.buySubmitted && next.plan.lane && next.plan.entry01 != null) {
+        saveOneSignalSessionTrade({
+          asset: next.asset,
+          slug: next.slug,
+          lane: next.plan.lane,
+          entry01: next.plan.entry01,
+          takeProfit01: next.takeProfit01,
+          watchStop01: next.watchStop01,
+          sizeUsd: next.sizeUsd,
+          tradedAtMs: Date.now(),
+        });
+      }
+    } finally {
+      clearOneSignalAssetInFlight(next.asset);
+      oneSignalDrainBusyRef.current = false;
+      if (oneSignalQueueRef.current.length > 0) void drainOneSignalQueue();
+    }
+  }, [loadMarket]);
+
+  useEffect(() => {
+    const onTrade = (ev: Event) => {
+      const req = (ev as CustomEvent<OneSignalTradeRequest>).detail;
+      if (!req?.slug?.trim() || !req.plan?.canTake) return;
+      oneSignalQueueRef.current.push(req);
+      void drainOneSignalQueue();
+    };
+    window.addEventListener(BPX_ONE_SIGNAL_SESSION_TRADE_EVENT, onTrade as EventListener);
+    return () => window.removeEventListener(BPX_ONE_SIGNAL_SESSION_TRADE_EVENT, onTrade as EventListener);
+  }, [drainOneSignalQueue]);
 
   const onGlobalTradeLaneChange = useCallback(
     (lane: 'up' | 'down') => {
@@ -1229,7 +1464,12 @@ function App() {
   const showEmbeddedTradeDock =
     tradeUiPrefs.embedded &&
     !binanceSpotActive &&
-    (mainTab === 'signals' || mainTab === 'sports' || mainTab === 'book' || mainTab === 'tracking' || mainTab === 'flowzones');
+    (mainTab === 'signals' ||
+      mainTab === 'sports' ||
+      mainTab === 'workspace' ||
+      mainTab === 'book' ||
+      mainTab === 'tracking' ||
+      mainTab === 'flowzones');
 
   /** Slide panel is fixed to the viewport — reserve its width on md+ so main UI stays visible beside it. */
   const slideTradePanelReservesSpace = tradeUiPrefs.slide && tradePanelOpen;
@@ -1243,7 +1483,7 @@ function App() {
     if (!tradeUiPrefs.embedded) {
       setTradeUiPref({ embedded: true, slide: true });
     }
-    if (mainTab !== 'signals' && mainTab !== 'book' && mainTab !== 'tracking') {
+    if (mainTab !== 'signals' && mainTab !== 'book' && mainTab !== 'tracking' && mainTab !== 'workspace') {
       setMainTab('signals');
     }
   }, [mainTab, setTradeUiPref, tradeUiPrefs.embedded, tradeUiPrefs.slide]);
@@ -1335,9 +1575,12 @@ function App() {
     if (!activeTradeSessionTabId) return;
     setTradeSessionTabs((list) => {
       if (!list.some((t) => t.id === activeTradeSessionTabId)) return list;
+      const active = list.find((t) => t.id === activeTradeSessionTabId);
+      const nextLabel = shortTradeTabLabel(currentTradeContext.question, slug);
+      if (active && active.slug === slug && active.label === nextLabel) return list;
       return list.map((t) =>
         t.id === activeTradeSessionTabId
-          ? { ...t, slug, label: shortTradeTabLabel(currentTradeContext.question, slug) }
+          ? { ...t, slug, label: nextLabel }
           : t,
       );
     });
@@ -1372,10 +1615,30 @@ function App() {
       if (syncGen !== marketSyncGenRef.current) return;
       if (`${selectedSlugRef.current}:${ids.join(',')}` !== reqKey) return;
       if (isOk(res)) {
+        const allFailed = res.data.length > 0 && res.data.every((e) => Boolean(e.error));
+        if (allFailed && initialLoad) {
+          const slug = selectedSlugRef.current.trim();
+          if (slug) {
+            const mRes = await marketsGet(slug);
+            if (isOk(mRes) && syncGen === marketSyncGenRef.current && slug === selectedSlugRef.current.trim()) {
+              setMarketJson(mRes.data);
+              const freshIds = pickTokenIds(mRes.data);
+              if (freshIds.length >= 2 && freshIds.join(',') !== ids.join(',')) {
+                void loadBooksRef.current(freshIds, opts);
+                return;
+              }
+            }
+          }
+        }
         setBooks(res.data);
-        booksHydratedRef.current = true;
+        booksHydratedRef.current = !allFailed;
         const ts = Date.now();
-        setBooksFetchedAt(ts);
+        setBooksFetchedAt(allFailed ? null : ts);
+        if (allFailed) {
+          if (initialLoad) setError('Order book unavailable — retrying with fresh market tokens…');
+          setBooksLoading(false);
+          return;
+        }
         const updateSeries = opts?.updateSeries === true;
         const updateFlow = opts?.updateFlow === true;
         if (updateSeries) {
@@ -1663,7 +1926,7 @@ function App() {
   // REST book poll: idle markets may get no WS deltas, so `booksFetchedAt` would age out while the book is still valid.
   useEffect(() => {
     if (binanceSpotActive) return;
-    const pollTabs = new Set(['book', 'flowzones', 'signals', 'sports', 'tracking']);
+    const pollTabs = new Set(['book', 'flowzones', 'signals', 'sports', 'workspace', 'tracking']);
     if (!pollTabs.has(mainTab)) return;
     if (mainTab === 'book' && !chartEnabled) return;
     if (!tokenIds || tokenIds.length === 0) return;
@@ -1673,12 +1936,14 @@ function App() {
     const run = () => {
       if (stopped) return;
       if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
-      const wantSeries = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports';
-      const wantFlow = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports';
+      const wantSeries =
+        mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports' || mainTab === 'workspace';
+      const wantFlow =
+        mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports' || mainTab === 'workspace';
       void loadBooks(tokenIds, { updateSeries: wantSeries, updateFlow: wantFlow });
     };
 
-    const intervalMs = mainTab === 'book' ? 5_000 : mainTab === 'signals' || mainTab === 'sports' ? 4_000 : 6_500;
+    const intervalMs = mainTab === 'book' ? 5_000 : mainTab === 'signals' || mainTab === 'sports' || mainTab === 'workspace' ? 4_000 : 6_500;
     void run();
     const id = window.setInterval(() => void run(), intervalMs);
     return () => {
@@ -1706,8 +1971,10 @@ function App() {
     const onVis = () => {
       if (document.visibilityState !== 'visible') return;
       if (!tokenIds || tokenIds.length === 0) return;
-      const wantSeries = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports';
-      const wantFlow = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports';
+      const wantSeries =
+        mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports' || mainTab === 'workspace';
+      const wantFlow =
+        mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports' || mainTab === 'workspace';
       void loadBooks(tokenIds, { updateSeries: wantSeries, updateFlow: wantFlow });
     };
     document.addEventListener('visibilitychange', onVis);
@@ -1715,9 +1982,30 @@ function App() {
   }, [tokenIds, mainTab, loadBooks, binanceSpotActive]);
 
   useEffect(() => {
+    let cancelled = false;
+
+    void (async () => {
+      setMarketsListLoading(true);
+      const { rows, err } = await fetchMarketsListRows(25);
+      if (cancelled) return;
+      setMarketsListLoading(false);
+      if (!err) {
+        setMarkets(rows);
+        if (rows.length === 0) {
+          setMarketsError('Markets list returned zero rows. Start the API (`npm run dev`) and hard-refresh, or open a market by slug below.');
+        } else {
+          setMarketsError(null);
+        }
+      } else {
+        setMarkets([]);
+        setMarketsError(pretty(err) + apiReachabilityHint(err));
+      }
+    })();
+
     void (async () => {
       setMarketsError(null);
       const h = await health();
+      if (cancelled) return;
       if (isOk(h)) {
         setAssistantAvailable(h.data.assistant_available === true);
         const g = h.data.gamma_reachable === true ? ' · Gamma OK' : h.data.gamma_reachable === false ? ' · Gamma unreachable' : '';
@@ -1736,42 +2024,14 @@ function App() {
               ? `API OK — ${h.data.polymarket}${g}${a}`
               : `API OK (HTTP mode — no polymarket CLI)${g}${a}`,
         );
+      } else {
+        setApiHealth(`API error: ${h.error}${!isOk(h) && h.error === 'fetch_failed' ? ' — is the API running on :8787?' : ''}`);
       }
-      else setApiHealth(`API error: ${h.error}${!isOk(h) && h.error === 'fetch_failed' ? ' — is the API running on :8787?' : ''}`);
-
-      // Defer the market list so first paint happens quickly.
-      const defer = (cb: () => void) => {
-        try {
-          const ric = (window as unknown as { requestIdleCallback?: (fn: () => void, opts?: { timeout?: number }) => number })
-            .requestIdleCallback;
-          if (typeof ric === 'function') {
-            ric(cb, { timeout: 1200 });
-            return;
-          }
-        } catch {
-          /* ignore */
-        }
-        window.setTimeout(cb, 250);
-      };
-      defer(() => {
-        void (async () => {
-          setMarketsListLoading(true);
-          const { rows, err } = await fetchMarketsListRows(25);
-          setMarketsListLoading(false);
-          if (!err) {
-            setMarkets(rows);
-            if (rows.length === 0) {
-              setMarketsError('Markets list returned zero rows. Start the API (`npm run dev`) and hard-refresh, or open a market by slug below.');
-            } else {
-              setMarketsError(null);
-            }
-          } else {
-            setMarkets([]);
-            setMarketsError(pretty(err) + apiReachabilityHint(err));
-          }
-        })();
-      });
     })();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   /** API was down on first paint — reload sidebar list once health is OK. */
@@ -1808,7 +2068,12 @@ function App() {
     }
     const wantSeries = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports';
     const wantFlow = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports';
-    queueMicrotask(() => void loadBooks(tokenIds, { updateSeries: wantSeries, updateFlow: wantFlow }));
+    const kickKey = booksKickKey(selectedSlug, tokenIds);
+    if (booksKickKeyRef.current === kickKey) {
+      booksKickKeyRef.current = null;
+      return;
+    }
+    void loadBooks(tokenIds, { updateSeries: wantSeries, updateFlow: wantFlow });
   }, [tokenIds, loadBooks, mainTab, binanceSpotActive, selectedSlug]);
 
   useEffect(() => {
@@ -1820,34 +2085,49 @@ function App() {
     queueMicrotask(() => setOutcomeTab((t) => Math.min(Math.max(0, t), n - 1)));
   }, [books]);
 
-  /** First visit: load `?slug=` from URL, else auto-open BTC 5m so Signals is not an empty shell. */
+  /** First visit: load `?slug=` from URL, else last market instantly + refresh BTC 5m window. */
   useEffect(() => {
     if (marketBootRef.current) return;
     marketBootRef.current = true;
     const params = new URLSearchParams(window.location.search);
     const slug = (params.get('slug') ?? params.get('market') ?? '').trim();
     if (slug) {
+      const clean = canonicalMarketSlug(slug);
+      const cached = readLastMarketCache();
       void (async () => {
-        const opened = await loadMarket(slug);
+        const opened = await loadMarket(slug, cached?.slug === clean ? { market: cached.market } : undefined);
         if (!opened.ok) marketBootRef.current = false;
       })();
       return;
     }
+
+    if (bootMarketState.slug) {
+      void loadMarket(
+        bootMarketState.slug,
+        bootMarketState.market ? { market: bootMarketState.market } : undefined,
+      );
+    }
+
     let cancelled = false;
-    (async () => {
+    void (async () => {
       setShortcutBusy({ asset: 'btc', interval: '5m' });
       try {
         const res = await marketsUpdownShortcut('btc', '5m');
         if (cancelled) return;
         if (!isOk(res)) {
-          setMarketsError(pretty(res));
+          if (!bootMarketState.slug) setMarketsError(pretty(res));
           marketBootRef.current = false;
           return;
         }
         const slugToOpen = res.data.trading_slug?.trim() || res.data.slug.trim();
-        void loadMarket(slugToOpen, { market: res.data.market });
+        const market = preloadedMarketForSlug(res.data.market, slugToOpen);
+        const sameSlug =
+          bootMarketState.slug && canonicalMarketSlug(bootMarketState.slug) === canonicalMarketSlug(slugToOpen);
+        if (!sameSlug || market) {
+          void loadMarket(slugToOpen, { market: market ?? undefined, force: !sameSlug });
+        }
       } catch (e) {
-        if (!cancelled) {
+        if (!cancelled && !bootMarketState.slug) {
           setMarketsError(e instanceof Error ? e.message : String(e));
           marketBootRef.current = false;
         }
@@ -1942,7 +2222,7 @@ function App() {
         }
       } else {
         // Keep last good PTB only when still the same market load generation.
-        setPtbError(pretty(ptb));
+        setPtbError(ptbErrorLine(ptb));
       }
     };
     void tick();
@@ -2247,46 +2527,20 @@ function App() {
   const updownPickerItems = useMemo(() => {
     const p = updownParsed;
     if (!p) return [];
-    const step = p.stepSec;
-    const snapped = Math.floor(p.ts / step) * step;
-    const titled = isTitledUpdownSlug(selectedSlug);
-    const items: { slug: string; label: string; ts: number }[] = [];
-    const count = p.interval === '1d' ? 14 : p.interval === '4h' ? 36 : p.interval === '1h' ? 48 : p.interval === '15m' ? 12 : 24;
-    for (let i = 0; i < count; i++) {
-      const ts = snapped - i * step;
-      const slug = updownSlugAtBucket(p.asset, p.interval, ts, titled);
-      const d = new Date(ts * 1000);
-      const label =
-        p.interval === '1d'
-          ? new Date((ts + step) * 1000).toLocaleDateString(undefined, {
-              timeZone: 'America/New_York',
-              month: 'short',
-              day: 'numeric',
-            })
-          : p.interval === '1h'
-            ? d.toLocaleString(undefined, {
-                timeZone: 'America/New_York',
-                month: 'short',
-                day: 'numeric',
-                hour: 'numeric',
-              })
-            : p.interval === '4h'
-              ? `${d.toLocaleTimeString(undefined, {
-                  timeZone: 'America/New_York',
-                  hour: 'numeric',
-                })}–${new Date((ts + step) * 1000).toLocaleTimeString(undefined, {
-                  timeZone: 'America/New_York',
-                  hour: 'numeric',
-                })} ET`
-              : d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
-      items.push({ slug, label, ts });
-    }
-    return items;
+    return buildUpdownWindowPickerItems({
+      asset: p.asset,
+      interval: p.interval,
+      bucketStartSec: p.ts,
+      stepSec: p.stepSec,
+      currentSlug: selectedSlug,
+      titled: isTitledUpdownSlug(selectedSlug),
+    });
   }, [selectedSlug, updownParsed]);
   const stepUpdownSlug = useCallback(
     (dir: -1 | 1) => nextUpdownSlug(selectedSlug, dir, updownSlugHints),
     [selectedSlug, updownSlugHints],
   );
+  const nextUpdownWindowSlug = useMemo(() => stepUpdownSlug(1), [stepUpdownSlug]);
   const [updownLiveSlugFromApi, setUpdownLiveSlugFromApi] = useState<string | null>(null);
 
   // For Up/Down markets, use the API's notion of "live" (bucket) rather than the browser clock.
@@ -2471,7 +2725,7 @@ function App() {
         }));
       }
       if (notice) setMarketsNotice(notice);
-      void navigateToMarket(slugToOpen, { market: data.market });
+      void navigateToMarket(slugToOpen, data.market ? { market: preloadedMarketForSlug(data.market, slugToOpen) } : undefined);
     };
 
     const cached = readUpdownShortcutCache(asset, interval);
@@ -2548,7 +2802,7 @@ function App() {
       }
       setShortcutBusy(null);
       if (openSeq === shortcutOpenSeqRef.current) {
-        void navigateToMarket(slugToOpen, { market: data.market });
+        void navigateToMarket(slugToOpen, data.market ? { market: preloadedMarketForSlug(data.market, slugToOpen) } : undefined);
       }
     } catch (e) {
       if (openSeq !== shortcutOpenSeqRef.current) return;
@@ -2574,6 +2828,48 @@ function App() {
       setShortcutBusy(null);
     }
   }
+
+  /** When the Up/Down window ends, roll to the next bucket without changing the main tab. */
+  useEffect(() => {
+    if (!updownAutoRoll || !updownParsed) return;
+    if (shortcutBusy) return;
+    if (!shouldAutoRollUpdownMarket({ endsInMs: marketEndsInMs, marketClosed: isMarketClosed(marketJson) })) {
+      updownAutoRollKeyRef.current = '';
+      return;
+    }
+
+    const selected = selectedSlug.trim().toLowerCase();
+    if (updownAutoRollKeyRef.current === selected || updownAutoRollBusyRef.current) return;
+
+    const runRoll = async () => {
+      if (updownAutoRollKeyRef.current === selected || updownAutoRollBusyRef.current) return;
+      updownAutoRollBusyRef.current = true;
+      updownAutoRollKeyRef.current = selected;
+      try {
+        if (isShortcutAsset(updownParsed.asset)) {
+          await openUpdownShortcut(updownParsed.asset as UpdownShortcutAsset, updownParsed.interval);
+          return;
+        }
+        const next = stepUpdownSlug(1);
+        if (next && next.trim().toLowerCase() !== selected) {
+          await navigateToMarket(next);
+        }
+      } finally {
+        updownAutoRollBusyRef.current = false;
+      }
+    };
+
+    void runRoll();
+    const pollMs = marketEndsInMs != null && marketEndsInMs <= 30_000 ? 2_000 : 5_000;
+    const id = window.setInterval(() => void runRoll(), pollMs);
+    return () => window.clearInterval(id);
+  }, [marketEndsInMs, marketJson, navigateToMarket, selectedSlug, shortcutBusy, stepUpdownSlug, updownAutoRoll, updownParsed]);
+
+  useEffect(() => {
+    if (marketEndsInMs != null && marketEndsInMs > 10_000) {
+      updownAutoRollKeyRef.current = '';
+    }
+  }, [selectedSlug, marketEndsInMs]);
 
   async function openSportsShortcut(league: SportsLeagueId) {
     releaseOrphanPointerCapture();
@@ -2919,7 +3215,7 @@ function App() {
 
   return (
       <div
-        className={`min-h-full bg-zinc-950 bg-[radial-gradient(100%_60%_at_50%_-10%,rgba(99,102,241,0.08),transparent_52%),linear-gradient(180deg,#0b0b0f_0%,#09090b_45%,#060608_100%)] font-sans text-zinc-200 antialiased transition-[padding] duration-200 ease-out ${
+        className={`min-h-full bg-zinc-950 bg-[radial-gradient(100%_60%_at_50%_-10%,rgba(99,102,241,0.08),transparent_52%),linear-gradient(180deg,#0b0b0f_0%,#09090b_45%,#060608_100%)] font-sans text-zinc-200 antialiased ${
           slideTradePanelReservesSpace ? 'md:pr-[380px]' : ''
         }`}
       >
@@ -2941,6 +3237,16 @@ function App() {
                   Live
                 </span>
               ) : null}
+              <ViewportZoomControls
+                scaleLabel={viewportZoom.scaleLabel}
+                mode={viewportZoom.mode}
+                onZoomIn={viewportZoom.zoomIn}
+                onZoomOut={viewportZoom.zoomOut}
+                onAutoFit={viewportZoom.setAutoFit}
+                onReset={viewportZoom.resetZoom}
+                floatingDockHidden={!viewportZoom.floatingVisible}
+                onShowFloatingDock={viewportZoom.showFloatingDock}
+              />
               <div className="flex flex-wrap items-center gap-1 rounded-full border border-zinc-700/45 bg-zinc-950/55 p-1">
                 <button
                   type="button"
@@ -3070,7 +3376,17 @@ function App() {
                 ) : null}
               </div>
 
-              <div className="flex items-center gap-2 sm:ml-auto">
+              <div className="flex flex-wrap items-center gap-2 sm:ml-auto">
+                <ViewportZoomControls
+                  scaleLabel={viewportZoom.scaleLabel}
+                  mode={viewportZoom.mode}
+                  onZoomIn={viewportZoom.zoomIn}
+                  onZoomOut={viewportZoom.zoomOut}
+                  onAutoFit={viewportZoom.setAutoFit}
+                  onReset={viewportZoom.resetZoom}
+                  floatingDockHidden={!viewportZoom.floatingVisible}
+                  onShowFloatingDock={viewportZoom.showFloatingDock}
+                />
                 <button
                   type="button"
                   onClick={() => setPositionsPanelOpen(true)}
@@ -3104,6 +3420,13 @@ function App() {
                 <MainTabButton id="flowzones" label="Flow" title="Flow Zones" active={mainTab === 'flowzones'} onSelect={setMainTab} />
                 <MainTabButton id="signals" label="Signals" active={mainTab === 'signals'} onSelect={setMainTab} />
                 <MainTabButton id="sports" label="Sports" active={mainTab === 'sports'} onSelect={setMainTab} />
+                <MainTabButton
+                  id="workspace"
+                  label="Workspace"
+                  title="Mega workspace — checkbox-driven multi-chart desk"
+                  active={mainTab === 'workspace'}
+                  onSelect={setMainTab}
+                />
                 <MainTabButton id="tracking" label="Tracking" title="Positions + open orders + cash" active={mainTab === 'tracking'} onSelect={setMainTab} />
                 <MainTabButton id="tradehistory" label="History" title="Trade history (paper + live log)" active={mainTab === 'tradehistory'} onSelect={setMainTab} />
                 <MainTabButton id="btc" label="BTC" title="BTC live spot + paper trading" active={mainTab === 'btc'} onSelect={setMainTab} />
@@ -3249,27 +3572,56 @@ function App() {
                             : '5-minute markers'}
                     <span className="ml-2 font-mono text-zinc-500">({updownParsed.asset.toUpperCase()} {updownParsed.interval})</span>
                   </div>
-                  {parseUpdownSlug(selectedSlug) || isTitledUpdownSlug(selectedSlug) ? (
-                    <button
-                      type="button"
-                      onClick={() => setUpdownPickerOpen((v) => !v)}
-                      className="rounded-lg border border-zinc-700/60 bg-black/20 px-2.5 py-1.5 text-[11px] font-bold text-zinc-200 hover:bg-black/30"
-                      title="Jump to an exact window boundary"
+                  <div className="flex flex-wrap items-center gap-2">
+                    {nextUpdownWindowSlug &&
+                    nextUpdownWindowSlug.trim().toLowerCase() !== selectedSlug.trim().toLowerCase() ? (
+                      <button
+                        type="button"
+                        onClick={() => void navigateToMarket(nextUpdownWindowSlug)}
+                        className="rounded-lg border border-cyan-700/50 bg-cyan-950/25 px-2.5 py-1.5 text-[11px] font-bold text-cyan-100 hover:bg-cyan-950/40"
+                        title={`Open the upcoming window early: ${nextUpdownWindowSlug}`}
+                      >
+                        Next window
+                      </button>
+                    ) : null}
+                    <label
+                      className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-zinc-700/60 bg-black/20 px-2.5 py-1.5 text-[11px] font-semibold text-zinc-300 hover:bg-black/30"
+                      title="When the window ends, stay on this screen and load the next bucket automatically"
                     >
-                      {updownPickerOpen ? 'Hide' : 'Choose window'}
-                    </button>
-                  ) : isShortcutAsset(updownParsed.asset as UpdownShortcutAsset) ? (
-                    <button
-                      type="button"
-                      onClick={() =>
-                        void openUpdownShortcut(updownParsed.asset as UpdownShortcutAsset, updownParsed.interval)
-                      }
-                      className="rounded-lg border border-zinc-700/60 bg-black/20 px-2.5 py-1.5 text-[11px] font-bold text-zinc-200 hover:bg-black/30"
-                      title="Reload the live window from Polymarket"
-                    >
-                      Live {updownParsed.interval}
-                    </button>
-                  ) : null}
+                      <input
+                        type="checkbox"
+                        checked={updownAutoRoll}
+                        onChange={(e) => {
+                          const on = e.target.checked;
+                          setUpdownAutoRoll(on);
+                          saveUpdownAutoRollEnabled(on);
+                        }}
+                        className="size-3.5 rounded border-zinc-600 bg-zinc-950 accent-amber-500"
+                      />
+                      Auto-roll
+                    </label>
+                    {parseUpdownSlug(selectedSlug) || isTitledUpdownSlug(selectedSlug) ? (
+                      <button
+                        type="button"
+                        onClick={() => setUpdownPickerOpen((v) => !v)}
+                        className="rounded-lg border border-zinc-700/60 bg-black/20 px-2.5 py-1.5 text-[11px] font-bold text-zinc-200 hover:bg-black/30"
+                        title="Jump to a past or future window boundary"
+                      >
+                        {updownPickerOpen ? 'Hide' : 'Choose window'}
+                      </button>
+                    ) : isShortcutAsset(updownParsed.asset as UpdownShortcutAsset) ? (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void openUpdownShortcut(updownParsed.asset as UpdownShortcutAsset, updownParsed.interval)
+                        }
+                        className="rounded-lg border border-zinc-700/60 bg-black/20 px-2.5 py-1.5 text-[11px] font-bold text-zinc-200 hover:bg-black/30"
+                        title="Reload the live window from Polymarket"
+                      >
+                        Live {updownParsed.interval}
+                      </button>
+                    ) : null}
+                  </div>
                 </div>
 
                 {updownPickerOpen && (parseUpdownSlug(selectedSlug) || isTitledUpdownSlug(selectedSlug)) ? (
@@ -3283,9 +3635,11 @@ function App() {
                           void navigateToMarket(it.slug);
                         }}
                         className={`rounded-lg border px-2 py-2 text-[11px] font-semibold transition-colors ${
-                          it.slug === selectedSlug
+                          it.isCurrent
                             ? 'border-emerald-600/60 bg-emerald-950/25 text-emerald-100'
-                            : 'border-zinc-800/70 bg-black/15 text-zinc-300 hover:bg-black/25'
+                            : it.isFuture
+                              ? 'border-cyan-700/50 bg-cyan-950/20 text-cyan-100 hover:bg-cyan-950/35'
+                              : 'border-zinc-800/70 bg-black/15 text-zinc-300 hover:bg-black/25'
                         }`}
                         title={it.slug}
                       >
@@ -3302,7 +3656,8 @@ function App() {
             mainTab !== 'tradehistory' &&
             mainTab !== 'btc' &&
             mainTab !== 'tvbtc' &&
-            mainTab !== 'perps' ? (
+            mainTab !== 'perps' &&
+            mainTab !== 'workspace' ? (
               <div className="mt-4 text-sm leading-relaxed text-zinc-500">Select a market to load token ids and ladders.</div>
             ) : null}
 
@@ -3352,24 +3707,42 @@ function App() {
                   {books && books.length >= 2 ? (
                     <div className="mt-3">
                       {flowMode === 'price' ? (
-                        <MomentumChart
+                        <ChartPanelChrome
                           title="Outcome mids (price momentum)"
-                          aLabel={outcomeLabels[0] ?? 'A'}
-                          aTone="up"
-                          a={(chartSeriesBySlug[selectedSlug]?.[books[0]!.token] ?? []).slice(-120)}
-                          bLabel={outcomeLabels[1] ?? 'B'}
-                          bTone="down"
-                          b={(chartSeriesBySlug[selectedSlug]?.[books[1]!.token] ?? []).slice(-120)}
-                          lastUpdateMs={booksFetchedAt}
-                          priceToBeatUsd={ssrPriceToBeat}
-                        />
+                          scale={bookPriceZoom.scale}
+                          onZoomIn={bookPriceZoom.zoomIn}
+                          onZoomOut={bookPriceZoom.zoomOut}
+                          onResetZoom={bookPriceZoom.resetZoom}
+                          variant="inline"
+                        >
+                          <MomentumChart
+                            title="Outcome mids (price momentum)"
+                            aLabel={outcomeLabels[0] ?? 'A'}
+                            aTone="up"
+                            a={(chartSeriesBySlug[selectedSlug]?.[books[0]!.token] ?? []).slice(-120)}
+                            bLabel={outcomeLabels[1] ?? 'B'}
+                            bTone="down"
+                            b={(chartSeriesBySlug[selectedSlug]?.[books[1]!.token] ?? []).slice(-120)}
+                            lastUpdateMs={booksFetchedAt}
+                            priceToBeatUsd={ssrPriceToBeat}
+                          />
+                        </ChartPanelChrome>
                       ) : (
-                        <OrderFlowChart
-                          title={`Order flow (active: ${outcomeLabels[outcomeTab] ?? `Outcome ${outcomeTab + 1}`})`}
-                          series={(flowSeriesBySlug[selectedSlug]?.[books[outcomeTab]!.token] ?? []).slice(-180)}
-                          lastUpdateMs={booksFetchedAt}
-                          priceToBeatUsd={ssrPriceToBeat}
-                        />
+                        <ChartPanelChrome
+                          title={`Order flow (${outcomeLabels[outcomeTab] ?? `Outcome ${outcomeTab + 1}`})`}
+                          scale={bookFlowZoom.scale}
+                          onZoomIn={bookFlowZoom.zoomIn}
+                          onZoomOut={bookFlowZoom.zoomOut}
+                          onResetZoom={bookFlowZoom.resetZoom}
+                          variant="inline"
+                        >
+                          <OrderFlowChart
+                            title={`Order flow (active: ${outcomeLabels[outcomeTab] ?? `Outcome ${outcomeTab + 1}`})`}
+                            series={(flowSeriesBySlug[selectedSlug]?.[books[outcomeTab]!.token] ?? []).slice(-180)}
+                            lastUpdateMs={booksFetchedAt}
+                            priceToBeatUsd={ssrPriceToBeat}
+                          />
+                        </ChartPanelChrome>
                       )}
                     </div>
                   ) : (
@@ -3458,10 +3831,6 @@ function App() {
                       <span className="font-mono text-amber-50/95">mlb-tor-atl-2026-06-04</span>), or search — then stay on this tab.
                     </p>
                   </div>
-                ) : booksLoading && !books ? (
-                  <div className="mb-4 rounded-2xl border border-zinc-800/60 bg-zinc-950/40 px-4 py-6 text-center text-sm text-zinc-400">
-                    Loading order books for signals…
-                  </div>
                 ) : null}
                 {error && selectedSlug.trim() && !marketJson ? (
                   <div className="mb-4 rounded-2xl border border-amber-800/40 bg-amber-950/20 px-4 py-4 text-sm leading-relaxed text-amber-100/90">
@@ -3498,7 +3867,7 @@ function App() {
                         if (!slug) return;
                         void priceToBeat(slug).then((ptb) => {
                           if (!isOk(ptb)) {
-                            setPtbError(pretty(ptb));
+                            setPtbError(ptbErrorLine(ptb));
                             return;
                           }
                           setSsrPriceToBeat(ptb.data.price_to_beat);
@@ -3669,6 +4038,27 @@ function App() {
               </div>
             ) : null}
 
+            {!binanceSpotActive && mainTab === 'workspace' ? (
+              <div className="mt-5">
+                <Suspense fallback={tabSuspenseFallback}>
+                  <WorkspaceTab
+                    currentSlug={selectedSlug}
+                    market={marketJson}
+                    books={books}
+                    outcomeLabels={outcomeLabels}
+                    flowSeriesForSlug={flowSeriesBySlug[selectedSlug] ?? null}
+                    booksFetchedAt={booksFetchedAt}
+                    priceToBeatUsd={ssrPriceToBeat}
+                    endsInMs={marketEndsInMs}
+                    onOpenInBook={(slug) => {
+                      void navigateToMarket(slug);
+                      setMainTab('book');
+                    }}
+                  />
+                </Suspense>
+              </div>
+            ) : null}
+
             {mainTab === 'assistant' ? (
               <div className="mt-5">
                 <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-zinc-800/50 bg-zinc-900/20 p-4 ring-1 ring-white/[0.02]">
@@ -3832,6 +4222,19 @@ function App() {
               }}
             />
           </Suspense>
+        ) : null}
+
+        {viewportZoom.floatingVisible ? (
+          <ViewportZoomControls
+            variant="floating"
+            scaleLabel={viewportZoom.scaleLabel}
+            mode={viewportZoom.mode}
+            onZoomIn={viewportZoom.zoomIn}
+            onZoomOut={viewportZoom.zoomOut}
+            onAutoFit={viewportZoom.setAutoFit}
+            onReset={viewportZoom.resetZoom}
+            onCloseFloating={viewportZoom.hideFloatingDock}
+          />
         ) : null}
       </div>
       </div>

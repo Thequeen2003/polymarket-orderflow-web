@@ -22,11 +22,11 @@ function fmtProbCents(prob01: number | null | undefined): string | null {
   return c >= 10 ? `${c.toFixed(1)}¢` : `${c.toFixed(2)}¢`;
 }
 
-/** Quantize large USD spot/projections so the headline does not flicker every tick. */
+/** Quantize projected spot for the headline — keep cent precision on BTC/ETH. */
 export function quantizeStableUsd(n: number): number {
   if (!Number.isFinite(n)) return n;
   const abs = Math.abs(n);
-  const step = abs >= 50_000 ? 1 : abs >= 10_000 ? 0.5 : abs >= 1_000 ? 0.25 : 0.05;
+  const step = abs >= 10_000 ? 0.05 : 0.01;
   return Math.round(n / step) * step;
 }
 

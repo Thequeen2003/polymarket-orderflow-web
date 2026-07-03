@@ -91,7 +91,7 @@ export function computeContractLeadSignal(snap: ContractLeadInput): ContractLead
   const spotOk = spotRowHit(snap);
   const probOk = probRowHit(snap);
 
-  if (!spotLed && earlyGain < 2 && confirmGain < 2.5) {
+  if (!spotLed && earlyGain < 2 && confirmGain < 2.5 && timing !== 'BUILDING') {
     return null;
   }
 
@@ -130,6 +130,38 @@ export function computeContractLeadSignal(snap: ContractLeadInput): ContractLead
       title: `Enter ${sideLabel} · ${nowCents}`,
       actionLine: `${earlyHorizonSec}s: ${openStr} → ${nowCents} (${formatCentsDelta(earlyJump?.gain01 ?? 0)}) · ${confirmHorizonSec}s confirm only ${formatCentsDelta(confirmJump?.gain01 ?? 0)}`,
       reasonLine: `${verdict.replace('_', ' ')} — act on ${earlyHorizonSec}s lead, not ${confirmHorizonSec}s confirm.`,
+    };
+  }
+
+  if (
+    timing === 'BUILDING' &&
+    earlyScore >= 3 &&
+    (spotOk || probOk) &&
+    confirmGain < PRESSURE_EXTENDED_GAIN_CENTS &&
+    earlyGain >= 0.5
+  ) {
+    return {
+      ...base,
+      phase: 'ENTER',
+      title: `Enter ${sideLabel} inside momentum · ${nowCents}`,
+      actionLine: `${earlyHorizonSec}s +${earlyGain.toFixed(1)}¢ underway · ${confirmHorizonSec}s confirm only +${confirmGain.toFixed(1)}¢ — buy the move`,
+      reasonLine: 'Momentum building — enter inside the 10s lead before 30s confirm finishes.',
+    };
+  }
+
+  if (
+    (timing === 'EARLY' || timing === 'BUILDING') &&
+    earlyScore >= 3 &&
+    probOk &&
+    earlyGain >= 0.8 &&
+    confirmGain < PRESSURE_EXTENDED_GAIN_CENTS
+  ) {
+    return {
+      ...base,
+      phase: 'ENTER',
+      title: `Enter ${sideLabel} · ${nowCents}`,
+      actionLine: `Contract momentum +${earlyGain.toFixed(1)}¢ on ${earlyHorizonSec}s · score ${earlyScore}/5`,
+      reasonLine: `${verdict.replace('_', ' ')} — tape repricing inside momentum.`,
     };
   }
 

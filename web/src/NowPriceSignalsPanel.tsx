@@ -6,7 +6,7 @@ import type { TapeVelocity } from './tapeVelocity';
 import { computeStableProjectedHeader } from './chartStableProjectedHeader';
 import { PredictionHorizonTimer } from './PredictionHorizonTimer';
 import { PricePredictionSignalCard } from './PricePredictionSignalCard';
-import { buildContractProbProjectionGrid } from './contractProbProjection';
+import { buildContractProbProjectionGrid, enrichPricePredictionWithContracts } from './contractProbProjection';
 import { computePricePredictionSignal, type PricePredictionProjection } from './pricePredictionSignal';
 import { MachineVerdictCard } from './MachineVerdictCard';
 import {
@@ -55,15 +55,20 @@ import { buildMtfConsensus } from './multiTimeframeConsensus';
 import type { ContractLeadSignal } from './contractLeadSignal';
 import { computeDirectionEngine, type DirectionEngineSignal } from './directionEngine';
 import { NowPriceBuyStrip } from './NowPriceBuyStrip';
+import { buildNowPriceDeskTradeSignal, type NowPriceDeskTradeSignal } from './nowPriceDeskTradeSignal';
+import { buildDeskAheadPlaybook, deskCatchModeLabel, formatDeskBracketLine, type DeskAheadPlaybook } from './deskAheadPlaybook';
+import { computePreBuyTpOutlook } from './positionTpOutlook';
 import type { BuySideAdvisory } from './shouldBuyWhichSide';
-import type { BookTouchForArmRisk } from './armRiskFromSignal';
+import { computeEntryMoment } from './entryMoment';
+import { spreadBracketFromFillPrice01, type BookTouchForArmRisk } from './armRiskFromSignal';
+import { buildQuoteAssistTargets, loadEmergencyStopBundlePrefs } from './buyBundleStaging';
 import {
   computeExecutionSignal,
   EXEC_MIN_EDGE_PP,
   EXEC_MIN_MODEL_PROB,
   type ExecutionSignal,
 } from './executionSignal';
-import { updateExecutionConfirm, type ExecutionConfirmState } from './executionConfirmTracker';
+import { useExecutionConfirmTracker } from './executionSignalDesk';
 import { computeContractEntryJump, type ContractEntryJump } from './deskSpeedGainPct';
 import { computeBilateralEdge, pickEdgeLaneHint, pickStrongerEdgeSide } from './bilateralEdge';
 import {
@@ -1626,6 +1631,8 @@ type NowPriceHeroView = {
   laneLabel: string | null;
   subline: string;
   detail: string | null;
+  /** Structured next step before the desk signal fires. */
+  aheadPlaybook: DeskAheadPlaybook;
   confidencePct: number | null;
   confirmPct: number | null;
   phaseLabel: string | null;
@@ -1635,6 +1642,11 @@ type NowPriceHeroView = {
   projJumpCents1m: number | null;
   jumpHeadline: string | null;
   projLine: string | null;
+  tpHitProbPct: number | null;
+  readinessPct: number;
+  blockers: string[];
+  canTrade: boolean;
+  urgency: string;
 };
 
 type HeroMetricsCtx = {
@@ -1682,136 +1694,133 @@ const EMPTY_HERO_METRICS: Pick<
   projLine: null,
 };
 
-function withHeroMetrics(
-  view: Omit<NowPriceHeroView, keyof typeof EMPTY_HERO_METRICS>,
-  lane: 'up' | 'down' | null,
-  ctx: HeroMetricsCtx,
-): NowPriceHeroView {
-  if (!lane) return { ...view, ...EMPTY_HERO_METRICS };
-  return { ...view, ...resolveHeroLaneMetrics(lane, ctx) };
-}
-
-function buildNowPriceHeroView(args: {
+function resolveHeroLane(args: {
   executionSignal: ExecutionSignal | null;
   directionEngine: DirectionEngineSignal | null;
   tradeCall: string;
   upLabel: string;
   downLabel: string;
-  metricsCtx: HeroMetricsCtx;
-}): NowPriceHeroView {
-  const { executionSignal, directionEngine, tradeCall, upLabel, downLabel, metricsCtx } = args;
-
-  if (executionSignal?.phase === 'ENTER') {
-    const lane = executionSignal.verdict === 'ENTER_UP' ? upLabel : downLabel;
-    const laneKey: 'up' | 'down' = executionSignal.verdict === 'ENTER_UP' ? 'up' : 'down';
-    const tone: GlanceTone = laneKey === 'up' ? 'up' : 'down';
-    return withHeroMetrics(
-      {
-        tone,
-        emoji: executionSignal.emoji,
-        primary: 'ENTER',
-        laneLabel: lane,
-        subline: executionSignal.headline,
-        detail: executionSignal.summaryLine,
-        confidencePct: directionEngine?.confidencePct ?? null,
-        confirmPct: 100,
-        phaseLabel: 'GO',
-      },
-      laneKey,
-      metricsCtx,
-    );
-  }
-
-  if (executionSignal?.phase === 'ALERT') {
-    const laneKey: 'up' | 'down' | null =
-      executionSignal.bias.direction === 'up'
-        ? 'up'
-        : executionSignal.bias.direction === 'down'
-          ? 'down'
-          : null;
-    const lane = laneKey === 'up' ? upLabel : laneKey === 'down' ? downLabel : null;
-    const confirmPct = Math.min(
-      100,
-      Math.round((executionSignal.confirmHeldMs / Math.max(1, executionSignal.confirmRequiredMs)) * 100),
-    );
-    return withHeroMetrics(
-      {
-        tone: laneKey === 'up' ? 'up' : laneKey === 'down' ? 'down' : 'warn',
-        emoji: executionSignal.emoji,
-        primary: 'ALERT',
-        laneLabel: lane,
-        subline: executionSignal.headline,
-        detail: executionSignal.summaryLine,
-        confidencePct: directionEngine?.confidencePct ?? null,
-        confirmPct,
-        phaseLabel: 'CONFIRM',
-      },
-      laneKey,
-      metricsCtx,
-    );
-  }
-
-  if (directionEngine?.verdict === 'ENTER_UP' || directionEngine?.verdict === 'ENTER_DOWN') {
-    const laneKey: 'up' | 'down' = directionEngine.verdict === 'ENTER_UP' ? 'up' : 'down';
-    const tone: GlanceTone = laneKey === 'up' ? 'up' : 'down';
-    const lane = laneKey === 'up' ? upLabel : downLabel;
-    return withHeroMetrics(
-      {
-        tone,
-        emoji: directionEngine.emoji,
-        primary: directionEngine.hardRule ? 'HARD ENTER' : 'LEAN ENTER',
-        laneLabel: lane,
-        subline: directionEngine.headline,
-        detail: directionEngine.reasons[0] ?? null,
-        confidencePct: directionEngine.confidencePct,
-        confirmPct: null,
-        phaseLabel: directionEngine.hardRule ? 'HARD RULE' : 'DIRECTION',
-      },
-      laneKey,
-      metricsCtx,
-    );
-  }
-
-  if (tradeCall.startsWith('LONG ')) {
-    const laneKey: 'up' | 'down' = tradeCall.includes(upLabel) ? 'up' : 'down';
-    const tone: GlanceTone = laneKey === 'up' ? 'up' : 'down';
-    return withHeroMetrics(
-      {
-        tone,
-        emoji: laneKey === 'up' ? '🟢' : '🔴',
-        primary: 'LONG',
-        laneLabel: tradeCall.replace(/^LONG /, ''),
-        subline: directionEngine?.headline ?? tradeCall,
-        detail: directionEngine?.reasons[0] ?? null,
-        confidencePct: directionEngine?.confidencePct ?? null,
-        confirmPct: null,
-        phaseLabel: 'EDGE',
-      },
-      laneKey,
-      metricsCtx,
-    );
-  }
-
-  const isNoTrade =
-    tradeCall === 'NO TRADE' ||
-    executionSignal?.phase === 'NO_TRADE' ||
-    directionEngine?.verdict === 'NO_TRADE';
-
-  return withHeroMetrics(
-    {
-      tone: isNoTrade ? 'flat' : 'warn',
-      emoji: isNoTrade ? '⚪' : '🔵',
-      primary: isNoTrade ? 'NO TRADE' : 'WAIT',
-      laneLabel: null,
-      subline: directionEngine?.headline ?? tradeCall,
-      detail: directionEngine?.reasons[0] ?? null,
-      confidencePct: directionEngine?.confidencePct ?? null,
-      confirmPct: null,
-      phaseLabel: null,
-    },
-    directionEngine?.proposedLane ?? null,
-    metricsCtx,
+}): 'up' | 'down' | null {
+  const { executionSignal, directionEngine, tradeCall, upLabel, downLabel } = args;
+  if (executionSignal?.verdict === 'ENTER_UP' || directionEngine?.verdict === 'ENTER_UP') return 'up';
+  if (executionSignal?.verdict === 'ENTER_DOWN' || directionEngine?.verdict === 'ENTER_DOWN') return 'down';
+  return (
+    directionEngine?.proposedLane ??
+    (tradeCall.includes(upLabel) ? 'up' : tradeCall.includes(downLabel) ? 'down' : executionSignal?.proposedLane ?? null)
   );
+}
+
+function laneTpOutlook(args: {
+  lane: 'up' | 'down';
+  touch: BookTouchForArmRisk | null | undefined;
+  mid01: number | null;
+  probSeries: SpotPoint[];
+  endsInMs?: number | null;
+}) {
+  const ask = args.touch?.bestAsk;
+  const entry01 =
+    ask != null && ask > 0 && ask < 1 ? ask : args.mid01 != null && args.mid01 > 0 && args.mid01 < 1 ? args.mid01 : null;
+  if (entry01 == null) return null;
+  const prefs = loadEmergencyStopBundlePrefs();
+  let tpCents = '';
+  if (prefs.autoTpOnFill) {
+    const q = buildQuoteAssistTargets({
+      quote01: entry01,
+      bestBid: args.touch?.bestBid ?? null,
+      bestAsk: args.touch?.bestAsk ?? null,
+    });
+    tpCents = q?.tpCents?.trim() ?? '';
+  }
+  if (!tpCents) tpCents = spreadBracketFromFillPrice01(entry01, args.touch ?? {}).tpCents;
+  if (!tpCents.trim()) return null;
+  return computePreBuyTpOutlook({
+    entry01,
+    tpCents,
+    current01: args.mid01,
+    probSeries: args.probSeries,
+    endsInMs: args.endsInMs ?? null,
+  });
+}
+
+function synthesizeHeroDetail(
+  signal: NowPriceDeskTradeSignal,
+  metrics: Pick<NowPriceHeroView, 'edgePp' | 'projLine' | 'jumpHeadline'>,
+): string {
+  const stalePullback =
+    signal.exactAction.includes('Re-enter when pressure is EARLY') ||
+    signal.exactAction.includes('do not chase the ask.');
+  let detail =
+    stalePullback && signal.laneLabel && (signal.phase === 'LEAN' || signal.headline.toUpperCase().includes('LEAN'))
+      ? `Desk picks ${signal.laneLabel} — move already ran. Join on bid; don't chase wide ask. Hunt EARLY pressure (<4pp on 10s).`
+      : signal.exactAction;
+
+  if (signal.phase !== 'LEAN' && signal.phase !== 'ALERT') return detail;
+
+  const extras: string[] = [];
+  if (metrics.edgePp != null && metrics.edgePp < 3) {
+    extras.push(
+      metrics.edgePp <= 0
+        ? `Base edge ${metrics.edgePp.toFixed(1)}pp — ${signal.laneLabel ?? 'side'} is rich vs model; limit on bid only.`
+        : `Base edge +${metrics.edgePp.toFixed(1)}pp — thin cushion; don't pay the ask.`,
+    );
+  }
+  if (metrics.projLine && !detail.includes(metrics.projLine)) {
+    extras.push(metrics.projLine);
+  } else if (metrics.jumpHeadline && !detail.includes(metrics.jumpHeadline)) {
+    extras.push(metrics.jumpHeadline);
+  }
+  if (extras.length === 0) return detail;
+  return `${detail} ${extras.join(' ')}`;
+}
+
+function deskTradeSignalToHeroView(
+  signal: NowPriceDeskTradeSignal,
+  metricsCtx: HeroMetricsCtx,
+): NowPriceHeroView {
+  const lane = signal.lane;
+  const metrics = lane ? resolveHeroLaneMetrics(lane, metricsCtx) : EMPTY_HERO_METRICS;
+  const phaseLabel =
+    signal.phase === 'ENTER'
+      ? 'GO'
+      : signal.phase === 'ALERT'
+        ? 'CONFIRM'
+        : signal.phase === 'LEAN'
+          ? 'EDGE'
+          : signal.phase === 'NO_TRADE'
+            ? 'SKIP'
+            : null;
+  const leanHeadline = signal.headline.toUpperCase().includes('LEAN');
+  const primary =
+    signal.phase === 'ENTER'
+      ? 'ENTER'
+      : signal.phase === 'LEAN' || signal.phase === 'ALERT'
+        ? signal.phase
+        : leanHeadline
+          ? 'LEAN'
+          : signal.phase;
+  const subline =
+    (signal.phase === 'LEAN' || primary === 'LEAN') && leanHeadline
+      ? signal.confidencePct != null
+        ? `${signal.confidencePct}% conf · timing entry, don't chase ask`
+        : 'Desk edge live — time entry on bid, not wide ask'
+      : signal.headline;
+  return {
+    tone: signal.tone,
+    emoji: signal.emoji,
+    primary,
+    laneLabel: signal.laneLabel,
+    subline,
+    detail: synthesizeHeroDetail(signal, metrics),
+    confidencePct: signal.confidencePct,
+    confirmPct: signal.confirmPct,
+    phaseLabel,
+    tpHitProbPct: signal.tpHitProbPct,
+    readinessPct: signal.readinessPct,
+    blockers: signal.blockers,
+    canTrade: signal.canTrade,
+    urgency: signal.urgency,
+    ...metrics,
+  };
 }
 
 function nowPriceHeroShell(tone: GlanceTone, _phaseLabel: string | null): string {
@@ -1840,6 +1849,83 @@ function nowPriceHeroLaneTone(tone: GlanceTone): string {
   }
 }
 
+function deskCatchStripShell(mode: DeskAheadPlaybook['mode']): string {
+  switch (mode) {
+    case 'go':
+      return 'border-emerald-400 bg-emerald-500 shadow-lg shadow-emerald-900/50 ring-2 ring-emerald-300/60';
+    case 'arm':
+      return 'border-amber-400 bg-amber-500/95 shadow-lg shadow-amber-900/40 ring-2 ring-amber-300/50';
+    case 'watch':
+      return 'border-cyan-400 bg-cyan-600/90 shadow-lg shadow-cyan-900/40 ring-2 ring-cyan-300/40';
+    case 'wait':
+      return 'border-zinc-500 bg-zinc-800 shadow-md shadow-black/40 ring-1 ring-zinc-400/30';
+    case 'skip':
+      return 'border-zinc-600 bg-zinc-900/90 ring-1 ring-zinc-600/40';
+  }
+}
+
+function deskCatchStripText(mode: DeskAheadPlaybook['mode']): string {
+  return mode === 'go' || mode === 'arm' ? 'text-black' : 'text-zinc-50';
+}
+
+function DeskCatchStrip(props: { playbook: DeskAheadPlaybook }): ReactElement {
+  const { playbook } = props;
+  const pulse = playbook.mode === 'go' ? 'animate-pulse' : '';
+  const textCls = deskCatchStripText(playbook.mode);
+  const bracketLine = formatDeskBracketLine(playbook.bracket, playbook.tpHitProbPct);
+
+  return (
+    <div
+      className={`rounded-2xl border-2 px-4 py-4 text-center sm:px-5 sm:py-5 ${deskCatchStripShell(playbook.mode)} ${pulse}`}
+      role="status"
+      aria-live="polite"
+    >
+      <div className={`text-[10px] font-black uppercase tracking-[0.22em] ${textCls} opacity-80`}>
+        {deskCatchModeLabel(playbook.mode)}
+      </div>
+      <div
+        className={`mt-1.5 font-black leading-[1.1] tracking-tight ${textCls} text-[clamp(1.35rem,5vw,2rem)]`}
+      >
+        {playbook.catchLine}
+      </div>
+      {bracketLine ? (
+        <div
+          className={`mt-2 font-mono text-[clamp(0.95rem,3.2vw,1.25rem)] font-black tabular-nums leading-snug tracking-tight ${textCls}`}
+        >
+          {bracketLine}
+        </div>
+      ) : null}
+      {playbook.confirmSec != null && playbook.confirmSec > 0 ? (
+        <div
+          className={`mt-2 font-mono text-[clamp(2rem,8vw,3.25rem)] font-black tabular-nums leading-none ${textCls}`}
+        >
+          {playbook.confirmSec}s
+        </div>
+      ) : null}
+      {playbook.mode !== 'go' ? (
+        <div className="mx-auto mt-3 max-w-lg space-y-1 text-left text-[11px] leading-snug sm:text-xs">
+          <div className={`flex gap-2 ${textCls} opacity-95`}>
+            <span className="w-10 shrink-0 font-black uppercase opacity-70">When</span>
+            <span className="min-w-0 font-semibold">{playbook.when}</span>
+          </div>
+          <div className={`flex gap-2 ${textCls}`}>
+            <span className="w-10 shrink-0 font-black uppercase opacity-70">Do</span>
+            <span className="min-w-0 font-bold">{playbook.do}</span>
+          </div>
+          {playbook.skip ? (
+            <div className={`flex gap-2 ${textCls} opacity-75`}>
+              <span className="w-10 shrink-0 font-bold uppercase opacity-70">Skip</span>
+              <span className="min-w-0">{playbook.skip}</span>
+            </div>
+          ) : null}
+        </div>
+      ) : playbook.skip ? (
+        <p className={`mt-2 text-[11px] font-bold ${textCls} opacity-85`}>{playbook.skip}</p>
+      ) : null}
+    </div>
+  );
+}
+
 function NowPriceHeroSignalBanner(props: { view: NowPriceHeroView }): ReactElement {
   const { view } = props;
   const laneCls = nowPriceHeroLaneTone(view.tone);
@@ -1851,9 +1937,29 @@ function NowPriceHeroSignalBanner(props: { view: NowPriceHeroView }): ReactEleme
         : view.confidencePct != null && view.confidencePct >= 55
           ? 'text-amber-200'
           : 'text-zinc-400';
+  const pulse = view.canTrade ? 'animate-pulse' : '';
 
   return (
-    <div className={`rounded-xl border px-3 py-3 sm:px-4 ${nowPriceHeroShell(view.tone, view.phaseLabel)}`}>
+    <div className={`rounded-xl border px-3 py-3 sm:px-4 ${nowPriceHeroShell(view.tone, view.phaseLabel)} ${pulse}`}>
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2 border-b border-white/[0.06] pb-2">
+        <span className="text-[9px] font-black uppercase tracking-[0.16em] text-zinc-500">Main desk trade signal</span>
+        <div className="flex flex-wrap items-center gap-2">
+          {view.tpHitProbPct != null ? (
+            <span
+              className={`rounded-lg border px-2 py-0.5 font-mono text-[10px] font-black tabular-nums ${
+                view.tpHitProbPct >= 55
+                  ? 'border-emerald-600/45 bg-emerald-950/40 text-emerald-100'
+                  : view.tpHitProbPct >= 35
+                    ? 'border-amber-600/45 bg-amber-950/40 text-amber-50'
+                    : 'border-rose-600/45 bg-rose-950/40 text-rose-50'
+              }`}
+            >
+              TP {view.tpHitProbPct}%
+            </span>
+          ) : null}
+          <span className="font-mono text-[10px] font-bold tabular-nums text-zinc-400">{view.readinessPct}% ready</span>
+        </div>
+      </div>
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="flex min-w-0 flex-1 items-start gap-2 sm:gap-3">
           <span className="select-none text-2xl leading-none sm:text-3xl" aria-hidden>
@@ -1870,13 +1976,29 @@ function NowPriceHeroSignalBanner(props: { view: NowPriceHeroView }): ReactEleme
             </div>
             <p className="mt-1 text-[13px] font-bold leading-snug text-zinc-100 sm:text-sm">{view.subline}</p>
             {view.detail ? (
-              <p className="mt-1 max-w-3xl text-[11px] leading-snug text-zinc-400">{view.detail}</p>
+              <p className="mt-1.5 rounded-lg border border-black/30 bg-black/25 px-2.5 py-2 text-[11px] font-semibold leading-snug text-zinc-200">
+                {view.detail}
+              </p>
+            ) : null}
+            {view.blockers.length > 0 ? (
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {view.blockers.map((b) => (
+                  <span
+                    key={b}
+                    className="rounded-md border border-amber-600/40 bg-amber-950/35 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-amber-100/90"
+                  >
+                    {b}
+                  </span>
+                ))}
+              </div>
             ) : null}
             {view.edgePp != null || view.jumpGainCents != null || view.projJumpCents1m != null ? (
               <div className="mt-2.5 flex flex-wrap gap-2">
                 {view.edgePp != null ? (
                   <div className="rounded-lg border border-black/35 bg-black/35 px-2.5 py-2 sm:min-w-[5.5rem]">
-                    <div className="text-[8px] font-bold uppercase tracking-[0.12em] text-zinc-500">Edge</div>
+                    <div className="text-[8px] font-bold uppercase tracking-[0.12em] text-zinc-500">
+                      {view.edgePp >= 3 ? 'Edge' : view.edgePp <= 0 ? 'Rich vs model' : 'Thin edge'}
+                    </div>
                     <div
                       className={`mt-0.5 font-mono text-lg font-black tabular-nums sm:text-xl ${
                         view.tone === 'up' ? 'text-emerald-300' : view.tone === 'down' ? 'text-rose-300' : 'text-zinc-200'
@@ -2557,6 +2679,12 @@ export function NowPriceSignalsPanel(props: {
     });
   }, [probTicksUpEarly, probTicksDownEarly, lastProbUp, lastProbDown, tape?.netPressure]);
 
+  const pricePredictionDisplay = useMemo(() => {
+    if (!pricePrediction) return null;
+    if (!contractProbGrid) return pricePrediction;
+    return enrichPricePredictionWithContracts(pricePrediction, contractProbGrid, upLabel, downLabel);
+  }, [pricePrediction, contractProbGrid, upLabel, downLabel]);
+
   const normLive = useMemo(
     () => normalizeBinaryFlexible(lastProbUp, lastProbDown),
     [lastProbUp, lastProbDown],
@@ -2874,18 +3002,7 @@ export function NowPriceSignalsPanel(props: {
     downLabel,
   ]);
 
-  const [execConfirm, setExecConfirm] = useState<ExecutionConfirmState | null>(null);
-  useEffect(() => {
-    if (!executionInputBase) return;
-    setExecConfirm((prev) => updateExecutionConfirm(prev, executionInputBase, Date.now()));
-  }, [executionInputBase]);
-  useEffect(() => {
-    if (!executionInputBase) return;
-    const id = window.setInterval(() => {
-      setExecConfirm((prev) => updateExecutionConfirm(prev, executionInputBase, Date.now()));
-    }, 1000);
-    return () => window.clearInterval(id);
-  }, [executionInputBase]);
+  const execConfirm = useExecutionConfirmTracker(executionInputBase);
 
   const executionSignal = useMemo(() => {
     if (!executionInputBase) return null;
@@ -2895,11 +3012,123 @@ export function NowPriceSignalsPanel(props: {
     });
   }, [executionInputBase, execConfirm?.confirmHeldMs]);
 
+  const entryMoment = useMemo(
+    () =>
+      computeEntryMoment({
+        advisory: buySideAdvisory ?? null,
+        execution: executionSignal,
+        machine: machineReadout ?? null,
+        pressureTiming: pressureBuildup?.timing ?? null,
+        contractLead: pressureBuildup?.contractLead ?? null,
+        upLabel,
+        downLabel,
+      }),
+    [buySideAdvisory, executionSignal, machineReadout, pressureBuildup?.timing, pressureBuildup?.contractLead, upLabel, downLabel],
+  );
+
   const speedHint = pressureBuildup
     ? pressureBuildupShortLabel(pressureBuildup)
     : directionScore
       ? directionScoreShortLabel(directionScore)
       : null;
+
+  const tradeCall = edgeScalp
+    ? edgeScalp.scalpSignal === 'LONG_UP'
+      ? `LONG ${upLabel}`
+      : edgeScalp.scalpSignal === 'LONG_DOWN'
+        ? `LONG ${downLabel}`
+        : 'NO TRADE'
+    : machineReadout?.focusLane
+      ? `LEAN ${machineReadout.focusLane === 'up' ? upLabel : downLabel}`
+      : 'WAIT';
+
+  const heroMetricsCtx: HeroMetricsCtx = useMemo(
+    () => ({
+      directionEngine,
+      bilateral: bilateralEdgeSnap,
+      jumps: contractEarlyJumps,
+      contractLag,
+    }),
+    [directionEngine, bilateralEdgeSnap, contractEarlyJumps, contractLag],
+  );
+
+  const heroActiveLanePre = useMemo(
+    () =>
+      resolveHeroLane({
+        executionSignal,
+        directionEngine,
+        tradeCall,
+        upLabel,
+        downLabel,
+      }),
+    [executionSignal, directionEngine, tradeCall, upLabel, downLabel],
+  );
+
+  const favoredTpOutlook = useMemo(() => {
+    if (!heroActiveLanePre) return null;
+    return laneTpOutlook({
+      lane: heroActiveLanePre,
+      touch: heroActiveLanePre === 'up' ? bookTouchUp : bookTouchDown,
+      mid01: heroActiveLanePre === 'up' ? pMktUp : pMktDown,
+      probSeries: heroActiveLanePre === 'up' ? probUp : probDown,
+      endsInMs,
+    });
+  }, [heroActiveLanePre, bookTouchUp, bookTouchDown, pMktUp, pMktDown, probUp, probDown, endsInMs]);
+
+  const deskTradeSignal = useMemo(
+    () =>
+      buildNowPriceDeskTradeSignal({
+        execution: executionSignal,
+        entryMoment,
+        advisory: buySideAdvisory ?? null,
+        directionEngine,
+        tpOutlook: favoredTpOutlook,
+        contractLead: pressureBuildup?.contractLead ?? null,
+        pressureTiming: pressureBuildup?.timing ?? null,
+        upLabel,
+        downLabel,
+      }),
+    [executionSignal, entryMoment, buySideAdvisory, directionEngine, favoredTpOutlook, pressureBuildup?.contractLead, pressureBuildup?.timing, upLabel, downLabel],
+  );
+
+  const aheadPlaybook = useMemo(() => {
+    const lane = deskTradeSignal.lane ?? heroActiveLanePre;
+    const touch = lane === 'up' ? bookTouchUp : lane === 'down' ? bookTouchDown : null;
+    return buildDeskAheadPlaybook({
+      signal: deskTradeSignal,
+      entryMoment,
+      contractLead: pressureBuildup?.contractLead ?? null,
+      pressureTiming: pressureBuildup?.timing ?? null,
+      bandGauge: bandGauge ?? null,
+      band: bandDistances,
+      execution: executionSignal,
+      advisory: buySideAdvisory ?? null,
+      bid01: touch?.bestBid ?? null,
+      ask01: touch?.bestAsk ?? null,
+    });
+  }, [
+    deskTradeSignal,
+    entryMoment,
+    pressureBuildup?.contractLead,
+    pressureBuildup?.timing,
+    bandGauge,
+    bandDistances,
+    executionSignal,
+    buySideAdvisory,
+    heroActiveLanePre,
+    bookTouchUp,
+    bookTouchDown,
+  ]);
+
+  const heroSignal = useMemo(
+    () => ({
+      ...deskTradeSignalToHeroView(deskTradeSignal, heroMetricsCtx),
+      aheadPlaybook,
+    }),
+    [deskTradeSignal, heroMetricsCtx, aheadPlaybook],
+  );
+
+  const heroActiveLane: 'up' | 'down' | null = deskTradeSignal.lane ?? heroActiveLanePre;
 
   if (spotLast == null || priceToBeat == null || bandDistances == null || !glance) {
     return (
@@ -2912,51 +3141,20 @@ export function NowPriceSignalsPanel(props: {
   const geoTone: GlanceTone =
     bandDistances.geo === 'ABOVE' ? 'up' : bandDistances.geo === 'BELOW' ? 'down' : 'warn';
 
-  const tradeCall = edgeScalp
-    ? edgeScalp.scalpSignal === 'LONG_UP'
-      ? `LONG ${upLabel}`
-      : edgeScalp.scalpSignal === 'LONG_DOWN'
-        ? `LONG ${downLabel}`
-        : 'NO TRADE'
-    : machineReadout?.focusLane
-      ? `LEAN ${machineReadout.focusLane === 'up' ? upLabel : downLabel}`
-      : 'WAIT';
-
-  const heroSignal = buildNowPriceHeroView({
-    executionSignal,
-    directionEngine,
-    tradeCall,
-    upLabel,
-    downLabel,
-    metricsCtx: {
-      directionEngine,
-      bilateral: bilateralEdgeSnap,
-      jumps: contractEarlyJumps,
-      contractLag,
-    },
-  });
-
-  const heroActiveLane: 'up' | 'down' | null =
-    executionSignal?.verdict === 'ENTER_UP' || directionEngine?.verdict === 'ENTER_UP'
-      ? 'up'
-      : executionSignal?.verdict === 'ENTER_DOWN' || directionEngine?.verdict === 'ENTER_DOWN'
-        ? 'down'
-        : directionEngine?.proposedLane ??
-          (tradeCall.includes(upLabel) ? 'up' : tradeCall.includes(downLabel) ? 'down' : null);
-
-  const machineHint =
-    machineReadout != null
-      ? `${machineReadout.agreementScore}% ${machineReadout.focusLane?.toUpperCase() ?? 'SPLIT'}`
-      : null;
-
   const headlineEdgePp =
     upEdgePp(binaryBias?.probUp ?? null, pMktUp) ??
     (edgeScalp?.edge != null ? edgeScalp.edge * 100 : null) ??
     fairValueGap?.rawGapPp ??
     null;
 
+  const machineHint =
+    machineReadout != null
+      ? `${machineReadout.agreementScore}% ${machineReadout.focusLane?.toUpperCase() ?? 'SPLIT'}`
+      : null;
+
   return (
     <div className="flex min-w-0 flex-col gap-3 rounded-2xl border border-zinc-800/60 bg-[#0b1018] p-3 sm:p-4">
+      <DeskCatchStrip playbook={heroSignal.aheadPlaybook} />
       <NowPriceHeroSignalBanner view={heroSignal} />
 
       <NowPriceQuickContextStrip
@@ -2992,6 +3190,10 @@ export function NowPriceSignalsPanel(props: {
         bookTouchDown={bookTouchDown}
         endsInMs={endsInMs}
         leanLane={heroActiveLane}
+        entryMoment={entryMoment}
+        deskTradeSignal={deskTradeSignal}
+        contractLead={pressureBuildup?.contractLead ?? null}
+        pressureTiming={pressureBuildup?.timing ?? null}
       />
 
       <details className="rounded-xl border border-zinc-800/50 bg-zinc-950/30 px-3 py-2">
@@ -3016,9 +3218,9 @@ export function NowPriceSignalsPanel(props: {
         </div>
       </details>
 
-      {pricePrediction ? (
+      {pricePredictionDisplay ? (
         <PricePredictionSignalCard
-          signal={pricePrediction}
+          signal={pricePredictionDisplay}
           contractProb={contractProbGrid}
           upLabel={upLabel}
           downLabel={downLabel}

@@ -43,6 +43,10 @@ export type BuySideAdvisory = {
   mid: number | null;
   /** Score breakdown for transparency. */
   scores: { up: number; down: number };
+  /** 0–100 agreement-weighted conviction on the pick (numeric). */
+  confidencePct: number;
+  /** 0–100 directional momentum on the favored side (margin + tape/forecast). */
+  momentumScore: number;
   /** True when the advisory is stale (stability shows whipsaw or freshly flipped). */
   cautionFresh: boolean;
 };
@@ -103,6 +107,8 @@ const NEITHER_ADVISORY: BuySideAdvisory = {
   winProb: null,
   mid: null,
   scores: { up: 0, down: 0 },
+  confidencePct: 0,
+  momentumScore: 0,
   cautionFresh: false,
 };
 
@@ -112,6 +118,50 @@ function label(lane: 'up' | 'down', upLabel?: string, downLabel?: string): strin
 
 function cap(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
+}
+
+function computeMomentumScore(args: {
+  scores: LaneScores;
+  winner: 'up' | 'down' | null;
+  tape: TapeVelocity | null;
+  tapeLane: 'up' | 'down' | null;
+  forecast: SwitchForecast | null;
+}): number {
+  const { scores, winner, tape, tapeLane, forecast } = args;
+  const total = scores.up + scores.down;
+  const absMargin = Math.abs(scores.up - scores.down);
+  let mom = total > 0 ? cap((absMargin / total) * 72, 0, 72) : 0;
+  mom += cap(absMargin * 3.5, 0, 18);
+  if (winner && tape?.reliable && tapeLane) {
+    const tl = tapeLaneVote(tapeLane, tape.dominance);
+    if (tl === winner) {
+      mom += tape.burst === 'extreme' ? 12 : tape.burst === 'aggressive' ? 8 : 4;
+      if (tape.acceleration === 'surging') mom += 6;
+      else if (tape.acceleration === 'building') mom += 3;
+    } else if (tl) {
+      mom -= 10;
+    }
+  }
+  if (
+    winner &&
+    forecast &&
+    forecast.lane === winner &&
+    (forecast.status === 'GO_IN' || forecast.status === 'SWITCH_INCOMING')
+  ) {
+    mom += forecast.confidence === 'HIGH' ? 10 : forecast.confidence === 'MED' ? 6 : 3;
+  }
+  return Math.round(cap(mom, 0, 100));
+}
+
+function confidencePctFromAgreement(
+  agreementScore: number,
+  confidence: BuySideConfidence,
+  verdict: BuySideVerdict,
+): number {
+  if (verdict === 'NEITHER') return Math.round(cap(agreementScore * 0.55, 0, 45));
+  if (confidence === 'HIGH') return Math.round(cap(agreementScore, 72, 100));
+  if (confidence === 'MED') return Math.round(cap(agreementScore * 0.92, 48, 88));
+  return Math.round(cap(agreementScore * 0.78, 18, 62));
 }
 
 type LaneScores = { up: number; down: number };
@@ -249,6 +299,8 @@ function shouldBuyWhichSideFromBook(input: ShouldBuyInput): BuySideAdvisory {
     return {
       ...NEITHER_ADVISORY,
       scores,
+      confidencePct: confidencePctFromAgreement(agreementScore, 'LOW', 'NEITHER'),
+      momentumScore: computeMomentumScore({ scores, winner: null, tape, tapeLane, forecast: input.forecast ?? null }),
       reasons,
       recommendation: reasons[0] ?? 'No clear side from the book yet.',
       cautionFresh: stability?.warnFresh === true || stability?.whipsaw === true,
@@ -309,6 +361,14 @@ function shouldBuyWhichSideFromBook(input: ShouldBuyInput): BuySideAdvisory {
     winProb: winProb ?? null,
     mid: winMid ?? null,
     scores,
+    confidencePct: confidencePctFromAgreement(agreementScore, confidence, winner === 'up' ? 'BUY_UP' : 'BUY_DOWN'),
+    momentumScore: computeMomentumScore({
+      scores,
+      winner,
+      tape,
+      tapeLane,
+      forecast: input.forecast ?? null,
+    }),
     cautionFresh: stability?.warnFresh === true || stability?.whipsaw === true,
   };
 }
@@ -413,6 +473,8 @@ export function shouldBuyWhichSide(input: ShouldBuyInput): BuySideAdvisory {
     return {
       ...NEITHER_ADVISORY,
       scores,
+      confidencePct: confidencePctFromAgreement(machine.agreementScore, 'LOW', 'NEITHER'),
+      momentumScore: computeMomentumScore({ scores, winner: null, tape, tapeLane, forecast }),
       reasons,
       recommendation: reasons[0] ?? 'No clear edge on either side.',
       cautionFresh: stability?.warnFresh === true || stability?.whipsaw === true,
@@ -498,6 +560,12 @@ export function shouldBuyWhichSide(input: ShouldBuyInput): BuySideAdvisory {
     winProb: edgeInfo?.pWin ?? null,
     mid: edgeInfo?.mid ?? null,
     scores,
+    confidencePct: confidencePctFromAgreement(
+      machine.agreementScore,
+      confidence,
+      winner === 'up' ? 'BUY_UP' : 'BUY_DOWN',
+    ),
+    momentumScore: computeMomentumScore({ scores, winner, tape, tapeLane, forecast }),
     cautionFresh,
   };
 }

@@ -831,7 +831,10 @@ function lockBucketPtb(cacheKey: string, out: { value: number; source: string })
   return out;
 }
 
-async function tryRtdsBucketPtb(bucket: { symbol: string; bucketStartMs: number }): Promise<{ value: number; source: string } | null> {
+async function tryRtdsBucketPtb(
+  bucket: { symbol: string; bucketStartMs: number },
+  opts?: { maxWaitMs?: number },
+): Promise<{ value: number; source: string } | null> {
   const cacheKey = bucketPtbCacheKey(bucket.symbol, bucket.bucketStartMs);
   const locked = ptbByBucketCache.get(cacheKey);
   if (locked && isLockedPtbSource(locked.source)) return locked;
@@ -861,7 +864,9 @@ async function tryRtdsBucketPtb(bucket: { symbol: string; bucketStartMs: number 
   const justOpened = bucketOpen && now - bucket.bucketStartMs < 45_000;
   const bucketAgeMs = Math.max(0, now - bucket.bucketStartMs);
   const openGraceMs = openTickGraceMsForBucket(bucketAgeMs);
-  const maxWaitMs = justOpened ? 18_000 : bucketAgeMs > 120_000 ? 12_000 : 8_000;
+  const defaultMaxWaitMs = justOpened ? 18_000 : bucketAgeMs > 120_000 ? 12_000 : 8_000;
+  const maxWaitMs =
+    opts?.maxWaitMs != null ? Math.min(Math.max(500, opts.maxWaitMs), defaultMaxWaitMs) : defaultMaxWaitMs;
   const deadline = Date.now() + maxWaitMs;
 
   const tryDerive = (): { value: number; source: string } | null => {
@@ -1280,12 +1285,29 @@ async function replyUpdownShortcut(
   const trading_slug = await resolveUpdownTradingSlug(live, interval);
   let marketOut: unknown | undefined;
   if (market) {
-    const norm = normalizeMarket(market) as Record<string, unknown>;
-    marketOut = norm;
     const liveKey = live.toLowerCase();
     const tradeKey = trading_slug.trim().toLowerCase();
-    marketBySlugCache.set(liveKey, cacheSet(norm));
-    if (tradeKey && tradeKey !== liveKey) marketBySlugCache.set(tradeKey, cacheSet(norm));
+    const liveNorm = normalizeMarket(market) as Record<string, unknown>;
+    marketBySlugCache.set(liveKey, cacheSet(liveNorm));
+    if (tradeKey && tradeKey !== liveKey) {
+      try {
+        const tradeMarket = await gammaMarketCached(trading_slug);
+        if (tradeMarket) {
+          const tradeNorm = normalizeMarket(tradeMarket) as Record<string, unknown>;
+          marketOut = tradeNorm;
+          marketBySlugCache.set(tradeKey, cacheSet(tradeNorm));
+        } else {
+          marketOut = liveNorm;
+          marketBySlugCache.set(tradeKey, cacheSet(liveNorm));
+        }
+      } catch {
+        marketOut = liveNorm;
+        marketBySlugCache.set(tradeKey, cacheSet(liveNorm));
+      }
+    } else {
+      marketOut = liveNorm;
+      if (tradeKey) marketBySlugCache.set(tradeKey, cacheSet(liveNorm));
+    }
   }
   const payload: Record<string, unknown> = {
     ...data,
@@ -1788,6 +1810,39 @@ app.get('/api/clob/book/:token', async (req, res) => {
 const PTB_BY_SLUG_CACHE_MS = 90_000;
 const ptbBySlugCache = new Map<string, CacheEntry<{ price_to_beat: number; source: string }>>();
 
+type PtbOut = { value: number; source: string };
+
+/** Return as soon as page or RTDS hits; prefer page when both succeed. Do not wait for slow RTDS after page wins. */
+async function coalesceBucketPtb(pageP: Promise<PtbOut | null>, rtdsP: Promise<PtbOut | null>): Promise<PtbOut | null> {
+  return new Promise((resolve) => {
+    let pageOut: PtbOut | null = null;
+    let rtdsOut: PtbOut | null = null;
+    let pageDone = false;
+    let rtdsDone = false;
+    const tryFinish = () => {
+      if (pageOut) {
+        resolve(pageOut);
+        return;
+      }
+      if (pageDone && rtdsOut) {
+        resolve(rtdsOut);
+        return;
+      }
+      if (pageDone && rtdsDone) resolve(null);
+    };
+    void pageP.then((r) => {
+      pageOut = r;
+      pageDone = true;
+      tryFinish();
+    });
+    void rtdsP.then((r) => {
+      rtdsOut = r;
+      rtdsDone = true;
+      tryFinish();
+    });
+  });
+}
+
 app.get('/api/price-to-beat/:slug', async (req, res) => {
   const raw = String(req.params.slug ?? '').trim();
   const slug = normalizeMarketLookupRef(raw);
@@ -1805,27 +1860,50 @@ app.get('/api/price-to-beat/:slug', async (req, res) => {
     }
   }
 
-  let ssrErr: unknown = null;
-  const pageP = tryPolymarketPagePtb(slug, POLYMARKET_WEB);
-  const ssrP = bucket
-    ? Promise.resolve(null)
-    : tryPriceToBeat(slug).catch((e) => {
-        ssrErr = e;
-        return null;
-      });
-  const rtdsP = bucket ? tryRtdsBucketPtb(bucket) : Promise.resolve(null);
+  if (bucket) {
+    const bKey = bucketPtbCacheKey(bucket.symbol, bucket.bucketStartMs);
+    const locked = ptbByBucketCache.get(bKey);
+    if (locked && isLockedPtbSource(locked.source)) {
+      const payload = { price_to_beat: locked.value, source: locked.source };
+      ptbBySlugCache.set(cacheKey, cacheSet(payload));
+      return json(res, 200, { ok: true, data: { slug, ...payload } });
+    }
+  }
 
-  const [rtdsOut, pageOut, ssrOut] = await Promise.all([rtdsP, pageP, ssrP]);
-  const chosen = rtdsOut ?? pageOut ?? ssrOut;
-  if (chosen) {
-    const preview = chosen.source === 'rtds_chainlink_preview_pre_open';
+  let ssrErr: unknown = null;
+
+  const finishPtb = (out: { value: number; source: string }) => {
+    if (bucket) lockBucketPtb(bucketPtbCacheKey(bucket.symbol, bucket.bucketStartMs), out);
+    const preview = out.source === 'rtds_chainlink_preview_pre_open';
     const payload = {
-      price_to_beat: chosen.value,
-      source: chosen.source,
+      price_to_beat: out.value,
+      source: out.source,
       ...(preview && bucket ? { preview: true, opens_at_ms: bucket.bucketStartMs } : {}),
     };
-    if (!preview) ptbBySlugCache.set(cacheKey, cacheSet({ price_to_beat: chosen.value, source: chosen.source }));
+    if (!preview) ptbBySlugCache.set(cacheKey, cacheSet({ price_to_beat: out.value, source: out.source }));
     return json(res, 200, { ok: true, data: { slug, ...payload } });
+  };
+
+  if (bucket) {
+    const chosen = await coalesceBucketPtb(
+      tryPolymarketPagePtb(slug, POLYMARKET_WEB),
+      tryRtdsBucketPtb(bucket, { maxWaitMs: 8_000 }),
+    );
+    if (chosen) return finishPtb(chosen);
+  } else {
+    const pageOut = await tryPolymarketPagePtb(slug, POLYMARKET_WEB);
+    if (pageOut) return finishPtb(pageOut);
+  }
+
+  if (!bucket) {
+    try {
+      const ssrOut = await tryPriceToBeat(slug);
+      const payload = { price_to_beat: ssrOut.value, source: ssrOut.source };
+      ptbBySlugCache.set(cacheKey, cacheSet(payload));
+      return json(res, 200, { ok: true, data: { slug, ...payload } });
+    } catch (e) {
+      ssrErr = e;
+    }
   }
 
   return json(res, 502, {
@@ -1833,7 +1911,7 @@ app.get('/api/price-to-beat/:slug', async (req, res) => {
     error: 'price_to_beat_failed',
     details: {
       slug,
-      err: String(ssrErr ?? 'no_ssr_or_rtds_ptb'),
+      err: String(ssrErr ?? 'no_page_rtds_or_ssr_ptb'),
       ...(bucket != null && Date.now() < bucket.bucketStartMs ? { window_opens_at_ms: bucket.bucketStartMs } : {}),
     },
   });

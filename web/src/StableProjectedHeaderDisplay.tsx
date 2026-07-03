@@ -1,15 +1,7 @@
 import { useRef, type ReactElement } from 'react';
 import type { OutcomeProbDisplay, StableProjectedHeaderSnapshot } from './chartStableProjectedHeader';
 import { stableProjectedHeaderKey } from './chartStableProjectedHeader';
-
-function fmtUsd(n: number): string {
-  return `$${n.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
-}
-
-function fmtUsdSigned(n: number): string {
-  const s = n >= 0 ? '+' : '-';
-  return `${s}$${Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
-}
+import { fmtSpotUsd, fmtSpotUsdSigned } from './fmtSpotUsd';
 
 function OutcomeChip(props: { side: OutcomeProbDisplay; variant: 'up' | 'down' }): ReactElement {
   const { side, variant } = props;
@@ -63,8 +55,7 @@ export function useStableProjectedHeaderDisplay(
 }
 
 function fmtDistFromPtb(n: number): string {
-  const s = n >= 0 ? '+' : '-';
-  return `${s}$${Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+  return fmtSpotUsdSigned(n);
 }
 
 function ConfirmedBandChip(props: {
@@ -83,8 +74,8 @@ function ConfirmedBandChip(props: {
       }`}
       title={
         isAbove
-          ? `Confirmed UP break line — ${fmtDistFromPtb(distFromPtb)} from PTB (${fmtUsd(props.ptbUsd)})`
-          : `Confirmed DOWN break line — ${fmtDistFromPtb(-distFromPtb)} from PTB (${fmtUsd(props.ptbUsd)})`
+          ? `Confirmed UP break line — ${fmtDistFromPtb(distFromPtb)} from PTB (${fmtSpotUsd(props.ptbUsd)})`
+          : `Confirmed DOWN break line — ${fmtDistFromPtb(-distFromPtb)} from PTB (${fmtSpotUsd(props.ptbUsd)})`
       }
     >
       <span
@@ -98,7 +89,7 @@ function ConfirmedBandChip(props: {
         {isAbove ? fmtDistFromPtb(distFromPtb) : fmtDistFromPtb(-distFromPtb)}
       </span>
       <span className="text-[8px] font-semibold uppercase tracking-[0.08em] text-zinc-500/90">from PTB</span>
-      <span className="font-mono text-[10px] tabular-nums text-zinc-400">{fmtUsd(props.priceUsd)}</span>
+      <span className="font-mono text-[10px] tabular-nums text-zinc-400">{fmtSpotUsd(props.priceUsd)}</span>
     </div>
   );
 }
@@ -119,7 +110,7 @@ function NowBandDistanceChip(props: {
   return (
     <div
       className="flex flex-col rounded-lg border border-zinc-700/55 bg-zinc-900/40 px-2 py-1 text-zinc-100"
-      title={`Now vs PTB ${fmtUsd(ptbUsd)} · Confirmed above ${fmtUsd(bandHi)} · Confirmed below ${fmtUsd(bandLo)}`}
+      title={`Now vs PTB ${fmtSpotUsd(ptbUsd)} · Confirmed above ${fmtSpotUsd(bandHi)} · Confirmed below ${fmtSpotUsd(bandLo)}`}
     >
       <span className="text-[8px] font-bold uppercase tracking-[0.12em] text-zinc-400">Now vs PTB</span>
       <span
@@ -131,10 +122,10 @@ function NowBandDistanceChip(props: {
       </span>
       <div className="mt-0.5 flex flex-col gap-0.5">
         <span className="font-mono text-[10px] tabular-nums text-emerald-300/90">
-          {aboveClear ? `↑ clear +${fmtUsd(Math.abs(toAbove))}` : `↑ ${fmtUsd(toAbove)} to above`}
+          {aboveClear ? `↑ clear +${fmtSpotUsd(Math.abs(toAbove))}` : `↑ ${fmtSpotUsd(toAbove)} to above`}
         </span>
         <span className="font-mono text-[10px] tabular-nums text-rose-300/90">
-          {belowClear ? `↓ clear +${fmtUsd(Math.abs(toBelow))}` : `↓ ${fmtUsd(toBelow)} to below`}
+          {belowClear ? `↓ clear +${fmtSpotUsd(Math.abs(toBelow))}` : `↓ ${fmtSpotUsd(toBelow)} to below`}
         </span>
       </div>
     </div>
@@ -160,14 +151,14 @@ export function StableProjectedHeaderDisplay(props: {
       <div className="min-w-0">
         <div className="text-[9px] font-bold uppercase tracking-[0.14em] text-zinc-400">Now</div>
         <div className="font-mono text-2xl font-semibold tabular-nums tracking-tight text-zinc-50 sm:text-3xl">
-          {fmtUsd(nowUsd)}
+          {fmtSpotUsd(nowUsd)}
         </div>
         <div className="mt-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
           <span className="text-[9px] font-bold uppercase tracking-[0.14em] text-indigo-300/80">
             Proj {s.horizonSec}s
           </span>
           <span className="font-mono text-sm font-semibold tabular-nums text-zinc-300 sm:text-base">
-            {fmtUsd(s.projectedSpotUsd)}
+            {fmtSpotUsd(s.projectedSpotUsd)}
           </span>
           <span
             className={`text-xs font-semibold tabular-nums sm:text-sm ${
@@ -175,7 +166,7 @@ export function StableProjectedHeaderDisplay(props: {
             }`}
             title="Projected move vs current spot (stable, not tick noise)"
           >
-            {fmtUsdSigned(deltaVsNowUsd)}
+            {fmtSpotUsdSigned(deltaVsNowUsd)}
           </span>
         </div>
       </div>

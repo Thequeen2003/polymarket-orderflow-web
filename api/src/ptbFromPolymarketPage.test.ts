@@ -1,5 +1,29 @@
 import { describe, expect, it } from 'vitest';
-import { tryPolymarketPagePtb } from './ptbFromPolymarketPage.js';
+import { parsePolymarketPagePtbFromHtml, tryPolymarketPagePtb } from './ptbFromPolymarketPage.js';
+
+describe('parsePolymarketPagePtbFromHtml', () => {
+  it('parses locked priceToBeat from embedded event JSON', () => {
+    const out = parsePolymarketPagePtbFromHtml('<script>{"priceToBeat":61883.2293952956}</script>');
+    expect(out?.value).toBeCloseTo(61883.2293952956, 4);
+    expect(out?.source).toBe('polymarket_page_price_to_beat');
+  });
+
+  it('parses active-window openPrice when closePrice is still null', () => {
+    const out = parsePolymarketPagePtbFromHtml(
+      '{"state":{"data":{"openPrice":63520.44797620156,"closePrice":null}}}',
+    );
+    expect(out?.value).toBeCloseTo(63520.44797620156, 4);
+    expect(out?.source).toBe('polymarket_page_open_price');
+  });
+
+  it('prefers priceToBeat over openPrice when both are present', () => {
+    const out = parsePolymarketPagePtbFromHtml(
+      '{"priceToBeat":76611.31,"openPrice":63520.44,"closePrice":null}',
+    );
+    expect(out?.value).toBeCloseTo(76611.31, 2);
+    expect(out?.source).toBe('polymarket_page_price_to_beat');
+  });
+});
 
 describe('tryPolymarketPagePtb', () => {
   it('parses priceToBeat from embedded event JSON', async () => {

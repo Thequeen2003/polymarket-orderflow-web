@@ -58,7 +58,7 @@ export function updateStableTakeSignalPlan(
   const meaningKey = takeSignalPlanMeaningKey(live);
   if (!prev) return { displayed: live, meaningKey, sinceMs: nowMs };
   if (meaningKey === prev.meaningKey) {
-    return { displayed: live, meaningKey, sinceMs: prev.sinceMs };
+    return prev;
   }
   if (nowMs - prev.sinceMs < holdMs) {
     return prev;

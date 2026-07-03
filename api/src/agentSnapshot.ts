@@ -189,7 +189,7 @@ async function resolvePtb(
     bucket ? deps.tryRtdsBucketPtb(bucket) : Promise.resolve(null),
     deps.tryPolymarketPagePtb(slug).catch(() => null),
   ]);
-  const chosen = rtds ?? page ?? ssr;
+  const chosen = page ?? rtds ?? ssr;
   if (!chosen) return null;
   return {
     priceToBeatUsd: chosen.value,

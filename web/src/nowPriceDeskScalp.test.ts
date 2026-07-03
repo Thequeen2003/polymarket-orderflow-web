@@ -21,6 +21,8 @@ const buyUpAdvisory: BuySideAdvisory = {
   winProb: 0.62,
   mid: 0.55,
   scores: { up: 3, down: 1 },
+  confidencePct: 78,
+  momentumScore: 64,
   cautionFresh: false,
 };
 
@@ -44,6 +46,7 @@ describe('resolveGlobalStopForEntry', () => {
       takeLossWhenDeskTpBelowEntry: false,
       autoDeskScalp: false,
       submitBuyOnTake: false,
+      checklistVisible: true,
     });
     expect(sl).toBe('40');
   });

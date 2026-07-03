@@ -54,9 +54,17 @@ import { buildMtfConsensus, type MtfConsensus } from './multiTimeframeConsensus'
 import { detectOverextension, type Overextension } from './overextensionDetector';
 import { computeLaneEdges, type LaneEdges } from './tradeEdgeCalculator';
 import { suggestLevelsForLane, resolveTradeLevelsForDirective, type TradeLevels } from './tradeLevels';
-import { updateStability, type DirectiveStability } from './directiveStability';
+import { useDirectiveStability } from './useDirectiveStability';
+import type { DirectiveStability } from './directiveStability';
 import { clearTrackedPointerCapture, trackPointerCapture } from './pointerCaptureSafety';
 import { detectDirectiveDiscrepancy, type DirectiveDiscrepancy } from './directiveDiscrepancyGuard';
+import {
+  bandGaugeMeaningKey,
+  machineReadoutMeaningKey,
+  noTradeScoreMeaningKey,
+  switchForecastMeaningKey,
+  tradeDirectiveMeaningKey,
+} from './signalsDeskStable';
 import {
   updateReEntryState,
   checkReEntry,
@@ -78,6 +86,7 @@ import { playBoomChime, primeBoomChime } from './boomChime';
 import { downloadJournalCsv } from './directiveJournal';
 import { RoundNote } from './RoundNote';
 import { classifyExitReason, updateReEntryStateWithReason } from './reEntryGuard';
+import { fmtSpotUsd, fmtSpotUsdAxis, fmtSpotUsdSigned } from './fmtSpotUsd';
 import { DeskClosePanel } from './DeskClosePanel';
 import { SpotPriceProjectionGrid, type PtbDirectionContext } from './SpotPriceProjectionGrid';
 import { computeStableProjectedHeader } from './chartStableProjectedHeader';
@@ -130,12 +139,11 @@ function isFiniteNumber(x: unknown): x is number {
 }
 
 function fmtUsd(n: number | null): string {
-  return n == null || !Number.isFinite(n) ? '—' : `$${n.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+  return fmtSpotUsd(n);
 }
 
 function fmtUsdSigned(n: number | null): string {
-  if (n == null || !Number.isFinite(n)) return '—';
-  return `${n >= 0 ? '+' : '-'}$${Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+  return fmtSpotUsdSigned(n);
 }
 
 function fmtUsdSignedTight(n: number | null): string {
@@ -149,16 +157,8 @@ function fmtPctSigned(n: number | null): string {
   return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
 }
 
-function fmtAxisPrice(p: number, opts?: { precise?: boolean }): string {
-  const a = Math.abs(p);
-  if (opts?.precise) {
-    // Wide zooms (1h / 4h): show full precision so a $40 move on $107k BTC is visible.
-    const digits = a >= 1_000 ? 2 : a >= 10 ? 3 : 4;
-    return `$${p.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
-  }
-  if (a >= 1_000_000) return `$${(p / 1_000_000).toFixed(2)}M`;
-  if (a >= 1_000) return `$${(p / 1_000).toFixed(2)}k`;
-  return `$${p.toFixed(2)}`;
+function fmtAxisPrice(p: number): string {
+  return fmtSpotUsdAxis(p);
 }
 
 /** `m:ss` countdown from remaining ms (market round). */
@@ -545,7 +545,7 @@ export function PtbOpportunityModeChart(props: {
       ? 'block h-full min-h-[min(26svh,320px)] max-h-[min(38svh,440px)] w-full rounded-[18px] bg-[#0a0f16] [contain:paint]'
       : chartAreaRoomy
         ? signalsEmbed
-          ? 'block h-auto w-full max-w-none rounded-[20px] bg-[#0a0f16]'
+          ? 'block h-full min-h-[min(52svh,520px)] w-full max-w-none rounded-[20px] bg-[#0a0f16]'
           : 'block h-full min-h-[min(68svh,1500px)] w-full max-w-none flex-1 rounded-[24px] bg-[#0a0f16] [contain:paint] xl:min-h-[min(74svh,1700px)]'
         : 'block h-full min-h-[min(54vh,620px)] max-h-[min(88vh,960px)] w-full rounded-[24px] bg-[#0a0f16] [contain:paint]';
   const chartSvgMain =
@@ -553,7 +553,7 @@ export function PtbOpportunityModeChart(props: {
       ? 'block h-full min-h-[min(26svh,320px)] max-h-[min(38svh,440px)] w-full rounded-[18px] bg-[#0a0f16] [contain:strict]'
       : chartAreaRoomy
         ? signalsEmbed
-          ? 'block h-auto w-full max-w-none rounded-[20px] bg-[#0a0f16]'
+          ? 'block h-full min-h-[min(52svh,520px)] w-full max-w-none rounded-[20px] bg-[#0a0f16]'
           : 'block h-full min-h-[min(68svh,1500px)] w-full max-w-none flex-1 rounded-[24px] bg-[#0a0f16] xl:min-h-[min(74svh,1700px)] [contain:strict]'
         : 'block h-full min-h-[min(54vh,620px)] max-h-[min(88vh,960px)] w-full rounded-[24px] bg-[#0a0f16] [contain:strict]';
   const gradId = useId().replace(/:/g, '');
@@ -717,7 +717,7 @@ export function PtbOpportunityModeChart(props: {
   const staleAfterMs = signalsEmbed ? 90_000 : 55_000;
   const [chartNow, setChartNow] = useState(() => Date.now());
   useEffect(() => {
-    const id = window.setInterval(() => setChartNow(Date.now()), 1_000);
+    const id = window.setInterval(() => setChartNow(Date.now()), 5_000);
     return () => window.clearInterval(id);
   }, []);
   const stale = feedLastMs == null ? pts.length < 2 : chartNow - feedLastMs > staleAfterMs;
@@ -1119,10 +1119,14 @@ export function PtbOpportunityModeChart(props: {
     wallFlow,
   ]);
 
+  const machineReadoutRef = useRef(machineReadout);
+  machineReadoutRef.current = machineReadout;
+  const machineReadoutKey = machineReadoutMeaningKey(machineReadout);
+
   useEffect(() => {
     if (!publishDesk) return;
-    onMachineReadout?.(machineReadout);
-  }, [publishDesk, machineReadout, onMachineReadout]);
+    onMachineReadout?.(machineReadoutRef.current);
+  }, [publishDesk, machineReadoutKey, onMachineReadout]);
 
   /**
    * Top-level "what should I actually do?" directive — fuses the machine readout
@@ -1140,15 +1144,23 @@ export function PtbOpportunityModeChart(props: {
     });
   }, [machineReadout, switchForecast, currentPositionLane, upLabel, downLabel]);
 
-  useEffect(() => {
-    if (!publishDesk) return;
-    onTradeDirective?.(tradeDirective);
-  }, [publishDesk, tradeDirective, onTradeDirective]);
+  const tradeDirectiveRef = useRef(tradeDirective);
+  tradeDirectiveRef.current = tradeDirective;
+  const tradeDirectiveKey = tradeDirectiveMeaningKey(tradeDirective);
 
   useEffect(() => {
     if (!publishDesk) return;
-    onSwitchForecast?.(switchForecast);
-  }, [publishDesk, switchForecast, onSwitchForecast]);
+    onTradeDirective?.(tradeDirectiveRef.current);
+  }, [publishDesk, tradeDirectiveKey, onTradeDirective]);
+
+  const switchForecastRef = useRef(switchForecast);
+  switchForecastRef.current = switchForecast;
+  const switchForecastKey = switchForecastMeaningKey(switchForecast);
+
+  useEffect(() => {
+    if (!publishDesk) return;
+    onSwitchForecast?.(switchForecastRef.current);
+  }, [publishDesk, switchForecastKey, onSwitchForecast]);
 
   /** Auto-suggested take-profit / stop-loss levels for the Answer card (directive lane, else best +EV book). */
   const tradeLevels: TradeLevels | null = useMemo(
@@ -1181,11 +1193,7 @@ export function PtbOpportunityModeChart(props: {
    * directive has been steady. Holds state via useState so the next render gets
    * the previous snapshot for change detection.
    */
-  const [directiveStability, setDirectiveStability] = useState<DirectiveStability | null>(null);
-  useEffect(() => {
-    if (!tradeDirective) return;
-    setDirectiveStability((prev) => updateStability(prev, tradeDirective, Date.now()));
-  }, [tradeDirective]);
+  const directiveStability = useDirectiveStability(tradeDirective, deskResetKey);
 
   /** Sensor-vs-directive discrepancy check for the warning stripe. */
   const directiveDiscrepancy: DirectiveDiscrepancy | null = useMemo(() => {
@@ -1331,10 +1339,12 @@ export function PtbOpportunityModeChart(props: {
     noTradeScoreRef.current = noTradeScore;
   }, [noTradeScore]);
 
+  const noTradeScoreKey = noTradeScoreMeaningKey(noTradeScore);
+
   useEffect(() => {
     if (!publishDesk) return;
-    onNoTradeScore?.(noTradeScore);
-  }, [publishDesk, onNoTradeScore, noTradeScore]);
+    onNoTradeScore?.(noTradeScoreRef.current);
+  }, [publishDesk, noTradeScoreKey, onNoTradeScore]);
 
   /**
    * Operator verdict — same fusion the trade card displays. Hoisted to the
@@ -2253,10 +2263,14 @@ export function PtbOpportunityModeChart(props: {
     });
   }, [model, priceToBeat, mode, derivedStrip, projection, upLabel, downLabel]);
 
+  const bandGaugeSnapshotKey = bandGaugeMeaningKey(bandGaugeSnapshot);
+  const bandGaugeSnapshotRef = useRef(bandGaugeSnapshot);
+  bandGaugeSnapshotRef.current = bandGaugeSnapshot;
+
   useEffect(() => {
     if (!publishDesk) return;
-    onBandGaugeSnapshot?.(bandGaugeSnapshot);
-  }, [publishDesk, bandGaugeSnapshot, onBandGaugeSnapshot]);
+    onBandGaugeSnapshot?.(bandGaugeSnapshotRef.current);
+  }, [publishDesk, bandGaugeSnapshotKey, onBandGaugeSnapshot]);
 
   if (!model) {
     const sk = skeleton;
@@ -3212,13 +3226,8 @@ export function PtbOpportunityModeChart(props: {
           ) : null}
 
           {(() => {
-            // On 15m+ windows show full prices ($107,234.50) at a larger font so you can
-            // actually see how small the move is. Right-anchor so longer labels grow into
-            // the gutter instead of overflowing past the SVG edge.
-            const precise = zoomWindow >= 900;
-            const tickFont = precise ? 14 : 11;
-            const tickX = precise ? width - 4 : width - padR + 6;
-            const tickAnchor: 'start' | 'end' = precise ? 'end' : 'start';
+            const tickFont = 12;
+            const tickX = width - 4;
             return tickPrices.map((tp, i) => (
               <g key={`grid-${i}`}>
                 <line x1={padL} x2={padL + innerW} y1={yPrice(tp)} y2={yPrice(tp)} stroke="rgba(39,39,42,0.8)" strokeWidth="1" />
@@ -3228,13 +3237,13 @@ export function PtbOpportunityModeChart(props: {
                   fill="rgb(228 228 231)"
                   fontSize={tickFont}
                   fontFamily="ui-monospace, monospace"
-                  fontWeight={precise ? 600 : 400}
-                  textAnchor={tickAnchor}
+                  fontWeight={600}
+                  textAnchor="end"
                   stroke="rgb(10 15 22)"
-                  strokeWidth={precise ? 2.4 : 0.6}
+                  strokeWidth={2.4}
                   paintOrder="stroke"
                 >
-                  {fmtAxisPrice(tp, { precise })}
+                  {fmtAxisPrice(tp)}
                 </text>
               </g>
             ));

@@ -4,6 +4,7 @@ import { describeSpot } from './liveContext';
 import type { BookSnapshot } from './orderflowMetrics';
 import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
 import { analyzePtbReaction, buildSpotCandles, candleStraddlesPtb } from './spotVsPtb';
+import { fmtSpotUsd, fmtSpotUsdSigned } from './fmtSpotUsd';
 
 export type SpotPoint = { t: number; v: number };
 
@@ -31,12 +32,11 @@ function toPath(points: { x: number; y: number }[]): string {
 }
 
 function fmtUsd(x: number): string {
-  return `$${x.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+  return fmtSpotUsd(x);
 }
 
 function fmtUsdSigned(x: number): string {
-  const s = x >= 0 ? '+' : '';
-  return `${s}${fmtUsd(x)}`;
+  return fmtSpotUsdSigned(x);
 }
 
 const BUCKET_N = 20;

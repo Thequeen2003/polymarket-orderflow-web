@@ -40,3 +40,12 @@ export function pickMarketSlug(m: unknown): string {
   if (typeof o.id === 'number' && Number.isFinite(o.id)) return String(o.id);
   return '';
 }
+
+/** Use shortcut `market` only when its Gamma slug matches the slug we are opening (avoids wrong CLOB tokens). */
+export function preloadedMarketForSlug(market: unknown, slug: string): unknown | undefined {
+  if (!market || typeof market !== 'object') return undefined;
+  const want = slug.trim().toLowerCase();
+  if (!want) return undefined;
+  const got = pickMarketSlug(market).trim().toLowerCase();
+  return got === want ? market : undefined;
+}

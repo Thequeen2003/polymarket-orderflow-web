@@ -97,6 +97,31 @@ describe('computePositionExitReadout', () => {
     expect(r.headline).toMatch(/EXIT now/i);
   });
 
+  it('returns exit_now when bracket call is sell_now (desk TP below entry)', () => {
+    const r = computePositionExitReadout({
+      heldLane: 'up',
+      directive: null,
+      forecast: null,
+      tape: tapeNeutral,
+      upLabel: 'UP',
+      downLabel: 'DOWN',
+      bracketCall: {
+        action: 'sell_now',
+        severity: 'danger',
+        reason: 'desk_tp_below_entry',
+        headline: 'Sell now — desk TP 52.0¢ fell below entry 55.0¢.',
+        detail: 'Live Targets collapsed under your avg entry.',
+        entryCents: 55,
+        armedTpCents: 62,
+        armedSlCents: 50,
+        liveDeskTpCents: 52,
+        bidCents: 54,
+      },
+    });
+    expect(r.band).toBe('exit_now');
+    expect(r.headline).toMatch(/desk TP/i);
+  });
+
   it('returns hold when exit is on the other lane', () => {
     const directive: TradeDirective = {
       action: 'EXIT',

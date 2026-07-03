@@ -49,8 +49,12 @@ import { PAPER_ACCOUNT_SYNC_EVENT } from './paperAccountSync';
 import { paperSettlementCaption } from './paperMarketSettlement';
 import { parseRestingOrderSnapshot } from './orderStatusParse';
 import { floorShares4, floorSharesWhole, floorUsdWhole, roundPrice01, roundShares4, roundUsd2 } from './tradingRound';
-import { computeHeldLaneTpOutlook, computePreBuyTpOutlook } from './positionTpOutlook';
+import { computePreBuyTpOutlook, computeHeldLaneTpOutlook, adjustTpOutlookWithMomentum } from './positionTpOutlook';
 import { PositionTpOutlookCard } from './PositionTpOutlookCard';
+import { computePositionBracketCall } from './positionBracketCall';
+import { buildPositionDeskSignal } from './positionDeskSignal';
+import { PositionDeskSignalStrip } from './PositionDeskSignalStrip';
+import { useDeskMomentumTracker } from './useDeskMomentumTracker';
 import { bullpenOutcomeForOrder } from './bullpenOutcome';
 import { formatTradeApiError } from './formatTradeApiError';
 import { bracketCentsStrTo01 } from './bracketCentsInput';
@@ -88,6 +92,7 @@ import { filledSharesFromRow, netMatchedSharesFromHistory, remainingSharesFromRo
 import { LiveTradingHud } from './LiveTradingHud';
 import { LivePositionStrip } from './LivePositionStrip';
 import { marketBuyUsdFromIntent } from './liveAggressiveBuy';
+import { submitLiveBracketExit } from './liveBracketExit';
 import { resolveLiveLaneShares, resolveLiveOutcomeShares } from './livePositionTruth';
 import { resolveLiveSellOutcome } from './liveSellOutcome';
 import { loadTradeAccountMode, saveTradeAccountMode } from './tradeAccountMode';
@@ -123,6 +128,7 @@ import {
 import {
   BPX_DESK_TOAST_EVENT,
   BPX_TRADE_SUBMIT_BUY_EVENT,
+  BPX_TRADE_SUBMIT_SELL_EVENT,
   BPX_TRADE_SYNC_SIZE_SHARES_EVENT,
 } from './takeSignalDesk';
 import {
@@ -1026,6 +1032,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const bracketOutcomeLaneRef = useRef<'up' | 'down' | null>(null);
   const deskAutoBuyClickedNonceRef = useRef<number | null>(null);
   const deskAutoBuyIngressRef = useRef<{ key: string; at: number } | null>(null);
+  const deskAutoSellClickedNonceRef = useRef<number | null>(null);
+  const deskAutoSellIngressRef = useRef<{ key: string; at: number } | null>(null);
   const applyArmRiskNowRef = useRef<(prefs?: ArmRiskAfterBuyPrefs) => void>(() => {});
   const buyRiskArmedRowIdsRef = useRef<Set<string>>(new Set());
   const buyReconcileToastRowIdsRef = useRef<Set<string>>(new Set());
@@ -1066,6 +1074,13 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     armSlTp?: boolean;
     sizeShares?: number;
     fromSignalsDesk?: boolean;
+  } | null>(null);
+  const [pendingAutoSell, setPendingAutoSell] = useState<{
+    lane: 'up' | 'down';
+    at: number;
+    sellNonce: number;
+    fromSignalsDesk?: boolean;
+    reason?: string;
   } | null>(null);
 
   useEffect(() => {
@@ -1303,11 +1318,47 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     return () => window.removeEventListener(BPX_TRADE_SUBMIT_BUY_EVENT, onSubmitBuy as EventListener);
   }, [controlledLane, downToken, onLaneChange, pushToast, upToken]);
 
+  useEffect(() => {
+    const onSubmitSell = (ev: Event) => {
+      const ce = ev as CustomEvent<{ lane?: 'up' | 'down'; reason?: string }>;
+      const d = ce.detail;
+      const submitLane = d?.lane;
+      if (submitLane !== 'up' && submitLane !== 'down') return;
+
+      const ingressKey = `${submitLane}|${d.reason ?? ''}`;
+      const ingressNow = Date.now();
+      const prevIngress = deskAutoSellIngressRef.current;
+      if (prevIngress && prevIngress.key === ingressKey && ingressNow - prevIngress.at < 12_000) return;
+      deskAutoSellIngressRef.current = { key: ingressKey, at: ingressNow };
+
+      deskBuyLaneRef.current = submitLane;
+      bracketOutcomeLaneRef.current = submitLane;
+      if (controlledLane == null) setLaneState(submitLane);
+      onLaneChange?.(submitLane);
+      setAction('sell');
+      setShowAdvanced(false);
+      setErr(null);
+      setOkMsg(null);
+      deskAutoSellClickedNonceRef.current = null;
+      setPendingAutoSell({
+        lane: submitLane,
+        at: ingressNow,
+        sellNonce: ingressNow,
+        fromSignalsDesk: true,
+        reason: d.reason,
+      });
+    };
+
+    window.addEventListener(BPX_TRADE_SUBMIT_SELL_EVENT, onSubmitSell as EventListener);
+    return () => window.removeEventListener(BPX_TRADE_SUBMIT_SELL_EVENT, onSubmitSell as EventListener);
+  }, [controlledLane, onLaneChange]);
+
   const [lastExecLatencyMs, setLastExecLatencyMs] = useState<number | null>(null);
   const liveSubmitGenRef = useRef(0);
   const submitLockRef = useRef(false);
   const buyButtonRef = useRef<HTMLButtonElement>(null);
   const [autoBuyRetryTick, setAutoBuyRetryTick] = useState(0);
+  const [autoSellRetryTick, setAutoSellRetryTick] = useState(0);
   const [killArmed, setKillArmed] = useState(false);
   const killArmTimerRef = useRef<number | null>(null);
 
@@ -7422,39 +7473,98 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     return accountMode === 'live' && balLoading ? '…' : '—';
   }, [accountMode, balLoading, lane, positionShares, resolveInstantMaxSellShares]);
 
-  const positionTpOutlookTrade = useMemo(() => {
+  const positionBracketCallTrade = useMemo(() => {
     if (positionShares == null || !(positionShares > 0)) return null;
     const entry01 = avgEntry;
-    const currentMid01 = mid;
-    const armedTp01 = takeProfitTakeCents.trim() ? centsStrTo01(takeProfitTakeCents) : null;
-    const tp01 = armedTp01 ?? targets?.tp01 ?? null;
-    const probSeries = lane === 'up' ? (probMomentumUp ?? []) : (probMomentumDown ?? []);
     const touch = lane === 'up' ? bookTouchUp : bookTouchDown;
-    return computeHeldLaneTpOutlook({
-      heldLane: lane,
-      currentMid01,
+    const bid01 = touch?.bestBid ?? null;
+    const armedTp01 = takeProfitTakeCents.trim() ? centsStrTo01(takeProfitTakeCents) : targets?.tp01 ?? null;
+    const armedSl01 = stopLossStopCents.trim() ? centsStrTo01(stopLossStopCents) : targets?.stop01 ?? null;
+    const liveDeskTp01 = liveDeskTp01FromBook(touch ?? {}, mid);
+    return computePositionBracketCall({
       entry01,
-      tp01,
-      probSeries,
-      bestAsk: touch?.bestAsk ?? null,
-      bestBid: touch?.bestBid ?? null,
-      crossProb,
-      endsInMs,
+      armedTp01,
+      armedSl01,
+      liveDeskTp01,
+      bid01,
     });
   }, [
     positionShares,
     avgEntry,
+    lane,
+    bookTouchUp,
+    bookTouchDown,
+    takeProfitTakeCents,
+    stopLossStopCents,
+    targets?.tp01,
+    targets?.stop01,
     mid,
+  ]);
+
+  const holdingShares = positionShares != null && positionShares > 0;
+  const deskMomentumTrade = useDeskMomentumTracker({
+    focusLane: holdingShares ? lane : null,
+    focusMid01: holdingShares ? mid : null,
+    liveDeskTp01: holdingShares
+      ? liveDeskTp01FromBook(lane === 'up' ? bookTouchUp ?? {} : bookTouchDown ?? {}, mid)
+      : null,
+    upMid01: holdingShares ? midUpEff : null,
+    downMid01: holdingShares ? midDownEff : null,
+    upLabel,
+    downLabel,
+    resetKey: marketSlug?.trim() ?? token?.trim() ?? null,
+  });
+
+  const heldTpOutlookRaw = useMemo(() => {
+    if (!holdingShares) return null;
+    const tp01 =
+      (takeProfitTakeCents.trim() ? centsStrTo01(takeProfitTakeCents) : null) ??
+      targets?.tp01 ??
+      riskTargetsFromEntry?.tp01 ??
+      null;
+    if (tp01 == null) return null;
+    const probSeries = lane === 'up' ? (probMomentumUp ?? []) : (probMomentumDown ?? []);
+    return computeHeldLaneTpOutlook({
+      heldLane: lane,
+      currentMid01: mid,
+      entry01: avgEntry,
+      tp01,
+      probSeries,
+      crossProb,
+      endsInMs,
+      bestAsk: bookTouch?.bestAsk ?? null,
+      bestBid: bookTouch?.bestBid ?? null,
+    });
+  }, [
+    holdingShares,
     takeProfitTakeCents,
     targets?.tp01,
+    riskTargetsFromEntry?.tp01,
     lane,
     probMomentumUp,
     probMomentumDown,
-    bookTouchUp,
-    bookTouchDown,
+    mid,
+    avgEntry,
     crossProb,
     endsInMs,
+    bookTouch?.bestAsk,
+    bookTouch?.bestBid,
   ]);
+
+  const heldTpOutlook = useMemo(
+    () => (heldTpOutlookRaw ? adjustTpOutlookWithMomentum(heldTpOutlookRaw, deskMomentumTrade) : null),
+    [heldTpOutlookRaw, deskMomentumTrade],
+  );
+
+  const deskSignalTrade = useMemo(
+    () =>
+      buildPositionDeskSignal({
+        bracket: positionBracketCallTrade,
+        momentum: deskMomentumTrade,
+        tpHitProb01: heldTpOutlook?.tpHitProb01 ?? null,
+      }),
+    [positionBracketCallTrade, deskMomentumTrade, heldTpOutlook?.tpHitProb01],
+  );
 
   const preBuyTpOutlook = useMemo(() => {
     if (action !== 'buy') return null;
@@ -7731,6 +7841,83 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
       setSubmitAbort(null);
     }
   };
+
+  /** Retry desk auto-sell while lane / balance catch up — stops after one market sell. */
+  useEffect(() => {
+    if (!pendingAutoSell?.fromSignalsDesk) return;
+    if (deskAutoSellClickedNonceRef.current === pendingAutoSell.sellNonce) return;
+    const id = window.setInterval(() => setAutoSellRetryTick((t) => t + 1), 400);
+    return () => window.clearInterval(id);
+  }, [pendingAutoSell]);
+
+  /** Auto-exit from Signals desk — market-sell full held size on the tagged outcome. */
+  useEffect(() => {
+    if (!pendingAutoSell) return;
+    if (lane !== pendingAutoSell.lane) {
+      flushSync(() => {
+        if (controlledLane == null) setLaneState(pendingAutoSell.lane);
+      });
+      onLaneChange?.(pendingAutoSell.lane);
+      if (!pendingAutoSell.fromSignalsDesk) return;
+    }
+    if (action !== 'sell') {
+      setAction('sell');
+      return;
+    }
+
+    const deskAuto = pendingAutoSell.fromSignalsDesk === true;
+    const nonce = pendingAutoSell.sellNonce;
+    if (deskAuto && deskAutoSellClickedNonceRef.current === nonce) return;
+
+    const ageMs = Date.now() - pendingAutoSell.at;
+    if (ageMs > 45_000) {
+      setPendingAutoSell(null);
+      pushToast('err', 'Auto-sell timed out — use Sell on the trade panel or exit manually.');
+      return;
+    }
+
+    if (busySubmit) return;
+    if (outcomeLocked) return;
+    if (!token?.trim()) return;
+
+    const held =
+      lane === 'up'
+        ? accountMode === 'paper'
+          ? paperUpPos.shares
+          : balUp
+        : accountMode === 'paper'
+          ? paperDownPos.shares
+          : balDown;
+    if (held == null || !Number.isFinite(held) || held <= 1e-4) {
+      if (deskAuto) deskAutoSellClickedNonceRef.current = nonce;
+      setPendingAutoSell(null);
+      return;
+    }
+
+    const sellAmt = floorShares4(held);
+    if (sellAmt < 1e-4) return;
+
+    if (deskAuto) deskAutoSellClickedNonceRef.current = nonce;
+    setPendingAutoSell(null);
+    if (submitLockRef.current) return;
+    void runMarketSell(sellAmt);
+  }, [
+    pendingAutoSell,
+    lane,
+    controlledLane,
+    onLaneChange,
+    action,
+    busySubmit,
+    outcomeLocked,
+    token,
+    autoSellRetryTick,
+    pushToast,
+    accountMode,
+    paperUpPos.shares,
+    paperDownPos.shares,
+    balUp,
+    balDown,
+  ]);
 
   const isSidebarOnly = visualStyle === 'sidebar';
 
@@ -9010,9 +9197,14 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
           })()}
         </div>
       ) : null}
-      {positionTpOutlookTrade ? (
+      {deskSignalTrade ? (
         <div className={isSlide ? 'mt-3' : 'mt-4'}>
-          <PositionTpOutlookCard outlook={positionTpOutlookTrade} compact={isSlide} />
+          <PositionDeskSignalStrip signal={deskSignalTrade} compact={isSlide} />
+        </div>
+      ) : null}
+      {holdingShares && heldTpOutlook ? (
+        <div className={isSlide ? 'mt-2' : 'mt-3'}>
+          <PositionTpOutlookCard outlook={heldTpOutlook} compact={isSlide} variant="held" />
         </div>
       ) : null}
       {busySubmit && submitAbort ? (

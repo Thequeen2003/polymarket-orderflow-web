@@ -8,6 +8,7 @@ import { pickConditionId } from './bookIntel';
 import { useRecentTapePrints } from './useRecentTapePrints';
 import type { SpotPoint } from './SpotLevelChart';
 import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
+import { fmtSpotUsd } from './fmtSpotUsd';
 import { underlyingChartTitle } from './underlyingChartTitle';
 import { midPrice, topOfBook } from './bookLevels';
 import { resolveUpDownIndices } from './upDown';
@@ -16,7 +17,7 @@ import type { SpotPtbMachineReadout } from './spotPtbMachineSignals';
 import { TradeDirectiveCard } from './TradeDirectiveCard';
 import type { TradeDirective } from './tradeDirective';
 import { resolveTradeLevelsForDirective } from './tradeLevels';
-import { updateStability, type DirectiveStability } from './directiveStability';
+import { useDirectiveStability } from './useDirectiveStability';
 import { detectDirectiveDiscrepancy } from './directiveDiscrepancyGuard';
 import {
   updateReEntryState,
@@ -31,7 +32,7 @@ import {
 } from './directiveJournal';
 
 function fmtUsd(n: number | null): string {
-  return n == null || !Number.isFinite(n) ? '—' : `$${n.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+  return fmtSpotUsd(n);
 }
 
 export function DualPtbReferenceTab(props: {
@@ -106,11 +107,7 @@ export function DualPtbReferenceTab(props: {
       }),
     [tradeDirective, machineVerdict?.crossProb, machineVerdict?.edges, endsInMs],
   );
-  const [stability, setStability] = useState<DirectiveStability | null>(null);
-  useEffect(() => {
-    if (!tradeDirective) return;
-    setStability((prev) => updateStability(prev, tradeDirective, Date.now()));
-  }, [tradeDirective]);
+  const stability = useDirectiveStability(tradeDirective, 0);
   const discrepancy = useMemo(
     () => detectDirectiveDiscrepancy(tradeDirective, machineVerdict),
     [tradeDirective, machineVerdict],

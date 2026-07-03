@@ -21,7 +21,7 @@ describe('chartStableProjectedHeader', () => {
   });
 
   it('quantizes large USD for stable display', () => {
-    expect(quantizeStableUsd(73_712.63)).toBe(73_713);
-    expect(quantizeStableUsd(73_712.2)).toBe(73_712);
+    expect(quantizeStableUsd(73_712.63)).toBeCloseTo(73_712.65, 2);
+    expect(quantizeStableUsd(73_712.2)).toBeCloseTo(73_712.2, 2);
   });
 });
