@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
-import { fallbackUpdownSlug, slugToOpenFromShortcut } from './updownShortcutCache';
+import {
+  fallbackUpdownSlug,
+  inferredBucketStartSec,
+  isUpdownShortcutWindowOpen,
+  preloadedMarketForSlug,
+  slugToOpenFromShortcut,
+} from './updownShortcutCache';
 
 describe('updownShortcutCache', () => {
   it('builds titled hourly fallback slug for 1h', () => {
@@ -34,5 +40,38 @@ describe('updownShortcutCache', () => {
         '5m',
       ),
     ).toBe('btc-updown-5m-95');
+  });
+
+  it('rejects expired shortcut windows', () => {
+    expect(
+      isUpdownShortcutWindowOpen({
+        slug: 'btc-updown-5m-100',
+        asset: 'btc',
+        window: '5m',
+        end: '2020-01-01T00:05:00.000Z',
+      }),
+    ).toBe(false);
+  });
+
+  it('uses trading window metadata for hints', () => {
+    expect(
+      inferredBucketStartSec(
+        {
+          slug: 'btc-updown-5m-100',
+          trading_slug: 'btc-updown-5m-95',
+          asset: 'btc',
+          window: '5m',
+          inferred_window_start_unix: 100,
+          trading_inferred_window_start_unix: 95,
+        },
+        'btc-updown-5m-95',
+      ),
+    ).toBe(95);
+  });
+
+  it('only preloads market when slug matches', () => {
+    const market = { slug: 'btc-updown-5m-100' };
+    expect(preloadedMarketForSlug(market, 'btc-updown-5m-100')).toBe(market);
+    expect(preloadedMarketForSlug(market, 'btc-updown-5m-95')).toBeUndefined();
   });
 });

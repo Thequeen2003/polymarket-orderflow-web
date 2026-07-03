@@ -430,6 +430,10 @@ export function marketsUpdownShortcut(asset: UpdownShortcutAsset, interval: Updo
     bucket_floor_et_unix?: number;
     /** Slug to load in the UI — for 5m, prior bucket when its CLOB book is live, else `slug`. */
     trading_slug?: string;
+    trading_inferred_window_start_unix?: number;
+    trading_inferred_end_unix?: number;
+    trading_start?: string | null;
+    trading_end?: string | null;
     /** Gamma market payload when shortcut already resolved it — skips a second `/api/markets/get`. */
     market?: unknown;
   }>(`/api/markets/updown-shortcut?asset=${encodeURIComponent(asset)}&interval=${encodeURIComponent(interval)}`, {

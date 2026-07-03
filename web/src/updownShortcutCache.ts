@@ -14,6 +14,10 @@ export type CachedUpdownShortcut = {
   interval?: string;
   window: string;
   inferred_window_start_unix?: number;
+  trading_inferred_window_start_unix?: number;
+  trading_inferred_end_unix?: number;
+  trading_start?: string | null;
+  trading_end?: string | null;
   start?: string | null;
   end?: string | null;
 };
@@ -53,6 +57,34 @@ function writeAll(rows: CacheRow[]): void {
   }
 }
 
+/** True when the cached shortcut window has not ended (with a short grace). */
+export function isUpdownShortcutWindowOpen(data: CachedUpdownShortcut, nowMs = Date.now()): boolean {
+  const endRaw = data.trading_end ?? data.end;
+  if (typeof endRaw !== 'string' || !endRaw.trim()) return true;
+  const endMs = Date.parse(endRaw);
+  if (!Number.isFinite(endMs)) return true;
+  return endMs + 120_000 > nowMs;
+}
+
+/** Only reuse preloaded Gamma JSON when it matches the slug being opened. */
+export function preloadedMarketForSlug(market: unknown, slug: string): unknown | undefined {
+  if (!market || typeof market !== 'object') return undefined;
+  const got = String((market as Record<string, unknown>).slug ?? '').trim().toLowerCase();
+  const want = slug.trim().toLowerCase();
+  return got && want && got === want ? market : undefined;
+}
+
+/** Bucket start for hints — prefer trading-window metadata when desk opens prior 5m bucket. */
+export function inferredBucketStartSec(data: CachedUpdownShortcut, slugToOpen: string): number | undefined {
+  const tradeStart = data.trading_inferred_window_start_unix;
+  if (typeof tradeStart === 'number' && Number.isFinite(tradeStart) && tradeStart > 0) {
+    const tradeSlug = data.trading_slug?.trim().toLowerCase();
+    if (tradeSlug && tradeSlug === slugToOpen.trim().toLowerCase()) return tradeStart;
+  }
+  const iw = data.inferred_window_start_unix;
+  return typeof iw === 'number' && Number.isFinite(iw) && iw > 0 ? iw : undefined;
+}
+
 /** Last good shortcut response — used when API times out or stalls. */
 export function readUpdownShortcutCache(
   asset: UpdownShortcutAsset,
@@ -63,6 +95,7 @@ export function readUpdownShortcutCache(
   const row = readAll().find((r) => cacheKey(r.asset, r.interval) === key);
   if (!row) return null;
   if (Date.now() - row.at > maxAgeMs) return null;
+  if (!isUpdownShortcutWindowOpen(row.data)) return null;
   return row.data;
 }
 

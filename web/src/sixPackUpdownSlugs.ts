@@ -99,6 +99,25 @@ export function parseUpdownSlugWithHints(
   return { asset: h.asset, interval: h.interval, ts: h.bucketStartSec, stepSec };
 }
 
+/** Avoid pointless hint-map updates — prevents `updownParsed` effect loops. */
+export function mergeUpdownSlugHint(
+  hints: Readonly<Record<string, UpdownSlugHint>>,
+  slug: string,
+  hint: UpdownSlugHint,
+): Record<string, UpdownSlugHint> {
+  const k = slug.trim().toLowerCase();
+  const prev = hints[k];
+  if (
+    prev &&
+    prev.asset === hint.asset &&
+    prev.interval === hint.interval &&
+    prev.bucketStartSec === hint.bucketStartSec
+  ) {
+    return hints as Record<string, UpdownSlugHint>;
+  }
+  return { ...hints, [k]: hint };
+}
+
 export function parseUpdownSlug(slug: string): ParsedUpdownSlug | null {
   const m = slug.trim().toLowerCase().match(/^([a-z0-9]{2,10})-updown-(5m|15m|1h|4h|1d)-(\d+)$/);
   if (!m) return null;
@@ -160,6 +179,29 @@ export function slugFromUpdownShortcutResponse(
   const fromApi = data.trading_slug?.trim();
   if (fromApi) return fromApi;
   return tradingSlugFromLiveShortcut(data.slug, interval);
+}
+
+/** Slug the desk should trade — `trading_slug` when the API provides it, else `slug`. */
+export function liveTradingSlugFromShortcut(data: { slug: string; trading_slug?: string }): string {
+  return data.trading_slug?.trim() || data.slug.trim();
+}
+
+/**
+ * Seconds the viewed slug lags the API live trading window.
+ * 0 = aligned; positive = older bucket; negative = future (next) bucket.
+ */
+export function updownWindowLagSec(
+  viewingSlug: string,
+  liveTradingSlug: string | null | undefined,
+  hints?: Readonly<Record<string, UpdownSlugHint>> | null,
+): number | null {
+  const viewing = parseUpdownSlugWithHints(viewingSlug, hints);
+  if (!viewing) return null;
+  const trade = liveTradingSlug?.trim();
+  if (!trade) return null;
+  const live = parseUpdownSlugWithHints(trade, hints);
+  if (!live || live.asset !== viewing.asset || live.interval !== viewing.interval) return null;
+  return live.ts - viewing.ts;
 }
 
 export type SixPackKey =

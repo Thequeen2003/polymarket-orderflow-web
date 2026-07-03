@@ -59,7 +59,7 @@ import {
 } from './updownBucketEt.js';
 import { clobHasBookCached, gammaMarketCached, resolveCanonicalUpdownSlug } from './updownCanonicalProbe.js';
 import { resolveSportsShortcut, listSportsLive, SPORTS_LEAGUES } from './sportsShortcut.js';
-import { resolveUpdownTradingSlug } from './updownTradingSlug.js';
+import { resolveUpdownTradingSlug, tradingWindowFieldsForSlug } from './updownTradingSlug.js';
 import {
   buildTitledDailySlug,
   buildTitledHourlySlug,
@@ -1278,19 +1278,29 @@ async function replyUpdownShortcut(
 ) {
   const live = String(data.slug ?? '').trim();
   const trading_slug = await resolveUpdownTradingSlug(live, interval);
-  let marketOut: unknown | undefined;
+  const tradeKey = trading_slug.trim().toLowerCase();
+  const liveKey = live.toLowerCase();
+  let marketOut: Record<string, unknown> | undefined;
   if (market) {
-    const norm = normalizeMarket(market) as Record<string, unknown>;
-    marketOut = norm;
-    const liveKey = live.toLowerCase();
-    const tradeKey = trading_slug.trim().toLowerCase();
-    marketBySlugCache.set(liveKey, cacheSet(norm));
-    if (tradeKey && tradeKey !== liveKey) marketBySlugCache.set(tradeKey, cacheSet(norm));
+    marketOut = normalizeMarket(market) as Record<string, unknown>;
+  }
+  if (tradeKey && tradeKey !== liveKey) {
+    try {
+      const tm = await gammaMarketCached(trading_slug);
+      if (tm) marketOut = normalizeMarket(tm) as Record<string, unknown>;
+    } catch {
+      /* keep live market if trading lookup fails */
+    }
+  }
+  if (marketOut) {
+    marketBySlugCache.set(liveKey, cacheSet(marketOut));
+    if (tradeKey) marketBySlugCache.set(tradeKey, cacheSet(marketOut));
   }
   const payload: Record<string, unknown> = {
     ...data,
     slug: live,
     trading_slug,
+    ...tradingWindowFieldsForSlug(trading_slug, live),
     ...(marketOut != null ? { market: marketOut } : {}),
   };
   const asset = String(data.asset ?? '').toLowerCase().trim();

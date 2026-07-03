@@ -29,3 +29,37 @@ export async function resolveUpdownTradingSlug(liveSlug: string, interval: strin
   }
   return live;
 }
+
+export function stepSecForUpdownInterval(interval: string): number {
+  if (interval === '15m') return 900;
+  if (interval === '1h') return 3600;
+  if (interval === '4h') return 4 * 3600;
+  if (interval === '1d') return 24 * 3600;
+  return 300;
+}
+
+function parseCanonicalUpdownSlugTs(slug: string): { interval: string; ts: number } | null {
+  const m = slug.trim().toLowerCase().match(/^[a-z0-9]{2,10}-updown-(5m|15m|1h|4h|1d)-(\d+)$/);
+  if (!m) return null;
+  const ts = Number(m[2]);
+  if (!Number.isFinite(ts) || ts <= 0) return null;
+  return { interval: m[1]!, ts };
+}
+
+/** When `trading_slug` differs from shortcut `slug`, attach window metadata for the slug the desk opens. */
+export function tradingWindowFieldsForSlug(tradingSlug: string, liveSlug: string): Record<string, unknown> {
+  const trade = tradingSlug.trim();
+  const live = liveSlug.trim();
+  if (!trade || trade === live) return {};
+  const parsed = parseCanonicalUpdownSlugTs(trade);
+  if (!parsed) return {};
+  const stepSec = stepSecForUpdownInterval(parsed.interval);
+  const startSec = parsed.ts;
+  const endSec = startSec + stepSec;
+  return {
+    trading_inferred_window_start_unix: startSec,
+    trading_inferred_end_unix: endSec,
+    trading_start: new Date(startSec * 1000).toISOString(),
+    trading_end: new Date(endSec * 1000).toISOString(),
+  };
+}

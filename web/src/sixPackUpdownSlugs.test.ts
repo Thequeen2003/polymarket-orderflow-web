@@ -3,12 +3,14 @@ import {
   inferUpdownHintFromMarketJson,
   isTitledUpdownSlug,
   isUpdownDeskMarket,
+  mergeUpdownSlugHint,
   nextUpdownSlug,
   parseUpdownSlug,
   parseUpdownSlugWithHints,
   slugFromUpdownShortcutResponse,
   tradingSlugFromLiveShortcut,
   updownSlugAtBucket,
+  updownWindowLagSec,
 } from './sixPackUpdownSlugs';
 
 describe('sixPackUpdownSlugs', () => {
@@ -102,5 +104,20 @@ describe('sixPackUpdownSlugs', () => {
     expect(next).toBe('bitcoin-up-or-down-on-june-12-2026');
     const prev = nextUpdownSlug(slug, -1, hints);
     expect(prev).toBe('bitcoin-up-or-down-on-june-10-2026');
+  });
+
+  it('mergeUpdownSlugHint skips identical updates', () => {
+    const hints = { 'btc-updown-5m-100': { asset: 'btc' as const, interval: '5m' as const, bucketStartSec: 100 } };
+    const next = { asset: 'btc' as const, interval: '5m' as const, bucketStartSec: 100 };
+    expect(mergeUpdownSlugHint(hints, 'btc-updown-5m-100', next)).toBe(hints);
+    expect(mergeUpdownSlugHint(hints, 'btc-updown-5m-100', { ...next, bucketStartSec: 95 })).not.toBe(hints);
+  });
+
+  it('measures lag vs trading_slug not next-bucket slug', () => {
+    const trade = 'btc-updown-5m-1000';
+    const live = 'btc-updown-5m-1300';
+    expect(updownWindowLagSec(trade, trade)).toBe(0);
+    expect(updownWindowLagSec(trade, live)).toBe(300);
+    expect(updownWindowLagSec(live, trade)).toBe(-300);
   });
 });

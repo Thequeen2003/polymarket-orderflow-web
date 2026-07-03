@@ -6,16 +6,21 @@ import {
   loadCryptoPaperAccount,
   saveCryptoPaperAccount,
 } from './cryptoPaperTrading';
-import { BtcUsdDecisionChart } from './BtcUsdDecisionChart';
-
-export type TvTf = '5' | '10' | '30';
+import { BtcUsdBinaryChart } from './BtcUsdBinaryChart';
+import {
+  BTC_USD_TF_OPTIONS,
+  binaryBiasFromCandles,
+  chartTfToTvMinutes,
+  fetchBtcUsdCandles,
+  type BtcUsdChartTf,
+} from './btcUsdCandles';
 
 /** Isolated from RTDS `BTC-USD` on the other tab — marks here use Binance USDT last. */
 const TV_PAPER_SYMBOL = 'BTC-USD-TV';
 
 const DOWN_TICKETS_KEY = 'pm:tvbtc:downTickets:v1';
 
-type DownTicket = { id: string; entryUsdt: number; stakeUsd: number; tf: TvTf; createdAt: number };
+type DownTicket = { id: string; entryUsdt: number; stakeUsd: number; tf: BtcUsdChartTf; createdAt: number };
 
 function loadDownTickets(): DownTicket[] {
   try {
@@ -30,10 +35,11 @@ function loadDownTickets(): DownTicket[] {
       const id = typeof o.id === 'string' ? o.id : '';
       const entryUsdt = Number(o.entryUsdt);
       const stakeUsd = Number(o.stakeUsd);
-      const tf = o.tf === '5' || o.tf === '10' || o.tf === '30' ? o.tf : null;
+      const tf = o.tf;
+      const validTf = BTC_USD_TF_OPTIONS.some((x) => x.id === tf) ? (tf as BtcUsdChartTf) : null;
       const createdAt = Number(o.createdAt);
-      if (!id || !Number.isFinite(entryUsdt) || entryUsdt <= 0 || !Number.isFinite(stakeUsd) || stakeUsd <= 0 || !tf || !Number.isFinite(createdAt)) continue;
-      out.push({ id, entryUsdt, stakeUsd, tf, createdAt });
+      if (!id || !Number.isFinite(entryUsdt) || entryUsdt <= 0 || !Number.isFinite(stakeUsd) || stakeUsd <= 0 || !validTf || !Number.isFinite(createdAt)) continue;
+      out.push({ id, entryUsdt, stakeUsd, tf: validTf, createdAt });
     }
     return out;
   } catch {
@@ -61,13 +67,10 @@ function floorQty8(x: number): number {
   return Math.floor(x * 1e8) / 1e8;
 }
 
-type Candle = { t: number; o: number; h: number; l: number; c: number; v: number };
-
 type SpotTicker = { lastUsd: string; changePct: string } | null;
 
-type ReadResult = { verdict: 'UP' | 'DOWN'; justification: string };
-
-function tradingViewEmbedSrc(frameId: string, interval: TvTf): string {
+function tradingViewEmbedSrc(frameId: string, tf: BtcUsdChartTf): string {
+  const interval = chartTfToTvMinutes(tf);
   const p = new URLSearchParams({
     frameElementId: frameId,
     symbol: 'BINANCE:BTCUSDT',
@@ -89,178 +92,17 @@ function tradingViewEmbedSrc(frameId: string, interval: TvTf): string {
   return `https://www.tradingview.com/widgetembed/?${p.toString()}`;
 }
 
-function sma(xs: number[], len: number): number[] {
-  const out: number[] = [];
-  for (let i = 0; i < xs.length; i++) {
-    if (i + 1 < len) {
-      out.push(NaN);
-      continue;
-    }
-    let s = 0;
-    for (let j = 0; j < len; j++) s += xs[i - j];
-    out.push(s / len);
-  }
-  return out;
-}
-
-/** Merge consecutive 5m candles into synthetic 10m (Binance has no native 10m kline). */
-function merge5mTo10m(five: Candle[]): Candle[] {
-  const out: Candle[] = [];
-  const n = five.length - (five.length % 2);
-  for (let i = 0; i < n; i += 2) {
-    const a = five[i]!;
-    const b = five[i + 1]!;
-    out.push({
-      t: a.t,
-      o: a.o,
-      h: Math.max(a.h, b.h),
-      l: Math.min(a.l, b.l),
-      c: b.c,
-      v: a.v + b.v,
-    });
-  }
-  return out;
-}
-
-function parseKlines(raw: unknown): Candle[] {
-  if (!Array.isArray(raw)) return [];
-  const out: Candle[] = [];
-  for (const row of raw) {
-    if (!Array.isArray(row) || row.length < 6) continue;
-    const t = Number(row[0]);
-    const o = Number(row[1]);
-    const h = Number(row[2]);
-    const l = Number(row[3]);
-    const c = Number(row[4]);
-    const v = Number(row[5]);
-    if (![t, o, h, l, c, v].every((x) => Number.isFinite(x))) continue;
-    out.push({ t, o, h, l, c, v });
-  }
-  return out;
-}
-
-/**
- * Rules-only bias from OHLCV (same Binance spot series as BINANCE:BTCUSDT).
- * No news; uses MAs, short slope, range position, and volume vs its average.
- */
-function shortTermReadFromCandles(candles: Candle[]): ReadResult {
-  if (candles.length < 28) {
-    return {
-      verdict: 'DOWN',
-      justification: 'Not enough closed candles to score; treat as no edge until more bars load.',
-    };
-  }
-
-  const closes = candles.map((x) => x.c);
-  const highs = candles.map((x) => x.h);
-  const lows = candles.map((x) => x.l);
-  const vols = candles.map((x) => x.v);
-  const n = closes.length;
-  const last = closes[n - 1]!;
-  const ma10 = sma(closes, 10);
-  const ma20 = sma(closes, 20);
-  const vSma = sma(vols, 20);
-  const m10 = ma10[n - 1]!;
-  const m20 = ma20[n - 1]!;
-  const vAvg = vSma[n - 1]!;
-  const vLast = vols[n - 1]!;
-  const lastBar = candles[n - 1]!;
-  const bullBar = lastBar.c >= lastBar.o;
-
-  let score = 0;
-  const notes: string[] = [];
-
-  if (last > m10) {
-    score += 1;
-    notes.push('Close holds above the short MA.');
-  } else {
-    score -= 1;
-    notes.push('Close sits under the short MA.');
-  }
-  if (last > m20) score += 1;
-  else score -= 1;
-
-  const slope3 = (last - closes[n - 4]!) / Math.max(1e-12, closes[n - 4]!);
-  if (slope3 > 0) {
-    score += 1;
-    notes.push('Recent closes stair-step higher.');
-  } else if (slope3 < 0) {
-    score -= 1;
-    notes.push('Recent closes stair-step lower.');
-  }
-
-  const hi20 = Math.max(...highs.slice(-20));
-  const lo20 = Math.min(...lows.slice(-20));
-  const rng = Math.max(1e-9, hi20 - lo20);
-  const pos = (last - lo20) / rng;
-  if (pos > 0.9 && !bullBar) {
-    score -= 1;
-    notes.push('Price hugs the top of the recent range on a weak close.');
-  } else if (pos < 0.12 && bullBar) {
-    score += 1;
-    notes.push('Price lifts from the bottom of the recent range.');
-  }
-
-  if (Number.isFinite(vAvg) && vAvg > 0 && vLast > vAvg * 1.15) {
-    if (bullBar) {
-      score += 1;
-      notes.push('Volume swells on a supportive (green) close.');
-    } else {
-      score -= 1;
-      notes.push('Volume swells on a defensive (red) close.');
-    }
-  }
-
-  const prev = closes[n - 2]!;
-  if (last > prev) score += 0.5;
-  else if (last < prev) score -= 0.5;
-
-  const verdict: 'UP' | 'DOWN' = score >= 0 ? 'UP' : 'DOWN';
-  const pick = notes.slice(0, 2).join(' ');
-  const justification =
-    pick ||
-    (verdict === 'UP'
-      ? 'Net constructive posture vs moving averages and recent closes.'
-      : 'Net defensive posture vs moving averages and recent closes.');
-
-  return { verdict, justification };
-}
-
-const TF_OPTIONS: { id: TvTf; label: string }[] = [
-  { id: '5', label: '5 mins' },
-  { id: '10', label: '10 mins' },
-  { id: '30', label: '30 mins' },
-];
-
-async function fetchCandlesForTf(tf: TvTf, signal: AbortSignal): Promise<Candle[]> {
-  if (tf === '10') {
-    const r = await fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=160', { signal, cache: 'no-store' });
-    if (!r.ok) throw new Error(`klines ${r.status}`);
-    const raw = (await r.json()) as unknown;
-    return merge5mTo10m(parseKlines(raw));
-  }
-  const interval = tf === '5' ? '5m' : '30m';
-  const limit = tf === '5' ? 120 : 80;
-  const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=${interval}&limit=${limit}`, {
-    signal,
-    cache: 'no-store',
-  });
-  if (!r.ok) throw new Error(`klines ${r.status}`);
-  const raw = (await r.json()) as unknown;
-  return parseKlines(raw);
-}
-
 export function TradingViewBtcUsdtTab(): ReactElement {
   const frameId = useId().replace(/:/g, '');
-  const [tvTf, setTvTf] = useState<TvTf>('5');
-  const src = useMemo(() => tradingViewEmbedSrc(frameId, tvTf), [frameId, tvTf]);
+  const [chartTf, setChartTf] = useState<BtcUsdChartTf>('5m');
+  const src = useMemo(() => tradingViewEmbedSrc(frameId, chartTf), [frameId, chartTf]);
 
   const [ticker, setTicker] = useState<SpotTicker>(null);
   const [tickerErr, setTickerErr] = useState(false);
 
   const [readBusy, setReadBusy] = useState(false);
   const [readErr, setReadErr] = useState<string | null>(null);
-  const [readOut, setReadOut] = useState<ReadResult | null>(null);
+  const [readOut, setReadOut] = useState<ReturnType<typeof binaryBiasFromCandles> | null>(null);
 
   const [entryStr, setEntryStr] = useState('');
   const [entryDirty, setEntryDirty] = useState(false);
@@ -327,15 +169,15 @@ export function TradingViewBtcUsdtTab(): ReactElement {
     const ac = new AbortController();
     const t = window.setTimeout(() => ac.abort(), 14_000);
     try {
-      const candles = await fetchCandlesForTf(tvTf, ac.signal);
-      setReadOut(shortTermReadFromCandles(candles));
+      const candles = await fetchBtcUsdCandles(chartTf, ac.signal);
+      setReadOut(binaryBiasFromCandles(candles));
     } catch (e) {
       setReadErr(e instanceof Error ? e.message : 'Could not load klines (network/CORS).');
     } finally {
       window.clearTimeout(t);
       setReadBusy(false);
     }
-  }, [tvTf]);
+  }, [chartTf]);
 
   const chNum = ticker ? Number(ticker.changePct) : NaN;
   const chTone =
@@ -394,7 +236,7 @@ export function TradingViewBtcUsdtTab(): ReactElement {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
       entryUsdt: entryNum,
       stakeUsd,
-      tf: tvTf,
+      tf: chartTf,
       createdAt: Date.now(),
     };
     setDownTickets((prev) => {
@@ -403,8 +245,8 @@ export function TradingViewBtcUsdtTab(): ReactElement {
       return next;
     });
     setAccount(loadCryptoPaperAccount());
-    setBetMsg(`DOWN · locked $${stakeUsd.toFixed(2)} vs entry $${entryNum.toLocaleString(undefined, { maximumFractionDigits: 2 })} (${tvTf} chart TF) — settle anytime at live mark.`);
-  }, [entryNum, stakeUsd, tvTf]);
+    setBetMsg(`DOWN · locked $${stakeUsd.toFixed(2)} vs entry $${entryNum.toLocaleString(undefined, { maximumFractionDigits: 2 })} (${chartTf} chart TF) — settle anytime at live mark.`);
+  }, [entryNum, stakeUsd, chartTf]);
 
   const settleDown = useCallback(
     (id: string) => {
@@ -487,33 +329,24 @@ export function TradingViewBtcUsdtTab(): ReactElement {
         </div>
       </div>
 
-      <BtcUsdDecisionChart />
+      <BtcUsdBinaryChart
+        tf={chartTf}
+        onTfChange={(next) => {
+          setChartTf(next);
+          setReadOut(null);
+          setReadErr(null);
+        }}
+        entryPrice={Number.isFinite(entryNum) && entryNum > 0 ? entryNum : null}
+        livePrice={markUsd}
+      />
 
-      {/* Timeframes + chart read: standalone controls (not Polymarket). */}
+      {/* Chart read uses the same TF as the binary candle chart above. */}
       <div className="rounded-2xl border border-zinc-800/70 bg-[#131722] p-3 ring-1 ring-orange-500/15 sm:p-4">
-        <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Chart timeframe</div>
-        <div className="mt-2 flex flex-wrap gap-2">
-          {TF_OPTIONS.map((opt) => (
-            <button
-              key={opt.id}
-              type="button"
-              onClick={() => {
-                setTvTf(opt.id);
-                setReadOut(null);
-                setReadErr(null);
-              }}
-              className={`min-h-[40px] rounded-lg px-4 text-[13px] font-bold transition-colors ${
-                tvTf === opt.id
-                  ? 'bg-[#ff5a1f] text-white shadow-md shadow-orange-950/40 ring-1 ring-orange-400/50'
-                  : 'border border-zinc-700/80 bg-zinc-900/60 text-zinc-200 hover:border-zinc-600 hover:bg-zinc-800/80'
-              }`}
-            >
-              {opt.label}
-            </button>
-          ))}
+        <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">
+          Binary read · <span className="font-mono text-zinc-400">{chartTf}</span>
         </div>
         <p className="mt-2 text-[11px] leading-relaxed text-zinc-500">
-          10m uses merged pairs of 5m candles so the read matches a 10-minute view. The chart iframe reloads when you switch TF.
+          10m uses merged 5m pairs. TradingView iframe below reloads when you switch timeframe on the candle chart.
         </p>
         <div className="mt-4 border-t border-zinc-800/60 pt-4">
           <button
@@ -525,8 +358,8 @@ export function TradingViewBtcUsdtTab(): ReactElement {
             {readBusy ? 'Reading closed bars…' : 'Short-term read (same data as chart)'}
           </button>
           <p className="mt-2 text-[10px] leading-relaxed text-zinc-600">
-            Fetches Binance public klines for the selected TF, scores only OHLCV (trend vs MAs, micro-slope, range location, volume vs avg). Output is{' '}
-            <span className="font-mono text-zinc-400">UP</span> or <span className="font-mono text-zinc-400">DOWN</span> — not financial advice.
+            Fetches Binance public klines for <span className="font-mono text-zinc-400">{chartTf}</span>, scores OHLCV (trend vs MAs, slope, range, volume). Output is{' '}
+            <span className="font-mono text-zinc-400">UP</span>, <span className="font-mono text-zinc-400">DOWN</span>, or <span className="font-mono text-zinc-400">WAIT</span> — not financial advice.
           </p>
           {readErr ? <p className="mt-2 text-[12px] text-rose-300">{readErr}</p> : null}
           {readOut ? (
@@ -542,7 +375,7 @@ export function TradingViewBtcUsdtTab(): ReactElement {
       <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/50 p-4 ring-1 ring-emerald-500/10 sm:p-5">
         <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Paper at price · tap direction</div>
         <p className="mt-1 text-[12px] leading-relaxed text-zinc-500">
-          Choose <span className="text-zinc-300">5 / 10 / 30</span> above for your chart context. Set <span className="text-zinc-300">entry (USDT)</span> and{' '}
+          Choose <span className="text-zinc-300">1m–1h</span> on the candle chart for context. Set <span className="text-zinc-300">entry (USDT)</span> and{' '}
           <span className="text-zinc-300">$ stake</span>, then tap <span className="font-semibold text-emerald-300">UP</span> or{' '}
           <span className="font-semibold text-rose-300">DOWN</span>. Uses the same paper cash wallet as the <span className="text-zinc-300">BTC (paper)</span> tab;
           positions are tagged <span className="font-mono text-zinc-400">{TV_PAPER_SYMBOL}</span> so they do not mix with RTDS <span className="font-mono text-zinc-400">BTC-USD</span>.

@@ -67,11 +67,13 @@ import {
   inferUpdownHintFromMarketJson,
   isTitledUpdownSlug,
   isUpdownDeskMarket,
+  mergeUpdownSlugHint,
   nextUpdownSlug,
   parseUpdownSlug,
   parseUpdownSlugWithHints,
   titledUpdownAssetFromSlug,
   updownSlugAtBucket,
+  updownWindowLagSec,
   type UpdownSlugHint,
 } from './sixPackUpdownSlugs';
 import { updownSlugToOpen } from './updownSlugToOpen';
@@ -86,6 +88,9 @@ import { useTradeAccountMode } from './useTradeAccountMode';
 import { appendLiveMidSeries, appendLiveSpotSeries, lastPointMs, maxFeedMs, normalizeEpochMs } from './feedFreshness';
 import {
   fallbackUpdownSlug,
+  inferredBucketStartSec,
+  isUpdownShortcutWindowOpen,
+  preloadedMarketForSlug,
   readUpdownShortcutCache,
   slugToOpenFromShortcut,
   writeUpdownShortcutCache,
@@ -714,6 +719,7 @@ function App() {
   /** Auto-retry count when slug is set but `markets/get` failed (Gamma blip). */
   const marketLoadRetryRef = useRef(0);
   const bootShortcutRetryRef = useRef(0);
+  const updownAutoLiveRef = useRef<string | null>(null);
   const wantSeriesRef = useRef<boolean>(false);
   const wantFlowRef = useRef<boolean>(false);
   const loadBooksRef = useRef<
@@ -814,12 +820,7 @@ function App() {
     if (parseUpdownSlug(selectedSlug)) return;
     const hint = inferUpdownHintFromMarketJson(selectedSlug, marketJson as Record<string, unknown>);
     if (!hint) return;
-    const k = selectedSlug.trim().toLowerCase();
-    setUpdownSlugHints((m) => {
-      const prev = m[k];
-      if (prev && prev.bucketStartSec === hint.bucketStartSec && prev.interval === hint.interval) return m;
-      return { ...m, [k]: hint };
-    });
+    setUpdownSlugHints((m) => mergeUpdownSlugHint(m, selectedSlug, hint));
   }, [selectedSlug, marketJson]);
 
   useEffect(() => {
@@ -1845,7 +1846,8 @@ function App() {
           return;
         }
         const slugToOpen = res.data.trading_slug?.trim() || res.data.slug.trim();
-        void loadMarket(slugToOpen, { market: res.data.market });
+        const bootMarket = preloadedMarketForSlug(res.data.market, slugToOpen);
+        void loadMarket(slugToOpen, { market: bootMarket });
       } catch (e) {
         if (!cancelled) {
           setMarketsError(e instanceof Error ? e.message : String(e));
@@ -2287,38 +2289,41 @@ function App() {
     (dir: -1 | 1) => nextUpdownSlug(selectedSlug, dir, updownSlugHints),
     [selectedSlug, updownSlugHints],
   );
-  const [updownLiveSlugFromApi, setUpdownLiveSlugFromApi] = useState<string | null>(null);
+  const [updownLiveTradingSlugFromApi, setUpdownLiveTradingSlugFromApi] = useState<string | null>(null);
 
   // For Up/Down markets, use the API's notion of "live" (bucket) rather than the browser clock.
   useEffect(() => {
-    if (!updownParsed) {
-      setUpdownLiveSlugFromApi(null);
+    const parsed = updownParsed;
+    if (!parsed) {
+      setUpdownLiveTradingSlugFromApi(null);
       return;
     }
-    const shortcutAsset = updownParsed.asset;
+    const shortcutAsset = parsed.asset;
     if (!isShortcutAsset(shortcutAsset)) {
       // We can still stream spot from RTDS if available, but the shortcut API is BTC/ETH/SOL only.
-      setUpdownLiveSlugFromApi(null);
+      setUpdownLiveTradingSlugFromApi(null);
       return;
     }
     let stopped = false;
     const tick = async () => {
-      const res = await marketsUpdownShortcut(shortcutAsset, updownParsed.interval);
+      const res = await marketsUpdownShortcut(shortcutAsset, parsed.interval);
       if (stopped) return;
-      if (isOk(res) && typeof res.data.slug === 'string' && res.data.slug) {
-        const slug = res.data.slug;
-        setUpdownLiveSlugFromApi(slug);
-        const iw = res.data.inferred_window_start_unix;
-        if (typeof iw === 'number' && !parseUpdownSlug(slug)) {
-          setUpdownSlugHints((m) => ({
-            ...m,
-            [slug.trim().toLowerCase()]: {
-              asset: shortcutAsset,
-              interval: updownParsed.interval,
-              bucketStartSec: iw,
-            },
-          }));
-        }
+      if (!isOk(res) || typeof res.data.slug !== 'string' || !res.data.slug) return;
+      const tradeSlug =
+        res.data.trading_slug?.trim() ||
+        res.data.slug.trim();
+      setUpdownLiveTradingSlugFromApi(tradeSlug);
+      const iw =
+        (res.data as { trading_inferred_window_start_unix?: number }).trading_inferred_window_start_unix ??
+        res.data.inferred_window_start_unix;
+      if (typeof iw === 'number') {
+        setUpdownSlugHints((m) =>
+          mergeUpdownSlugHint(m, tradeSlug, {
+            asset: shortcutAsset,
+            interval: parsed.interval,
+            bucketStartSec: iw,
+          }),
+        );
       }
     };
     void tick();
@@ -2327,15 +2332,23 @@ function App() {
       stopped = true;
       window.clearInterval(id);
     };
-  }, [updownParsed]);
+  }, [updownParsed?.asset, updownParsed?.interval, updownParsed?.ts]);
 
-  const updownBehindBySec = useMemo(() => {
-    const p = updownParsed;
-    if (!p) return null;
-    const live = updownLiveSlugFromApi ? parseUpdownSlugWithHints(updownLiveSlugFromApi, updownSlugHints) : null;
-    if (!live || live.asset !== p.asset || live.interval !== p.interval) return null;
-    return live.ts - p.ts;
-  }, [updownParsed, updownLiveSlugFromApi, updownSlugHints]);
+  const updownBehindBySec = useMemo(
+    () => updownWindowLagSec(selectedSlug, updownLiveTradingSlugFromApi, updownSlugHints),
+    [selectedSlug, updownLiveTradingSlugFromApi, updownSlugHints],
+  );
+
+  /** Closed shortcut Up/Down slugs (stale bookmarks) — auto-open the live trading window once. */
+  useEffect(() => {
+    const slug = selectedSlug.trim().toLowerCase();
+    if (!slug || !marketJson || !isMarketClosed(marketJson)) return;
+    const parsed = updownParsed;
+    if (!parsed || !isShortcutAsset(parsed.asset)) return;
+    if (updownAutoLiveRef.current === slug) return;
+    updownAutoLiveRef.current = slug;
+    void openUpdownShortcut(parsed.asset, parsed.interval);
+  }, [selectedSlug, marketJson, updownParsed]);
 
   const assistantContext = useMemo(
     () =>
@@ -2462,16 +2475,16 @@ function App() {
 
     const openFromShortcut = (data: CachedUpdownShortcut, notice?: string) => {
       if (openSeq !== shortcutOpenSeqRef.current) return;
+      if (!isUpdownShortcutWindowOpen(data)) return;
       const slugToOpen = slugToOpenFromShortcut(data, interval);
-      const iw = data.inferred_window_start_unix;
+      const iw = inferredBucketStartSec(data, slugToOpen);
       if (typeof iw === 'number') {
-        setUpdownSlugHints((m) => ({
-          ...m,
-          [slugToOpen.trim().toLowerCase()]: { asset, interval, bucketStartSec: iw },
-        }));
+        setUpdownSlugHints((m) =>
+          mergeUpdownSlugHint(m, slugToOpen, { asset, interval, bucketStartSec: iw }),
+        );
       }
       if (notice) setMarketsNotice(notice);
-      void navigateToMarket(slugToOpen, { market: data.market });
+      void navigateToMarket(slugToOpen, { market: preloadedMarketForSlug(data.market, slugToOpen) });
     };
 
     const cached = readUpdownShortcutCache(asset, interval);
@@ -2524,6 +2537,11 @@ function App() {
         interval: data.interval,
         window: data.window,
         inferred_window_start_unix: (data as { inferred_window_start_unix?: number }).inferred_window_start_unix,
+        trading_inferred_window_start_unix: (data as { trading_inferred_window_start_unix?: number })
+          .trading_inferred_window_start_unix,
+        trading_inferred_end_unix: (data as { trading_inferred_end_unix?: number }).trading_inferred_end_unix,
+        trading_start: (data as { trading_start?: string | null }).trading_start,
+        trading_end: (data as { trading_end?: string | null }).trading_end,
         start: data.start,
         end: data.end,
       });
@@ -2539,16 +2557,26 @@ function App() {
       if (interval === '5m' && !data.trading_slug?.trim() && !data.market) {
         slugToOpen = await updownSlugToOpen(data, interval);
       }
-      const iw = (data as { inferred_window_start_unix?: number }).inferred_window_start_unix;
+      const iw = inferredBucketStartSec(
+        {
+          slug: data.slug,
+          trading_slug: data.trading_slug,
+          asset: data.asset,
+          window: data.window,
+          inferred_window_start_unix: (data as { inferred_window_start_unix?: number }).inferred_window_start_unix,
+          trading_inferred_window_start_unix: (data as { trading_inferred_window_start_unix?: number })
+            .trading_inferred_window_start_unix,
+        },
+        slugToOpen,
+      );
       if (typeof iw === 'number') {
-        setUpdownSlugHints((m) => ({
-          ...m,
-          [slugToOpen.trim().toLowerCase()]: { asset, interval, bucketStartSec: iw },
-        }));
+        setUpdownSlugHints((m) =>
+          mergeUpdownSlugHint(m, slugToOpen, { asset, interval, bucketStartSec: iw }),
+        );
       }
       setShortcutBusy(null);
       if (openSeq === shortcutOpenSeqRef.current) {
-        void navigateToMarket(slugToOpen, { market: data.market });
+        void navigateToMarket(slugToOpen, { market: preloadedMarketForSlug(data.market, slugToOpen) });
       }
     } catch (e) {
       if (openSeq !== shortcutOpenSeqRef.current) return;
@@ -3169,11 +3197,21 @@ function App() {
                   </button>
                 ) : null}
               </div>
-            ) : updownBehindBySec != null && updownParsed != null && updownBehindBySec >= updownParsed.stepSec ? (
+            ) : updownBehindBySec != null && updownParsed != null && updownBehindBySec !== 0 ? (
               <div className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-800/25 bg-amber-950/15 px-3 py-2 text-xs text-amber-100/85">
                 <div className="leading-relaxed">
-                  You’re viewing an older {updownParsed.interval} window (behind by <span className="font-mono">{Math.round(updownBehindBySec / 60)}m</span>).
-                  Jump to the live window.
+                  {updownBehindBySec > 0 ? (
+                    <>
+                      You’re viewing an older {updownParsed.interval} window (behind by{' '}
+                      <span className="font-mono">{Math.round(updownBehindBySec / 60)}m</span>).
+                      Jump to the live trading window.
+                    </>
+                  ) : (
+                    <>
+                      You’re viewing the next {updownParsed.interval} window before it’s tradable.
+                      Jump to the live trading window.
+                    </>
+                  )}
                 </div>
                 <div className="flex gap-2">
                   {stepUpdownSlug(-1) ? (

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { priorCanonicalUpdownSlug } from './updownTradingSlug.js';
+import { priorCanonicalUpdownSlug, tradingWindowFieldsForSlug } from './updownTradingSlug.js';
 
 describe('updownTradingSlug', () => {
   it('derives prior 5m canonical slug', () => {
@@ -10,5 +10,14 @@ describe('updownTradingSlug', () => {
   it('returns null for non-canonical slugs', () => {
     expect(priorCanonicalUpdownSlug('bitcoin-up-or-down-on-may-16-2026')).toBeNull();
     expect(priorCanonicalUpdownSlug('btc-updown-15m-1000')).toBeNull();
+  });
+
+  it('adds trading window fields when desk opens prior 5m bucket', () => {
+    const live = 'btc-updown-5m-1778940000';
+    const trade = 'btc-updown-5m-1778939700';
+    const fields = tradingWindowFieldsForSlug(trade, live);
+    expect(fields.trading_inferred_window_start_unix).toBe(1778939700);
+    expect(fields.trading_inferred_end_unix).toBe(1778940000);
+    expect(tradingWindowFieldsForSlug(live, live)).toEqual({});
   });
 });
