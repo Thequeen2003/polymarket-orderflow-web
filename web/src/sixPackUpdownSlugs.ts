@@ -143,6 +143,19 @@ export function nextUpdownSlug(
   return updownSlugAtBucket(p.asset, p.interval, nextTs, titled);
 }
 
+/** Same asset+interval, exactly one bucket step — auto-roll / carry chart state. */
+export function isAdjacentUpdownBucket(
+  prevSlug: string,
+  nextSlug: string,
+  hints?: Readonly<Record<string, UpdownSlugHint>> | null,
+): boolean {
+  const a = parseUpdownSlugWithHints(prevSlug, hints);
+  const b = parseUpdownSlugWithHints(nextSlug, hints);
+  if (!a || !b) return false;
+  if (a.asset !== b.asset || a.interval !== b.interval) return false;
+  return Math.abs(b.ts - a.ts) === a.stepSec;
+}
+
 /**
  * Map live shortcut slug → slug the app trades with (client-only fallback).
  * Prefer `trading_slug` from `/api/markets/updown-shortcut` — it checks the prior 5m book on the server.

@@ -9,6 +9,7 @@ import type { EntryMoment } from './entryMoment';
 import type { ExecutionSignal } from './executionSignal';
 import type { NowPriceBandDistances } from './nowPriceSignals';
 import type { NowPriceDeskTradeSignal } from './nowPriceDeskTradeSignal';
+import type { NowPriceMomentumReadout } from './nowPriceMomentumReadout';
 import type { PressureTiming } from './pressureTiming';
 import type { BuySideAdvisory } from './shouldBuyWhichSide';
 import type { SpotBandGaugeSnapshot } from './spotBandDeskAction';
@@ -197,6 +198,7 @@ export function buildDeskAheadPlaybook(args: {
   entryMoment: EntryMoment | null;
   contractLead: ContractLeadSignal | null;
   pressureTiming: PressureTiming | null;
+  momentum?: NowPriceMomentumReadout | null;
   bandGauge: SpotBandGaugeSnapshot | null;
   band: NowPriceBandDistances | null;
   execution: ExecutionSignal | null;
@@ -204,7 +206,7 @@ export function buildDeskAheadPlaybook(args: {
   bid01: number | null;
   ask01: number | null;
 }): DeskAheadPlaybook {
-  const { signal, entryMoment, contractLead, pressureTiming, bandGauge, band, execution, advisory } = args;
+  const { signal, entryMoment, contractLead, pressureTiming, momentum = null, bandGauge, band, execution, advisory } = args;
   const lane = signal.lane;
   const label = signal.laneLabel;
   const ask = priceLabel(args.bid01, args.ask01, false);
@@ -220,10 +222,31 @@ export function buildDeskAheadPlaybook(args: {
   if (signal.canTrade && signal.phase === 'ENTER' && label) {
     return pack(
       'go',
-      'Desk is GO — enter now',
-      buyDo(label, bracket),
+      momentum?.canCatch ? momentum.tapeLine : 'Desk is GO — enter now',
+      momentum?.canCatch ? momentum.actionHint : buyDo(label, bracket),
       maxPaySkip(ask) ?? 'Do not wait for another tick',
     );
+  }
+
+  if (
+    momentum &&
+    momentum.phase !== 'flat' &&
+    momentum.phase !== 'chasing' &&
+    momentum.phase !== 'extended' &&
+    label &&
+    !signal.canTrade
+  ) {
+    if (momentum.canCatch && contractLead?.phase === 'ENTER') {
+      return pack('go', momentum.tapeLine, momentum.actionHint, maxPaySkip(ask));
+    }
+    if (momentum.phase === 'early' || momentum.phase === 'building' || momentum.canCatch) {
+      return pack(
+        momentum.biasAligned ? 'arm' : 'watch',
+        momentum.tapeLine,
+        momentum.actionHint,
+        momentum.biasAligned ? 'Skip if 30s confirm is already +6¢' : 'Wait for bias + desk pick confirm',
+      );
+    }
   }
 
   const confirmSec = entryMoment?.confirmSecRemaining ?? signal.confirmSecRemaining;

@@ -79,6 +79,19 @@ function fmtEntryCents(entry01: number | null | undefined): string | null {
   return `${(entry01 * 100).toFixed(1)}¢`;
 }
 
+function contractLeadLane(
+  lead: ContractLeadSignal,
+  upLabel?: string,
+  downLabel?: string,
+): 'up' | 'down' | null {
+  const label = lead.sideLabel.trim().toUpperCase();
+  const up = (upLabel ?? 'UP').toUpperCase();
+  const down = (downLabel ?? 'DOWN').toUpperCase();
+  if (label === up || label === 'UP') return 'up';
+  if (label === down || label === 'DOWN') return 'down';
+  return null;
+}
+
 function checksFromExecution(
   execution: ExecutionSignal,
   lane: 'up' | 'down' | null,
@@ -251,6 +264,32 @@ export function computeEntryMoment(input: EntryMomentInput): EntryMoment {
 
   // --- Global blockers ---
   if (!advisory || advisory.verdict === 'NEITHER') {
+    if (
+      (pressure === 'EARLY' || pressure === 'BUILDING') &&
+      contractLead?.phase === 'ENTER'
+    ) {
+      const leadLane = contractLeadLane(contractLead, upLabel, downLabel);
+      if (leadLane) {
+        const name = laneLabel(leadLane, upLabel, downLabel);
+        const pressureLabel = pressure === 'EARLY' ? 'early 10s lead' : 'momentum building';
+        return {
+          phase: 'ENTER_NOW',
+          lane: leadLane,
+          headline: `${name} · 10s momentum live`,
+          exactAction: `${contractLead.actionLine} Catch tape momentum — desk pick still neutral; size down until bias confirms.`,
+          readinessPct: 70,
+          confirmSecRemaining: 0,
+          checks: [
+            { id: 'side', label: 'Tape lane', pass: true, detail: `BUY ${name}` },
+            { id: 'pressure', label: 'Inside momentum', pass: true, detail: pressureLabel },
+            { id: 'bias', label: 'Desk pick', pass: false, detail: 'NEITHER — confirm settlement bias' },
+            { id: 'lead', label: 'Contract lead', pass: true, detail: contractLead.actionLine },
+          ],
+          urgency: 'now',
+          canExecute: true,
+        };
+      }
+    }
     const chop = machine?.regime === 'chop';
     return {
       phase: chop ? 'NO_TRADE' : 'WAIT_SETUP',
@@ -285,16 +324,12 @@ export function computeEntryMoment(input: EntryMomentInput): EntryMoment {
   }
 
   // --- Inside momentum (10s EARLY / BUILDING) — buy the move, not the 30s chase ---
-  if (
-    (pressure === 'EARLY' || pressure === 'BUILDING') &&
-    lane &&
-    advisory &&
-    advisoryLane(advisory) === lane &&
-    advisory.confidence !== 'LOW' &&
-    !advisory.cautionFresh
-  ) {
+  if ((pressure === 'EARLY' || pressure === 'BUILDING') && lane && advisory) {
     const leadEnter = contractLead?.phase === 'ENTER';
     const leadWatch = contractLead?.phase === 'WATCH';
+    const aligned = advisoryLane(advisory) === lane;
+    const lowOk = leadEnter || advisory.confidence !== 'LOW';
+    if (aligned && lowOk && !advisory.cautionFresh) {
     const entry = fmtEntryCents(takePlan?.entry01 ?? advisory.mid);
     const pressureLabel = pressure === 'EARLY' ? 'early 10s lead' : 'momentum building';
     const momentumChecks: EntryMomentCheck[] = [
@@ -303,7 +338,7 @@ export function computeEntryMoment(input: EntryMomentInput): EntryMoment {
       {
         id: 'conviction',
         label: 'Conviction',
-        pass: advisory.confidence !== 'LOW',
+        pass: true,
         detail: `${advisory.confidence} · ${advisory.confidencePct}%`,
       },
       {
@@ -364,6 +399,50 @@ export function computeEntryMoment(input: EntryMomentInput): EntryMoment {
           ? `${contractLead!.actionLine} Almost ready — enter on next tick inside momentum.`
           : `${advisory.recommendation} ${pressureLabel} live — prepare limit at ${entry ?? 'ask'}.`,
         readinessPct: Math.max(68, advisory.confidencePct - 6),
+        confirmSecRemaining: null,
+        checks: momentumChecks,
+        urgency: 'soon',
+        canExecute: false,
+      };
+    }
+    }
+
+    // Tape-led momentum when desk pick lags contract lead
+    const leadLane = contractLead ? contractLeadLane(contractLead, upLabel, downLabel) : null;
+    if (leadLane && !aligned && (leadEnter || leadWatch)) {
+      const name = laneLabel(leadLane, upLabel, downLabel);
+      const pressureLabel = pressure === 'EARLY' ? 'early 10s lead' : 'momentum building';
+      const entry = fmtEntryCents(takePlan?.entry01 ?? advisory.mid);
+      const momentumChecks: EntryMomentCheck[] = [
+        { id: 'side', label: 'Tape lane', pass: true, detail: `BUY ${name}` },
+        { id: 'pressure', label: 'Inside momentum', pass: true, detail: pressureLabel },
+        { id: 'bias', label: 'Desk pick', pass: false, detail: `Waiting ${name} advisory confirm` },
+        {
+          id: 'lead',
+          label: 'Contract lead',
+          pass: leadEnter,
+          detail: leadEnter ? contractLead!.actionLine : 'Building — one more tick',
+        },
+      ];
+      if (leadEnter) {
+        return {
+          phase: 'ENTER_NOW',
+          lane: leadLane,
+          headline: `INSIDE MOMENTUM · ${name}`,
+          exactAction: `${contractLead!.actionLine} Tape ahead of desk pick — catch on bid, confirm bias before full size.`,
+          readinessPct: 74,
+          confirmSecRemaining: 0,
+          checks: momentumChecks,
+          urgency: 'now',
+          canExecute: true,
+        };
+      }
+      return {
+        phase: 'ALERT',
+        lane: leadLane,
+        headline: `ALERT ${name} — ${pressureLabel}`,
+        exactAction: `${contractLead!.actionLine} Arm limit at ${entry ?? 'bid'} — bias confirm pending.`,
+        readinessPct: 62,
         confirmSecRemaining: null,
         checks: momentumChecks,
         urgency: 'soon',

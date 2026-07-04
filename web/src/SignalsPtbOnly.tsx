@@ -8,10 +8,10 @@ import { OverallOrderBookPanel } from './OverallOrderBookPanel';
 import type { BookSnapshot } from './orderflowMetrics';
 import { TrackingTab } from './TrackingTab';
 import type { SpotPoint } from './SpotLevelChart';
+import { usePredictionClockMs } from './predictionClock';
 import { pickMarketSlug } from './gammaMarketSlug';
 import {
   isUpdownDeskMarket,
-  parseUpdownSlug,
   parseUpdownSlugWithHints,
   type UpdownSlugHint,
 } from './sixPackUpdownSlugs';
@@ -82,7 +82,7 @@ import type { ExecuteTakeSignalOpts } from './takeSignalDesk';
 import { loadTradeAccountMode } from './tradeAccountMode';
 import type { NoTradeScore } from './noTradeScore';
 import { buildOperatorVerdict } from './operatorVerdict';
-import { computeDeskSingleAction, type DeskSingleAction } from './deskSingleAction';
+import { computeDeskSingleAction } from './deskSingleAction';
 import { computeDualOutcomeWallFlow } from './dualOutcomeWalls';
 import { computeSpotBandGaugeSnapshot, type SpotBandGaugeSnapshot } from './spotBandDeskAction';
 import {
@@ -115,12 +115,14 @@ import {
   tradeDirectiveMeaningKey,
 } from './signalsDeskStable';
 import { NowPriceSignalsPanel } from './NowPriceSignalsPanel';
+import { useSettlementBiasFeed } from './useSettlementBiasFeed';
 import { NowProbSignalsPanel } from './NowProbSignalsPanel';
 import { BookProbabilityLagMonitorPanel } from './BookProbabilityLagPanelBody';
 import { ProbabilityLagMonitorPanel } from './ProbabilityLagMonitorPanel';
 import {
   multiPanelMinH,
   multiPanelTileClass,
+  PANEL_TILE_MIN,
   readSignalsMultiPanel,
   saveSignalsMultiPanel,
   SIGNALS_PANEL_LABELS,
@@ -130,6 +132,7 @@ import {
 import { ChartPanelChrome } from './ChartPanelChrome';
 import {
   DEFAULT_CHART_PANEL_SCALE,
+  scaledMinHeight,
   zoomInChartPanelScale,
   zoomOutChartPanelScale,
 } from './chartPanelZoom';
@@ -387,7 +390,7 @@ function SignalsChartPanelShell(props: {
   onResetZoom: () => void;
   variant: 'tile' | 'inline';
   tileClassName?: string;
-  children: ReactElement;
+  children: React.ReactNode;
 }): ReactElement {
   const {
     title,
@@ -423,9 +426,19 @@ function SignalsChartPanelShell(props: {
 
   if (variant === 'inline') return inner;
 
+  const tileMinH =
+    scale === 1
+      ? multiPanelMinH(panelId)
+      : undefined;
+  const tileMinHStyle =
+    scale === 1
+      ? undefined
+      : { minHeight: scaledMinHeight(PANEL_TILE_MIN[panelId].vh, PANEL_TILE_MIN[panelId].px, scale) };
+
   return (
     <div
-      className={`flex min-h-0 min-w-0 flex-col overflow-hidden rounded-xl border border-zinc-800/60 bg-zinc-950/35 ring-1 ring-white/[0.02] ${multiPanelTileClass(panelId, visible)} ${multiPanelMinH(panelId)} ${tileClassName}`}
+      className={`flex min-h-0 min-w-0 flex-col overflow-visible rounded-xl border border-zinc-800/60 bg-zinc-950/35 ring-1 ring-white/[0.02] ${multiPanelTileClass(panelId, visible)} ${tileMinH ?? ''} ${tileClassName}`}
+      style={tileMinHStyle}
     >
       {inner}
     </div>
@@ -693,11 +706,7 @@ export function SignalsPtbOnly(props: {
     downLabel,
   ]);
   // Tape velocity, polled per second so it ticks even when prints are stale.
-  const [tapeClock, setTapeClock] = useState(() => Date.now());
-  useEffect(() => {
-    const id = window.setInterval(() => setTapeClock(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, []);
+  const tapeClock = usePredictionClockMs();
   const tapeNowSpot: TapeVelocity = useMemo(
     () => computeTapeVelocity(tapePrints, { now: tapeClock }),
     [tapePrints, tapeClock],
@@ -761,11 +770,7 @@ export function SignalsPtbOnly(props: {
     setReEntryStateSpot((s) => updateReEntryState(s, tradeDirectiveSpot, prev, Date.now()));
     previousDirectiveSpotRef.current = tradeDirectiveSpot;
   }, [tradeDirectiveSpot]);
-  const [reEntryNowSpot, setReEntryNowSpot] = useState(() => Date.now());
-  useEffect(() => {
-    const id = window.setInterval(() => setReEntryNowSpot(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, []);
+  const reEntryNowSpot = usePredictionClockMs();
   const reEntryCheckSpot = useMemo(() => {
     if (!tradeDirectiveSpot || !reEntryStateSpot) return null;
     return checkReEntry(reEntryStateSpot, tradeDirectiveSpot, reEntryNowSpot);
@@ -1895,6 +1900,19 @@ export function SignalsPtbOnly(props: {
     return { score, verdict, flags, spreadCents, chaseRisk, wideSpread, chop, scoreReasons } as const;
   }, [bookAbove, bookBelow, masterAction, masterLane, masterReady, ptbContext, tapeNowSpot]);
 
+  useSettlementBiasFeed({
+    slug,
+    enabled: !bookOnlyDesk && priceToBeat != null,
+    spot,
+    priceToBeat,
+    probUp,
+    probDown,
+    upLabel,
+    downLabel,
+    bandGauge: deskBandGauge,
+    ptbContext,
+  });
+
   // Compact score card. The old `ptbSignalCard` duplicated regime/control/slope tiles
   // already rendered inside `MachineVerdictCard`, plus a debounced "direction call" that
   // contradicted the directive. Now this card shows ONLY the page-level composite score
@@ -2548,7 +2566,7 @@ export function SignalsPtbOnly(props: {
 
   const spotVsPtbSection = (
     <div className="flex w-full min-w-0 flex-col gap-2">
-      <div className="w-full min-w-0 min-h-[min(52svh,520px)]">
+      <div className="w-full min-w-0">
         <PtbOpportunityModeChart
           slug={slug}
           mode={spotChartLane}
@@ -3219,31 +3237,35 @@ export function SignalsPtbOnly(props: {
           </div>
         ) : (
           <>
-            {!bookOnlyDesk ? (
-              <div className={chartTab === 'spot' ? 'flex min-w-0 flex-col gap-2' : 'hidden'}>
+            {!bookOnlyDesk && chartTab === 'spot' ? (
+              <div className="flex min-w-0 flex-col gap-2">
                 <SignalsChartPanelShell {...chartPanelShellProps('spot', spotPanelTitle, 'inline')}>
                   {spotVsPtbSection}
                 </SignalsChartPanelShell>
                 {spotVsPtbAnalyticsSection}
               </div>
             ) : null}
-            {hasDual ? (
-              <div className={chartTab === 'dual' ? 'flex min-h-0 flex-1 flex-col gap-2' : 'hidden'}>
+            {hasDual && chartTab === 'dual' ? (
+              <div className="flex min-h-0 flex-1 flex-col gap-2">
                 <SignalsChartPanelShell {...chartPanelShellProps('dual', dualPanelTitle, 'inline')}>
-                  {dualChartPanel}
+                  {dualChartPanel ?? null}
                 </SignalsChartPanelShell>
               </div>
             ) : null}
-            <div className={chartTab === 'now' ? 'flex min-w-0 flex-col' : 'hidden'}>
-              <SignalsChartPanelShell {...chartPanelShellProps('now', nowPanelTitle, 'inline')}>
-                {nowSignalsPanel}
-              </SignalsChartPanelShell>
-            </div>
-            <div className={chartTab === 'plm' ? 'flex min-w-0 flex-col' : 'hidden'}>
-              <SignalsChartPanelShell {...chartPanelShellProps('plm', plmPanelTitle, 'inline')}>
-                {plmPanel}
-              </SignalsChartPanelShell>
-            </div>
+            {chartTab === 'now' ? (
+              <div className="flex min-w-0 flex-col">
+                <SignalsChartPanelShell {...chartPanelShellProps('now', nowPanelTitle, 'inline')}>
+                  {nowSignalsPanel}
+                </SignalsChartPanelShell>
+              </div>
+            ) : null}
+            {chartTab === 'plm' ? (
+              <div className="flex min-w-0 flex-col">
+                <SignalsChartPanelShell {...chartPanelShellProps('plm', plmPanelTitle, 'inline')}>
+                  {plmPanel}
+                </SignalsChartPanelShell>
+              </div>
+            ) : null}
           </>
         )}
       </div>

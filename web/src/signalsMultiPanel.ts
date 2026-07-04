@@ -133,3 +133,10 @@ export function multiPanelMinH(id: SignalsPanelId): string {
       return 'min-h-[min(26vh,320px)]';
   }
 }
+
+export const PANEL_TILE_MIN: Record<SignalsPanelId, { vh: number; px: number }> = {
+  spot: { vh: 40, px: 460 },
+  dual: { vh: 34, px: 400 },
+  now: { vh: 30, px: 360 },
+  plm: { vh: 26, px: 320 },
+};

@@ -58,18 +58,15 @@ export function useViewportZoom() {
   );
   const scaleLabel = useMemo(() => formatViewportScalePct(scale), [scale]);
 
-  /** Chrome/Safari `zoom` scales the whole app — only apply when scale actually changes. */
+  /** Chrome/Safari `zoom` on <html> breaks click hit-testing on long pages — scale the app shell instead. */
   useEffect(() => {
     if (Math.abs(scaleRef.current - scale) < 0.001) return;
     scaleRef.current = scale;
-    const root = document.documentElement;
-    root.style.setProperty('--app-viewport-scale', String(scale));
-    root.style.zoom = String(scale);
+    document.documentElement.style.setProperty('--app-viewport-scale', String(scale));
   }, [scale]);
 
   useEffect(() => {
     return () => {
-      document.documentElement.style.zoom = '';
       document.documentElement.style.removeProperty('--app-viewport-scale');
     };
   }, []);

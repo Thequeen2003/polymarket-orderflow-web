@@ -185,7 +185,7 @@ export function evaluateOneSignalSnapshot(
   }
 
   const spotHist = snap.underlying?.spot?.history ?? [];
-  const spotMids = spotHist.slice(-8).map((p) => {
+  const spotMids = spotHist.slice(-8).map(() => {
     const implied = lane === 'up' ? entry01 + 0.01 : entry01 - 0.01;
     return implied;
   });

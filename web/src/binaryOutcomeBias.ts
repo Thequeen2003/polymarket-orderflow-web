@@ -49,6 +49,269 @@ export type BinaryOutcomeEstimate = {
   missing: string[];
 };
 
+export type SettlementBiasWarningLevel = 'none' | 'watch' | 'alert' | 'critical';
+
+export type SettlementBiasWarning = {
+  level: SettlementBiasWarningLevel;
+  favoredLane: 'up' | 'down';
+  favoredLabel: string;
+  favoredProbPct: number;
+  edgePp: number | null;
+  headline: string;
+  detail: string;
+  action: string;
+};
+
+export type SettlementBiasMomentumTier = 'flat' | 'weak' | 'moderate' | 'strong';
+
+export type SettlementBiasSideMomentum = {
+  scorePct: number;
+  tier: SettlementBiasMomentumTier;
+  /** Side tape is moving (gaining or losing). */
+  active: boolean;
+  /** True when this side's mid is rising on the window. */
+  gaining: boolean;
+};
+
+export type SettlementBiasDualReadout = {
+  finish: {
+    lane: 'up' | 'down';
+    label: string;
+    probPct: number;
+    upProbPct: number;
+    downProbPct: number;
+    headline: string;
+    subline: string;
+  };
+  momentum: {
+    upLabel: string;
+    downLabel: string;
+    up: SettlementBiasSideMomentum;
+    down: SettlementBiasSideMomentum;
+    favoredLane: 'up' | 'down' | 'flat';
+    favoredLabel: string;
+    subline: string;
+    /** True when spot or contract tape shows a directional push worth surfacing. */
+    active: boolean;
+    source: 'spot' | 'tape' | 'none';
+  };
+  /** Finish lane matches live momentum leader. */
+  aligned: boolean;
+  splitNote: string | null;
+};
+
+function sideMomentumTier(scorePct: number): SettlementBiasMomentumTier {
+  const edge = Math.abs(scorePct - 50);
+  if (edge < 4) return 'flat';
+  if (scorePct >= 78 || scorePct <= 22) return 'strong';
+  if (scorePct >= 62 || scorePct <= 38) return 'moderate';
+  return 'weak';
+}
+
+function momentumFavoredLane(upScorePct: number, downScorePct: number): 'up' | 'down' | 'flat' {
+  const d = upScorePct - downScorePct;
+  if (d > 4) return 'up';
+  if (d < -4) return 'down';
+  return 'flat';
+}
+
+const MOMENTUM_ACTIVE_BOUNDED = 0.08;
+const MOMENTUM_WEAK_BOUNDED = 0.04;
+const TAPE_DELTA_NOISE = 0.00025;
+
+/** Per-side tape push: rising mid → score above 50, falling → below 50. */
+export function sideMomentumFromDelta(
+  delta01: number | null | undefined,
+  spotAssist: number,
+): { scorePct: number; active: boolean; gaining: boolean; source: 'tape' | 'spot' | 'none' } {
+  if (delta01 != null && Number.isFinite(delta01) && Math.abs(delta01) >= TAPE_DELTA_NOISE) {
+    const b = tanhBounded(delta01, 0.01);
+    const active = Math.abs(b) >= MOMENTUM_WEAK_BOUNDED;
+    const scorePct = 50 + b * 50;
+    return { scorePct, active, gaining: b > 0, source: 'tape' };
+  }
+  if (Math.abs(spotAssist) >= MOMENTUM_ACTIVE_BOUNDED) {
+    const scorePct = 50 + spotAssist * 50;
+    return { scorePct, active: true, gaining: spotAssist > 0, source: 'spot' };
+  }
+  return { scorePct: 50, active: false, gaining: false, source: 'none' };
+}
+
+/** @deprecated Use sideMomentumFromDelta per outcome lane. */
+export function contractTapeMomentumBounded(
+  probDeltaUp01: number | null | undefined,
+  probDeltaDown01: number | null | undefined,
+): number | null {
+  const up = sideMomentumFromDelta(probDeltaUp01, 0);
+  if (up.source === 'tape') return tanhBounded(probDeltaUp01!, 0.01);
+  const dn = sideMomentumFromDelta(probDeltaDown01, 0);
+  if (dn.source === 'tape') return tanhBounded(probDeltaDown01!, 0.01);
+  return probDeltaUp01 == null && probDeltaDown01 == null ? null : 0;
+}
+
+/** Finish probability + complementary up/down momentum scores (spot B) or contract tape when spot is quiet. */
+export function buildSettlementBiasDualReadout(args: {
+  estimate: BinaryOutcomeEstimate;
+  upLabel?: string;
+  downLabel?: string;
+  probDeltaUp01?: number | null;
+  probDeltaDown01?: number | null;
+}): SettlementBiasDualReadout {
+  const upLabel = (args.upLabel ?? 'UP').trim() || 'UP';
+  const downLabel = (args.downLabel ?? 'DOWN').trim() || 'DOWN';
+  const finishLane: 'up' | 'down' = args.estimate.probUp >= 0.5 ? 'up' : 'down';
+  const finishLabel = finishLane === 'up' ? upLabel : downLabel;
+  const finishProb = finishLane === 'up' ? args.estimate.probUp : args.estimate.probDown;
+
+  const momSig = args.estimate.signals.find((s) => s.id === 'momentumNorm');
+  const spotBounded = momSig?.bounded ?? 0;
+
+  const upLive = sideMomentumFromDelta(args.probDeltaUp01, spotBounded);
+  const downLive = sideMomentumFromDelta(args.probDeltaDown01, -spotBounded);
+
+  const upScorePct = upLive.scorePct;
+  const downScorePct = downLive.scorePct;
+
+  const upMom: SettlementBiasSideMomentum = {
+    scorePct: upScorePct,
+    tier: upLive.active ? sideMomentumTier(upScorePct) : 'flat',
+    active: upLive.active,
+    gaining: upLive.gaining,
+  };
+  const downMom: SettlementBiasSideMomentum = {
+    scorePct: downScorePct,
+    tier: downLive.active ? sideMomentumTier(downScorePct) : 'flat',
+    active: downLive.active,
+    gaining: downLive.gaining,
+  };
+
+  const momentumActive = upLive.active || downLive.active;
+  const momentumSource: 'spot' | 'tape' | 'none' =
+    upLive.source === 'tape' || downLive.source === 'tape'
+      ? 'tape'
+      : upLive.source === 'spot' || downLive.source === 'spot'
+        ? 'spot'
+        : 'none';
+
+  const momentumFavored = momentumActive ? momentumFavoredLane(upScorePct, downScorePct) : 'flat';
+  const momentumFavoredLabel =
+    momentumFavored === 'up' ? upLabel : momentumFavored === 'down' ? downLabel : 'Flat';
+
+  const aligned = momentumFavored !== 'flat' && finishLane === momentumFavored;
+
+  const finishHeadline = `${finishLabel} wins at bell`;
+  const finishSubline = `${(finishProb * 100).toFixed(1)}% finish score — best side to hold through expiry`;
+
+  const horizonSec = args.estimate.horizonSec;
+  const pushWord = momentumSource === 'tape' ? 'contract tape' : 'spot drift';
+  const momentumSubline = !momentumActive
+    ? `Quiet ${horizonSec}s window — finish score drives the read`
+    : momentumFavored === 'up'
+      ? `${upLabel} gaining on ${pushWord} · ${downLabel} fading`
+      : momentumFavored === 'down'
+        ? `${downLabel} gaining on ${pushWord} · ${upLabel} fading`
+        : `Mixed ${pushWord} — finish score drives the read`;
+
+  let splitNote: string | null = null;
+  if (momentumFavored !== 'flat' && !aligned) {
+    const momWord = momentumFavored === 'up' ? 'lifting' : 'sliding';
+    splitNote = `Split: finish favors ${finishLabel} (${(finishProb * 100).toFixed(0)}%) but tape is ${momWord} ${momentumFavoredLabel} — don't confuse bell odds with the live push.`;
+  }
+
+  return {
+    finish: {
+      lane: finishLane,
+      label: finishLabel,
+      probPct: finishProb * 100,
+      upProbPct: args.estimate.probUp * 100,
+      downProbPct: args.estimate.probDown * 100,
+      headline: finishHeadline,
+      subline: finishSubline,
+    },
+    momentum: {
+      upLabel,
+      downLabel,
+      up: upMom,
+      down: downMom,
+      favoredLane: momentumFavored,
+      favoredLabel: momentumFavoredLabel,
+      subline: momentumSubline,
+      active: momentumActive,
+      source: momentumSource,
+    },
+    aligned,
+    splitNote,
+  };
+}
+
+/** Desk settlement lean vs book — surfaces early warning when model diverges from CLOB. */
+export function buildSettlementBiasWarning(args: {
+  estimate: BinaryOutcomeEstimate;
+  marketUp01: number | null;
+  upLabel?: string;
+  downLabel?: string;
+  probDeltaUp01?: number | null;
+  probDeltaDown01?: number | null;
+}): SettlementBiasWarning {
+  const upLabel = (args.upLabel ?? 'UP').trim() || 'UP';
+  const downLabel = (args.downLabel ?? 'DOWN').trim() || 'DOWN';
+  const favoredLane: 'up' | 'down' = args.estimate.probUp >= 0.5 ? 'up' : 'down';
+  const favoredProb = favoredLane === 'up' ? args.estimate.probUp : args.estimate.probDown;
+  const favoredLabel = favoredLane === 'up' ? upLabel : downLabel;
+  const edgePp =
+    args.marketUp01 != null && Number.isFinite(args.marketUp01)
+      ? (args.estimate.probUp - args.marketUp01) * 100
+      : null;
+  const strength = Math.max(args.estimate.probUp, args.estimate.probDown);
+  const absEdge = edgePp != null ? Math.abs(edgePp) : 0;
+
+  let level: SettlementBiasWarningLevel = 'none';
+  if (absEdge >= 12 || (strength >= 0.8 && absEdge >= 8)) level = 'critical';
+  else if (absEdge >= 8 || strength >= 0.72) level = 'alert';
+  else if (absEdge >= 5 || strength >= 0.65) level = 'watch';
+
+  const pct = (favoredProb * 100).toFixed(1);
+  const dual = buildSettlementBiasDualReadout({
+    estimate: args.estimate,
+    upLabel,
+    downLabel,
+    probDeltaUp01: args.probDeltaUp01,
+    probDeltaDown01: args.probDeltaDown01,
+  });
+  const headline =
+    level === 'none'
+      ? dual.splitNote != null
+        ? `Finish ${dual.finish.label} ${pct}% · momentum ${dual.momentum.favoredLabel}`
+        : `${dual.finish.label} finish ${pct}%`
+      : dual.splitNote != null
+        ? `EARLY WARNING — finish ${dual.finish.label} ${pct}% vs ${dual.momentum.favoredLabel} push`
+        : `EARLY WARNING — ${favoredLabel} finish ${pct}%`;
+
+  const detail =
+    edgePp != null
+      ? `Model vs book: ${edgePp >= 0 ? '+' : ''}${edgePp.toFixed(1)}pp on ${upLabel} · score ${args.estimate.score >= 0 ? '+' : ''}${args.estimate.score.toFixed(2)}`
+      : `Model score ${args.estimate.score >= 0 ? '+' : ''}${args.estimate.score.toFixed(2)}`;
+
+  const cheapLane = edgePp != null && edgePp > 4 ? upLabel : edgePp != null && edgePp < -4 ? downLabel : null;
+  const action =
+    level === 'none'
+      ? 'Tape aligned with desk model — no urgent settlement mismatch.'
+      : cheapLane
+        ? `${cheapLane} looks cheap vs settlement model — watch for catch-up repricing before the jump.`
+        : `${favoredLabel} path dominates — don't chase wide ask; time entry on lag or bid.`;
+
+  return {
+    level,
+    favoredLane,
+    favoredLabel,
+    favoredProbPct: favoredProb * 100,
+    edgePp,
+    headline,
+    detail,
+    action,
+  };
+}
+
 function sigmoid(x: number): number {
   if (x >= 20) return 1;
   if (x <= -20) return 0;

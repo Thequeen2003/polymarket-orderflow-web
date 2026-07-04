@@ -15,7 +15,7 @@ export type TradeSlidePanelProps = {
  * Fixed right trade column — no drag/resize. App.tsx adds matching right padding when open
  * so the main dashboard sits left of the panel instead of underneath it.
  */
-export function TradeSlidePanel(props: TradeSlidePanelProps): ReactElement {
+export function TradeSlidePanel(props: TradeSlidePanelProps): ReactElement | null {
   const { open, onClose, title = 'Trade', children } = props;
   const [subHeader, setSubHeader] = useState<ReactNode>(null);
   const floatChrome = useMemo(() => ({ setSubHeader }), []);
@@ -29,23 +29,20 @@ export function TradeSlidePanel(props: TradeSlidePanelProps): ReactElement {
     return () => window.removeEventListener('keydown', onKey);
   }, [open, onClose]);
 
+  if (!open) return null;
+
   return (
     <>
       <button
         type="button"
-        aria-hidden={!open}
-        tabIndex={open ? 0 : -1}
+        aria-hidden
+        tabIndex={-1}
         onClick={onClose}
-        className={`fixed inset-0 z-[134] bg-black/60 transition-opacity duration-200 md:hidden ${
-          open ? 'opacity-100' : 'pointer-events-none opacity-0'
-        }`}
+        className="fixed inset-0 z-[134] bg-black/60 transition-opacity duration-200 md:hidden"
         title="Close"
       />
       <div
-        className={`fixed inset-y-0 right-0 z-[135] flex w-[min(380px,100vw)] flex-col border-l border-zinc-700/80 bg-zinc-950 shadow-[-12px_0_40px_rgba(0,0,0,0.45)] will-change-transform transition-transform duration-200 ease-out ${
-          open ? 'translate-x-0' : 'pointer-events-none translate-x-full'
-        }`}
-        aria-hidden={!open}
+        className="fixed inset-y-0 right-0 z-[135] flex w-[min(380px,100vw)] flex-col border-l border-zinc-700/80 bg-zinc-950 shadow-[-12px_0_40px_rgba(0,0,0,0.45)]"
       >
         <div className="flex shrink-0 items-center justify-between gap-2 border-b border-zinc-800/80 px-3 py-2.5">
           <div className="min-w-0">

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type PointerEvent, type ReactElement } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type PointerEvent, type ReactElement } from 'react';
 import {
   BPX_BRACKET_DRAG_EVENT,
   BPX_BRACKET_OVERLAY_EVENT,
@@ -12,6 +12,8 @@ import { computePtbSettlementCrossProjections } from './ptbProjection';
 import { PTB_REACTION_DIMENSIONS, PTB_REACTION_ONE_LINER } from './ptbReactionFramework';
 import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
 import { buildSpotCandles, candleStraddlesPtb, ptbTouchEpsilonUsd } from './spotVsPtb';
+import { scaledMinHeight } from './chartPanelZoom';
+import { useChartPanelScale } from './chartPanelScaleContext';
 import { computeTickSlopeUsdPerSec } from './ptbCoreEngine';
 import {
   buildSpotSections,
@@ -511,6 +513,7 @@ export function PtbOpportunityModeChart(props: {
     wallFlow = null,
   } = props;
   const hasDualProbInput = probUp.length >= 1 && probDown.length >= 1;
+  const panelScale = useChartPanelScale();
   const featureFlags = useFeatureFlags();
   const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
   const [pinnedNoteVisible, setPinnedNoteVisible] = useState<boolean>(featureFlags.pinnedNote);
@@ -556,6 +559,10 @@ export function PtbOpportunityModeChart(props: {
           ? 'block h-full min-h-[min(52svh,520px)] w-full max-w-none rounded-[20px] bg-[#0a0f16]'
           : 'block h-full min-h-[min(68svh,1500px)] w-full max-w-none flex-1 rounded-[24px] bg-[#0a0f16] xl:min-h-[min(74svh,1700px)] [contain:strict]'
         : 'block h-full min-h-[min(54vh,620px)] max-h-[min(88vh,960px)] w-full rounded-[24px] bg-[#0a0f16] [contain:strict]';
+  const chartSvgScaledStyle: CSSProperties | undefined =
+    chartAreaRoomy && signalsEmbed && panelScale !== 1
+      ? { minHeight: scaledMinHeight(52, 520, panelScale) }
+      : undefined;
   const gradId = useId().replace(/:/g, '');
   const [displayMode, setDisplayMode] = useState<'line' | 'ohlc'>('line');
   type ZoomSec = 60 | 120 | 300 | 900 | 1800 | 3600 | 7200 | 14400;
@@ -2331,6 +2338,7 @@ export function PtbOpportunityModeChart(props: {
           <svg
             viewBox={`0 0 ${width} ${svgHeight}`}
             className={chartSvgSk}
+            style={chartSvgScaledStyle}
             preserveAspectRatio="xMidYMid meet"
             role="img"
             aria-label="Spot versus price to beat chart frame"
@@ -3169,6 +3177,7 @@ export function PtbOpportunityModeChart(props: {
           ref={spotSvgRef}
           viewBox={`0 0 ${width} ${svgHeight}`}
           className={chartSvgMain}
+          style={chartSvgScaledStyle}
           preserveAspectRatio="xMidYMid meet"
           role="img"
           aria-label="Spot price versus PTB"

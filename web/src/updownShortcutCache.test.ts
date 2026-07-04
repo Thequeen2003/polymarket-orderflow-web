@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { fallbackUpdownSlug, slugToOpenFromShortcut } from './updownShortcutCache';
+import { fallbackUpdownSlug, liveSlugFromUpdownShortcut, slugToOpenFromShortcut } from './updownShortcutCache';
 
 describe('updownShortcutCache', () => {
   it('builds titled hourly fallback slug for 1h', () => {
@@ -34,5 +34,14 @@ describe('updownShortcutCache', () => {
         '5m',
       ),
     ).toBe('btc-updown-5m-95');
+  });
+
+  it('liveSlugFromUpdownShortcut matches trading slug for desk poll', () => {
+    expect(
+      liveSlugFromUpdownShortcut(
+        { slug: 'btc-updown-5m-200', trading_slug: 'btc-updown-5m-195', asset: 'btc', window: '5m' },
+        '5m',
+      ),
+    ).toBe('btc-updown-5m-195');
   });
 });

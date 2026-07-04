@@ -560,7 +560,7 @@ export function computeExecutionSignal(
   const confirmRequiredMs = EXEC_CONFIRM_HOLD_MS;
 
   const snap = evaluateExecutionGates(input, nowMs);
-  const { proposedLane, baseAlert, allGatesPass, gates, blockReasons, dynamicTp } = snap;
+  const { proposedLane, baseAlert, allGatesPass, gates, blockReasons } = snap;
   const baseEdgeDiag = baseAlert ? null : diagnoseBaseEdge(input);
 
   const confirmPass = allGatesPass && confirmHeldMs >= confirmRequiredMs;

@@ -102,3 +102,19 @@ export function fallbackUpdownSlug(asset: UpdownShortcutAsset, interval: UpdownI
 export function slugToOpenFromShortcut(data: CachedUpdownShortcut, interval: UpdownInterval): string {
   return data.trading_slug?.trim() || data.slug.trim() || fallbackUpdownSlug(data.asset as UpdownShortcutAsset, interval);
 }
+
+/** Live desk slug from shortcut API — always prefer `trading_slug` (5m prior bucket with CLOB). */
+export function liveSlugFromUpdownShortcut(
+  data: Pick<CachedUpdownShortcut, 'slug' | 'trading_slug' | 'asset' | 'window'>,
+  interval: UpdownInterval,
+): string {
+  return slugToOpenFromShortcut(
+    {
+      slug: data.slug,
+      trading_slug: data.trading_slug,
+      asset: data.asset,
+      window: data.window,
+    },
+    interval,
+  );
+}

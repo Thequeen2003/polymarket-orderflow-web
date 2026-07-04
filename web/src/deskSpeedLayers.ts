@@ -249,7 +249,7 @@ export function ptbSupportForLane(
   return { support: 'NEUTRAL', note: 'At PTB — no clear gap-side speed' };
 }
 
-export function probSupportForLane(lane: 'up' | 'down', probDir: SpeedDirection): LaneSupport {
+export function probSupportForLane(_lane: 'up' | 'down', probDir: SpeedDirection): LaneSupport {
   if (probDir === 'FLAT') return 'NEUTRAL';
   return probDir === 'UP' ? 'TAILWIND' : 'HEADWIND';
 }
@@ -361,7 +361,7 @@ export function classifySpeedAlignment(layers: LayerSpeed[]): {
     lane: 'up',
     spot,
     ptb,
-    prob: layers.find((l) => l.id === 'probUp' || l.id === 'prob') ?? null,
+    prob: layers.find((l) => l.id === 'probUp' || l.id === 'probDown') ?? null,
     gapNowUsd: 0,
   });
 }

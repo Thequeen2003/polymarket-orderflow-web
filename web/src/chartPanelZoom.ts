@@ -24,3 +24,10 @@ export function zoomOutChartPanelScale(current: number): number {
 export function formatChartPanelScalePct(scale: number): string {
   return `${Math.round(scale * 100)}%`;
 }
+
+/** Layout min-height that grows with panel +/− (not CSS zoom). */
+export function scaledMinHeight(minVh: number, maxPx: number, scale: number): string {
+  const s = clampChartPanelScale(scale);
+  if (s === 1) return `min(${minVh}svh, ${maxPx}px)`;
+  return `min(calc(${minVh}svh * ${s}), calc(${maxPx}px * ${s}))`;
+}

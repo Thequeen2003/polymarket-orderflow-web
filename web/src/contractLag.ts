@@ -48,6 +48,35 @@ export type ContractLagReadout = {
   marketStale: boolean;
 };
 
+export function contractLagSideQualifier(lagCents: number): 'cheap' | 'rich' | 'fair' {
+  if (lagCents >= 0.5) return 'cheap';
+  if (lagCents <= -0.5) return 'rich';
+  return 'fair';
+}
+
+export type ContractLagTradeGates = {
+  lagOk: boolean;
+  edgeOk: boolean;
+  geoOk: boolean;
+  liveOk: boolean;
+  allOk: boolean;
+};
+
+export function contractLagTradeGates(lag: ContractLagReadout): ContractLagTradeGates {
+  const edgeThresholdPp = EDGE_TRADE_THRESHOLD * 100;
+  return {
+    lagOk: lag.lagCents >= CONTRACT_LAG_MIN_CENTS,
+    edgeOk: Math.abs(lag.edgePp) >= edgeThresholdPp,
+    geoOk: lag.geoAligned,
+    liveOk: !lag.marketStale,
+    allOk: lag.tradeable,
+  };
+}
+
+export function contractMidsPinnedExtreme(marketUp: number, marketDown: number): boolean {
+  return marketUp >= 0.98 || marketDown >= 0.98 || marketUp <= 0.02 || marketDown <= 0.02;
+}
+
 function clampProb01(p: number): number {
   return Math.max(0.01, Math.min(0.99, p));
 }
@@ -189,7 +218,8 @@ export function computeContractLagReadout(params: {
   });
 
   const geo = params.geo ?? null;
-  const geoAligned = favoredSide !== 'even' && geoAlignedWithSide(geo, favoredSide);
+  const geoAligned =
+    (favoredSide === 'up' || favoredSide === 'down') && geoAlignedWithSide(geo, favoredSide);
 
   const edgeThresholdPp = EDGE_TRADE_THRESHOLD * 100;
 
@@ -203,7 +233,7 @@ export function computeContractLagReadout(params: {
 
   const tradeable =
     !marketStale &&
-    favoredSide !== 'even' &&
+    (favoredSide === 'up' || favoredSide === 'down') &&
     lagCents >= CONTRACT_LAG_MIN_CENTS &&
     Math.abs(edgePp) >= edgeThresholdPp &&
     geoAligned;

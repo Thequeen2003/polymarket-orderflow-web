@@ -119,7 +119,7 @@ export function RawProjectionsTab(props: {
       <div className="rounded-xl border border-indigo-800/45 bg-indigo-950/20 px-4 py-3 ring-1 ring-indigo-500/10">
         <h2 className="text-sm font-bold text-indigo-100">Raw projected spot · hourly × 30 days</h2>
         <p className="mt-1 text-[11px] leading-snug text-zinc-400">
-          Linear extrapolation from the latest tick slope ({assetLabel ?? slug || 'asset'}). Each row is +1 hour from now.
+          Linear extrapolation from the latest tick slope ({assetLabel ?? (slug || 'asset')}). Each row is +1 hour from now.
           Not a forecast — uses only spot tape + PTB available on this desk.
         </p>
         {grid ? (

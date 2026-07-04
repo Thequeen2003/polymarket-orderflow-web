@@ -33,6 +33,10 @@ import { TradeSegmentedControl } from './tradeUi';
 import { loadTradeUiPreferences, saveTradeUiPreferences } from './tradeUiPreferences';
 import { pickMarketSlug, preloadedMarketForSlug } from './gammaMarketSlug';
 import { TradeSlidePanel } from './TradeSlidePanel';
+import { SettlementBiasDeskProvider } from './SettlementBiasDeskContext';
+import { SettlementBiasHangDock } from './SettlementBiasHangDock';
+import { ViewportZoomShell } from './ViewportZoomShell';
+import { AppSlidePaddingShell } from './SettlementBiasChrome';
 const PositionsCommandPanel = lazy(() =>
   import('./PositionsCommandPanel').then((m) => ({ default: m.PositionsCommandPanel })),
 );
@@ -47,6 +51,11 @@ const PtbMultiAssetGrid = lazy(() => import('./PtbMultiAssetGrid').then((m) => (
 import type { PtbMultiAssetRow } from './PtbMultiAssetGrid';
 const TrackingTab = lazy(() => import('./TrackingTab').then((m) => ({ default: m.TrackingTab })));
 const RawProjectionsTab = lazy(() => import('./RawProjectionsTab').then((m) => ({ default: m.RawProjectionsTab })));
+const BinaryCandleChartTab = lazy(() => import('./BinaryCandleChartTab').then((m) => ({ default: m.BinaryCandleChartTab })));
+const PocketOptionBitcoinTab = lazy(() =>
+  import('./PocketOptionBitcoinTab').then((m) => ({ default: m.PocketOptionBitcoinTab })),
+);
+const BtcPricePredictorPage = lazy(() => import('./BtcPricePredictorPage').then((m) => ({ default: m.BtcPricePredictorPage })));
 const WorkspaceTab = lazy(() => import('./WorkspaceTab').then((m) => ({ default: m.WorkspaceTab })));
 import { STREAM_ATTRIBUTION_LINE } from './streamAttribution';
 import { releaseOrphanPointerCapture } from './pointerCaptureSafety';
@@ -66,6 +75,7 @@ import { outcomeEntryExitHints } from './chartReadouts';
 import { buildRollingContext, rollingContextText } from './contextSummary';
 import {
   inferUpdownHintFromMarketJson,
+  isAdjacentUpdownBucket,
   isTitledUpdownSlug,
   isUpdownDeskMarket,
   nextUpdownSlug,
@@ -76,9 +86,14 @@ import {
 } from './sixPackUpdownSlugs';
 import { updownSlugToOpen } from './updownSlugToOpen';
 import {
+  pickUpdownAutoRollTarget,
   readUpdownAutoRollEnabled,
   saveUpdownAutoRollEnabled,
   shouldAutoRollUpdownMarket,
+  shouldClearUpdownAutoRollKey,
+  updownAutoRollPollMs,
+  updownLiveSlugPollMs,
+  UPDOWN_PREFETCH_LEAD_MS,
 } from './updownAutoRoll';
 import { buildUpdownWindowPickerItems } from './updownWindowPicker';
 import { inferMarketKind, marketUsesPtbSpotDesk } from './marketKind';
@@ -101,9 +116,11 @@ import {
   clearOneSignalAssetInFlight,
   saveOneSignalSessionTrade,
 } from './oneSignalSessionPersist';
-import { appendLiveMidSeries, appendLiveSpotSeries, lastPointMs, maxFeedMs, normalizeEpochMs } from './feedFreshness';
+import { appendChartSeriesPoint, appendLiveMidSeries, appendLiveSpotSeries, booksEntriesMidKey, lastPointMs, maxFeedMs, normalizeEpochMs } from './feedFreshness';
+import { usePredictionClockMs } from './predictionClock';
 import {
   fallbackUpdownSlug,
+  liveSlugFromUpdownShortcut,
   readUpdownShortcutCache,
   slugToOpenFromShortcut,
   writeUpdownShortcutCache,
@@ -476,15 +493,7 @@ function OutcomePane({
   const intel = useMemo(() => computeBookIntel(entry.book), [entry.book]);
   const gammaStats = useMemo(() => pickGammaVolumeStats(market), [market]);
   const gammaLines = useMemo(() => formatGammaVolumeLines(gammaStats), [gammaStats]);
-  const [now, setNow] = useState(() => Date.now());
-
-  // Global clock tick for freshness badges / relative time. Keep low-frequency to avoid re-render thrash.
-  useEffect(() => {
-    // Drive countdown clocks (e.g. "Time remaining") at 1s resolution.
-    // API polling still happens on its own cadence; this only updates the UI clock.
-    const id = window.setInterval(() => setNow(Date.now()), 1_000);
-    return () => window.clearInterval(id);
-  }, []);
+  const now = usePredictionClockMs();
 
   const ageMs = fetchedAt == null ? null : now - fetchedAt;
   const live = ageMs != null && ageMs < 60_000;
@@ -672,7 +681,10 @@ type MainTab =
   | 'perps'
   | 'multiscan'
   | 'assistant'
-  | 'raw';
+  | 'raw'
+  | 'binary'
+  | 'pocketbtc'
+  | 'btcpredict';
 
 function mainTabTitle(tab: MainTab): string {
   switch (tab) {
@@ -702,7 +714,17 @@ function mainTabTitle(tab: MainTab): string {
       return 'Assistant';
     case 'raw':
       return 'Projections (30d hourly)';
+    case 'binary':
+      return 'Turbo binary · BTC';
+    case 'pocketbtc':
+      return 'Pocket Option · BTC';
+    case 'btcpredict':
+      return 'BTC price predictor';
   }
+}
+
+function isBinanceOnlyDeskTab(tab: MainTab): boolean {
+  return tab === 'binary' || tab === 'pocketbtc' || tab === 'btcpredict' || tab === 'btc' || tab === 'tvbtc' || tab === 'perps';
 }
 
 function MainTabButton({
@@ -820,7 +842,7 @@ function App() {
   /** RTDS spot: Chainlink slash-USD series plus Binance-mirrored USDT tickers (e.g. btc/usdt) — drives multi-asset scan + selected slug. */
   const [spotBySymbol, setSpotBySymbol] = useState<Record<string, SpotPoint[]>>({});
   const [watchMetaBySlug, setWatchMetaBySlug] = useState<Record<string, { ptb: number | null; endsInMs: number | null }>>({});
-  const [now, setNow] = useState(() => Date.now());
+  const predictionClockMs = usePredictionClockMs();
   const spotBySymbolRef = useRef<Record<string, SpotPoint[]>>({});
   const selectedSlugRef = useRef<string>(bootMarketState.slug);
   const booksRef = useRef<ClobBookEntry[] | null>(null);
@@ -832,6 +854,11 @@ function App() {
   const bootShortcutRetryRef = useRef(0);
   const wantSeriesRef = useRef<boolean>(false);
   const wantFlowRef = useRef<boolean>(false);
+  /** Signals/sports: flow zones update on a slower cadence — full depth snapshots are expensive. */
+  const wantFlowSlowRef = useRef<boolean>(false);
+  const booksMidKeyRef = useRef('');
+  const lastBooksFetchedTouchRef = useRef(0);
+  const lastFlowFlushRef = useRef(0);
   const loadBooksRef = useRef<
     (ids: string[], opts?: { updateSeries?: boolean; updateFlow?: boolean }) => Promise<void>
   >(async () => {});
@@ -884,6 +911,8 @@ function App() {
   const tradeSessionAutoSeededRef = useRef(false);
   const updownAutoRollBusyRef = useRef(false);
   const updownAutoRollKeyRef = useRef('');
+  const updownSlugHintsRef = useRef<Record<string, UpdownSlugHint>>({});
+  const prefetchedBooksRef = useRef<Map<string, NonNullable<typeof books>>>(new Map());
   const [globalTradeContext, setGlobalTradeContext] = useState<{
     slug: string;
     question: string;
@@ -900,6 +929,10 @@ function App() {
   useEffect(() => {
     selectedSlugRef.current = selectedSlug;
   }, [selectedSlug]);
+
+  useEffect(() => {
+    updownSlugHintsRef.current = updownSlugHints;
+  }, [updownSlugHints]);
 
   useEffect(() => {
     booksRef.current = books;
@@ -958,8 +991,8 @@ function App() {
   useEffect(() => {
     wantSeriesRef.current =
       mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports' || mainTab === 'workspace';
-    wantFlowRef.current =
-      mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports' || mainTab === 'workspace';
+    wantFlowRef.current = mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'workspace';
+    wantFlowSlowRef.current = mainTab === 'signals' || mainTab === 'sports';
   }, [mainTab]);
 
   const prevDepthMapsRef = useRef<Record<string, { bids: Map<string, number>; asks: Map<string, number> }>>({});
@@ -1163,13 +1196,19 @@ function App() {
     setSelectedSlug(clean);
     selectedSlugRef.current = clean;
     setSlugInput(clean || slug.trim());
+
+    const cachedForSlug = readLastMarketCache();
+    const preloadedEarly = preloadedMarketForSlug(
+      opts?.market ?? (cachedForSlug?.slug === clean ? cachedForSlug.market : undefined),
+      clean,
+    );
+    const prefetchedBooks = prefetchedBooksRef.current.get(clean);
+    const usedPrefetchedBooks = Boolean(prefetchedBooks && prefetchedBooks.length > 0);
+    const adjacentRoll =
+      Boolean(clean && prevClean && isAdjacentUpdownBucket(prevClean, clean, updownSlugHintsRef.current));
+
     if (!sameMarket) {
       setError(null);
-      setMarketJson(null);
-      setBooks(null);
-      setBooksFetchedAt(null);
-      setBooksLoading(Boolean(clean));
-      booksHydratedRef.current = false;
       setGlobalTradeLocked(false);
       setSsrPriceToBeat(null);
       setSsrPtbSource(null);
@@ -1179,22 +1218,86 @@ function App() {
       setRtdsTickAt(null);
       setRtdsReceivedAt(null);
       setRtdsLastPollMs(null);
+
+      if (preloadedEarly != null && typeof preloadedEarly === 'object') {
+        setMarketJson(preloadedEarly);
+        if (prefetchedBooks && prefetchedBooks.length > 0) {
+          setBooks(prefetchedBooks);
+          booksHydratedRef.current = !prefetchedBooks.every((e) => Boolean(e.error));
+          setBooksFetchedAt(booksHydratedRef.current ? Date.now() : null);
+          setBooksLoading(false);
+          prefetchedBooksRef.current.delete(clean);
+        } else {
+          setBooks(null);
+          setBooksFetchedAt(null);
+          setBooksLoading(Boolean(clean));
+          booksHydratedRef.current = false;
+        }
+      } else {
+        setMarketJson(null);
+        setBooks(null);
+        setBooksFetchedAt(null);
+        setBooksLoading(Boolean(clean));
+        booksHydratedRef.current = false;
+      }
+
       if (clean) {
-        setChartSeriesBySlug((m) => {
-          const next = { ...m };
-          delete next[clean];
-          return next;
-        });
-        setFlowSeriesBySlug((m) => {
-          const next = { ...m };
-          delete next[clean];
-          return next;
-        });
-        setSpotSeriesBySlug((m) => {
-          const next = { ...m };
-          delete next[clean];
-          return next;
-        });
+        if (adjacentRoll && prevClean) {
+          setChartSeriesBySlug((m) => {
+            const carried = m[prevClean];
+            if (!carried) {
+              const next = { ...m };
+              delete next[clean];
+              return next;
+            }
+            return { ...m, [clean]: carried };
+          });
+          setFlowSeriesBySlug((m) => {
+            const carried = m[prevClean];
+            if (!carried) {
+              const next = { ...m };
+              delete next[clean];
+              return next;
+            }
+            return { ...m, [clean]: carried };
+          });
+          setSpotSeriesBySlug((m) => {
+            const carried = m[prevClean];
+            if (!carried) {
+              const next = { ...m };
+              delete next[clean];
+              return next;
+            }
+            return { ...m, [clean]: carried };
+          });
+        } else {
+          setChartSeriesBySlug((m) => {
+            const next = { ...m };
+            delete next[clean];
+            return next;
+          });
+          setFlowSeriesBySlug((m) => {
+            const next = { ...m };
+            delete next[clean];
+            return next;
+          });
+          setSpotSeriesBySlug((m) => {
+            const next = { ...m };
+            delete next[clean];
+            return next;
+          });
+        }
+      }
+
+      if (preloadedEarly != null && typeof preloadedEarly === 'object') {
+        const ids = pickTokenIds(preloadedEarly);
+        if (ids.length >= 2 && !prefetchedBooks) {
+          booksKickKeyRef.current = booksKickKey(clean, ids);
+          void loadBooksRef.current(ids, {
+            updateSeries: wantSeriesRef.current,
+            updateFlow: wantFlowRef.current,
+          });
+        }
       }
     } else if (clean && (!booksHydratedRef.current || force)) {
       setBooksLoading(true);
@@ -1225,8 +1328,7 @@ function App() {
       return { ok: false };
     }
     writeLastMarketSlug(clean);
-    const cachedForSlug = readLastMarketCache();
-    const preloaded = preloadedMarketForSlug(
+    const preloaded = preloadedEarly ?? preloadedMarketForSlug(
       opts?.market ?? (cachedForSlug?.slug === clean ? cachedForSlug.market : undefined),
       clean,
     );
@@ -1238,13 +1340,13 @@ function App() {
       const applyMeta = !sameMarket || force;
       if (applyMeta) setMarketJson(preloaded);
       const ids = pickTokenIds(preloaded);
-      if (ids.length >= 2 && (!booksHydratedRef.current || applyMeta)) {
-        booksKickKeyRef.current = booksKickKey(clean, ids);
-        void loadBooksRef.current(ids, {
-          updateSeries: wantSeriesRef.current,
-          updateFlow: wantFlowRef.current,
-        });
-      } else if (ids.length < 2 && applyMeta) {
+        if (ids.length >= 2 && !usedPrefetchedBooks && (!booksHydratedRef.current || applyMeta)) {
+          booksKickKeyRef.current = booksKickKey(clean, ids);
+          void loadBooksRef.current(ids, {
+            updateSeries: wantSeriesRef.current,
+            updateFlow: wantFlowRef.current,
+          });
+        } else if (ids.length < 2 && applyMeta) {
         setBooksLoading(false);
       }
       writeLastMarketCache(clean, preloaded);
@@ -1416,8 +1518,8 @@ function App() {
     if (typeof endRaw !== 'string') return null;
     const t = Date.parse(endRaw);
     if (!Number.isFinite(t)) return null;
-    return t - now;
-  }, [marketJson, now]);
+    return t - predictionClockMs;
+  }, [marketJson, predictionClockMs]);
 
   const tradePanelSharedProps = useMemo(
     () => ({
@@ -1632,8 +1734,10 @@ function App() {
         }
         setBooks(res.data);
         booksHydratedRef.current = !allFailed;
+        booksMidKeyRef.current = booksEntriesMidKey(res.data);
         const ts = Date.now();
         setBooksFetchedAt(allFailed ? null : ts);
+        lastBooksFetchedTouchRef.current = ts;
         if (allFailed) {
           if (initialLoad) setError('Order book unavailable — retrying with fresh market tokens…');
           setBooksLoading(false);
@@ -1647,12 +1751,18 @@ function App() {
             if (!slug) return m;
             const existingForSlug = m[slug] ?? {};
             const nextForSlug: Record<string, SeriesPoint[]> = { ...existingForSlug };
+            let changed = false;
             for (const e of res.data) {
               const token = e.token;
               const v = e.error ? null : midPrice(e.book);
               const prev = nextForSlug[token] ?? [];
-              nextForSlug[token] = [...prev, { t: ts, v }].slice(-180);
+              const next = appendChartSeriesPoint(prev, ts, v);
+              if (next !== prev) {
+                changed = true;
+                nextForSlug[token] = next;
+              }
             }
+            if (!changed) return m;
             return { ...m, [slug]: nextForSlug };
           });
         }
@@ -1724,7 +1834,24 @@ function App() {
     booksWsRef.current?.close();
     booksWsRef.current = null;
     booksCacheRef.current = new Map();
+    for (const entry of booksRef.current ?? []) {
+      if (!idsSet.has(entry.token) || entry.error) continue;
+      const book = entry.book as { bids?: { price: string; size: string }[]; asks?: { price: string; size: string }[] } | null;
+      if (!book || !Array.isArray(book.bids) || !Array.isArray(book.asks)) continue;
+      booksCacheRef.current.set(entry.token, { bids: book.bids, asks: book.asks });
+    }
     booksWsIdsRef.current = key;
+    booksMidKeyRef.current = '';
+    if (booksCacheRef.current.size > 0) {
+      const seeded: { token: string; book: unknown; error: string | null }[] = [];
+      for (const token of ids) {
+        const b = booksCacheRef.current.get(token);
+        seeded.push({ token, book: b ? { bids: b.bids, asks: b.asks } : { bids: [], asks: [] }, error: null });
+      }
+      booksMidKeyRef.current = booksEntriesMidKey(seeded);
+    }
+    lastBooksFetchedTouchRef.current = 0;
+    lastFlowFlushRef.current = 0;
 
     // Keep UI responsive while we wait for first WS book snapshot.
     if (!booksHydratedRef.current) setBooksLoading(true);
@@ -1746,40 +1873,61 @@ function App() {
       booksDirtyRef.current = false;
       const ts = Date.now();
       const entries = toEntries();
-      setBooks(entries);
-      booksHydratedRef.current = true;
-      setBooksFetchedAt(ts);
-      setBooksLoading(false);
+      const midKey = booksEntriesMidKey(entries);
+      const midsChanged = midKey !== booksMidKeyRef.current;
+
+      if (midsChanged) {
+        booksMidKeyRef.current = midKey;
+        setBooks(entries);
+        booksHydratedRef.current = true;
+        setBooksFetchedAt(ts);
+        lastBooksFetchedTouchRef.current = ts;
+        setBooksLoading(false);
+      } else if (ts - lastBooksFetchedTouchRef.current >= 5_000) {
+        lastBooksFetchedTouchRef.current = ts;
+        setBooksFetchedAt(ts);
+      } else {
+        return;
+      }
 
       const slug = selectedSlugRef.current.trim();
       if (!slug) return;
 
-      if (wantSeriesRef.current) {
+      if (wantSeriesRef.current && midsChanged) {
         setChartSeriesBySlug((m) => {
           const existingForSlug = m[slug] ?? {};
           const nextForSlug: Record<string, SeriesPoint[]> = { ...existingForSlug };
+          let changed = false;
           for (const e of entries) {
             const token = e.token;
             const v = e.error ? null : midPrice(e.book);
             const prev = nextForSlug[token] ?? [];
-            nextForSlug[token] = [...prev, { t: ts, v }].slice(-180);
+            const next = appendChartSeriesPoint(prev, ts, v);
+            if (next !== prev) {
+              changed = true;
+              nextForSlug[token] = next;
+            }
           }
+          if (!changed) return m;
           return { ...m, [slug]: nextForSlug };
         });
       }
 
-      if (wantFlowRef.current) {
+      const wantFlowNow =
+        wantFlowRef.current || (wantFlowSlowRef.current && ts - lastFlowFlushRef.current >= 2_000);
+      if (wantFlowNow && midsChanged) {
+        lastFlowFlushRef.current = ts;
         setFlowSeriesBySlug((m) => {
           const existingForSlug = m[slug] ?? {};
           const nextForSlug: Record<string, BookSnapshot[]> = { ...existingForSlug };
           for (const e of entries) {
             const token = e.token;
-            const key = `${slug}:${token}`;
-            const prevMaps = prevDepthMapsRef.current[key] ?? null;
+            const flowKey = `${slug}:${token}`;
+            const prevMaps = prevDepthMapsRef.current[flowKey] ?? null;
             const prev = nextForSlug[token] ?? [];
             if (e.error) continue;
             const { snap, next } = snapshotFromBook(e.book, ts, prevMaps);
-            prevDepthMapsRef.current[key] = next;
+            prevDepthMapsRef.current[flowKey] = next;
             nextForSlug[token] = [...prev, snap].slice(-360);
           }
           return { ...m, [slug]: nextForSlug };
@@ -1788,8 +1936,7 @@ function App() {
     };
 
     // Coalesce book updates to avoid rendering at full WS tick rate.
-    // Rendering ~60fps from websocket churn can cause visible UI jank.
-    const MIN_FLUSH_MS = 150;
+    const MIN_FLUSH_MS = 200;
     let lastFlushAt = 0;
     let flushTimer: number | null = null;
 
@@ -1844,7 +1991,7 @@ function App() {
             booksWsRef.current = null;
             booksWsIdsRef.current = '';
             setBooksWsEpoch((n) => n + 1);
-          }, 2_500);
+          }, 800);
         }
       },
       onPriceChanges: (changes) => {
@@ -1936,21 +2083,39 @@ function App() {
     const run = () => {
       if (stopped) return;
       if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      const wsFresh =
+        booksWsStatus === 'open' &&
+        booksFetchedAt != null &&
+        Date.now() - booksFetchedAt < 20_000;
+      if (wsFresh && (mainTab === 'signals' || mainTab === 'sports')) return;
       const wantSeries =
         mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports' || mainTab === 'workspace';
       const wantFlow =
-        mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'signals' || mainTab === 'sports' || mainTab === 'workspace';
+        mainTab === 'book' || mainTab === 'flowzones' || mainTab === 'workspace';
       void loadBooks(tokenIds, { updateSeries: wantSeries, updateFlow: wantFlow });
     };
 
-    const intervalMs = mainTab === 'book' ? 5_000 : mainTab === 'signals' || mainTab === 'sports' || mainTab === 'workspace' ? 4_000 : 6_500;
+    const wsFreshNow =
+      booksWsStatus === 'open' &&
+      booksFetchedAt != null &&
+      Date.now() - booksFetchedAt < 20_000;
+    const intervalMs =
+      wsFreshNow && (mainTab === 'signals' || mainTab === 'sports')
+        ? 8_000
+        : marketEndsInMs != null && marketEndsInMs <= 60_000
+          ? 1_000
+          : mainTab === 'book'
+            ? 2_000
+            : mainTab === 'signals' || mainTab === 'sports' || mainTab === 'workspace'
+              ? 1_500
+              : 3_500;
     void run();
     const id = window.setInterval(() => void run(), intervalMs);
     return () => {
       stopped = true;
       window.clearInterval(id);
     };
-  }, [chartEnabled, loadBooks, mainTab, selectedSlug, tokenIds, binanceSpotActive]);
+  }, [booksFetchedAt, booksWsStatus, chartEnabled, loadBooks, mainTab, selectedSlug, tokenIds, binanceSpotActive, marketEndsInMs]);
 
   /** If CLOB WS goes quiet, REST + reconnect so implied mids do not sit "stale" for minutes. */
   useEffect(() => {
@@ -1959,10 +2124,10 @@ function App() {
     const id = window.setInterval(() => {
       if (document.visibilityState !== 'visible') return;
       const age = booksFetchedAt == null ? Number.POSITIVE_INFINITY : Date.now() - booksFetchedAt;
-      if (age < 35_000) return;
+      if (age < 15_000) return;
       void loadBooks(tokenIds, { updateSeries: true, updateFlow: true });
-      if (age > 50_000) setBooksWsEpoch((n) => n + 1);
-    }, 12_000);
+      if (age > 25_000) setBooksWsEpoch((n) => n + 1);
+    }, 5_000);
     return () => window.clearInterval(id);
   }, [binanceSpotActive, booksFetchedAt, loadBooks, mainTab, selectedSlug, tokenIds]);
 
@@ -2150,7 +2315,7 @@ function App() {
     if (!slug || marketJson) return;
     if (!isRetryableMarketMetaError(error)) return;
     if (marketLoadRetryRef.current >= 4) return;
-    const delayMs = 800 + marketLoadRetryRef.current * 900;
+    const delayMs = 200 + marketLoadRetryRef.current * 300;
     const id = window.setTimeout(() => {
       marketLoadRetryRef.current += 1;
       void loadMarket(slug, { force: true });
@@ -2226,7 +2391,7 @@ function App() {
       }
     };
     void tick();
-    intervalId = window.setInterval(() => void tick(), 5_000);
+    intervalId = window.setInterval(() => void tick(), 1_500);
     return () => {
       stopped = true;
       if (intervalId != null) window.clearInterval(intervalId);
@@ -2262,11 +2427,6 @@ function App() {
   }, [selectedSlug, updownSlugHints, marketJson, spotBySymbol]);
 
   useEffect(() => {
-    const id = window.setInterval(() => setNow(Date.now()), 5_000);
-    return () => window.clearInterval(id);
-  }, []);
-
-  useEffect(() => {
     writeStringArray(PTB_WATCH_SLUGS_KEY, ptbWatchSlugs);
   }, [ptbWatchSlugs]);
 
@@ -2286,7 +2446,10 @@ function App() {
   // (intentionally no second clock interval)
 
   const spotLenForRtds = spotSeriesBySlug[selectedSlug]?.length ?? 0;
-  const rtdsPollFast = isUpdownDeskMarket(selectedSlug, updownSlugHints) && spotLenForRtds < 2;
+  const rtdsPollUrgent =
+    updownParsed != null && marketEndsInMs != null && marketEndsInMs <= 120_000;
+  const rtdsPollFast =
+    rtdsPollUrgent || (isUpdownDeskMarket(selectedSlug, updownSlugHints) && spotLenForRtds < 2);
 
   useEffect(() => {
     const symFromSlug = (slug: string): string | null => {
@@ -2435,13 +2598,12 @@ function App() {
     const bootTimers = [
       window.setTimeout(() => {
         if (!stopped) void tick();
-      }, 140),
+      }, 60),
       window.setTimeout(() => {
         if (!stopped) void tick();
-      }, 400),
+      }, 180),
     ];
-    // RTDS numbers feel "frozen" if we poll too slowly. Keep 1s cadence for normal mode.
-    const intervalMs = rtdsPollFast ? 750 : 1_000;
+    const intervalMs = rtdsPollUrgent ? 450 : rtdsPollFast ? 650 : 900;
     const id = window.setInterval(() => void tick(), intervalMs);
     const onVis = () => {
       if (document.visibilityState !== 'visible' || stopped) return;
@@ -2454,7 +2616,7 @@ function App() {
       for (const t of bootTimers) window.clearTimeout(t);
       document.removeEventListener('visibilitychange', onVis);
     };
-  }, [selectedSlug, ptbWatchSlugs, rtdsPollFast, mainTab, updownParsed, updownSlugHints, marketJson]);
+  }, [selectedSlug, ptbWatchSlugs, rtdsPollFast, rtdsPollUrgent, mainTab, updownParsed, updownSlugHints, marketJson, marketEndsInMs]);
 
   useEffect(() => {
     if (mainTab !== 'multiscan') return;
@@ -2551,7 +2713,6 @@ function App() {
     }
     const shortcutAsset = updownParsed.asset;
     if (!isShortcutAsset(shortcutAsset)) {
-      // We can still stream spot from RTDS if available, but the shortcut API is BTC/ETH/SOL only.
       setUpdownLiveSlugFromApi(null);
       return;
     }
@@ -2560,13 +2721,35 @@ function App() {
       const res = await marketsUpdownShortcut(shortcutAsset, updownParsed.interval);
       if (stopped) return;
       if (isOk(res) && typeof res.data.slug === 'string' && res.data.slug) {
-        const slug = res.data.slug;
-        setUpdownLiveSlugFromApi(slug);
+        const liveSlug = liveSlugFromUpdownShortcut(
+          {
+            slug: res.data.slug,
+            trading_slug: res.data.trading_slug,
+            asset: res.data.asset,
+            window: res.data.window,
+          },
+          updownParsed.interval,
+        );
+        setUpdownLiveSlugFromApi(liveSlug);
+        writeUpdownShortcutCache(shortcutAsset, updownParsed.interval, {
+          slug: res.data.slug,
+          trading_slug: res.data.trading_slug,
+          market: res.data.market,
+          asset: res.data.asset,
+          interval: res.data.interval,
+          window: res.data.window,
+          inferred_window_start_unix: (res.data as { inferred_window_start_unix?: number }).inferred_window_start_unix,
+          start: res.data.start,
+          end: res.data.end,
+        });
+        const slugToOpen = liveSlug;
+        const market = preloadedMarketForSlug(res.data.market, slugToOpen);
+        if (market) writeLastMarketCache(slugToOpen, market);
         const iw = res.data.inferred_window_start_unix;
-        if (typeof iw === 'number' && !parseUpdownSlug(slug)) {
+        if (typeof iw === 'number' && !parseUpdownSlug(liveSlug)) {
           setUpdownSlugHints((m) => ({
             ...m,
-            [slug.trim().toLowerCase()]: {
+            [liveSlug.trim().toLowerCase()]: {
               asset: shortcutAsset,
               interval: updownParsed.interval,
               bucketStartSec: iw,
@@ -2576,12 +2759,86 @@ function App() {
       }
     };
     void tick();
-    const id = window.setInterval(() => void tick(), 20_000);
+    const pollMs = updownLiveSlugPollMs(marketEndsInMs);
+    const id = window.setInterval(() => void tick(), pollMs);
     return () => {
       stopped = true;
       window.clearInterval(id);
     };
-  }, [updownParsed]);
+  }, [updownParsed, marketEndsInMs]);
+
+  /** Prefetch the next Up/Down bucket before the window ends so auto-roll opens instantly. */
+  useEffect(() => {
+    if (!updownParsed || marketEndsInMs == null) return;
+    if (marketEndsInMs > UPDOWN_PREFETCH_LEAD_MS || marketEndsInMs <= 0) return;
+    const stepNext = stepUpdownSlug(1);
+    if (!stepNext) return;
+
+    let cancelled = false;
+    const prefetchSlug = stepNext.trim().toLowerCase();
+
+    const prefetchBooksFor = (slug: string, market: unknown) => {
+      const ids = pickTokenIds(market);
+      if (ids.length < 2) return;
+      if (prefetchedBooksRef.current.has(slug.trim().toLowerCase())) return;
+      void clobBooks(ids).then((bRes) => {
+        if (cancelled || !isOk(bRes)) return;
+        prefetchedBooksRef.current.set(slug.trim().toLowerCase(), bRes.data);
+      });
+    };
+
+    const cached = readLastMarketCache();
+    if (cached?.slug.trim().toLowerCase() !== prefetchSlug) {
+      void marketsGet(stepNext).then((res) => {
+        if (cancelled || !isOk(res)) return;
+        writeLastMarketCache(stepNext, res.data);
+        prefetchBooksFor(stepNext, res.data);
+      });
+    } else if (cached?.market) {
+      prefetchBooksFor(stepNext, cached.market);
+    }
+
+    if (isShortcutAsset(updownParsed.asset)) {
+      void marketsUpdownShortcut(updownParsed.asset, updownParsed.interval).then((res) => {
+        if (cancelled || !isOk(res)) return;
+        writeUpdownShortcutCache(updownParsed.asset as UpdownShortcutAsset, updownParsed.interval, {
+          slug: res.data.slug,
+          trading_slug: res.data.trading_slug,
+          market: res.data.market,
+          asset: res.data.asset,
+          interval: res.data.interval,
+          window: res.data.window,
+          inferred_window_start_unix: (res.data as { inferred_window_start_unix?: number }).inferred_window_start_unix,
+          start: res.data.start,
+          end: res.data.end,
+        });
+        const slugToOpen = res.data.trading_slug?.trim() || res.data.slug.trim();
+        const market = preloadedMarketForSlug(res.data.market, slugToOpen);
+        if (market) {
+          writeLastMarketCache(slugToOpen, market);
+          prefetchBooksFor(slugToOpen, market);
+        }
+      });
+    }
+
+    const repollMs =
+      marketEndsInMs <= 15_000 ? 2_000 : marketEndsInMs <= 45_000 ? 5_000 : 12_000;
+    const repollId = window.setInterval(() => {
+      if (cancelled) return;
+      const slug = stepUpdownSlug(1);
+      if (!slug) return;
+      void marketsGet(slug).then((res) => {
+        if (cancelled || !isOk(res)) return;
+        writeLastMarketCache(slug, res.data);
+        prefetchBooksFor(slug, res.data);
+      });
+    }, repollMs);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(repollId);
+    };
+  }, [marketEndsInMs, stepUpdownSlug, updownParsed]);
 
   const updownBehindBySec = useMemo(() => {
     const p = updownParsed;
@@ -2705,13 +2962,19 @@ function App() {
     };
   }, [autoEnabled, assistantAvailable, assistantContext, autoBusy, books, pushAutoLine, rollingCtxText, selectedSlug, updownParsed]);
 
-  async function openUpdownShortcut(asset: UpdownShortcutAsset, interval: UpdownInterval) {
+  async function openUpdownShortcut(
+    asset: UpdownShortcutAsset,
+    interval: UpdownInterval,
+    opts?: { silent?: boolean; forceNavigate?: boolean },
+  ) {
     releaseOrphanPointerCapture();
     const openSeq = ++shortcutOpenSeqRef.current;
+    const silent = opts?.silent === true;
+    const forceNavigate = opts?.forceNavigate === true;
     setError(null);
     setMarketsError(null);
     setMarketsNotice(null);
-    setShortcutBusy({ asset, interval });
+    if (!silent) setShortcutBusy({ asset, interval });
     setLastShortcut({ asset, interval });
 
     const openFromShortcut = (data: CachedUpdownShortcut, notice?: string) => {
@@ -2732,7 +2995,7 @@ function App() {
     const currentSlug = selectedSlugRef.current.trim().toLowerCase();
     if (cached) {
       const cachedSlug = canonicalMarketSlug(slugToOpenFromShortcut(cached, interval));
-      const needsCacheOpen = currentSlug !== cachedSlug || !marketJson;
+      const needsCacheOpen = forceNavigate || currentSlug !== cachedSlug || !marketJson;
       if (needsCacheOpen) {
         openFromShortcut(
           cached,
@@ -2757,7 +3020,7 @@ function App() {
               `Shortcut API slow — kept ${asset.toUpperCase()} ${interval}. ${pretty(first)}`,
             );
           }
-          setShortcutBusy(null);
+          if (!silent) setShortcutBusy(null);
           return;
         }
         const fallbackSlug = fallbackUpdownSlug(asset, interval);
@@ -2765,7 +3028,7 @@ function App() {
           `Shortcut API failed — trying ${fallbackSlug}. ${pretty(first)}`,
         );
         void navigateToMarket(fallbackSlug);
-        setShortcutBusy(null);
+        if (!silent) setShortcutBusy(null);
         return;
       }
 
@@ -2800,7 +3063,7 @@ function App() {
           [slugToOpen.trim().toLowerCase()]: { asset, interval, bucketStartSec: iw },
         }));
       }
-      setShortcutBusy(null);
+      if (!silent) setShortcutBusy(null);
       if (openSeq === shortcutOpenSeqRef.current) {
         void navigateToMarket(slugToOpen, data.market ? { market: preloadedMarketForSlug(data.market, slugToOpen) } : undefined);
       }
@@ -2825,14 +3088,13 @@ function App() {
         );
         void navigateToMarket(fallbackSlug);
       }
-      setShortcutBusy(null);
+      if (!silent) setShortcutBusy(null);
     }
   }
 
   /** When the Up/Down window ends, roll to the next bucket without changing the main tab. */
   useEffect(() => {
     if (!updownAutoRoll || !updownParsed) return;
-    if (shortcutBusy) return;
     if (!shouldAutoRollUpdownMarket({ endsInMs: marketEndsInMs, marketClosed: isMarketClosed(marketJson) })) {
       updownAutoRollKeyRef.current = '';
       return;
@@ -2842,17 +3104,56 @@ function App() {
     if (updownAutoRollKeyRef.current === selected || updownAutoRollBusyRef.current) return;
 
     const runRoll = async () => {
-      if (updownAutoRollKeyRef.current === selected || updownAutoRollBusyRef.current) return;
+      if (updownAutoRollBusyRef.current) return;
+      if (updownAutoRollKeyRef.current === selected) return;
       updownAutoRollBusyRef.current = true;
-      updownAutoRollKeyRef.current = selected;
+      const before = selectedSlugRef.current.trim().toLowerCase();
       try {
+        const stepNext = stepUpdownSlug(1);
+        const rollTasks: Promise<unknown>[] = [];
+
         if (isShortcutAsset(updownParsed.asset)) {
-          await openUpdownShortcut(updownParsed.asset as UpdownShortcutAsset, updownParsed.interval);
-          return;
+          rollTasks.push(
+            openUpdownShortcut(updownParsed.asset as UpdownShortcutAsset, updownParsed.interval, {
+              silent: true,
+              forceNavigate: true,
+            }),
+          );
+        } else {
+          if (stepNext && stepNext.toLowerCase() !== before) {
+            const prefetched = readLastMarketCache();
+            const cleanNext = canonicalMarketSlug(stepNext);
+            rollTasks.push(
+              navigateToMarket(
+                stepNext,
+                prefetched?.slug.trim().toLowerCase() === cleanNext ? { market: prefetched.market } : undefined,
+              ),
+            );
+          }
+          const target = pickUpdownAutoRollTarget({
+            selectedSlug: before,
+            stepNextSlug: stepNext,
+            liveSlugFromApi: updownLiveSlugFromApi,
+          });
+          if (target) {
+            rollTasks.push(
+              (async () => {
+                const nowSlug = selectedSlugRef.current.trim().toLowerCase();
+                if (target.forceReload || target.slug.trim().toLowerCase() === nowSlug) {
+                  await loadMarket(target.slug, { force: true });
+                } else {
+                  await navigateToMarket(target.slug);
+                }
+              })(),
+            );
+          }
         }
-        const next = stepUpdownSlug(1);
-        if (next && next.trim().toLowerCase() !== selected) {
-          await navigateToMarket(next);
+
+        await Promise.all(rollTasks);
+
+        const after = selectedSlugRef.current.trim().toLowerCase();
+        if (after !== before) {
+          updownAutoRollKeyRef.current = before;
         }
       } finally {
         updownAutoRollBusyRef.current = false;
@@ -2860,13 +3161,23 @@ function App() {
     };
 
     void runRoll();
-    const pollMs = marketEndsInMs != null && marketEndsInMs <= 30_000 ? 2_000 : 5_000;
+    const pollMs = updownAutoRollPollMs(marketEndsInMs);
     const id = window.setInterval(() => void runRoll(), pollMs);
     return () => window.clearInterval(id);
-  }, [marketEndsInMs, marketJson, navigateToMarket, selectedSlug, shortcutBusy, stepUpdownSlug, updownAutoRoll, updownParsed]);
+  }, [
+    loadMarket,
+    marketEndsInMs,
+    marketJson,
+    navigateToMarket,
+    selectedSlug,
+    stepUpdownSlug,
+    updownAutoRoll,
+    updownLiveSlugFromApi,
+    updownParsed,
+  ]);
 
   useEffect(() => {
-    if (marketEndsInMs != null && marketEndsInMs > 10_000) {
+    if (shouldClearUpdownAutoRollKey(marketEndsInMs)) {
       updownAutoRollKeyRef.current = '';
     }
   }, [selectedSlug, marketEndsInMs]);
@@ -3214,11 +3525,9 @@ function App() {
   );
 
   return (
-      <div
-        className={`min-h-full bg-zinc-950 bg-[radial-gradient(100%_60%_at_50%_-10%,rgba(99,102,241,0.08),transparent_52%),linear-gradient(180deg,#0b0b0f_0%,#09090b_45%,#060608_100%)] font-sans text-zinc-200 antialiased ${
-          slideTradePanelReservesSpace ? 'md:pr-[380px]' : ''
-        }`}
-      >
+    <SettlementBiasDeskProvider>
+      <ViewportZoomShell scale={viewportZoom.scale}>
+      <AppSlidePaddingShell tradeSlideReservesSpace={slideTradePanelReservesSpace}>
       <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
         <header className="rounded-2xl border border-zinc-800/50 bg-zinc-900/20 px-5 py-5 shadow-lg shadow-black/20 ring-1 ring-white/[0.03] backdrop-blur-sm sm:px-6">
           <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
@@ -3328,8 +3637,9 @@ function App() {
         </header>
 
         <div className="mt-8 flex flex-col gap-5 xl:grid xl:grid-cols-12 xl:items-start xl:gap-6">
+          {!isBinanceOnlyDeskTab(mainTab) ? (
           <div
-            className={`rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-5 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm xl:col-span-3 ${
+            className={`relative z-20 rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-5 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm xl:col-span-3 ${
               mainTab === 'signals' || mainTab === 'sports' ? 'order-2 xl:order-1' : ''
             }`}
           >
@@ -3359,18 +3669,33 @@ function App() {
               marketControls
             )}
           </div>
+          ) : null}
 
           <div
-            className={`min-w-0 max-w-full rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-4 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm sm:p-5 ${
-              showEmbeddedTradeDock ? 'xl:col-span-7' : 'xl:col-span-9'
+            className={`relative z-10 min-w-0 max-w-full rounded-2xl border border-zinc-800/50 bg-zinc-950/40 p-4 shadow-lg shadow-black/25 ring-1 ring-white/[0.02] backdrop-blur-sm sm:p-5 ${
+              isBinanceOnlyDeskTab(mainTab) ? 'xl:col-span-12' : showEmbeddedTradeDock ? 'xl:col-span-7' : 'xl:col-span-9'
             } ${mainTab === 'signals' || mainTab === 'sports' ? 'order-1 xl:order-2' : ''}`}
           >
             <div className="flex flex-col gap-3 border-b border-zinc-800/40 pb-3 sm:flex-row sm:flex-wrap sm:items-center">
               <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
                 <div className="text-[15px] font-semibold text-zinc-100">{mainTabTitle(mainTab)}</div>
+                {!isBinanceOnlyDeskTab(mainTab) ? (
                 <div className="min-w-0 max-w-full truncate rounded-md bg-zinc-900/50 px-2 py-0.5 font-mono text-xs text-zinc-400">
                   {selectedSlug || '—'}
                 </div>
+                ) : mainTab === 'binary' ? (
+                  <div className="rounded-md border border-orange-800/40 bg-orange-950/25 px-2 py-0.5 font-mono text-xs text-orange-100/90">
+                    Turbo binary · practice
+                  </div>
+                ) : mainTab === 'pocketbtc' ? (
+                  <div className="rounded-md border border-blue-800/40 bg-blue-950/25 px-2 py-0.5 font-mono text-xs text-blue-100/90">
+                    Pocket Option · practice
+                  </div>
+                ) : mainTab === 'btcpredict' ? (
+                  <div className="rounded-md border border-cyan-800/40 bg-cyan-950/25 px-2 py-0.5 font-mono text-xs text-cyan-100/90">
+                    Live Binance · prediction only
+                  </div>
+                ) : null}
                 {booksLoading ? (
                   <div className="rounded-full bg-indigo-500/15 px-2.5 py-0.5 text-xs font-medium text-indigo-200/90">Loading…</div>
                 ) : null}
@@ -3444,6 +3769,27 @@ function App() {
                   active={mainTab === 'perps'}
                   onSelect={setMainTab}
                 />
+                <MainTabButton
+                  id="btcpredict"
+                  label="Predict"
+                  title="BTC price predictor — multi-horizon UP/DOWN signals from live Binance spot"
+                  active={mainTab === 'btcpredict'}
+                  onSelect={setMainTab}
+                />
+                <MainTabButton
+                  id="binary"
+                  label="Binary"
+                  title="Turbo binary dashboard — BTC UP/DOWN like IQ Option, practice wallet"
+                  active={mainTab === 'binary'}
+                  onSelect={setMainTab}
+                />
+                <MainTabButton
+                  id="pocketbtc"
+                  label="PO BTC"
+                  title="Pocket Option style Bitcoin — CALL/PUT momentum desk, practice wallet"
+                  active={mainTab === 'pocketbtc'}
+                  onSelect={setMainTab}
+                />
                 <MainTabButton id="multiscan" label="Multi" title="Multi-asset PTB scan" active={mainTab === 'multiscan'} onSelect={setMainTab} />
                 <MainTabButton id="assistant" label="Assistant" active={mainTab === 'assistant'} onSelect={setMainTab} />
                 <MainTabButton
@@ -3462,7 +3808,7 @@ function App() {
               </div>
             ) : null}
 
-            {isMarketClosed(marketJson) ? (
+            {isMarketClosed(marketJson) && !isBinanceOnlyDeskTab(mainTab) ? (
               <div className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-800/25 bg-amber-950/15 px-3 py-2 text-xs text-amber-100/85">
                 <div className="leading-relaxed">
                   {updownParsed ? (
@@ -3492,7 +3838,7 @@ function App() {
                   </button>
                 ) : null}
               </div>
-            ) : updownBehindBySec != null && updownParsed != null && updownBehindBySec >= updownParsed.stepSec ? (
+            ) : updownBehindBySec != null && updownParsed != null && updownBehindBySec >= updownParsed.stepSec && !isBinanceOnlyDeskTab(mainTab) ? (
               <div className="mt-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-800/25 bg-amber-950/15 px-3 py-2 text-xs text-amber-100/85">
                 <div className="leading-relaxed">
                   You’re viewing an older {updownParsed.interval} window (behind by <span className="font-mono">{Math.round(updownBehindBySec / 60)}m</span>).
@@ -3598,7 +3944,7 @@ function App() {
                         }}
                         className="size-3.5 rounded border-zinc-600 bg-zinc-950 accent-amber-500"
                       />
-                      Auto-roll
+                      Auto new window
                     </label>
                     {parseUpdownSlug(selectedSlug) || isTitledUpdownSlug(selectedSlug) ? (
                       <button
@@ -3657,6 +4003,9 @@ function App() {
             mainTab !== 'btc' &&
             mainTab !== 'tvbtc' &&
             mainTab !== 'perps' &&
+            mainTab !== 'binary' &&
+            mainTab !== 'pocketbtc' &&
+            mainTab !== 'btcpredict' &&
             mainTab !== 'workspace' ? (
               <div className="mt-4 text-sm leading-relaxed text-zinc-500">Select a market to load token ids and ladders.</div>
             ) : null}
@@ -3714,6 +4063,7 @@ function App() {
                           onZoomOut={bookPriceZoom.zoomOut}
                           onResetZoom={bookPriceZoom.resetZoom}
                           variant="inline"
+                          useCssZoom
                         >
                           <MomentumChart
                             title="Outcome mids (price momentum)"
@@ -3735,6 +4085,7 @@ function App() {
                           onZoomOut={bookFlowZoom.zoomOut}
                           onResetZoom={bookFlowZoom.resetZoom}
                           variant="inline"
+                          useCssZoom
                         >
                           <OrderFlowChart
                             title={`Order flow (active: ${outcomeLabels[outcomeTab] ?? `Outcome ${outcomeTab + 1}`})`}
@@ -3798,6 +4149,24 @@ function App() {
             {mainTab === 'tvbtc' ? <TradingViewBtcUsdtTab /> : null}
 
             {mainTab === 'perps' ? <PerpsCommandCenter /> : null}
+
+            {mainTab === 'btcpredict' ? (
+              <Suspense fallback={tabSuspenseFallback}>
+                <BtcPricePredictorPage />
+              </Suspense>
+            ) : null}
+
+            {mainTab === 'binary' ? (
+              <Suspense fallback={tabSuspenseFallback}>
+                <BinaryCandleChartTab />
+              </Suspense>
+            ) : null}
+
+            {mainTab === 'pocketbtc' ? (
+              <Suspense fallback={tabSuspenseFallback}>
+                <PocketOptionBitcoinTab />
+              </Suspense>
+            ) : null}
 
             {!binanceSpotActive && mainTab === 'flowzones' ? (
               <div className="mt-5">
@@ -4133,6 +4502,9 @@ function App() {
             </div>
           ) : null}
         </div>
+      </div>
+      </AppSlidePaddingShell>
+      </ViewportZoomShell>
 
         {tradeUiPrefs.slide ? (
         <TradeSlidePanel
@@ -4187,13 +4559,11 @@ function App() {
                   <div className="mb-3 rounded-2xl border border-amber-900/25 bg-amber-950/10 p-3 text-[12px] leading-relaxed text-amber-100/85">
                     <p className="font-medium text-amber-100">Tokens not ready</p>
                     <p className="mt-1 text-amber-100/75">
-                      Waiting for both outcome tokens — trade controls unlock when books populate.
+                      Waiting for both outcome tokens — you can still switch Practice/Live; order buttons unlock when books populate.
                     </p>
                   </div>
                 ) : null}
-                <div className={effectiveTradeEnabled ? '' : 'pointer-events-none opacity-50'} aria-hidden={!effectiveTradeEnabled}>
-                  <SignalsTradePanel {...tradePanelSharedProps} visualStyle="slide" />
-                </div>
+                <SignalsTradePanel {...tradePanelSharedProps} visualStyle="slide" />
               </>
             ) : (
               <div className="rounded-2xl border border-zinc-800/60 bg-zinc-950/40 p-4 text-[13px] leading-relaxed text-zinc-400">
@@ -4236,8 +4606,9 @@ function App() {
             onCloseFloating={viewportZoom.hideFloatingDock}
           />
         ) : null}
-      </div>
-      </div>
+
+      <SettlementBiasHangDock />
+    </SettlementBiasDeskProvider>
   );
 }
 

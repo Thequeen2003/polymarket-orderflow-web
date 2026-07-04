@@ -1,4 +1,30 @@
+import { midPrice } from './bookLevels';
+import type { SeriesPoint } from './MomentumChart';
 import type { SpotPoint } from './SpotLevelChart';
+
+const CHART_MID_EPSILON = 0.00005;
+
+/** Fingerprint CLOB mids — skip React updates when the book did not move. */
+export function booksEntriesMidKey(
+  entries: readonly { token: string; book: unknown; error?: string | null }[],
+): string {
+  return entries
+    .map((e) => `${e.token}:${e.error ? 'e' : (midPrice(e.book)?.toFixed(5) ?? 'x')}`)
+    .join('|');
+}
+
+/** Append a chart point only when mid moved — returns `prev` when unchanged. */
+export function appendChartSeriesPoint(
+  prev: SeriesPoint[],
+  ts: number,
+  v: number | null,
+  maxLen = 180,
+): SeriesPoint[] {
+  if (v == null) return prev;
+  const last = prev[prev.length - 1];
+  if (last && last.v != null && Math.abs(last.v - v) < CHART_MID_EPSILON) return prev;
+  return [...prev, { t: ts, v }].slice(-maxLen);
+}
 
 /** Normalize epoch seconds vs ms for feed-freshness clocks. */
 export function normalizeEpochMs(t: number | null | undefined): number | null {

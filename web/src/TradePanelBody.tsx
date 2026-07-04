@@ -59,10 +59,17 @@ export function TradePanelBody(props: Props): ReactElement {
           ) : null}
         </div>
       ) : null}
-      {enabled ? (
-        <SignalsTradePanel {...panelProps} visualStyle={visualStyle} />
+      {ready ? (
+        <>
+          {!enabled ? (
+            <div className="mb-3">
+              <TradeUnavailable ready />
+            </div>
+          ) : null}
+          <SignalsTradePanel {...panelProps} visualStyle={visualStyle} />
+        </>
       ) : (
-        <TradeUnavailable ready={ready} />
+        <TradeUnavailable ready={false} />
       )}
     </div>
   );

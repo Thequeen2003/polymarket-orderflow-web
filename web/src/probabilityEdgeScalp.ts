@@ -66,11 +66,6 @@ export type ProbabilityEdgeScalp = {
   siglas: string[];
 };
 
-function edgeTradeFromEdge(edge: number, threshold = EDGE_TRADE_THRESHOLD): EdgeTradeSide {
-  if (edge > threshold) return 'LONG_UP';
-  if (edge < -threshold) return 'LONG_DOWN';
-  return 'NO_TRADE';
-}
 
 function edgeTradeLabel(side: EdgeTradeSide, upLabel: string, downLabel: string): string {
   if (side === 'LONG_UP') return `BUY ${upLabel} (scalp long)`;
@@ -245,11 +240,11 @@ function deriveQuality(
   scalpSignal: EdgeTradeSide,
 ): ScalpQuality {
   if (scalpSignal === 'NO_TRADE' || edgeTrade === 'NO_TRADE') return 'NONE';
-  if (scalpSignal !== edgeTrade && scalpSignal !== 'NO_TRADE') {
+  if (scalpSignal !== edgeTrade) {
     // score disagrees with raw edge — medium at best
     return momentumOk && repricingIntoEdge ? 'MEDIUM' : 'LOW';
   }
-  if (momentumOk && repricingIntoEdge && scalpSignal !== 'NO_TRADE') return 'HIGH';
+  if (momentumOk && repricingIntoEdge) return 'HIGH';
   if (momentumOk || repricingIntoEdge) return 'MEDIUM';
   return 'LOW';
 }

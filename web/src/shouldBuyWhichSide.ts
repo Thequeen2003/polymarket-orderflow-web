@@ -307,7 +307,6 @@ function shouldBuyWhichSideFromBook(input: ShouldBuyInput): BuySideAdvisory {
     };
   }
 
-  const loser: 'up' | 'down' = winner === 'up' ? 'down' : 'up';
   const winLabel = label(winner, upLabel, downLabel);
   const winMid = winner === 'up' ? midUp : midDown;
   const winProb = winner === 'up' ? probUp : probDown;

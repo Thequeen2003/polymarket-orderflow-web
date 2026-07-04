@@ -271,8 +271,8 @@ function deskSpeedGateKey(s: DeskSpeedSnapshot | null | undefined): string {
     up.alignment,
     down.mode,
     down.alignment,
-    numKey(up.prob, 3),
-    numKey(down.prob, 3),
+    numKey(up.prob?.velocityPerSec, 3),
+    numKey(down.prob?.velocityPerSec, 3),
   ].join(',');
 }
 
@@ -290,9 +290,8 @@ export function executionInputMeaningKey(input: ExecutionSignalInput | null | un
     deskSpeedGateKey(input.deskSpeedEarly),
     deskSpeedGateKey(input.deskSpeedConfirm),
     input.machine?.regime ?? '-',
-    input.machine?.verdict ?? '-',
     input.machine?.focusLane ?? '-',
-    input.mtf?.consensus ?? '-',
+    input.mtf?.dominantLane ?? '-',
     input.pressureTiming ?? '-',
     numKey(input.earlyProbGainCents, 1),
     input.upLabel ?? '',

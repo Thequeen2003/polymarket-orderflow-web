@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { computeContractLagReadout, CONTRACT_LAG_MIN_CENTS } from './contractLag';
+import { computeContractLagReadout, CONTRACT_LAG_MIN_CENTS, contractLagSideQualifier, contractLagTradeGates, contractMidsPinnedExtreme } from './contractLag';
 
 describe('contractLag', () => {
   it('computes DOWN lag when spot below PTB but Down mid sticky', () => {
@@ -62,5 +62,22 @@ describe('contractLag', () => {
     });
     expect(r.lagCents).toBeLessThan(CONTRACT_LAG_MIN_CENTS);
     expect(r.phase).toBe('aligned');
+  });
+
+  it('trade gates reflect lag, edge, geo, and stale state', () => {
+    const r = computeContractLagReadout({
+      modelPUp: 0.28,
+      marketUp: 0.44,
+      marketDown: 0.56,
+      geo: 'BELOW',
+      repricingIntoEdge: false,
+      probDownDelta01: 0,
+    });
+    const gates = contractLagTradeGates(r);
+    expect(gates.lagOk).toBe(true);
+    expect(gates.geoOk).toBe(true);
+    expect(gates.allOk).toBe(true);
+    expect(contractLagSideQualifier(r.lagDownCents)).toBe('cheap');
+    expect(contractMidsPinnedExtreme(0.99, 0.01)).toBe(true);
   });
 });

@@ -572,6 +572,70 @@ export function binanceAggTrades(symbol: string, limit = 80) {
   return getJson<BinanceAggTrade[]>(`/api/binance/agg-trades?${q.toString()}`);
 }
 
+export type BinanceSpotTicker = {
+  symbol: string;
+  lastPrice: number | null;
+  bidPrice: number | null;
+  askPrice: number | null;
+  priceChangePercent: number | null;
+};
+
+export function binanceTicker(symbol: string) {
+  const q = new URLSearchParams();
+  q.set('symbol', symbol);
+  return getJson<BinanceSpotTicker>(`/api/binance/ticker?${q.toString()}`);
+}
+
+export function binanceKlines(symbol: string, interval: string, limit = 120) {
+  const q = new URLSearchParams();
+  q.set('symbol', symbol);
+  q.set('interval', interval);
+  q.set('limit', String(limit));
+  return getJson<unknown[]>(`/api/binance/klines?${q.toString()}`);
+}
+
+export type IqOptionDeskCandle = {
+  t: number;
+  o: number;
+  h: number;
+  l: number;
+  c: number;
+  v: number;
+  closed: boolean;
+  bid: number | null;
+  ask: number | null;
+};
+
+export type IqOptionSnapshot = {
+  connected: boolean;
+  configured: boolean;
+  error: string | null;
+  market: 'BTCX';
+  activeId: number;
+  barSec: number;
+  livePrice: number | null;
+  bid: number | null;
+  ask: number | null;
+  practiceBalanceUsd: number | null;
+  practiceBalanceId: number | null;
+  candles: IqOptionDeskCandle[];
+  updatedAt: number;
+};
+
+export function iqOptionStatus() {
+  return getJson<{ configured: boolean; market: string; activeId: number }>('/api/iqoption/status');
+}
+
+export function iqOptionSnapshot(barSec: number) {
+  const q = new URLSearchParams();
+  q.set('barSec', String(barSec));
+  return getJson<IqOptionSnapshot>(`/api/iqoption/snapshot?${q.toString()}`);
+}
+
+export function iqOptionPlaceBinary(body: { direction: 'up' | 'down'; amountUsd: number; expiryMin: number }) {
+  return postJson<{ optionId: number }>('/api/iqoption/binary', body);
+}
+
 export type DataTradeRow = {
   timestamp: number;
   side: string;

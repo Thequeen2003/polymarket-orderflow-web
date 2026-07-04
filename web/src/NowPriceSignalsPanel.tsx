@@ -7,6 +7,12 @@ import { computeStableProjectedHeader } from './chartStableProjectedHeader';
 import { PredictionHorizonTimer } from './PredictionHorizonTimer';
 import { PricePredictionSignalCard } from './PricePredictionSignalCard';
 import { buildContractProbProjectionGrid, enrichPricePredictionWithContracts } from './contractProbProjection';
+import {
+  classifyConfirmedBandZone,
+  confirmedBandDetail,
+  confirmedBandLabel,
+  type ConfirmedBandZone,
+} from './pricePredictionHorizonFusion';
 import { computePricePredictionSignal, type PricePredictionProjection } from './pricePredictionSignal';
 import { MachineVerdictCard } from './MachineVerdictCard';
 import {
@@ -28,12 +34,12 @@ import {
   type FairValueSimpleReadout,
   type FvgSignalTier,
 } from './fairValueGap';
-import { computeContractLagReadout, CONTRACT_LAG_STALE_MS, recentProbDelta01, type ContractLagPhase, type ContractLagReadout } from './contractLag';
+import { computeContractLagReadout, CONTRACT_LAG_STALE_MS, recentProbDelta01, type ContractLagPhase, type ContractLagReadout, contractLagSideQualifier, contractLagTradeGates, contractMidsPinnedExtreme } from './contractLag';
 import { lastPointMs, maxFeedMs } from './feedFreshness';
 import type { StableProjectedHeaderSnapshot } from './chartStableProjectedHeader';
 import type { GlanceTone } from './nowPriceGlance';
 import { useFairValueGap } from './useFairValueGap';
-import { estimateBinaryOutcomeBias, type BinaryBiasSignal, type BinaryOutcomeEstimate } from './binaryOutcomeBias';
+import { estimateBinaryOutcomeBias } from './binaryOutcomeBias';
 import {
   EDGE_TRADE_THRESHOLD,
   evaluateProbabilityEdgeScalp,
@@ -56,7 +62,15 @@ import type { ContractLeadSignal } from './contractLeadSignal';
 import { computeDirectionEngine, type DirectionEngineSignal } from './directionEngine';
 import { NowPriceBuyStrip } from './NowPriceBuyStrip';
 import { buildNowPriceDeskTradeSignal, type NowPriceDeskTradeSignal } from './nowPriceDeskTradeSignal';
+import { buildNowPriceMomentumReadout, type NowPriceMomentumReadout } from './nowPriceMomentumReadout';
 import { buildDeskAheadPlaybook, deskCatchModeLabel, formatDeskBracketLine, type DeskAheadPlaybook } from './deskAheadPlaybook';
+import { DeskScreenSection, DeskScreenSectionTabs } from './DeskScreenSection';
+import {
+  readNowPriceDeskPanels,
+  toggleNowPriceDeskPanel,
+  writeNowPriceDeskPanels,
+  type NowPriceDeskPanelId,
+} from './nowPriceDeskPanels';
 import { computePreBuyTpOutlook } from './positionTpOutlook';
 import type { BuySideAdvisory } from './shouldBuyWhichSide';
 import { computeEntryMoment } from './entryMoment';
@@ -741,7 +755,7 @@ function PressureBuildupCard(props: {
   upLabel: string;
   downLabel: string;
 }): ReactElement {
-  const { pressure, upLabel, downLabel } = props;
+  const { pressure } = props;
   const active = pressure.active;
   const tone = pressureVerdictTone(pressure.verdict, active.kind, pressure.timing);
   const shell =
@@ -1183,149 +1197,6 @@ function ProbabilityEdgeScalpCard(props: {
   );
 }
 
-function fmtPctDelta(model: number | null, market: number | null): string {
-  if (model == null || market == null || !Number.isFinite(model) || !Number.isFinite(market)) return '';
-  const d = (model - market) * 100;
-  if (Math.abs(d) < 0.05) return '≈ market';
-  return `${d >= 0 ? '+' : ''}${d.toFixed(1)}pp vs book`;
-}
-
-function signalTone(bounded: number): 'up' | 'down' | 'flat' {
-  if (bounded > 0.12) return 'up';
-  if (bounded < -0.12) return 'down';
-  return 'flat';
-}
-
-function biasArrow(bounded: number): string {
-  if (bounded > 0.08) return '↑';
-  if (bounded < -0.08) return '↓';
-  return '→';
-}
-
-function BinaryOutcomeModelCard(props: {
-  estimate: BinaryOutcomeEstimate;
-  upLabel: string;
-  downLabel: string;
-  normMarketUp: number | null;
-  embedded?: boolean;
-}): ReactElement {
-  const { estimate, upLabel, downLabel, normMarketUp, embedded = false } = props;
-  const modelTone = estimate.probUp >= 0.55 ? 'up' : estimate.probUp <= 0.45 ? 'down' : 'flat';
-
-  return (
-    <div className={embedded ? 'min-w-0' : 'rounded-xl border border-violet-800/45 bg-violet-950/20 px-3 py-3 sm:px-4'}>
-      <div className={`flex flex-wrap items-start justify-between gap-3 ${embedded ? 'mb-3' : ''}`}>
-        {!embedded ? (
-          <div className="min-w-0 flex-1">
-            <div className="text-[9px] font-black uppercase tracking-[0.14em] text-violet-300/90">
-              Settlement bias model
-            </div>
-            <p className="mt-1 max-w-2xl text-[10px] leading-snug text-zinc-500">
-              Binary contract: <span className="text-zinc-400">Y = 1</span> if spot finishes{' '}
-              <span className="font-semibold text-amber-200/90">above PTB</span> at expiry. The desk does not forecast
-              price — it estimates{' '}
-              <span className="font-mono text-zinc-400">P̂(Y=1) = σ(w₁Δ_PTB + w₂m_norm + w₃S + w₄r)</span>.
-            </p>
-          </div>
-        ) : null}
-        <div className="flex flex-wrap gap-3">
-          <div
-            className={`rounded-lg border px-3 py-2 text-center ${
-              modelTone === 'up'
-                ? 'border-emerald-700/50 bg-emerald-950/35'
-                : modelTone === 'down'
-                  ? 'border-rose-700/50 bg-rose-950/35'
-                  : 'border-zinc-700/50 bg-zinc-900/40'
-            }`}
-          >
-            <div className="text-[8px] font-bold uppercase tracking-[0.12em] text-zinc-500">Model P({upLabel})</div>
-            <div className="font-mono text-2xl font-bold tabular-nums text-zinc-50">{fmtProbPct01(estimate.probUp)}</div>
-            <div className="text-[9px] text-zinc-500">{fmtPctDelta(estimate.probUp, normMarketUp)}</div>
-          </div>
-          <div className="rounded-lg border border-zinc-700/50 bg-black/25 px-3 py-2 text-center">
-            <div className="text-[8px] font-bold uppercase tracking-[0.12em] text-zinc-500">Model P({downLabel})</div>
-            <div className="font-mono text-xl font-bold tabular-nums text-zinc-300">{fmtProbPct01(estimate.probDown)}</div>
-          </div>
-          {normMarketUp != null ? (
-            <div className="rounded-lg border border-zinc-700/40 bg-black/20 px-3 py-2 text-center">
-              <div className="text-[8px] font-bold uppercase tracking-[0.12em] text-zinc-500">P_mkt P({upLabel})</div>
-              <div className="font-mono text-lg font-semibold tabular-nums text-zinc-400">{fmtProbPct01(normMarketUp)}</div>
-            </div>
-          ) : null}
-        </div>
-      </div>
-
-      <div className="mt-3 grid gap-2 sm:grid-cols-2">
-        {estimate.signals.map((sig: BinaryBiasSignal) => (
-          <div
-            key={sig.id}
-            className={`rounded-lg border px-2.5 py-2 ${
-              signalTone(sig.bounded) === 'up'
-                ? 'border-emerald-800/40 bg-emerald-950/15'
-                : signalTone(sig.bounded) === 'down'
-                  ? 'border-rose-800/40 bg-rose-950/15'
-                  : 'border-zinc-800/50 bg-black/20'
-            }`}
-          >
-            <div className="flex items-baseline justify-between gap-2">
-              <div className="text-[10px] font-semibold text-zinc-200">
-                {sig.label}{' '}
-                <span
-                  className={
-                    signalTone(sig.bounded) === 'up'
-                      ? 'text-emerald-300'
-                      : signalTone(sig.bounded) === 'down'
-                        ? 'text-rose-300'
-                        : 'text-zinc-500'
-                  }
-                  aria-hidden
-                >
-                  {biasArrow(sig.bounded)}
-                </span>
-              </div>
-              <div className="font-mono text-[11px] tabular-nums text-violet-200/90">
-                {sig.contribution >= 0 ? '+' : ''}
-                {sig.contribution.toFixed(2)} score
-              </div>
-            </div>
-            <div className="mt-0.5 font-mono text-[10px] text-zinc-500">{sig.formula}</div>
-            <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[10px] tabular-nums text-zinc-400">
-              <span>
-                raw{' '}
-                {sig.id === 'ptbDistance'
-                  ? `${sig.raw >= 0 ? '+' : ''}${(sig.raw * 100).toFixed(3)}%`
-                  : `${sig.raw >= 0 ? '+' : ''}${sig.raw.toFixed(4)}`}
-              </span>
-              <span>bounded {sig.bounded >= 0 ? '+' : ''}{sig.bounded.toFixed(3)}</span>
-              <span>w×b {sig.contribution >= 0 ? '+' : ''}{sig.contribution.toFixed(2)}</span>
-            </div>
-            <div className="mt-1 text-[10px] leading-snug text-zinc-500">{sig.interpretation}</div>
-          </div>
-        ))}
-      </div>
-
-      <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-white/5 pt-2 font-mono text-[10px] tabular-nums text-zinc-500">
-        <span>
-          Score{' '}
-          <span className="font-semibold text-violet-200/90">
-            {estimate.score >= 0 ? '+' : ''}
-            {estimate.score.toFixed(3)}
-          </span>
-          <span className="text-zinc-600">
-            {' '}
-            (= {estimate.signals.map((s) => `${s.contribution >= 0 ? '+' : ''}${s.contribution.toFixed(2)}`).join(' ')})
-          </span>
-        </span>
-        <span>σ(score) → P̂({upLabel}) {fmtProbPct01(estimate.probUp)}</span>
-        <span>horizon {estimate.horizonSec}s</span>
-        {estimate.missing.length ? (
-          <span className="text-amber-400/90">partial: {estimate.missing.join(', ')}</span>
-        ) : null}
-      </div>
-    </div>
-  );
-}
-
 function DeepLayerBlock(props: { title: string; children: ReactNode }): ReactElement {
   return (
     <div className="rounded-xl border border-zinc-800/45 bg-black/20">
@@ -1341,6 +1212,7 @@ function PriceHeadlineRow(props: {
   spotUsd: number;
   ptbUsd: number;
   distVsPtb: number;
+  band?: NowPriceBandDistances | null;
   spotProjections: PricePredictionProjection[] | null;
   upLabel: string;
   downLabel: string;
@@ -1355,7 +1227,8 @@ function PriceHeadlineRow(props: {
   const sep = <span className="text-zinc-600">·</span>;
   return (
     <div className="rounded-xl border border-indigo-800/40 bg-indigo-950/20 px-3 py-2.5">
-      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1 font-mono text-[11px] font-bold tabular-nums leading-snug">
+      {p.band ? <ConfirmedBandGeometryStrip band={p.band} compact /> : null}
+      <div className={`flex flex-wrap items-baseline gap-x-2 gap-y-1 font-mono text-[11px] font-bold tabular-nums leading-snug ${p.band ? 'mt-2' : ''}`}>
         <span className="text-[13px] text-zinc-50">{fmtUsd(p.spotUsd)}</span>
         {sep}
         <span className="text-zinc-400">
@@ -1435,65 +1308,6 @@ function PriceHeadlineRow(props: {
   );
 }
 
-function CompactSnapshotStrip(props: {
-  geo: string;
-  geoTone: GlanceTone;
-  spotUsd: number;
-  ptbUsd: number;
-  distVsPtb: number;
-  tradeCall: string;
-  tradeTone: GlanceTone;
-  edgePp: number | null;
-  edgeUpLabel: string;
-  edgeTitle: string | null;
-  speedHint: string | null;
-  machineHint: string | null;
-  upMid: string | null;
-  downMid: string | null;
-}): ReactElement {
-  const p = props;
-  const edgeStr = p.edgePp != null ? fmtPp(p.edgePp) : '—';
-  const pill = (text: string, tone?: GlanceTone, title?: string) => (
-    <span
-      title={title}
-      className={`inline-flex shrink-0 items-center rounded-md border px-2 py-1 font-mono text-[10px] font-bold tabular-nums ${
-        tone === 'up'
-          ? 'border-emerald-700/45 bg-emerald-950/30 text-emerald-200'
-          : tone === 'down'
-            ? 'border-rose-700/45 bg-rose-950/30 text-rose-200'
-            : tone === 'warn'
-              ? 'border-amber-700/40 bg-amber-950/25 text-amber-200'
-              : 'border-zinc-700/50 bg-zinc-900/40 text-zinc-300'
-      }`}
-    >
-      {text}
-    </span>
-  );
-
-  return (
-    <div className="rounded-xl border border-zinc-700/50 bg-zinc-950/50 px-2.5 py-2">
-      <div className="flex flex-wrap items-center gap-1.5">
-        {pill(p.geo, p.geoTone)}
-        {pill(fmtUsd(p.spotUsd))}
-        {pill(`${fmtUsdSigned(p.distVsPtb)} PTB`)}
-        {pill(p.tradeCall, p.tradeTone)}
-        {pill(
-          `${p.edgeUpLabel} edge ${edgeStr}`,
-          p.edgePp != null && p.edgePp > 0.3 ? 'up' : p.edgePp != null && p.edgePp < -0.3 ? 'down' : 'flat',
-          p.edgeTitle ?? undefined,
-        )}
-        {p.speedHint ? pill(p.speedHint, p.speedHint.includes('DOWN') ? 'down' : p.speedHint.includes('UP') ? 'up' : 'warn') : null}
-        {p.machineHint ? pill(p.machineHint, 'flat') : null}
-      </div>
-      {p.upMid || p.downMid ? (
-        <div className="mt-1.5 flex flex-wrap gap-x-3 font-mono text-[10px] tabular-nums text-zinc-500">
-          {p.upMid ? <span className="text-emerald-300/85">{p.upMid}</span> : null}
-          {p.downMid ? <span className="text-rose-300/85">{p.downMid}</span> : null}
-        </div>
-      ) : null}
-    </div>
-  );
-}
 
 function fmtEndsInShort(ms: number | null | undefined): string | null {
   if (ms == null || !Number.isFinite(ms)) return null;
@@ -1524,6 +1338,92 @@ function quickCtxPill(tone: GlanceTone, large = false): string {
 }
 
 /** Compact context strip — spot, contracts, breaks at desk-normal type. */
+function confirmedBandZoneShell(zone: ConfirmedBandZone): string {
+  if (zone === 'above') return 'border-emerald-600/55 bg-emerald-950/35 text-emerald-100';
+  if (zone === 'below') return 'border-rose-600/55 bg-rose-950/35 text-rose-100';
+  return 'border-amber-600/50 bg-amber-950/30 text-amber-100';
+}
+
+function ConfirmedBreakLineChip(props: { kind: 'above' | 'below'; priceUsd: number; ptbUsd: number }): ReactElement {
+  const isAbove = props.kind === 'above';
+  const distFromPtb = isAbove ? props.priceUsd - props.ptbUsd : props.ptbUsd - props.priceUsd;
+  return (
+    <div
+      className={`flex min-w-[7.5rem] flex-1 flex-col rounded-lg border px-2 py-1 ${
+        isAbove
+          ? 'border-emerald-800/45 bg-emerald-950/25 text-emerald-100'
+          : 'border-rose-800/45 bg-rose-950/25 text-rose-100'
+      }`}
+      title={
+        isAbove
+          ? `Confirmed UP break — ${fmtUsdSigned(distFromPtb)} above PTB`
+          : `Confirmed DOWN break — ${fmtUsdSigned(-distFromPtb)} below PTB`
+      }
+    >
+      <span className="text-[8px] font-bold uppercase tracking-[0.12em] opacity-85">
+        {isAbove ? 'Confirmed Above' : 'Confirmed Below'}
+      </span>
+      <span className="font-mono text-sm font-bold tabular-nums">{fmtUsdSigned(isAbove ? distFromPtb : -distFromPtb)}</span>
+      <span className="text-[8px] font-semibold uppercase tracking-[0.08em] text-zinc-500/90">from PTB</span>
+      <span className="font-mono text-[10px] tabular-nums text-zinc-400">{fmtUsd(props.priceUsd)}</span>
+    </div>
+  );
+}
+
+function NowVsBandChip(props: { band: NowPriceBandDistances }): ReactElement {
+  const { band } = props;
+  const distFromPtb = band.now - band.ptb;
+  const toAbove = band.bandHi - band.now;
+  const toBelow = band.now - band.bandLo;
+  const aboveClear = toAbove <= 0;
+  const belowClear = toBelow <= 0;
+
+  return (
+    <div
+      className="flex min-w-[7.5rem] flex-1 flex-col rounded-lg border border-zinc-700/55 bg-zinc-900/40 px-2 py-1 text-zinc-100"
+      title={`Now vs PTB ${fmtUsd(band.ptb)} · Above line ${fmtUsd(band.bandHi)} · Below line ${fmtUsd(band.bandLo)}`}
+    >
+      <span className="text-[8px] font-bold uppercase tracking-[0.12em] text-zinc-400">Now vs PTB</span>
+      <span
+        className={`font-mono text-sm font-bold tabular-nums ${
+          distFromPtb > 0.005 ? 'text-emerald-300' : distFromPtb < -0.005 ? 'text-rose-300' : 'text-amber-200'
+        }`}
+      >
+        {fmtUsdSigned(distFromPtb)}
+      </span>
+      <span className="mt-0.5 font-mono text-[10px] tabular-nums text-emerald-300/90">
+        {aboveClear ? `↑ clear +${fmtUsd(Math.abs(toAbove))}` : `↑ ${fmtUsd(toAbove)} to above`}
+      </span>
+      <span className="font-mono text-[10px] tabular-nums text-rose-300/90">
+        {belowClear ? `↓ clear +${fmtUsd(Math.abs(toBelow))}` : `↓ ${fmtUsd(toBelow)} to below`}
+      </span>
+    </div>
+  );
+}
+
+function ConfirmedBandGeometryStrip(props: { band: NowPriceBandDistances; compact?: boolean }): ReactElement {
+  const { band, compact = false } = props;
+  const zone = classifyConfirmedBandZone(band.now, band.bandHi, band.bandLo);
+  const label = confirmedBandLabel(zone);
+  const detail = confirmedBandDetail(band.now, band.bandHi, band.bandLo, zone);
+
+  return (
+    <div className="space-y-2">
+      <div className={`rounded-lg border px-2.5 py-2 ${confirmedBandZoneShell(zone)}`}>
+        <div className="text-[10px] font-black uppercase tracking-[0.12em]">{label}</div>
+        {!compact ? (
+          <div className="mt-0.5 font-mono text-[10px] font-semibold tabular-nums opacity-90">{detail}</div>
+        ) : null}
+      </div>
+      <div className="flex flex-wrap gap-2">
+        <ConfirmedBreakLineChip kind="above" priceUsd={band.bandHi} ptbUsd={band.ptb} />
+        <NowVsBandChip band={band} />
+        <ConfirmedBreakLineChip kind="below" priceUsd={band.bandLo} ptbUsd={band.ptb} />
+      </div>
+    </div>
+  );
+}
+
 function NowPriceQuickContextStrip(props: {
   band: NowPriceBandDistances;
   glance: ReturnType<typeof buildSpotBandGlance>;
@@ -1544,7 +1444,6 @@ function NowPriceQuickContextStrip(props: {
   slopeUsdPerMin: number | null;
 }): ReactElement {
   const p = props;
-  const geoLabel = p.band.geo.replace('_', ' ');
   const endsLabel = fmtEndsInShort(p.endsInMs);
   const activeEdge =
     p.activeLane === 'down' ? p.edgeDownPp : p.activeLane === 'up' ? p.edgeUpPp : p.edgeUpPp;
@@ -1555,10 +1454,9 @@ function NowPriceQuickContextStrip(props: {
 
   return (
     <div className="rounded-xl border border-zinc-700/50 bg-zinc-950/50 px-2.5 py-2.5 sm:px-3 sm:py-3">
-      <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
-        <span className={`${quickCtxPill(p.geoTone)} text-[10px] font-black uppercase tracking-wide`}>
-          {geoLabel}
-        </span>
+      <ConfirmedBandGeometryStrip band={p.band} />
+
+      <div className="mt-3 flex flex-wrap items-center gap-1.5 sm:gap-2">
         <span className="font-mono text-[13px] font-bold tabular-nums text-zinc-50">{fmtUsd(p.band.now)}</span>
         <span
           className={`font-mono text-[11px] font-bold tabular-nums ${
@@ -1776,34 +1674,43 @@ function synthesizeHeroDetail(
 function deskTradeSignalToHeroView(
   signal: NowPriceDeskTradeSignal,
   metricsCtx: HeroMetricsCtx,
-): NowPriceHeroView {
+): Omit<NowPriceHeroView, 'aheadPlaybook'> {
   const lane = signal.lane;
   const metrics = lane ? resolveHeroLaneMetrics(lane, metricsCtx) : EMPTY_HERO_METRICS;
-  const phaseLabel =
-    signal.phase === 'ENTER'
-      ? 'GO'
-      : signal.phase === 'ALERT'
-        ? 'CONFIRM'
-        : signal.phase === 'LEAN'
-          ? 'EDGE'
-          : signal.phase === 'NO_TRADE'
-            ? 'SKIP'
-            : null;
+  const momentumFirst = signal.source === 'momentum';
   const leanHeadline = signal.headline.toUpperCase().includes('LEAN');
+  const phaseLabel =
+    momentumFirst
+      ? 'MOMENTUM'
+      : signal.phase === 'ENTER'
+        ? 'GO'
+        : signal.phase === 'ALERT'
+          ? 'CONFIRM'
+          : signal.phase === 'LEAN'
+            ? 'EDGE'
+            : signal.phase === 'NO_TRADE'
+              ? 'SKIP'
+              : null;
   const primary =
-    signal.phase === 'ENTER'
-      ? 'ENTER'
-      : signal.phase === 'LEAN' || signal.phase === 'ALERT'
-        ? signal.phase
-        : leanHeadline
-          ? 'LEAN'
-          : signal.phase;
+    momentumFirst && (signal.phase === 'ALERT' || signal.phase === 'ENTER')
+      ? signal.phase === 'ENTER'
+        ? 'ENTER'
+        : 'CATCH'
+      : signal.phase === 'ENTER'
+        ? 'ENTER'
+        : signal.phase === 'LEAN' || signal.phase === 'ALERT'
+          ? signal.phase
+          : leanHeadline
+            ? 'LEAN'
+            : signal.phase;
   const subline =
-    (signal.phase === 'LEAN' || primary === 'LEAN') && leanHeadline
-      ? signal.confidencePct != null
-        ? `${signal.confidencePct}% conf · timing entry, don't chase ask`
-        : 'Desk edge live — time entry on bid, not wide ask'
-      : signal.headline;
+    momentumFirst
+      ? signal.headline
+      : (signal.phase === 'LEAN' || primary === 'LEAN') && leanHeadline
+        ? signal.confidencePct != null
+          ? `${signal.confidencePct}% conf · timing entry, don't chase ask`
+          : 'Desk edge live — time entry on bid, not wide ask'
+        : signal.headline;
   return {
     tone: signal.tone,
     emoji: signal.emoji,
@@ -1866,6 +1773,44 @@ function deskCatchStripShell(mode: DeskAheadPlaybook['mode']): string {
 
 function deskCatchStripText(mode: DeskAheadPlaybook['mode']): string {
   return mode === 'go' || mode === 'arm' ? 'text-black' : 'text-zinc-50';
+}
+
+function NowPriceMomentumStrip(props: { readout: NowPriceMomentumReadout }): ReactElement {
+  const { readout } = props;
+  const shell =
+    readout.phase === 'early' || readout.canCatch
+      ? 'border-emerald-500/50 bg-emerald-950/40 ring-1 ring-emerald-500/25'
+      : readout.phase === 'building' || readout.phase === 'live'
+        ? 'border-cyan-500/45 bg-cyan-950/35 ring-1 ring-cyan-500/20'
+        : readout.phase === 'chasing' || readout.phase === 'extended'
+          ? 'border-amber-600/45 bg-amber-950/30 ring-1 ring-amber-500/15'
+          : 'border-zinc-700/50 bg-zinc-950/35';
+
+  return (
+    <div className={`rounded-xl border px-3 py-2.5 sm:px-4 ${shell}`} role="status" aria-live="polite">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span className="text-base" aria-hidden>
+          {readout.emoji}
+        </span>
+        <span className="text-sm font-semibold text-zinc-100 sm:text-base">{readout.headline}</span>
+      </div>
+      <p className="mt-1 text-xs text-zinc-400 sm:text-sm">{readout.tapeLine}</p>
+      <div className="mt-2 flex flex-wrap gap-1.5">
+        {readout.confirmations.map((c) => (
+          <span
+            key={c.label}
+            className={`rounded-md px-2 py-0.5 text-[10px] font-medium sm:text-xs ${
+              c.ok
+                ? 'bg-emerald-500/20 text-emerald-200'
+                : 'bg-zinc-800/80 text-zinc-500'
+            }`}
+          >
+            {c.ok ? '✓' : '○'} {c.label}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function DeskCatchStrip(props: { playbook: DeskAheadPlaybook }): ReactElement {
@@ -2118,6 +2063,123 @@ function contractLagPhaseCls(phase: ContractLagPhase): string {
   return 'border-zinc-600/50 bg-zinc-900/40 text-zinc-300';
 }
 
+function contractLagPhaseHeadline(phase: ContractLagPhase, stale: boolean): string {
+  if (stale) return 'STALE MIDS';
+  if (phase === 'lagging') return 'LAGGING';
+  if (phase === 'catching_up') return 'CATCHING UP';
+  return 'ALIGNED';
+}
+
+function ContractLagGatePill(props: { ok: boolean; label: string; detail: string }): ReactElement {
+  const { ok, label, detail } = props;
+  return (
+    <span
+      title={detail}
+      className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[9px] font-bold uppercase tracking-wide ${
+        ok
+          ? 'border-emerald-600/45 bg-emerald-950/35 text-emerald-200'
+          : 'border-zinc-700/55 bg-zinc-900/50 text-zinc-500'
+      }`}
+    >
+      <span aria-hidden>{ok ? '✓' : '○'}</span>
+      {label}
+    </span>
+  );
+}
+
+function ContractLagMidBar(props: { market01: number; model01: number; accent: 'up' | 'down' }): ReactElement {
+  const { market01, model01, accent } = props;
+  const mktPct = Math.max(2, Math.min(98, market01 * 100));
+  const modPct = Math.max(2, Math.min(98, model01 * 100));
+  const fill = accent === 'up' ? 'bg-emerald-500/55' : 'bg-rose-500/55';
+  return (
+    <div className="relative mt-2 h-2.5 overflow-hidden rounded-full bg-zinc-800/80">
+      <div className={`absolute inset-y-0 left-0 rounded-full ${fill}`} style={{ width: `${mktPct}%` }} />
+      <div
+        className="absolute top-0 bottom-0 w-0.5 bg-violet-300 shadow-[0_0_6px_rgba(167,139,250,0.65)]"
+        style={{ left: `calc(${modPct}% - 1px)` }}
+        title={`Model fair ${fmtCents(model01)}`}
+      />
+    </div>
+  );
+}
+
+function ContractLagLaneCard(props: {
+  laneLabel: string;
+  accent: 'up' | 'down';
+  market01: number;
+  model01: number;
+  lagCents: number;
+  delta30Cents: number | null;
+  highlighted: boolean;
+}): ReactElement {
+  const { laneLabel, accent, market01, model01, lagCents, delta30Cents, highlighted } = props;
+  const qual = contractLagSideQualifier(lagCents);
+  const qualCls =
+    qual === 'cheap'
+      ? 'border-emerald-600/45 bg-emerald-950/40 text-emerald-100'
+      : qual === 'rich'
+        ? 'border-rose-600/45 bg-rose-950/40 text-rose-100'
+        : 'border-zinc-700/50 bg-zinc-900/45 text-zinc-400';
+  const qualLabel = qual === 'cheap' ? 'Cheap vs model' : qual === 'rich' ? 'Rich vs model' : 'Fair';
+  const shell = highlighted
+    ? accent === 'up'
+      ? 'border-emerald-600/55 bg-emerald-950/20 ring-1 ring-emerald-500/25'
+      : 'border-rose-600/55 bg-rose-950/20 ring-1 ring-rose-500/25'
+    : 'border-zinc-800/55 bg-black/25';
+
+  return (
+    <div className={`rounded-xl border px-3 py-2.5 ${shell}`}>
+      <div className="flex items-start justify-between gap-2">
+        <div>
+          <div className={`text-[9px] font-black uppercase tracking-[0.12em] ${accent === 'up' ? 'text-emerald-400' : 'text-rose-400'}`}>
+            {laneLabel}
+          </div>
+          <div
+            className={`mt-1 font-mono text-[clamp(1.35rem,4vw,1.75rem)] font-black tabular-nums leading-none ${
+              qual === 'cheap' ? 'text-emerald-200' : qual === 'rich' ? 'text-rose-200' : 'text-zinc-300'
+            }`}
+          >
+            {lagCents >= 0 ? '+' : ''}
+            {lagCents.toFixed(1)}¢
+          </div>
+          <div className="mt-0.5 text-[10px] font-semibold text-zinc-500">lag room</div>
+        </div>
+        <span className={`shrink-0 rounded-md border px-2 py-1 text-[8px] font-black uppercase tracking-wide ${qualCls}`}>
+          {qualLabel}
+        </span>
+      </div>
+
+      <ContractLagMidBar market01={market01} model01={model01} accent={accent} />
+
+      <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 font-mono text-[10px] tabular-nums">
+        <div>
+          <div className="text-[8px] font-bold uppercase tracking-wide text-zinc-600">Market</div>
+          <div className="font-bold text-zinc-100">{fmtCents(market01)}</div>
+        </div>
+        <div>
+          <div className="text-[8px] font-bold uppercase tracking-wide text-violet-400/80">Model</div>
+          <div className="font-bold text-violet-200">{fmtCents(model01)}</div>
+        </div>
+      </div>
+
+      {delta30Cents != null ? (
+        <div
+          className={`mt-2 font-mono text-[10px] font-semibold tabular-nums ${
+            delta30Cents > 0.15 ? 'text-emerald-300' : delta30Cents < -0.15 ? 'text-rose-300' : 'text-zinc-500'
+          }`}
+        >
+          30s tape {delta30Cents >= 0 ? '+' : ''}
+          {delta30Cents.toFixed(1)}¢
+          <span className="ml-1 font-normal text-zinc-600">(recent move, not projection)</span>
+        </div>
+      ) : (
+        <div className="mt-2 text-[10px] text-zinc-600">30s tape — not enough ticks</div>
+      )}
+    </div>
+  );
+}
+
 function ContractMidSparkline(props: {
   pts: { t: number; v: number }[];
   label: string;
@@ -2161,13 +2223,13 @@ function ContractMidSparkline(props: {
 
 function ContractLagBox(props: {
   lag: ContractLagReadout;
+  band: NowPriceBandDistances;
   upLabel: string;
   downLabel: string;
-  distVsPtb: number;
   probTicksUp: { t: number; v: number }[];
   probTicksDown: { t: number; v: number }[];
 }): ReactElement {
-  const { lag, upLabel, downLabel, distVsPtb, probTicksUp, probTicksDown } = props;
+  const { lag, band, upLabel, downLabel, probTicksUp, probTicksDown } = props;
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
     const id = window.setInterval(() => setNowMs(Date.now()), 1000);
@@ -2179,20 +2241,27 @@ function ContractLagBox(props: {
       ? Math.max(0, Math.round((nowMs - lag.marketUpdatedAtMs) / 1000))
       : null;
   const stale = ageSec != null && ageSec * 1000 > CONTRACT_LAG_STALE_MS;
-
+  const gates = contractLagTradeGates(lag);
+  const pinnedExtreme = contractMidsPinnedExtreme(lag.marketUp, lag.marketDown);
   const favoredIsUp = lag.favoredSide === 'up';
   const favoredIsDown = lag.favoredSide === 'down';
+  const geoLabel = lag.geo?.replace('_', ' ') ?? '—';
+  const spotBandLabel = confirmedBandLabel(classifyConfirmedBandZone(band.now, band.bandHi, band.bandLo));
 
   return (
     <div
       className={`rounded-2xl border p-3 sm:p-4 ${
         stale
           ? 'border-rose-700/55 bg-gradient-to-br from-rose-950/30 to-zinc-950/80'
-          : 'border-amber-700/45 bg-gradient-to-br from-amber-950/25 to-zinc-950/80'
+          : lag.phase === 'catching_up'
+            ? 'border-emerald-700/45 bg-gradient-to-br from-emerald-950/20 to-zinc-950/80'
+            : lag.phase === 'lagging'
+              ? 'border-amber-700/45 bg-gradient-to-br from-amber-950/25 to-zinc-950/80'
+              : 'border-zinc-700/50 bg-gradient-to-br from-zinc-950/50 to-zinc-950/80'
       }`}
     >
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
+        <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <div className="text-[10px] font-black uppercase tracking-[0.16em] text-amber-300/90">Contract lag</div>
             <span
@@ -2204,78 +2273,87 @@ function ContractLagBox(props: {
             >
               {stale ? `STALE ${ageSec}s` : 'LIVE mids'}
             </span>
+            {pinnedExtreme ? (
+              <span className="rounded-md border border-amber-600/45 bg-amber-950/35 px-1.5 py-0.5 text-[8px] font-black uppercase tracking-wide text-amber-100">
+                Pinned book
+              </span>
+            ) : null}
           </div>
-          <div className="mt-1 text-[10px] text-zinc-500">
-            Live CLOB mid vs model · 30s Δ shows recent move (not forward projection)
-          </div>
+          <p className="mt-1 text-[10px] leading-snug text-zinc-500">
+            Positive lag = that side is <span className="text-emerald-300/90">cheap</span> vs desk model (catch-up room).
+            Violet tick = model fair.
+          </p>
         </div>
         <div
-          className={`rounded-xl border px-4 py-2.5 text-center ${
+          className={`min-w-[9.5rem] shrink-0 rounded-xl border px-4 py-2.5 text-center ${
             stale ? 'border-rose-600/50 bg-rose-950/35 text-rose-100' : contractLagPhaseCls(lag.phase)
           }`}
         >
           <div className="text-[8px] font-bold uppercase tracking-[0.14em] opacity-80">
-            {stale ? 'data stale' : lag.phase.replace('_', ' ')}
+            {contractLagPhaseHeadline(lag.phase, stale)}
           </div>
-          <div className="mt-1 text-sm font-black leading-tight">{stale ? 'Mids not updating' : lag.call}</div>
+          <div className="mt-1 text-sm font-black leading-snug">{stale ? 'Refresh CLOB' : lag.call}</div>
         </div>
+      </div>
+
+      <div className="mt-3 flex flex-wrap gap-1.5">
+        <ContractLagGatePill ok={gates.liveOk} label="Live" detail="CLOB mid updated within 25s" />
+        <ContractLagGatePill ok={gates.lagOk} label="Lag ≥5¢" detail={`Largest lag ${lag.lagCents.toFixed(1)}¢ on ${lag.favoredLabel}`} />
+        <ContractLagGatePill ok={gates.edgeOk} label="Edge ≥3pp" detail={`${upLabel} edge ${fmtPp(lag.edgePp)}`} />
+        <ContractLagGatePill
+          ok={gates.geoOk}
+          label="Geo"
+          detail={
+            lag.geoAligned
+              ? `Spot ${spotBandLabel} (${geoLabel}) confirms ${lag.favoredLabel}`
+              : gates.lagOk
+                ? `Spot ${spotBandLabel} (${geoLabel}) does not confirm ${lag.favoredLabel}`
+                : 'No favored lag side yet'
+          }
+        />
+        <ContractLagGatePill
+          ok={gates.allOk}
+          label="Trade"
+          detail={gates.allOk ? 'All filters pass' : 'Waiting on one or more filters'}
+        />
       </div>
 
       <div className="mt-3 grid gap-2 sm:grid-cols-2">
-        <div
-          className={`rounded-xl border px-3 py-2.5 ${
-            favoredIsUp && lag.lagUpCents >= 5
-              ? 'border-emerald-600/50 bg-emerald-950/25 ring-1 ring-emerald-500/20'
-              : 'border-zinc-800/50 bg-black/25'
-          }`}
-        >
-          <div className="text-[9px] font-bold uppercase tracking-wide text-zinc-500">{upLabel} lag</div>
-          <div className={`mt-1 font-mono text-2xl font-black tabular-nums ${lag.lagUpCents > 0.5 ? 'text-emerald-300' : lag.lagUpCents < -0.5 ? 'text-rose-300/80' : 'text-zinc-400'}`}>
-            {lag.lagUpCents >= 0 ? '+' : ''}{lag.lagUpCents.toFixed(1)}¢
-          </div>
-          <div className="mt-1 font-mono text-[10px] tabular-nums text-zinc-500">
-            Mkt {fmtCents(lag.marketUp)} → model {fmtCents(lag.modelUp)}
-            {lag.marketDeltaUpCents != null ? (
-              <span className={lag.marketDeltaUpCents > 0 ? ' text-emerald-400' : lag.marketDeltaUpCents < 0 ? ' text-rose-400' : ''}>
-                {' '}
-                30s Δ {lag.marketDeltaUpCents >= 0 ? '+' : ''}{lag.marketDeltaUpCents.toFixed(1)}¢
-              </span>
-            ) : null}
-          </div>
-        </div>
-        <div
-          className={`rounded-xl border px-3 py-2.5 ${
-            favoredIsDown && lag.lagDownCents >= 5
-              ? 'border-emerald-600/50 bg-emerald-950/25 ring-1 ring-emerald-500/20'
-              : 'border-zinc-800/50 bg-black/25'
-          }`}
-        >
-          <div className="text-[9px] font-bold uppercase tracking-wide text-zinc-500">{downLabel} lag</div>
-          <div className={`mt-1 font-mono text-2xl font-black tabular-nums ${lag.lagDownCents > 0.5 ? 'text-emerald-300' : lag.lagDownCents < -0.5 ? 'text-rose-300/80' : 'text-zinc-400'}`}>
-            {lag.lagDownCents >= 0 ? '+' : ''}{lag.lagDownCents.toFixed(1)}¢
-          </div>
-          <div className="mt-1 font-mono text-[10px] tabular-nums text-zinc-500">
-            Mkt {fmtCents(lag.marketDown)} → model {fmtCents(lag.modelDown)}
-            {lag.marketDeltaDownCents != null ? (
-              <span className={lag.marketDeltaDownCents > 0 ? ' text-emerald-400' : lag.marketDeltaDownCents < 0 ? ' text-rose-400' : ''}>
-                {' '}
-                30s Δ {lag.marketDeltaDownCents >= 0 ? '+' : ''}{lag.marketDeltaDownCents.toFixed(1)}¢
-              </span>
-            ) : null}
-          </div>
-        </div>
+        <ContractLagLaneCard
+          laneLabel={upLabel}
+          accent="up"
+          market01={lag.marketUp}
+          model01={lag.modelUp}
+          lagCents={lag.lagUpCents}
+          delta30Cents={lag.marketDeltaUpCents}
+          highlighted={favoredIsUp && lag.lagUpCents >= 5}
+        />
+        <ContractLagLaneCard
+          laneLabel={downLabel}
+          accent="down"
+          market01={lag.marketDown}
+          model01={lag.modelDown}
+          lagCents={lag.lagDownCents}
+          delta30Cents={lag.marketDeltaDownCents}
+          highlighted={favoredIsDown && lag.lagDownCents >= 5}
+        />
       </div>
 
-      <div className="mt-2 grid gap-2 sm:grid-cols-2">
-        <ContractMidSparkline pts={probTicksUp} label={upLabel} model01={lag.modelUp} accent="up" />
-        <ContractMidSparkline pts={probTicksDown} label={downLabel} model01={lag.modelDown} accent="down" />
+      <div className="mt-3">
+        <ConfirmedBandGeometryStrip band={band} compact />
       </div>
 
-      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10px] tabular-nums text-zinc-500">
-        <span>
-          Spot {fmtUsdSigned(distVsPtb)} vs PTB
-          {lag.geo ? ` · ${lag.geo.replace('_', ' ')}` : ''}
-        </span>
+      <details className="mt-2 rounded-lg border border-zinc-800/50 bg-black/20 px-2 py-1.5">
+        <summary className="cursor-pointer text-[9px] font-semibold uppercase tracking-wide text-zinc-500 hover:text-zinc-300">
+          Live mid tape
+        </summary>
+        <div className="mt-2 grid gap-2 sm:grid-cols-2">
+          <ContractMidSparkline pts={probTicksUp} label={upLabel} model01={lag.modelUp} accent="up" />
+          <ContractMidSparkline pts={probTicksDown} label={downLabel} model01={lag.modelDown} accent="down" />
+        </div>
+      </details>
+
+      <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-zinc-800/45 bg-zinc-950/35 px-2.5 py-2 font-mono text-[10px] tabular-nums">
         <span
           title={
             buildUpEdgeHeadline({
@@ -2288,18 +2366,22 @@ function ContractLagBox(props: {
         >
           {upLabel} edge {fmtPp(lag.edgePp)}
         </span>
-        <span className={lag.geoAligned ? 'text-emerald-400/90' : 'text-amber-400/90'}>
-          {lag.geoAligned ? 'Geo ✓' : 'Geo ✗'}
-        </span>
         {lag.repricingIntoEdge != null ? (
           <span className={lag.repricingIntoEdge ? 'text-emerald-400/90' : 'text-zinc-500'}>
-            {lag.repricingIntoEdge ? 'REP+ catch-up' : 'REP− not moving yet'}
+            {lag.repricingIntoEdge ? 'Reprices toward model' : 'Not repricing yet'}
           </span>
         ) : null}
       </div>
-      <p className="mt-2 text-[10px] leading-snug text-zinc-500">{lag.detail}</p>
-      <p className="mt-1 text-[9px] text-zinc-600">
-        Trade filter: lag ≥ +5¢ · |edge| ≥ 3pp · spot geometry confirms side · LAGGING = before jump · CATCHING UP = 56→70 move
+
+      <p className="mt-2 text-[11px] font-medium leading-snug text-zinc-300">{lag.detail}</p>
+      {pinnedExtreme && lag.lagCents < 5 ? (
+        <p className="mt-1 text-[10px] leading-snug text-amber-200/90">
+          Book pinned near 0¢/100¢ — sub-5¢ lag is often noise. Wait for reopen or a spot-driven reprice.
+        </p>
+      ) : null}
+      <p className="mt-1 text-[9px] leading-snug text-zinc-600">
+        <span className="font-semibold text-zinc-500">LAGGING</span> = mispriced, jump not started ·{' '}
+        <span className="font-semibold text-zinc-500">CATCHING UP</span> = mid moving toward model (e.g. 56¢→70¢)
       </p>
     </div>
   );
@@ -2701,7 +2783,6 @@ export function NowPriceSignalsPanel(props: {
     [booksFetchedAt, probLastUpdateMs, probTicksDown, probTicksUp],
   );
 
-  const normNow = normLive;
   const binaryBias = useMemo(() => {
     if (spotLast == null || priceToBeat == null) return null;
     return estimateBinaryOutcomeBias({
@@ -2839,6 +2920,15 @@ export function NowPriceSignalsPanel(props: {
 
   const [spotOpen, setSpotOpen] = useState(false);
   const [layersOpen, setLayersOpen] = useState(false);
+  const [deskPanels, setDeskPanels] = useState(readNowPriceDeskPanels);
+
+  useEffect(() => {
+    writeNowPriceDeskPanels(deskPanels);
+  }, [deskPanels]);
+
+  const toggleDeskPanel = (id: NowPriceDeskPanelId) => {
+    setDeskPanels((prev) => toggleNowPriceDeskPanel(prev, id));
+  };
 
   const fairValueSimple = useMemo(() => {
     if (binaryBias == null || pMktUp == null) return null;
@@ -3075,6 +3165,32 @@ export function NowPriceSignalsPanel(props: {
     });
   }, [heroActiveLanePre, bookTouchUp, bookTouchDown, pMktUp, pMktDown, probUp, probDown, endsInMs]);
 
+  const momentumReadout = useMemo(
+    () =>
+      buildNowPriceMomentumReadout({
+        pressure: pressureBuildup ?? null,
+        pressureTiming: pressureBuildup?.timing ?? null,
+        advisory: buySideAdvisory ?? null,
+        contractLead: pressureBuildup?.contractLead ?? null,
+        binaryBiasPUp: binaryBias?.probUp ?? null,
+        machineReadout: machineReadout ?? null,
+        probDeltaUp01: recentDeltaUp01,
+        probDeltaDown01: recentDeltaDown01,
+        upLabel,
+        downLabel,
+      }),
+    [
+      pressureBuildup,
+      buySideAdvisory,
+      binaryBias?.probUp,
+      machineReadout,
+      recentDeltaUp01,
+      recentDeltaDown01,
+      upLabel,
+      downLabel,
+    ],
+  );
+
   const deskTradeSignal = useMemo(
     () =>
       buildNowPriceDeskTradeSignal({
@@ -3085,10 +3201,11 @@ export function NowPriceSignalsPanel(props: {
         tpOutlook: favoredTpOutlook,
         contractLead: pressureBuildup?.contractLead ?? null,
         pressureTiming: pressureBuildup?.timing ?? null,
+        momentum: momentumReadout,
         upLabel,
         downLabel,
       }),
-    [executionSignal, entryMoment, buySideAdvisory, directionEngine, favoredTpOutlook, pressureBuildup?.contractLead, pressureBuildup?.timing, upLabel, downLabel],
+    [executionSignal, entryMoment, buySideAdvisory, directionEngine, favoredTpOutlook, pressureBuildup?.contractLead, pressureBuildup?.timing, momentumReadout, upLabel, downLabel],
   );
 
   const aheadPlaybook = useMemo(() => {
@@ -3099,6 +3216,7 @@ export function NowPriceSignalsPanel(props: {
       entryMoment,
       contractLead: pressureBuildup?.contractLead ?? null,
       pressureTiming: pressureBuildup?.timing ?? null,
+      momentum: momentumReadout,
       bandGauge: bandGauge ?? null,
       band: bandDistances,
       execution: executionSignal,
@@ -3109,6 +3227,7 @@ export function NowPriceSignalsPanel(props: {
   }, [
     deskTradeSignal,
     entryMoment,
+    momentumReadout,
     pressureBuildup?.contractLead,
     pressureBuildup?.timing,
     bandGauge,
@@ -3152,30 +3271,77 @@ export function NowPriceSignalsPanel(props: {
       ? `${machineReadout.agreementScore}% ${machineReadout.focusLane?.toUpperCase() ?? 'SPLIT'}`
       : null;
 
+  const catchSummary = `${deskCatchModeLabel(heroSignal.aheadPlaybook.mode)} · ${heroSignal.aheadPlaybook.catchLine}`;
+  const signalSummary = [
+    heroSignal.primary,
+    heroSignal.laneLabel,
+    `${heroSignal.readinessPct}% ready`,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+  const contextSummary = [
+    glance.headline,
+    confirmedBandLabel(classifyConfirmedBandZone(bandDistances.now, bandDistances.bandHi, bandDistances.bandLo)),
+    fmtUsd(bandDistances.now),
+  ].join(' · ');
+
   return (
     <div className="flex min-w-0 flex-col gap-3 rounded-2xl border border-zinc-800/60 bg-[#0b1018] p-3 sm:p-4">
-      <DeskCatchStrip playbook={heroSignal.aheadPlaybook} />
-      <NowPriceHeroSignalBanner view={heroSignal} />
-
-      <NowPriceQuickContextStrip
-        band={bandDistances}
-        glance={glance}
-        geoTone={geoTone}
-        upLabel={upLabel}
-        downLabel={downLabel}
-        probUp01={pMktUp}
-        probDown01={pMktDown}
-        probUpDelta01={recentDeltaUp01}
-        probDownDelta01={recentDeltaDown01}
-        modelPUp={binaryBias?.probUp ?? null}
-        edgeUpPp={bilateralEdgeSnap.edgeUpPp}
-        edgeDownPp={bilateralEdgeSnap.edgeDownPp}
-        activeLane={heroActiveLane}
-        speedHint={speedHint}
-        machineHint={machineHint}
-        endsInMs={endsInMs}
-        slopeUsdPerMin={slopeUsdPerMin}
+      <DeskScreenSectionTabs
+        tabs={[
+          { id: 'catch', label: 'Catch', open: deskPanels.catch, onToggle: () => toggleDeskPanel('catch') },
+          { id: 'signal', label: 'Signal', open: deskPanels.signal, onToggle: () => toggleDeskPanel('signal') },
+          { id: 'context', label: 'Context', open: deskPanels.context, onToggle: () => toggleDeskPanel('context') },
+        ]}
       />
+
+      <DeskScreenSection
+        title="Catch playbook"
+        summary={catchSummary}
+        open={deskPanels.catch}
+        onToggle={() => toggleDeskPanel('catch')}
+      >
+        {momentumReadout ? <NowPriceMomentumStrip readout={momentumReadout} /> : null}
+        <div className={momentumReadout ? 'mt-2' : undefined}>
+          <DeskCatchStrip playbook={heroSignal.aheadPlaybook} />
+        </div>
+      </DeskScreenSection>
+
+      <DeskScreenSection
+        title="Main desk trade signal"
+        summary={signalSummary}
+        open={deskPanels.signal}
+        onToggle={() => toggleDeskPanel('signal')}
+      >
+        <NowPriceHeroSignalBanner view={heroSignal} />
+      </DeskScreenSection>
+
+      <DeskScreenSection
+        title="Quick context"
+        summary={contextSummary}
+        open={deskPanels.context}
+        onToggle={() => toggleDeskPanel('context')}
+      >
+        <NowPriceQuickContextStrip
+          band={bandDistances}
+          glance={glance}
+          geoTone={geoTone}
+          upLabel={upLabel}
+          downLabel={downLabel}
+          probUp01={pMktUp}
+          probDown01={pMktDown}
+          probUpDelta01={recentDeltaUp01}
+          probDownDelta01={recentDeltaDown01}
+          modelPUp={binaryBias?.probUp ?? null}
+          edgeUpPp={bilateralEdgeSnap.edgeUpPp}
+          edgeDownPp={bilateralEdgeSnap.edgeDownPp}
+          activeLane={heroActiveLane}
+          speedHint={speedHint}
+          machineHint={machineHint}
+          endsInMs={endsInMs}
+          slopeUsdPerMin={slopeUsdPerMin}
+        />
+      </DeskScreenSection>
 
       <NowPriceBuyStrip
         slug={slug}
@@ -3205,6 +3371,7 @@ export function NowPriceSignalsPanel(props: {
             spotUsd={bandDistances.now}
             ptbUsd={bandDistances.ptb}
             distVsPtb={bandDistances.distNowFromPtb}
+            band={bandDistances}
             spotProjections={pricePrediction?.projections ?? null}
             upLabel={upLabel}
             downLabel={downLabel}
@@ -3224,6 +3391,11 @@ export function NowPriceSignalsPanel(props: {
           contractProb={contractProbGrid}
           upLabel={upLabel}
           downLabel={downLabel}
+          confirmedBand={
+            bandDistances != null
+              ? { bandHi: bandDistances.bandHi, bandLo: bandDistances.bandLo }
+              : null
+          }
         />
       ) : null}
 
@@ -3252,9 +3424,9 @@ export function NowPriceSignalsPanel(props: {
       {contractLag ? (
         <ContractLagBox
           lag={contractLag}
+          band={bandDistances}
           upLabel={upLabel}
           downLabel={downLabel}
-          distVsPtb={bandDistances.distNowFromPtb}
           probTicksUp={probTicksUp}
           probTicksDown={probTicksDown}
         />
@@ -3338,18 +3510,6 @@ export function NowPriceSignalsPanel(props: {
           {deskSpeed ? (
             <DeepLayerBlock title={`Speed layers · ${deskSpeed.horizonSec}s · UP / DOWN split`}>
               <DeskSpeedLayersCard speed={deskSpeed} embedded />
-            </DeepLayerBlock>
-          ) : null}
-
-          {binaryBias ? (
-            <DeepLayerBlock title="Settlement bias model">
-              <BinaryOutcomeModelCard
-                estimate={binaryBias}
-                upLabel={upLabel}
-                downLabel={downLabel}
-                normMarketUp={pMktUp}
-                embedded
-              />
             </DeepLayerBlock>
           ) : null}
 

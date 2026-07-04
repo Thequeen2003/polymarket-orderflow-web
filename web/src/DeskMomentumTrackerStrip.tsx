@@ -25,6 +25,11 @@ const PHASE_STYLE: Record<
     badge: 'border-fuchsia-500/45 bg-fuchsia-950/45 text-fuchsia-50',
     label: 'Switched',
   },
+  fading: {
+    ring: 'border-orange-700/50 bg-orange-950/28 ring-orange-900/25',
+    badge: 'border-orange-500/45 bg-orange-950/45 text-orange-50',
+    label: 'Fading',
+  },
   idle: {
     ring: 'border-zinc-700/55 bg-zinc-950/35 ring-white/[0.03]',
     badge: 'border-zinc-600/45 bg-zinc-900/50 text-zinc-300',

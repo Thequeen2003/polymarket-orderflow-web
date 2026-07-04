@@ -96,6 +96,7 @@ import {
   type UpdownAsset,
   type UpdownInterval,
 } from './agentSnapshot.js';
+import { getIqOptionSnapshot, iqOptionConfigured, placeIqOptionBinaryOrder } from './iqOptionDesk.js';
 import {
   liveOrdersViaBullpen,
   liveTradingEnvSummary,
@@ -2127,6 +2128,101 @@ app.get('/api/binance/agg-trades', async (req, res) => {
   } catch (e) {
     return json(res, 502, { ok: false, error: 'binance_agg_trades_failed', details: String(e) });
   }
+});
+
+/** Binance 24h ticker — last trade price for spot desks (not Polymarket). */
+app.get('/api/binance/ticker', async (req, res) => {
+  const rawSym = String(req.query.symbol ?? 'BTCUSDT').trim().toUpperCase();
+  if (!/^[A-Z0-9]{6,24}$/.test(rawSym)) {
+    return json(res, 400, { ok: false, error: 'bad_symbol', details: { symbol: rawSym } });
+  }
+  try {
+    const url = `https://api.binance.com/api/v3/ticker/24hr?symbol=${encodeURIComponent(rawSym)}`;
+    const r = await fetch(url);
+    if (!r.ok) {
+      const t = await r.text();
+      return json(res, 502, { ok: false, error: 'binance_ticker_failed', details: t.slice(0, 500) });
+    }
+    const j = (await r.json()) as Record<string, unknown>;
+    const lastPrice = Number(j.lastPrice);
+    const bid = Number(j.bidPrice);
+    const ask = Number(j.askPrice);
+    const changePct = Number(j.priceChangePercent);
+    return json(res, 200, {
+      ok: true,
+      data: {
+        symbol: rawSym,
+        lastPrice: Number.isFinite(lastPrice) ? lastPrice : null,
+        bidPrice: Number.isFinite(bid) ? bid : null,
+        askPrice: Number.isFinite(ask) ? ask : null,
+        priceChangePercent: Number.isFinite(changePct) ? changePct : null,
+      },
+    });
+  } catch (e) {
+    return json(res, 502, { ok: false, error: 'binance_ticker_failed', details: String(e) });
+  }
+});
+
+/** Binance klines — OHLCV history for spot candle charts. */
+app.get('/api/binance/klines', async (req, res) => {
+  const rawSym = String(req.query.symbol ?? 'BTCUSDT').trim().toUpperCase();
+  if (!/^[A-Z0-9]{6,24}$/.test(rawSym)) {
+    return json(res, 400, { ok: false, error: 'bad_symbol', details: { symbol: rawSym } });
+  }
+  const interval = String(req.query.interval ?? '1m').trim();
+  if (!/^[0-9]+[smhdwMySMHDWM]$/.test(interval)) {
+    return json(res, 400, { ok: false, error: 'bad_interval', details: { interval } });
+  }
+  const lim = Number(req.query.limit ?? '120');
+  const limit = Number.isFinite(lim) ? Math.min(1000, Math.max(1, Math.floor(lim))) : 120;
+  try {
+    const url = `https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(rawSym)}&interval=${encodeURIComponent(interval)}&limit=${limit}`;
+    const r = await fetch(url);
+    if (!r.ok) {
+      const t = await r.text();
+      return json(res, 502, { ok: false, error: 'binance_klines_failed', details: t.slice(0, 500) });
+    }
+    const raw = (await r.json()) as unknown;
+    return json(res, 200, { ok: true, data: Array.isArray(raw) ? raw : [] });
+  } catch (e) {
+    return json(res, 502, { ok: false, error: 'binance_klines_failed', details: String(e) });
+  }
+});
+
+/** IQ Option Bitcoin (BTCX) practice desk — live candles + turbo binary (not Polymarket). */
+app.get('/api/iqoption/status', (_req, res) => {
+  return json(res, 200, {
+    ok: true,
+    data: {
+      configured: iqOptionConfigured(),
+      market: 'BTCX',
+      activeId: 73,
+    },
+  });
+});
+
+app.get('/api/iqoption/snapshot', async (req, res) => {
+  const barSecRaw = Number(req.query.barSec ?? '60');
+  const barSec = Number.isFinite(barSecRaw) ? Math.min(900, Math.max(60, Math.floor(barSecRaw))) : 60;
+  try {
+    const snap = await getIqOptionSnapshot(barSec);
+    return json(res, 200, { ok: true, data: snap });
+  } catch (e) {
+    return json(res, 502, { ok: false, error: 'iqoption_snapshot_failed', details: String(e) });
+  }
+});
+
+app.post('/api/iqoption/binary', async (req, res) => {
+  const body = req.body as { direction?: string; amountUsd?: number; expiryMin?: number } | undefined;
+  const direction = body?.direction === 'up' || body?.direction === 'down' ? body.direction : null;
+  const amountUsd = Number(body?.amountUsd);
+  const expiryMin = Number(body?.expiryMin ?? 1);
+  if (!direction || !Number.isFinite(amountUsd) || amountUsd <= 0) {
+    return json(res, 400, { ok: false, error: 'bad_request', details: 'Need direction (up|down) and amountUsd > 0' });
+  }
+  const result = await placeIqOptionBinaryOrder({ direction, amountUsd, expiryMin });
+  if (!result.ok) return json(res, 502, { ok: false, error: result.error });
+  return json(res, 200, { ok: true, data: { optionId: result.optionId } });
 });
 
 /** Parallel order books — HTTP-first per token (2.5s cache; bounded per-token timeouts). */

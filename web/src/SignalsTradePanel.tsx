@@ -1547,8 +1547,8 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const [takeProfitStatus, setTakeProfitStatus] = useState<'OFF' | 'ARMED' | 'TRIGGERED'>('OFF');
 
   /** Suggested TP/SL levels (displayed as hints — never auto-filled into the inputs). */
-  const [suggestedSlCents, setSuggestedSlCents] = useState('');
-  const [suggestedTpCents, setSuggestedTpCents] = useState('');
+  const [_, setSuggestedSlCents] = useState('');
+  const [__, setSuggestedTpCents] = useState('');
   /** Emergency stop (+ optional TP) staged before buy — arms SL on fill; SL persists per lane. */
   const [buyBundleByLane, setBuyBundleByLane] = useState(() => {
     const prefs = loadEmergencyStopBundlePrefs();
@@ -6717,7 +6717,6 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   }, [action, bracketPlannedEntry01, buySizingPrice01, previewPrice01]);
 
   /** Entry + size for buy-bundle SL/TP — the order being placed, not prior avg entry or held shares. */
-  const buyBundleEntry01 = buyBracketSizingEntry01;
   const buyBundleShares = useMemo(() => {
     if (action !== 'buy' || !amtOk) return null;
     const entry = buyBracketSizingEntry01;
@@ -6776,11 +6775,6 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
   const buyBundleBracketRef01 = useMemo(
     () => resolveBracketRef({ avgEntry01: null, plannedEntry01: buyBundleBracketEntry01, mid01 }).ref01,
     [buyBundleBracketEntry01, mid01],
-  );
-
-  const bracketEntry01 = useMemo(
-    () => resolveBracketRef({ avgEntry01: avgEntry ?? null, plannedEntry01: bracketPlannedEntry01, mid01 }).ref01,
-    [avgEntry, bracketPlannedEntry01, mid01],
   );
 
   /** Live SL/TP hints for the visible UP/DOWN lane — tracks quote/limit as the book moves. */
@@ -6986,30 +6980,6 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
     autoBundleTpLaneRef.current = { lane, cents: tp };
     buyBundleTpDraftRef.current = { ...buyBundleTpDraftRef.current, [lane]: EMPTY_BRACKET_INPUT_DRAFT };
   }, [action, applyBuyBundleTpCents, emergencyStopBundlePrefs.autoTpOnFill, lane, quoteAssistTpCents]);
-
-  const applySuggestedBuyBundleLevels = useCallback(() => {
-    const sl = suggestedSlDisplay.trim();
-    const tp = suggestedTpDisplay.trim();
-    if (!sl && !tp) return;
-    bracketLaneDraftRef.current[lane] = {
-      sl: sl || bracketLaneDraftRef.current[lane].sl,
-      tp: tp || bracketLaneDraftRef.current[lane].tp,
-    };
-    buyBundleByLaneRef.current = {
-      ...buyBundleByLaneRef.current,
-      [lane]: {
-        sl: sl || buyBundleByLaneRef.current[lane].sl,
-        tp: tp || buyBundleByLaneRef.current[lane].tp,
-      },
-    };
-    setBuyBundleByLane((prev) => ({
-      ...prev,
-      [lane]: {
-        sl: sl || prev[lane].sl,
-        tp: tp || prev[lane].tp,
-      },
-    }));
-  }, [lane, suggestedSlDisplay, suggestedTpDisplay]);
 
   const globalSlCentsForBuy = useMemo(
     () => resolveGlobalStopForEntry(limit01, loadNowPriceDeskScalpPrefs()),
@@ -9743,7 +9713,6 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                         submitLockRef.current = false;
                         return;
                       }
-                      const cancelMs = Math.max(250, Math.min(5000, Math.floor(Number(pickAutoCancelMs) || 1500)));
                       setBusySubmit(true);
                       try {
                         if (accountMode === 'paper') {
@@ -11319,7 +11288,7 @@ export function SignalsTradePanel(props: SignalsTradePanelProps): ReactElement {
                     setOkMsg(
                       useMarketBuy
                         ? `Market buy submitted · ack ${rt}ms — filling at best available price…`
-                        : `${execMode === 'touch' ? 'Quick' : 'Limit'} buy sent · intended ${(price * 100).toFixed(1)}¢ · ack ${rt}ms — reading exchange state…`,
+                        : `Limit buy sent · intended ${(price * 100).toFixed(1)}¢ · ack ${rt}ms — reading exchange state…`,
                     );
                     scheduleTruthRefreshBurst(submitToken, oid ?? null, () => afterLiveBuyRowReconcile(optimistic.id));
                   }

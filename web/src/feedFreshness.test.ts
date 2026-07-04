@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  appendChartSeriesPoint,
   appendLiveMidSeries,
   appendLiveSpotSeries,
+  booksEntriesMidKey,
   maxFeedMs,
   normalizeEpochMs,
   seedProbSeriesFromLiveMid,
@@ -73,5 +75,26 @@ describe('feedFreshness', () => {
     const out = seedProbSeriesFromLiveMid([], 0.62, BASE);
     expect(out.length).toBe(3);
     expect(out[2]!.v).toBe(0.62);
+  });
+
+  it('appendChartSeriesPoint keeps reference when mid flat', () => {
+    const prev = [{ t: BASE, v: 0.5 }];
+    expect(appendChartSeriesPoint(prev, BASE + 1000, 0.5)).toBe(prev);
+  });
+
+  it('appendChartSeriesPoint appends when mid moves', () => {
+    const prev = [{ t: BASE, v: 0.5 }];
+    const out = appendChartSeriesPoint(prev, BASE + 1000, 0.52);
+    expect(out).toHaveLength(2);
+    expect(out[1]).toEqual({ t: BASE + 1000, v: 0.52 });
+  });
+
+  it('booksEntriesMidKey fingerprints token mids', () => {
+    const key = booksEntriesMidKey([
+      { token: 'a', book: { bids: [{ price: '0.48', size: '1' }], asks: [{ price: '0.52', size: '1' }] } },
+      { token: 'b', book: { bids: [], asks: [] }, error: 'x' },
+    ]);
+    expect(key).toContain('a:0.50000');
+    expect(key).toContain('b:e');
   });
 });

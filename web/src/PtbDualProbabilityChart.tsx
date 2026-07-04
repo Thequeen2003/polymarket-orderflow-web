@@ -1,6 +1,8 @@
-import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactElement } from 'react';
 import type { SpotPoint } from './SpotLevelChart';
 import { buildSpotCandlesInRange, type SpotCandle } from './spotVsPtb';
+import { scaledMinHeight } from './chartPanelZoom';
+import { useChartPanelScale } from './chartPanelScaleContext';
 import { pickBookLevels } from './bookLevels';
 import { computeProbMicrostructure } from './ptbAdvancedContext';
 import { computePtbSystemDecision, PTB_DECISION_FALLBACK } from './ptbDecisionEngine';
@@ -416,6 +418,7 @@ export function PtbDualProbabilityChart(props: {
   } = props;
   const decisionFirst = decisionFirstProp ?? (compactHeader || signalsLayout);
   const compactChrome = compactHeader || signalsLayout || combinedColumn;
+  const panelScale = useChartPanelScale();
   const effectiveHideReadingGuide = hideReadingGuide || signalsLayout || combinedColumn;
   const showSharedChrome = laneOnly == null && !combinedColumn;
   // Stale flag: re-render only when the staleness boolean actually flips, not every 2s.
@@ -717,7 +720,7 @@ export function PtbDualProbabilityChart(props: {
   const chartTall = largeCharts || decisionFirst;
   const chartFill = chartTall || signalsLayout;
   const width = combinedColumn ? 520 : chartTall ? 1100 : 680;
-  const height = combinedColumn ? 280 : chartTall ? 720 : 460;
+  const height = (combinedColumn ? 280 : chartTall ? 720 : 460) * panelScale;
   const padL = 12;
   const padR = 58;
   const padY = 10;
@@ -749,6 +752,16 @@ export function PtbDualProbabilityChart(props: {
       : signalsLayout
         ? 'grid min-h-[min(38svh,460px)] flex-1 grid-cols-2 items-stretch gap-2 sm:gap-3 md:min-h-[min(42svh,500px)] lg:gap-4'
         : 'contents';
+  const chartGridStyle: CSSProperties | undefined =
+    chartFill && panelScale !== 1
+      ? {
+          minHeight: scaledMinHeight(
+            decisionFirst && laneOnly == null ? 52 : 38,
+            decisionFirst && laneOnly == null ? 680 : 460,
+            panelScale,
+          ),
+        }
+      : undefined;
 
   // `stale` is now driven by the tick effect above (re-renders only on flip).
   const pathUpActive = engine.pathUpActive;
@@ -2132,7 +2145,7 @@ export function PtbDualProbabilityChart(props: {
           </div>
         ) : null}
 
-        <div className={chartGridClass}>
+        <div className={chartGridClass} style={chartGridStyle}>
         {showUpPanel ? (
         <div
           className={`flex w-full min-w-0 flex-col rounded-xl border bg-zinc-950/50 shadow-inner shadow-black/30 ring-1 ring-emerald-500/10 ${panelBoxClass} ${

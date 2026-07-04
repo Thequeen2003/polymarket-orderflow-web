@@ -133,7 +133,7 @@ export function classifyTpRegime(input: RegimeTpClassifyInput): TpMarketRegime {
   if (
     mode === 'ACCELERATION_IMBALANCE' ||
     input.pressureTiming === 'BUILDING' ||
-    (spotVelocityHigh(input.deskSpeed) && alignment !== 'CHOP')
+    (spotVelocityHigh(input.deskSpeed))
   ) {
     if (alignment === 'TREND_GRIND' || machine === 'trend') return 'TREND_GRIND';
     return 'ACCELERATION';

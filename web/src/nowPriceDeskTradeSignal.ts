@@ -9,6 +9,7 @@ import type { EntryMoment } from './entryMoment';
 import type { PositionTpOutlook } from './positionTpOutlook';
 import type { BuySideAdvisory } from './shouldBuyWhichSide';
 import type { ContractLeadSignal } from './contractLeadSignal';
+import type { NowPriceMomentumReadout } from './nowPriceMomentumReadout';
 import type { PressureTiming } from './pressureTiming';
 
 export type NowPriceDeskTradePhase = 'ENTER' | 'ALERT' | 'LEAN' | 'WAIT' | 'NO_TRADE';
@@ -31,7 +32,7 @@ export type NowPriceDeskTradeSignal = {
   canTrade: boolean;
   tone: 'up' | 'down' | 'warn' | 'flat';
   emoji: string;
-  source: 'execution' | 'entry_moment' | 'direction' | 'advisory' | 'none';
+  source: 'execution' | 'entry_moment' | 'momentum' | 'direction' | 'advisory' | 'none';
 };
 
 function laneName(lane: 'up' | 'down', upLabel: string, downLabel: string): string {
@@ -145,6 +146,7 @@ export function buildNowPriceDeskTradeSignal(args: {
   tpOutlook: PositionTpOutlook | null;
   contractLead?: ContractLeadSignal | null;
   pressureTiming?: PressureTiming | null;
+  momentum?: NowPriceMomentumReadout | null;
   upLabel: string;
   downLabel: string;
 }): NowPriceDeskTradeSignal {
@@ -156,6 +158,7 @@ export function buildNowPriceDeskTradeSignal(args: {
     tpOutlook,
     contractLead = null,
     pressureTiming = null,
+    momentum = null,
     upLabel,
     downLabel,
   } = args;
@@ -308,6 +311,76 @@ export function buildNowPriceDeskTradeSignal(args: {
       emoji: momentumHeadline ? '⚡' : leanHeadline ? '⚡' : '⏳',
       source: 'entry_moment',
     };
+  }
+
+  // --- Live momentum window (10s tape — catch before 30s chase) ---
+  if (momentum && momentum.phase !== 'flat' && momentum.lane) {
+    const lane = momentum.lane;
+    const label = momentum.laneLabel ?? laneName(lane, upLabel, downLabel);
+    const chasing = momentum.phase === 'chasing' || momentum.phase === 'extended';
+    const execConfirmAlmostDone =
+      execution?.phase === 'ALERT' &&
+      Math.ceil((execution.confirmRequiredMs - execution.confirmHeldMs) / 1000) <= 2;
+    const preferMomentum =
+      !execConfirmAlmostDone &&
+      !chasing &&
+      (momentum.phase === 'early' || momentum.phase === 'building' || momentum.canCatch);
+    if (preferMomentum) {
+      const momBlockers = momentum.confirmations.filter((c) => !c.ok).map((c) => c.label);
+      const phase: NowPriceDeskTradePhase =
+        momentum.canCatch &&
+        (contractLead?.phase === 'ENTER' || (momentum.biasAligned && (entryMoment?.readinessPct ?? 0) >= 70))
+          ? 'ENTER'
+          : 'ALERT';
+      const tpNote =
+        tpHitProbPct != null && tpCents != null
+          ? ` TP ~${tpHitProbPct}% to ${tpCents.toFixed(1)}¢.`
+          : '';
+      return {
+        phase,
+        lane,
+        laneLabel: label,
+        headline: momentum.headline,
+        exactAction: `${momentum.actionHint}${tpNote}`,
+        confidencePct: advisory?.confidencePct ?? directionEngine?.confidencePct ?? null,
+        confirmPct: entryMoment?.readinessPct ?? null,
+        confirmSecRemaining: entryMoment?.confirmSecRemaining ?? null,
+        readinessPct: Math.max(
+          entryMoment?.readinessPct ?? 0,
+          momentum.biasAligned ? 78 : 65,
+          momentum.earlyScore * 14,
+        ),
+        tpHitProbPct,
+        tpCents,
+        urgency: phase === 'ENTER' ? 'now' : 'soon',
+        blockers: momBlockers,
+        canTrade: phase === 'ENTER',
+        tone: toneForLane(lane),
+        emoji: momentum.emoji,
+        source: 'momentum',
+      };
+    }
+    if (chasing && lane) {
+      return {
+        phase: 'WAIT',
+        lane,
+        laneLabel: label,
+        headline: momentum.headline,
+        exactAction: momentum.actionHint,
+        confidencePct: advisory?.confidencePct ?? directionEngine?.confidencePct ?? null,
+        confirmPct: null,
+        confirmSecRemaining: null,
+        readinessPct: entryMoment?.readinessPct ?? 28,
+        tpHitProbPct,
+        tpCents,
+        urgency: 'wait',
+        blockers: momentum.confirmations.filter((c) => !c.ok).map((c) => c.label),
+        canTrade: false,
+        tone: toneForLane(lane),
+        emoji: momentum.emoji,
+        source: 'momentum',
+      };
+    }
   }
 
   // --- Execution ALERT (confirming) ---

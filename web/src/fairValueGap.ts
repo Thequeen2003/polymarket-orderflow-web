@@ -128,8 +128,7 @@ export function buildFairValueGapSampleInput(params: {
     now: params.now,
     ptb: params.ptb,
     spotPts: params.spotPts,
-    probUp01: params.probUp01,
-    probDown01: params.probDown01,
+    pUp01: params.probUp01 ?? (params.probDown01 != null ? 1 - params.probDown01 : null),
   });
   if (!est) return null;
   const pExpected = est.probUp;

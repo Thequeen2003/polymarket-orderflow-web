@@ -100,7 +100,7 @@ export function syncSentRowsFromOpenOrders(orders: unknown[]): number {
     if (rowShowsExchangeFill(row)) continue;
     const snap = byOid.get(oid);
     if (!snap) {
-      if (!localLiveOrderAbsentFromOpenOrders(row, byOid, nowMs)) continue;
+      if (!localLiveOrderAbsentFromOpenOrders(row, new Set(byOid.keys()), nowMs)) continue;
       const filled = Math.max(0, Number(row.shares ?? 0));
       updateTradeHistoryRow(row.id, {
         status: filled > 1e-6 ? 'partial' : 'no_fill',

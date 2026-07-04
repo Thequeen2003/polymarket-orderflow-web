@@ -18,8 +18,6 @@ import {
 import {
   classifyPressureTiming,
   probPressurePointEarly,
-  PRESSURE_CONFIRM_HORIZON_SEC,
-  PRESSURE_EARLY_HORIZON_SEC,
   spotLedLeadNote,
   type PressureTiming,
   type PressureTimingReadout,
